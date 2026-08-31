@@ -1,19 +1,17 @@
 [Unit]
 Description=zflow spike E: pre-login uinput injection test
-# Order before the display manager so the uinput device exists when the
-# greeter's compositor enumerates input devices. This is the early-boot claim
-# under test. DefaultDependencies=no would start it even earlier but we want
-# systemd + /dev + udev up, so keep default ordering and just precede the DM.
+# Hold the display manager until the injector creates and classifies its
+# keyboard. The process sends READY=1 before it waits for the greeter.
 Before=display-manager.service
 Wants=systemd-udevd.service
 After=systemd-udevd.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 # absolute path is filled in by install.sh
-ExecStart=__BINARY__ --log /var/log/zflow-spike-e.log --delay 20 --rounds 24 --interval 5
-# a real zflowd would use Type=notify + sd_notify READY=1 after device
-# creation; the spike fakes readiness with the internal delay
+ExecStart=__BINARY__ --log /var/log/zflow-spike-e.log --greeter-timeout 30 --settle-ms 5000
+TimeoutStartSec=15
 Restart=no
 
 [Install]

@@ -1,13 +1,37 @@
-# Spike E: pre-login injection (stub)
+# Spike E: pre-login injection
 
-**Question:** can a root daemon's uinput keyboard, created before the display manager starts, type a password at the GDM/SDDM greeter, and do the virtual devices classify correctly?
+**Question:** can a root daemon create a correctly classified uinput keyboard
+before GDM starts and deliver keys to the greeter password field?
 
-**Kill criteria:** failure would gut the kernel-backbone rationale. Expected to pass; too much architecture rides on it to leave untested.
+**Status:** passed on Ubuntu 26.04.1 with GDM 50.1. The controlled 2026-08-31
+boot proved pre-GDM creation, keyboard classification, seat0 assignment, and
+delivery to GDM's password field. See [`RESULT.md`](RESULT.md) for the timing
+evidence.
 
-**Plan:**
+## Reproduce the GDM run
 
-1. Reuse spike B's receiver, extended with a virtual keyboard (EV_KEY with the full keyboard range), or a standalone script driving uinput.
-2. Wrap it in a systemd unit: `WantedBy=multi-user.target`, `Before=gdm.service`, `Type=notify` behavior faked with a readiness sleep for the spike.
-3. Reboot. At the greeter, from a second machine (ssh), inject a known key sequence; confirm the greeter's password field receives it.
-4. Check classification: `udevadm info` shows ID_INPUT_KEYBOARD / ID_INPUT_MOUSE, `libinput list-devices` lists both, and the devices land on seat0.
-5. Repeat at the lock screen and on a VT. RESULT.md records distro, display manager, and any udev property that had to be forced.
+Build and install the corrected one-shot harness:
+
+```bash
+cargo build --release --manifest-path spikes/e-prelogin/Cargo.toml
+sudo spikes/e-prelogin/install.sh
+sudo reboot
+```
+
+At GDM, select the user and leave the password field focused. Wait for five
+password dots to appear and disappear once. The harness never sends Enter and
+refuses to inject after an authenticated seat0 session becomes active.
+
+After login, preserve the evidence and remove the boot service:
+
+```bash
+sudo spikes/e-prelogin/uninstall.sh
+sed -n '1,240p' /var/log/zflow-spike-e.log
+```
+
+The log records udev properties, the matching `libinput list-devices` block,
+systemd readiness, and the injection timestamp.
+
+The GDM run answers the narrow feasibility question. Lock screen, VT, SDDM,
+greetd, and authorization behavior belong to the wider matrix in
+[`TESTPLAN.md`](../../TESTPLAN.md).

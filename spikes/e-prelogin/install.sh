@@ -22,5 +22,6 @@ systemctl daemon-reload
 systemctl enable zflow-spike-e.service
 
 echo "installed and enabled. reboot to run it."
-echo "after reboot: watch the greeter, then read /var/log/zflow-spike-e.log"
+echo "at GDM: focus the password field and wait for five dots to appear and disappear once."
+echo "after login: read /var/log/zflow-spike-e.log, then uninstall the spike."
 echo "remove with: sudo $DIR/uninstall.sh"

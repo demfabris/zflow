@@ -10,7 +10,7 @@ Convention: each spike lives in `spikes/<letter>-<name>/` with a `RESULT.md` rec
 | B | Does receiver-side smoothing feel better than raw on the real link? | 0 | PASSED: adaptive best-of-three by hand on the real link; near-local with radio treated (RESULT.md) |
 | C | Does a uinput virtual touchpad trigger real GNOME gestures? | 1 | PARTIAL: udev + libinput layers PASS (76-update progressive stream captured); overview fires but snaps, isolated to GNOME Shell's presentation layer; next steps in RESULT.md |
 | D | Does MultitouchSupport deliver contact frames on the actual macbook? | 1 | PASSED: 3-finger frames at ~63 Hz on macOS 27, undisturbed by a swallowing event tap; device list is hot-plug dynamic (RESULT.md) |
-| E | Does pre-login uinput injection work at the greeter? | 1 | classification half verified live (ID_INPUT_MOUSE + GNOME accepts); greeter half pending reboot test |
+| E | Does pre-login uinput injection work at the greeter? | 1 | PASSED on GDM: pre-DM creation, keyboard classification, seat0 libinput, and visible password-field injection (RESULT.md) |
 | F | Do quinn datagrams stay timely under jitter vs raw UDP? | 2 | pending |
 | G | How big is the grab-on-demand arming leak? | 2 | pending |
 | H | Does QoS marking change the over-the-air access category? | 2 | pending |
