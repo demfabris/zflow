@@ -1,0 +1,9 @@
+[package]
+name = "spike-c-virtual-touchpad"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+evdev = "0.12"
