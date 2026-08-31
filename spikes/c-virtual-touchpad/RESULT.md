@@ -24,16 +24,33 @@ GESTURE_SWIPE_UPDATE stream or collapses the gesture into begin/end) needs
 `sudo libinput debug-events` on the virtual node and was not captured before
 the session wrapped.
 
-## Open question and next step
+## Diagnostic captured (same evening): libinput layer is PERFECT
 
-One capture of `sudo timeout 20 libinput debug-events --device <node>` while
-`spike-c-virtual-touchpad --loop --slow` runs. If UPDATE deltas stream
-continuously, the snap is mutter-side interpretation of this device and needs
-comparison against a real touchpad's event stream (borrow a laptop, or replay
-a libinput record from one); if UPDATEs are missing, the synthetic stream
-lacks something libinput's gesture engine wants (candidate suspects:
-perfectly synchronized finger landing in one frame, zero inter-finger jitter,
-missing ABS_MT_TOUCH_MAJOR/PRESSURE).
+`sudo libinput debug-events --device /dev/input/event26` (libinput-tools
+1.31.1, the same libinput mutter links) during the slow loop:
+
+- `GESTURE_SWIPE_BEGIN 3`, then **76 continuous GESTURE_SWIPE_UPDATE events
+  at exact 16 ms spacing**, steady dy ~-5.96 (dx 0.00), the scripted 400 ms
+  mid-gesture hold plainly visible between updates 36 and 37 (+17.448 s ->
+  +17.864 s), then a clean `GESTURE_SWIPE_END`.
+
+The synthetic pad and libinput's gesture engine are exonerated: this is a
+textbook progressive stream. Meanwhile gnome-shell's journal logged JS errors
+at exactly the swipe times: `Invalid overview shown transition from HIDDEN to
+HIDING` and `SHOWING to SHOWING`. So the gesture demonstrably reaches Shell's
+overview machinery and the failure is in Shell's presentation/state layer.
+Caveat against over-reading: the test loop blindly alternates up/down swipes
+every few seconds, which itself produces illegal transitions (a hide gesture
+from HIDDEN, a second show mid-animation); part of the error spam is the
+loop's fault, not a single gesture's.
+
+## Remaining next steps
+
+1. A single clean up-swipe from a settled desktop (no loop), watching whether
+   one isolated gesture tracks 1:1. The tool supports it (run without
+   `--loop`); nobody was watching during the one single-shot run.
+2. The definitive product test regardless: replay real Mac contact frames
+   (spike D's ~63 Hz stream has natural stagger and jitter) end to end.
 
 ## Consequence for the product
 
