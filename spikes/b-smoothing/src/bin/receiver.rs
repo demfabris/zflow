@@ -58,6 +58,8 @@ struct RecvFrame {
 struct Shared {
     mode: Mode,
     fixed_delay_us: i64,
+    adapt_cap_us: i64,
+    jitter_pct: usize,
     session: Option<u64>,
     queue: VecDeque<RecvFrame>,
     highest_seq: Option<u64>,
@@ -111,8 +113,8 @@ impl Shared {
         }
         let mut v: Vec<i64> = self.owd_window.iter().map(|&(_, o)| o - min).collect();
         v.sort_unstable();
-        // nearest-rank p95, not the max at small counts
-        let idx = ((v.len() * 95).div_ceil(100)).saturating_sub(1);
+        // nearest-rank percentile, not the max at small counts
+        let idx = ((v.len() * self.jitter_pct).div_ceil(100)).saturating_sub(1);
         Some(v[idx])
     }
 
@@ -248,6 +250,8 @@ fn main() -> std::io::Result<()> {
     let shared = Arc::new(Mutex::new(Shared {
         mode,
         fixed_delay_us: delay_ms * 1000,
+        adapt_cap_us: ADAPT_MAX_US,
+        jitter_pct: 95,
         session: None,
         queue: VecDeque::new(),
         highest_seq: None,
@@ -279,9 +283,21 @@ fn main() -> std::io::Result<()> {
                         }
                         None
                     }
+                    ["cap", ms] => {
+                        if let Ok(v) = ms.parse::<i64>() {
+                            s.adapt_cap_us = v.clamp(2, 200) * 1000;
+                        }
+                        None
+                    }
+                    ["pct", p] => {
+                        if let Ok(v) = p.parse::<usize>() {
+                            s.jitter_pct = v.clamp(50, 99);
+                        }
+                        None
+                    }
                     ["stats"] => None,
                     _ => {
-                        eprintln!("? commands: raw | fixed | adaptive | delay <ms> | stats");
+                        eprintln!("? commands: raw | fixed | adaptive | delay <ms> | cap <ms> | pct <n> | stats");
                         continue;
                     }
                 };
@@ -294,9 +310,11 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 eprintln!(
-                    "mode {:?}, fixed delay {} ms, recv {}, gaps {}, queued {}, offset_min {:?} us, jitter_p95 {:?} us",
+                    "mode {:?}, fixed delay {} ms, cap {} ms, pct {}, recv {}, gaps {}, queued {}, offset_min {:?} us, jitter_pctl {:?} us",
                     s.mode,
                     s.fixed_delay_us / 1000,
+                    s.adapt_cap_us / 1000,
+                    s.jitter_pct,
                     s.recv_count,
                     s.gap_count,
                     s.queue.len(),
@@ -413,7 +431,7 @@ fn main() -> std::io::Result<()> {
 
         if last_adapt.elapsed() >= Duration::from_millis(100) {
             cached_adaptive_us = match s.jitter_p95() {
-                Some(p95) => (p95 + ADAPT_MARGIN_US).clamp(ADAPT_MIN_US, ADAPT_MAX_US),
+                Some(p) => (p + ADAPT_MARGIN_US).clamp(ADAPT_MIN_US, s.adapt_cap_us),
                 // sparse or idle: decay toward the floor instead of holding
                 // a stale spike-era delay forever
                 None => (cached_adaptive_us * 3 / 4).max(ADAPT_MIN_US),

@@ -56,7 +56,8 @@ zflow MUST:
 | macOS source capture during Secure Event Input | keyboard unsupported; pointer and scroll experiment | Per-event-class matrix |
 | Linux virtual touchpad and native target gestures | experiment | libinput and compositor matrix |
 | Raw Mac trackpad contact capture (signed build, feature flag) | experiment | Contact capture and replay matrix |
-| Adaptive radio probes and QoS marking | provisional | Radio and energy matrix |
+| AWDL suppression during sessions (macOS, opt-in) | planned, mechanism proven | Consent flow + re-apply loop |
+| QoS marking | provisional | Radio and energy matrix |
 | Automatic path failover | planned | Candidate-racing failure matrix |
 | Clipboard and file transfer | deferred | Separate bulk transport |
 
@@ -392,7 +393,9 @@ A 20-byte payload at 50 Hz consumes 8 kbit/s per direction before QUIC, UDP, IP,
 
 The selected cadence MAY vary by path and platform. It runs only while a remote-input activation is live and stops on release.
 
-First measurement (2026-08-31, spikes/a-radio/RESULT.md): on the reference link, keepalive originated on the wired host toward the WiFi peer DEGRADED latency monotonically with rate, in both arm orders. Frames to a dozing station queue at the AP behind its doze schedule. Any keepalive benefit must come from each peer's own transmission; a peer MUST NOT send wake traffic on behalf of the other side.
+Measured 2026-08-31 (spikes/a-radio/RESULT.md): on the reference link, keepalive DEGRADED latency in BOTH directions: wired-host-originated (monotonic with rate, both arm orders) and mac-originated (100 Hz made jitter worse and unstable). Traffic-based radio wake is dead on this evidence; a peer MUST NOT send wake traffic on behalf of the other side, and zflow ships no keepalive-as-treatment without a link-specific measurement proving it helps. Probes remain for RTT/path measurement only.
+
+The same session identified the dominant jitter source: **AWDL**. `ifconfig awdl0 down` on the mac collapsed p80 delay variation 40x (to 1-3 ms) and stopped frame loss entirely, with the adaptive playout delay self-settling from 35 ms to 3 ms. The macOS radio layer is therefore **AWDL suppression**: the root daemon MAY hold awdl0 down while a remote-input session is active, strictly opt-in with a clear consent flow, restoring it on session end, with the documented cost that AirDrop, Handoff, and Universal Control are unavailable while suppressed. Diagnostics detect the AWDL stall signature and suggest enabling this. macOS may re-enable awdl0 on its own; the daemon re-applies while the session stays active.
 
 ### Service class
 
@@ -415,6 +418,8 @@ The baseline implements:
 - immediate reliable key and button transitions after their motion anchor matures.
 
 The adaptive experiment compares a fixed delay with a delay based on a recent packet-delay percentile plus scheduler margin. It measures fast growth, slow contraction, late frames, overshoot, and recovery. It does not freeze the original 1-5 ms, 20 ms, 30-40 ms, or 250 ms constants without trace evidence.
+
+Field results so far (2026-08-31, spikes/b-smoothing/RESULT.md): adaptive with velocity-scaled catch-up beat raw and fixed at every tuning in a live hand test on a hostile link; the percentile and delay cap MUST be runtime-tunable (p80/35 ms beat p95/80 ms untreated); and on a treated link the delay self-settled to 3 ms, so a correctly adapting estimator needs no per-link configuration.
 
 The [1 Euro filter](https://gery.casiez.net/1euro/) remains an optional clock-estimator experiment. zflow adds it only if trace replay improves residual clock error or catch-up behavior against a simpler affine fit.
 

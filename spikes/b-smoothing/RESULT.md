@@ -1,4 +1,40 @@
-# Spike B result: harness validation (real-link feel test still pending)
+# Spike B result: PASSED on the real link (feel test verdict below)
+
+## Real-link feel test, 2026-08-31 evening
+
+Setup: fabrico's real mouse on the Linux box, frames relayed through the
+macbook and back (every frame crosses the WiFi twice, ~2x the jitter of a
+real single-crossing deployment), injected into the live GNOME cursor. Modes
+and tuning switched live while driving.
+
+Untreated link that evening: p80 one-way delay variation 34-40 ms, p95 65-125
+ms, ~300 frames lost across the session. Verdicts by hand:
+
+- raw: rubber-banding, "pretty similar to synergy rubberbanding actually".
+- fixed 16 ms: rubber-banding back on every spike (no slew by design).
+- adaptive, 80 ms cap, p95: "smoother but adds a clear latency" (the delay
+  pinned at the cap the whole time).
+- adaptive, 35 ms cap, p80: still bad on the untreated link, but **"so far
+  the best one was adaptive"**: smoothness beat immediacy in every pairing.
+- No stuck state, no runaway, mode switches clean, through ~19k frames.
+
+**Then the radio treatment** (see ../a-radio/RESULT.md): `awdl0 down` on the
+mac collapsed p80 jitter 40x to 1-3 ms, the adaptive delay self-settled from
+its 35 ms cap to 3 ms with no retuning, frame loss stopped entirely, and the
+verdict came back "yep muuuuch better". Adaptive playout + a treated radio is
+the product experience, and the estimator adapting downward on its own is the
+design working as intended.
+
+Kill criteria: PASSED. Smoothing beats raw at every tuning tried, and the
+layered design (radio treatment + adaptive playout) delivers near-local feel
+through a double WiFi crossing.
+
+---
+
+The sections below record the earlier synthetic-jitter validation of the
+harness.
+
+# Harness validation (loopback, synthetic jitter)
 
 Date: 2026-08-31. Host: Ubuntu 26.4, GNOME Shell 50.1, Wayland, wired. This
 records the loopback/synthetic-jitter validation of the harness itself, plus

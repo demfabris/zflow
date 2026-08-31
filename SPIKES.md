@@ -6,8 +6,8 @@ Convention: each spike lives in `spikes/<letter>-<name>/` with a `RESULT.md` rec
 
 | Spike | Question | Tier | Status |
 |---|---|---|---|
-| A | Does steady traffic flatten the real link's RTT spikes? | 0 | two order-controlled runs: inbound keepalive DEGRADES the link (RESULT.md); mac-originated arm pending |
-| B | Does receiver-side smoothing feel better than raw on the real link? | 0 | harness validated with synthetic jitter (RESULT.md); real-link feel test pending |
+| A | Does steady traffic flatten the real link's RTT spikes? | 0 | ANSWERED: keepalive refuted both directions; AWDL is the jitter source, awdl0-down collapses it 40x (RESULT.md) |
+| B | Does receiver-side smoothing feel better than raw on the real link? | 0 | PASSED: adaptive best-of-three by hand on the real link; near-local with radio treated (RESULT.md) |
 | C | Does a uinput virtual touchpad trigger real GNOME gestures? | 1 | stub |
 | D | Does MultitouchSupport deliver contact frames on the actual macbook? | 1 | stub |
 | E | Does pre-login uinput injection work at the greeter? | 1 | classification half verified live (ID_INPUT_MOUSE + GNOME accepts); greeter half pending reboot test |

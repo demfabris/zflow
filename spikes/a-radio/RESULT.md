@@ -46,6 +46,29 @@ arm), background ICMP keepalive at the stated rate. Raw data in results.csv.
    toggles, awdl0 down, and QoS marking (the AP-queueing mechanism implicated
    here is exactly what WMM priorities exist for).
 
+## Mac-originated arm and the AWDL answer (2026-08-31 evening, live)
+
+Run during the spike B feel test with the receiver's jitter estimator as the
+measurement instrument (p80 of one-way delay variation over a 3 s window,
+double WiFi crossing via the relay):
+
+- Untreated: p80 ~40 ms, steady frame loss.
+- **Mac-originated 100 Hz UDP** (unprivileged blaster on the mac): p80 got
+  worse and unstable (72 → 43 → 131 ms across three 12 s samples), loss
+  accelerated. Keepalive is refuted in BOTH directions on this link.
+- **`sudo ifconfig awdl0 down`**: p80 collapsed 40x to 0.99-2.8 ms within
+  seconds, frame loss stopped dead, and the adaptive playout delay
+  self-settled from 35 ms to 3 ms. Subjective verdict through the feel test:
+  near-local.
+
+**Conclusion: AWDL channel-hopping is the dominant jitter source on this
+setup, not power save, and traffic-based radio wake is dead.** The radio
+layer for zflow on macOS is AWDL suppression (a consented daemon holding
+awdl0 down during active sessions, awdlkiller-style, at the documented cost
+of AirDrop/Handoff/Universal Control while active), plus multipath to wired
+paths. The formal mac-keepalive.sh matrix is moot; keep the script only if a
+different network ever needs re-testing.
+
 ## Design consequences for SPEC.md
 
 - A receiver must never blast keepalive toward a dozing peer expecting to help
