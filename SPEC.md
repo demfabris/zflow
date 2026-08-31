@@ -2,7 +2,7 @@
 
 > Specification v0.3, draft, 2026-08-31
 >
-> Implementation status: design and empty Rust scaffold. No product behavior described here exists yet.
+> Implementation status: the headless Linux prototype is implemented. It is not yet a qualified alpha: the privileged, packaged two-host qualification run in [TESTPLAN.md](TESTPLAN.md) has not run.
 >
 > v0.3 records three maintainer decisions after adversarial review: on-demand device grabs, raw-contact capture in the signed macOS baseline behind a flag, and the split of release matrices into [TESTPLAN.md](TESTPLAN.md).
 
@@ -666,11 +666,13 @@ The simulator run passes when the sender enqueues a reliable cumulative checkpoi
 
 ## Naming, licensing, and repository state
 
-The crates.io package name zflow belongs to an existing project. The Cargo package MUST choose an available name before publication; the installed binary may remain zflow.
+The crates.io package name zflow belongs to an existing project. The project uses the available Cargo package name `zflow-kvm`; the installed binary remains `zflow`.
 
-The repository has no license. The team MUST choose an SPDX license before it accepts code or copies a dependency implementation. Reusing Lan Mouse code requires GPL-3.0 compatibility.
+The repository uses GPL-3.0-or-later. This keeps source reuse from GPL-3.0-or-later projects compatible.
 
-The current repository contains an empty Cargo package and a hello-world binary. The implementation sequence begins after this specification and the naming/license decisions receive review.
+The repository contains the headless Rust package, protocol model, configuration layer, setup and control CLI, authenticated QUIC daemon, Linux evdev/uinput runtime, packaging, and isolated feasibility harnesses.
+
+As of 2026-08-31, implementation steps 0 through 5 are code-complete and pass the rootless automated suite. Step 6 is the next product gate. It requires installing the package on two Linux hosts and running the alpha qualification in [TESTPLAN.md](TESTPLAN.md), including real evdev/uinput ownership, watchdog recovery, suspend and resume, pre-login authorization, and measurements on the maintainer's jittery link. Passing Spike E proves the GDM pre-login primitive; it does not replace that run. Steps 7 through 11 remain future work.
 
 ## Implementation sequence
 
@@ -693,6 +695,8 @@ Release matrices from TESTPLAN.md gate each beta along the way.
 
 ### Settled for the first prototype
 
+- The Cargo package is `zflow-kvm`, the installed binary is `zflow`, and the project license is GPL-3.0-or-later (maintainer implementation decision, 2026-08-31).
+- The Linux evdev/uinput backend remains independent after the bounded Lan Mouse reuse gate found that reuse would require a maintained fork without removing zflow's backend or protocol work. Lan Mouse remains a reference for later portal/EIS work (reuse gate, 2026-08-31).
 - Linux uses evdev plus uinput as its system backbone.
 - Linux grabs on demand at Arming after a neutral frame; the bounded switch-time leak is accepted (maintainer decision, 2026-08-31).
 - Mid-session enrollment of new physical devices is baseline behavior.

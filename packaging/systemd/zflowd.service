@@ -1,0 +1,60 @@
+[Unit]
+Description=zflow headless input-sharing daemon
+Documentation=https://github.com/demfabris/zflow
+Wants=systemd-udevd.service
+After=local-fs.target systemd-udevd.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=zflow
+Group=zflow
+ExecStartPre=/usr/bin/test -c /dev/uinput
+ExecStart=/usr/local/bin/zflowd --config /etc/zflow/zflow.toml
+Restart=on-failure
+RestartSec=250ms
+TimeoutStartSec=15s
+TimeoutStopSec=2s
+WatchdogSec=2s
+WatchdogSignal=SIGKILL
+KillMode=control-group
+
+StateDirectory=zflow
+StateDirectoryMode=0700
+RuntimeDirectory=zflow
+RuntimeDirectoryMode=0750
+UMask=0077
+
+# DevicePolicy gates kernel device access. The zflow udev rules grant Unix read
+# permission only to the event nodes selected during setup.
+DevicePolicy=closed
+DeviceAllow=/dev/uinput rw
+DeviceAllow=char-input r
+PrivateDevices=no
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/zflow
+RemoveIPC=yes
+# mdns-sd enumerates interfaces through Linux route netlink.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+TasksMax=128
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -4,6 +4,21 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Headless Linux alpha qualification
+
+Before calling the current prototype an alpha, install the package on two Linux hosts and exercise the real service, daemon account, evdev devices, uinput devices, and network path. The qualification run must cover:
+
+- setup, udev permissions, `zflow doctor`, pairing, revocation, and both pre-login permission gates;
+- CLI and hotkey ownership changes with keys, buttons, relative motion, and high-resolution wheel input;
+- isolated loss, jitter bursts, a lost terminal frame, lease expiry, peer revocation, and an unknown or locked seat;
+- an incomplete capture set, a competing grabber, device removal, and hotplug enrollment;
+- daemon kill and `SIGSTOP` while Idle and Remote, with watchdog recovery inside the declared bound;
+- suspend and resume, cold boot, and authorized GDM pre-login input;
+- local metric output for latency variation, loss, drops, playout lateness, catch-up, and synthetic cleanup;
+- an arming-leak measurement and a Quinn datagram timing comparison on the maintainer's jittery link, closing spikes G and F.
+
+The run passes with no stuck or duplicated transitions, no unauthorized injection, exact final motion and wheel displacement, and local ownership restored inside the declared bound. Record hardware, software versions, commands, metrics, and failures. This qualifies the first Linux alpha on that tested combination; the broader Linux backbone matrix below still gates Linux beta.
+
 ## Linux backbone matrix (gates Linux beta)
 
 Test GDM with GNOME, SDDM with KWin, and greetd with a wlroots compositor at: greeter, logged-in session, lock screen, VT, suspend and resume, display-manager restart, daemon restart.

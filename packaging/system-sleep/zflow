@@ -1,0 +1,24 @@
+#!/bin/sh
+# Drop every input handle and clock model across system sleep.
+set -eu
+
+marker=/run/zflowd-resume-after-sleep
+
+case "${1:-}" in
+    pre)
+        rm -f -- "$marker"
+        if systemctl is-active --quiet zflowd.service; then
+            install -o root -g root -m 0600 /dev/null "$marker"
+            if ! systemctl stop zflowd.service; then
+                rm -f -- "$marker"
+                exit 1
+            fi
+        fi
+        ;;
+    post)
+        if [ -f "$marker" ] && [ ! -L "$marker" ]; then
+            rm -f -- "$marker"
+            systemctl start zflowd.service
+        fi
+        ;;
+esac

@@ -1,5 +1,7 @@
 # Handoff: zflow Mac session
 
+> Archived 2026-08-31. The Mac session completed the A/B radio and smoothing work plus the D contact-capture gate. `SPIKES.md` and each spike's `RESULT.md` now carry current project status. The notes below preserve the commands and coordination record from that session.
+
 You are an agent session running on fabrico's macbook. The project lives on
 GitHub (private) and the primary session runs on the wired Linux box
 (`ubuntu`, LAN `192.168.1.118`, also on tailscale `100.120.229.99`). The two
@@ -9,13 +11,11 @@ Push your results so the Linux side can pull them.
 ## What zflow is (30 seconds)
 
 A software KVM (deskflow/lan-mouse alternative), Wayland + macOS only, whose
-bet is staying smooth over jittery WiFi. Right now the project is in the
-feasibility-spike phase: kill-risk experiments before implementation. Read, in
-order: `SPIKES.md` (the experiment plan and kill criteria), then
-`spikes/a-radio/RESULT.md` and `spikes/b-smoothing/RESULT.md` (findings so
-far), then skim `SPEC.md` if you need design context. Don't refactor spike
-code; it's throwaway by design. Findings are not: record everything in the
-spike's RESULT.md, commit, push.
+bet is staying smooth over jittery WiFi. This handoff covered the feasibility
+spikes that ran before implementation. Read `SPIKES.md` for the current ledger,
+then each spike's `RESULT.md` for evidence. Don't refactor spike code; it's
+throwaway by design. Findings are not: record everything in the spike's
+RESULT.md, commit, push.
 
 ## Established findings you should not re-derive
 

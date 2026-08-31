@@ -1,0 +1,57 @@
+[package]
+name = "zflow-kvm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zflow-kvm = { path = ".." }
+
+[[bin]]
+name = "negotiation"
+path = "fuzz_targets/negotiation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reliable_control"
+path = "fuzz_targets/reliable_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "motion"
+path = "fuzz_targets/motion.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "probe"
+path = "fuzz_targets/probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery"
+path = "fuzz_targets/discovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing"
+path = "fuzz_targets/pairing.rs"
+test = false
+doc = false
+bench = false

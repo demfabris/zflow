@@ -1,0 +1,6 @@
+# zflow setup writes one rule per selected physical event node below this line.
+# Match stable parent attributes. Do not grant the zflow account access by
+# eventN alone because event numbers can change across boots.
+#
+# Example:
+# ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="046d", ATTRS{id/product}=="c548", ATTRS{phys}=="usb-0000:00:14.0-2/input0", ENV{ZFLOW_CAPTURE_EXCLUDE}!="1", ENV{ZFLOW_CAPTURE}="1", GROUP="zflow", MODE="0640"

@@ -1,6 +1,52 @@
 [package]
-name = "zflow"
+name = "zflow-kvm"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Low-latency, loss-resilient input sharing for Linux and macOS"
+repository = "https://github.com/demfabris/zflow"
+rust-version = "1.88"
+
+[lib]
+name = "zflow"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zflow"
+path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0"
+bincode = { version = "2.0", features = ["serde"] }
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive"] }
+getrandom = "0.3"
+if-addrs = "0.15.0"
+mdns-sd = { version = "0.21.1", default-features = false, features = ["async"] }
+postcard = { version = "1.1", features = ["alloc"] }
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1.1.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13.2"
+libc = "0.2"
+mio = { version = "1.2.2", default-features = false, features = ["os-ext", "os-poll"] }
+nix = { version = "0.30", features = ["socket", "user"] }
+sd-notify = "0.5.0"
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.23"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

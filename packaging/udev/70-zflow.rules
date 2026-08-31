@@ -1,0 +1,8 @@
+# Give the locked zflow service account access to the uinput control node.
+ACTION=="add|change", SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="zflow", MODE="0660", OPTIONS+="static_node=uinput"
+
+# Stable roles for zflow's baseline virtual devices. The capture backend also
+# checks the kernel identifiers, but these properties let setup and future
+# session helpers exclude injection devices without matching a changing eventN.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/bustype}=="0006", ATTRS{id/vendor}=="1209", ATTRS{id/product}=="5a01", ATTRS{name}=="zflow remote keyboard", ATTRS{phys}=="zflow/remote/keyboard", ENV{ZFLOW_VIRTUAL_DEVICE}="1", ENV{ZFLOW_DEVICE_ROLE}="remote-keyboard", ENV{ZFLOW_CAPTURE_EXCLUDE}="1", ENV{ID_SEAT}="seat0", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1", ENV{ID_INPUT_KEYBOARD}="1"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/bustype}=="0006", ATTRS{id/vendor}=="1209", ATTRS{id/product}=="5a02", ATTRS{name}=="zflow remote pointer", ATTRS{phys}=="zflow/remote/pointer", ENV{ZFLOW_VIRTUAL_DEVICE}="1", ENV{ZFLOW_DEVICE_ROLE}="remote-pointer", ENV{ZFLOW_CAPTURE_EXCLUDE}="1", ENV{ID_SEAT}="seat0", ENV{ID_INPUT}="1", ENV{ID_INPUT_MOUSE}="1"
