@@ -19,7 +19,7 @@ use crate::{
         ReliableControlMessage, ScrollUnit, Sender, SenderConfig, SenderTick, SessionCloseReason,
         SessionContext, SessionEpoch, TouchState, TransportGeneration,
     },
-    linux::{CaptureTransition, CapturedDeviceFrame, KeyState},
+    linux::{CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS},
     metrics::{SessionMetrics, SessionMetricsSnapshot},
     transport::{InputChannels, InputConnection, InputControlMessage, InputDatagram},
     wire::CURRENT_PROTOCOL_VERSION,
@@ -65,12 +65,15 @@ impl SessionOptions {
         playout.adaptive_percentile = (config.playout.percentile * 100.0).round() as u8;
         playout.validate()?;
 
-        let capabilities = InputCapabilities::from([
+        let mut capabilities = InputCapabilities::from([
             InputCapability::Keyboard,
             InputCapability::ConsumerControls,
             InputCapability::Pointer,
             InputCapability::Scroll,
         ]);
+        if config.input.experimental_touchpad {
+            capabilities.insert(InputCapability::Touch);
+        }
         let required_capabilities = InputCapabilities::from([
             InputCapability::Keyboard,
             InputCapability::Pointer,
@@ -91,7 +94,11 @@ impl SessionOptions {
                     phase: false,
                     momentum_phase: false,
                 },
-                maximum_contacts: 0,
+                maximum_contacts: if config.input.experimental_touchpad {
+                    MAX_TOUCHPAD_CONTACTS as u16
+                } else {
+                    0
+                },
                 maximum_receiver_lease_ms: config.transport.lease_ms as u32,
                 maximum_checkpoint_bound_ms: config.transport.checkpoint_ms as u32,
             },
@@ -352,7 +359,13 @@ async fn run_session(
                         };
                         let captured_at = frame.captured_at;
                         let frame = capture_merge.merge(frame);
-                        send_capture(&mut channels, active, frame, clock.now()).await?;
+                        send_capture(
+                            &mut channels,
+                            active,
+                            &negotiated,
+                            frame,
+                            clock.now(),
+                        ).await?;
                         lock_metrics(&metrics)
                             .capture_to_send_us
                             .record(captured_at.elapsed().as_secs_f64() * 1_000_000.0);
@@ -598,6 +611,20 @@ async fn run_session(
     }
     Ok(())
     }.await;
+    let outbound_cleanup_result = if sender.as_ref().is_some_and(Sender::is_remote) {
+        sender.take();
+        capture_merge.clear();
+        emit_event(
+            &events,
+            SessionEvent {
+                session_id,
+                peer: peer.clone(),
+                kind: SessionEventKind::OutboundEnded,
+            },
+        )
+    } else {
+        Ok(())
+    };
     let cleanup_result = close_receiver(
         &mut receiver,
         &events,
@@ -608,6 +635,7 @@ async fn run_session(
         &metrics,
     )
     .await;
+    outbound_cleanup_result?;
     cleanup_result?;
     run_result
 }
@@ -663,13 +691,18 @@ fn select_negotiation(
         .next()
         .copied();
     let scroll_fields = intersect_scroll_fields(left.scroll_fields, right.scroll_fields);
+    let contact_limit = if capabilities.contains(InputCapability::Touch) {
+        left.maximum_contacts.min(right.maximum_contacts)
+    } else {
+        0
+    };
     let selected = NegotiatedSession {
         protocol_version: version,
         maximum_datagram_size: left.maximum_datagram_size.min(right.maximum_datagram_size),
         capabilities,
         pointer_unit,
         scroll_fields,
-        contact_limit: 0,
+        contact_limit,
         receiver_lease_ms: left
             .maximum_receiver_lease_ms
             .min(right.maximum_receiver_lease_ms),
@@ -912,12 +945,42 @@ impl CaptureMerger {
 async fn send_capture(
     channels: &mut InputChannels,
     sender: &mut Sender,
+    negotiated: &NegotiatedSession,
     captured: CapturedDeviceFrame,
     now: MonotonicTimeMicros,
 ) -> Result<()> {
-    if captured.frame.motion != crate::core::MotionDelta::default() {
-        let frame = sender.capture_motion(captured.frame.motion, None, now)?;
-        channels.datagrams.send_motion(&frame)?;
+    let touch = negotiated
+        .capabilities
+        .contains(InputCapability::Touch)
+        .then_some(captured.frame.touch_snapshot)
+        .flatten();
+    let motion = captured.frame.motion;
+    match touch {
+        Some(state) if sender.held_state().active_touch.is_empty() && !state.is_empty() => {
+            let begin = sender.touch_begin(state, now)?;
+            channels.control_send.send_control(&begin).await?;
+            if motion != crate::core::MotionDelta::default() {
+                let frame = sender.capture_motion(motion, None, now)?;
+                channels.datagrams.send_motion(&frame)?;
+            }
+        }
+        Some(state) if !sender.held_state().active_touch.is_empty() && state.is_empty() => {
+            if motion != crate::core::MotionDelta::default() {
+                let frame = sender.capture_motion(motion, None, now)?;
+                channels.datagrams.send_motion(&frame)?;
+            }
+            let end = sender.touch_end(false, now)?;
+            channels.control_send.send_control(&end).await?;
+        }
+        Some(state) if !state.is_empty() => {
+            let frame = sender.capture_motion(motion, Some(state), now)?;
+            channels.datagrams.send_motion(&frame)?;
+        }
+        _ if motion != crate::core::MotionDelta::default() => {
+            let frame = sender.capture_motion(motion, None, now)?;
+            channels.datagrams.send_motion(&frame)?;
+        }
+        _ => {}
     }
     for transition in captured.frame.transitions {
         let message = match transition {
@@ -1734,6 +1797,24 @@ mod tests {
     }
 
     #[test]
+    fn touch_is_optional_and_uses_the_smaller_contact_limit() {
+        let baseline = options().offer;
+        let mut config = Config::default();
+        config.input.experimental_touchpad = true;
+        let touch = SessionOptions::from_config(&config).unwrap().offer;
+
+        let mixed = select_negotiation(&baseline, &touch).unwrap();
+        assert!(!mixed.capabilities.contains(InputCapability::Touch));
+        assert_eq!(mixed.contact_limit, 0);
+
+        let mut smaller = touch.clone();
+        smaller.maximum_contacts = 3;
+        let selected = select_negotiation(&touch, &smaller).unwrap();
+        assert!(selected.capabilities.contains(InputCapability::Touch));
+        assert_eq!(selected.contact_limit, 3);
+    }
+
+    #[test]
     fn negotiated_capabilities_reject_omitted_event_families_before_receiver_state() {
         let offer = options().offer;
         let selected = select_negotiation(&offer, &offer).unwrap();
@@ -1809,6 +1890,7 @@ mod tests {
             frame: CaptureFrame {
                 transitions: vec![CaptureTransition::Key { usage: key, state }],
                 motion: MotionDelta::default(),
+                touch_snapshot: None,
                 event_count: 1,
             },
             captured_at: Instant::now(),
@@ -2114,6 +2196,7 @@ mod tests {
                     scroll_y: 30,
                     ..MotionDelta::default()
                 },
+                touch_snapshot: None,
                 event_count: 5,
             },
             captured_at: Instant::now(),
@@ -2233,6 +2316,98 @@ mod tests {
         assert!(receiver_metrics.synthetic_releases >= 2);
         assert_eq!(receiver_metrics.loss, 0);
         right.close(SessionCloseReason::LocalRelease);
+        client_endpoint.wait_idle().await;
+        server_endpoint.wait_idle().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_loss_ends_active_outbound_before_session_closes() {
+        let (_left_directory, left_identity) = identity();
+        let (_right_directory, right_identity) = identity();
+        let left_client = input_client_config(&left_identity, right_identity.spki()).unwrap();
+        let right_server = input_server_config(&right_identity, left_identity.spki()).unwrap();
+        let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server_endpoint = quinn::Endpoint::server(right_server.quinn_config(), listen).unwrap();
+        let client_endpoint = quinn::Endpoint::client(listen).unwrap();
+        let server_address = server_endpoint.local_addr().unwrap();
+        let accept_endpoint = server_endpoint.clone();
+        let accept_config = right_server.clone();
+        let accepted = tokio::spawn(async move {
+            let incoming = accept_endpoint.accept().await.unwrap();
+            accept_input(incoming, &accept_config).await.unwrap()
+        });
+        let left_connection = connect_input(&client_endpoint, server_address, &left_client)
+            .await
+            .unwrap();
+        let right_connection = accepted.await.unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (left, right) = tokio::join!(
+            start_session(
+                left_connection,
+                "right".into(),
+                TransportGeneration(1),
+                options(),
+                event_tx.clone(),
+            ),
+            start_session(
+                right_connection,
+                "left".into(),
+                TransportGeneration(1),
+                options(),
+                event_tx,
+            )
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        left.begin_outbound(context()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = event_rx.recv().await.unwrap();
+                if let SessionEventKind::ReceiverEffects {
+                    effects, applied, ..
+                } = event.kind
+                {
+                    let opened = event.peer == "left"
+                        && effects
+                            .iter()
+                            .any(|effect| matches!(effect, ReceiverEffect::ActivationOpened(_)));
+                    applied.send(Ok(())).unwrap();
+                    if opened {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("peer did not observe the outbound activation");
+
+        right.connection.close();
+        let lifecycle = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut lifecycle = Vec::new();
+            loop {
+                let event = event_rx.recv().await.unwrap();
+                match event.kind {
+                    SessionEventKind::ReceiverEffects { applied, .. } => {
+                        applied.send(Ok(())).unwrap();
+                    }
+                    SessionEventKind::OutboundEnded if event.peer == "right" => {
+                        lifecycle.push("outbound-ended");
+                    }
+                    SessionEventKind::Closed { .. } if event.peer == "right" => {
+                        lifecycle.push("closed");
+                        break lifecycle;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("sender session did not report transport loss");
+        assert_eq!(lifecycle, ["outbound-ended", "closed"]);
+
+        left.close(SessionCloseReason::LocalRelease);
         client_endpoint.wait_idle().await;
         server_endpoint.wait_idle().await;
     }

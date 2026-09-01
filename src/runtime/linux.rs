@@ -41,6 +41,7 @@ pub struct LinuxRuntimeConfig {
     pub capture_devices: Vec<ConfigDeviceSelector>,
     pub activation_chord: Vec<String>,
     pub escape_chord: Vec<String>,
+    pub experimental_touchpad: bool,
     pub rescan_interval: Duration,
     pub readiness_probe_interval: Duration,
     pub command_capacity: usize,
@@ -55,6 +56,7 @@ impl LinuxRuntimeConfig {
             capture_devices: config.input.capture_devices.clone(),
             activation_chord: config.input.activation_chord.clone(),
             escape_chord: config.input.escape_chord.clone(),
+            experimental_touchpad: config.input.experimental_touchpad,
             ..Self::default()
         }
     }
@@ -95,6 +97,7 @@ impl Default for LinuxRuntimeConfig {
                 "KEY_LEFTMETA".into(),
                 "KEY_BACKSPACE".into(),
             ],
+            experimental_touchpad: false,
             rescan_interval: Duration::from_secs(2),
             readiness_probe_interval: Duration::from_millis(25),
             command_capacity: 256,
@@ -154,7 +157,6 @@ pub enum RuntimeDiagnostic {
     UngrabRequiredDescriptorClose,
     CapturedFrameQueueFull,
     InjectionFailed,
-    UnsupportedTouchInjection,
     ReadinessProbeFailed,
     ServiceNotificationFailed,
     EventQueueFull,
@@ -275,11 +277,13 @@ pub enum LinuxRuntimeError {
     StartupChannelClosed,
     #[error("Linux input runtime thread panicked")]
     ThreadPanicked,
+    #[error("could not replace the virtual input devices during reload: {0}")]
+    ReloadVirtualInput(#[source] InjectionError),
 }
 
 #[derive(Debug, Error)]
 pub enum RuntimeStartupError {
-    #[error("could not create the baseline virtual input devices: {0}")]
+    #[error("could not create the virtual input devices: {0}")]
     VirtualInput(#[from] InjectionError),
     #[error("could not scan physical input devices: {0}")]
     DeviceScan(#[source] io::Error),
@@ -617,7 +621,7 @@ impl RuntimeLoop {
         capture_tx: SyncSender<CapturedDeviceFrame>,
         status: Arc<Mutex<LinuxRuntimeStatus>>,
     ) -> Result<Self, RuntimeStartupError> {
-        let virtual_input = VirtualInput::create()?;
+        let virtual_input = VirtualInput::create(config.experimental_touchpad)?;
         let activation_chord = ChordTracker::new(
             ConfiguredChord::parse(&config.activation_chord, ChordPurpose::Activation)
                 .expect("runtime configuration was validated before thread startup"),
@@ -763,7 +767,7 @@ impl RuntimeLoop {
         ) {
             Ok(readiness) => {
                 lock_status(&self.status).virtual_devices = readiness;
-                if readiness.is_ready() {
+                if readiness.is_ready_for(self.config.experimental_touchpad) {
                     if sd_notify::notify(&[NotifyState::Ready]).is_ok() {
                         self.ready_notified = true;
                         lock_status(&self.status).ready = true;
@@ -950,6 +954,17 @@ impl RuntimeLoop {
             ConfiguredChord::parse(&config.escape_chord, ChordPurpose::Escape)
                 .expect("reloaded runtime configuration was validated"),
         );
+        if config.experimental_touchpad != self.config.experimental_touchpad {
+            self.release_receiver_state(RuntimeCloseReason::LocalRelease);
+            let replacement = VirtualInput::create(config.experimental_touchpad)
+                .map_err(LinuxRuntimeError::ReloadVirtualInput)?;
+            self.virtual_input = replacement;
+            self.ready_notified = false;
+            self.next_readiness_probe = Instant::now();
+            let mut status = lock_status(&self.status);
+            status.ready = false;
+            status.virtual_devices = VirtualDeviceReadiness::default();
+        }
         self.scanner = PeriodicDeviceScanner::new(config.rescan_interval);
         self.config = config;
         self.next_rescan = Instant::now();
@@ -1455,9 +1470,7 @@ fn apply_receiver_effect(
         } => virtual_input
             .keyboard
             .set_key(modifier_usage(modifier), pressed),
-        ReceiverEffect::TouchReplaced { state, .. } if !state.is_empty() => {
-            return Err(RuntimeDiagnostic::UnsupportedTouchInjection);
-        }
+        ReceiverEffect::TouchReplaced { state, .. } => virtual_input.replace_touch(&state),
         ReceiverEffect::ActivationClosed { .. } => {
             return virtual_input
                 .release_all()
@@ -1466,7 +1479,6 @@ fn apply_receiver_effect(
         ReceiverEffect::ActivationOpened(_)
         | ReceiverEffect::ScrollBegan(_)
         | ReceiverEffect::ScrollEnded { .. }
-        | ReceiverEffect::TouchReplaced { .. }
         | ReceiverEffect::SnapshotAck { .. }
         | ReceiverEffect::TakeoverAccepted { .. }
         | ReceiverEffect::Rejected { .. } => Ok(()),

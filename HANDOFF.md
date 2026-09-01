@@ -1,88 +1,187 @@
-# Handoff: zflow Mac session
+# Handoff: Mac source to Ubuntu
 
-> Archived 2026-08-31. The Mac session completed the A/B radio and smoothing work plus the D contact-capture gate. `SPIKES.md` and each spike's `RESULT.md` now carry current project status. The notes below preserve the commands and coordination record from that session.
+Date: 2026-09-01
 
-You are an agent session running on fabrico's macbook. The project lives on
-GitHub (private) and the primary session runs on the wired Linux box
-(`ubuntu`, LAN `192.168.1.118`, also on tailscale `100.120.229.99`). The two
-sessions cannot message each other; fabrico relays the "go" between terminals.
-Push your results so the Linux side can pull them.
+You are the Codex session on fabrico's MacBook Pro. Build and test the first
+Mac-to-Linux zflow path. Push each finished checkpoint to `origin/main` so the
+Ubuntu session can inspect and test it.
 
-## What zflow is (30 seconds)
+## Start here
 
-A software KVM (deskflow/lan-mouse alternative), Wayland + macOS only, whose
-bet is staying smooth over jittery WiFi. This handoff covered the feasibility
-spikes that ran before implementation. Read `SPIKES.md` for the current ledger,
-then each spike's `RESULT.md` for evidence. Don't refactor spike code; it's
-throwaway by design. Findings are not: record everything in the spike's
-RESULT.md, commit, push.
+Use the existing checkout or clone the private repository, then confirm that
+you pulled the Linux touch implementation from 2026-09-01:
 
-## Established findings you should not re-derive
-
-- The link's baseline is genuinely bad: probing sparsely from the Linux box,
-  p95 88-135 ms over a ~3 ms floor, a quarter of probes over 30 ms.
-- Keepalive traffic sent TOWARD this mac made latency worse, monotonically
-  with rate, in two order-controlled runs (AP queues frames behind this mac's
-  WiFi doze schedule). Whether this mac's OWN transmission fixes its inbound
-  path is YOUR job 2.
-- The smoothing receiver was validated under synthetic jitter: exact
-  displacement conservation, 3.2x smaller post-spike bursts in adaptive mode.
-  The real-link feel verdict is YOUR job 1 (mac side is trivial).
-
-## Job 1: relay for the real-link feel test (do this first, ~2 min of work)
-
-The Linux box runs both sender and receiver; you bounce the frames so every
-frame crosses the WiFi twice and picks up real radio jitter:
-
-```
-python3 spikes/b-smoothing/relay.py 5556 192.168.1.118:5555
+```sh
+git pull --ff-only origin main
+git log -1 --oneline
+git status --short
+sw_vers
+uname -m
 ```
 
-Tell fabrico it's listening. The Linux session runs the rest and fabrico
-drives the mouse. Leave it running until they say done. If port 5555 is wrong,
-they'll give you the right one.
+The Ubuntu receiver is available at:
 
-## Job 2: mac-originated keepalive arms (the decisive radio question)
+- LAN: `192.168.1.118`
+- Tailscale: `100.120.229.99`
+- input service: UDP `43119`
+- pairing service: UDP `43120`
 
-Coordinate start with fabrico (the Linux side must be probing first, they'll
-run `ping -D -i 1.13 macbook.local | tee probe.log`):
+Use the LAN address for desk testing. The two Codex sessions cannot message
+each other, so fabrico will relay coordination between terminals.
 
+Read these files before changing code:
+
+1. The `## macOS` section in `SPEC.md`
+2. The `## Signed macOS package` section in `TESTPLAN.md`
+3. `spikes/d-multitouch-mac/RESULT.md` and `mt_probe.c`
+4. `src/linux/touch.rs`, `src/linux/uinput.rs`, `src/session.rs`, and the wire
+   touch types
+
+## Current state
+
+The Linux source and receiver now forward complete type-B multitouch contact
+snapshots. The protocol sends a reliable begin and end around datagram updates.
+The Ubuntu receiver exposes a five-slot `zflow remote touchpad` through uinput.
+
+An XPS laptop running CachyOS/KDE drove Ubuntu GNOME through this path:
+
+- one-finger pointer movement worked;
+- three-finger horizontal workspace movement tracked the fingers;
+- three-finger vertical Overview movement tracked the fingers after fabrico
+  disabled `spotlight@nin` on Ubuntu.
+
+Spotlight removes GNOME's Overview search controller while Ubuntu Dock still
+allocates it. Their collision caused the instant Overview transition. Keep
+Spotlight disabled during gesture tests. GNOME Shell also logged some
+`Touch jump detected and discarded` warnings for the virtual device. Capture
+those warnings during the Mac test rather than treating the extension fix as
+proof that the touch stream is clean.
+
+Spike D passed on this MacBook Pro with an external Bluetooth Magic Trackpad:
+
+- Apple M4 Max, macOS 27.0 build `26A5421a`;
+- stable raw contact IDs and normalized positions;
+- about 63 to 65 contact frames per second;
+- raw frames continued while a default CGEventTap swallowed derived mouse and
+  scroll events.
+
+`MTDeviceCreateList` missed the awake Magic Trackpad in several early runs.
+Enumerate devices when capture starts and again after device or Bluetooth
+changes. Do not enumerate once at process startup.
+
+## Session goal
+
+Build one foreground Mac source that connects to the existing Ubuntu receiver.
+Prove these paths in order:
+
+1. keyboard, pointer, and continuous scroll through a CGEvent session tap;
+2. raw Magic Trackpad contacts through MultitouchSupport and the existing touch
+   wire protocol;
+3. clean release after process death, network loss, device removal, and finger
+   lift.
+
+This session does not need Mac target injection, CoreHID, LoginWindow support,
+notarized packaging, AWDL control, clipboard support, or a GUI.
+
+## Architecture constraints
+
+Keep event capture in a logged-in user process. The future root LaunchDaemon
+owns networking and console-session arbitration, but it must not create event
+taps or call CGEventPost. A foreground session executable can stand in for the
+LaunchAgent during this test.
+
+Reuse zflow's identity, pairing, wire, transport, lease, and touch lifecycle.
+Do not create a second protocol in C or Swift. The crate gates `runtime` and
+`session` behind Linux today. Move the platform-neutral session pieces that
+the Mac source needs. Keep Linux behavior and tests intact.
+
+Load MultitouchSupport symbols at runtime. If the framework or a required
+symbol disappears, report that raw touch is unavailable and retain the
+keyboard, pointer, and scroll path. Keep raw contact capture behind the
+existing experimental touch capability.
+
+The event-tap and Multitouch callbacks must copy bounded event data into a
+queue and return. Run protocol and network work outside those callbacks.
+Re-enable a tap disabled by timeout or user input. The explicit zflow escape
+path releases remote input and disables filtering.
+
+Avoid double delivery. In raw-touch mode, the Magic Trackpad contacts should
+drive Ubuntu's virtual touchpad. Do not also inject their derived CG mouse or
+scroll events through the virtual pointer during the same test.
+
+## First test sequence
+
+Confirm the known private-framework path and TCC state before changing it:
+
+```sh
+cd spikes/d-multitouch-mac
+clang -O2 -Wall -o mt_probe mt_probe.c \
+  -framework CoreFoundation -framework ApplicationServices
+clang -O2 -o mt_diag mt_diag.c -framework IOKit -framework CoreFoundation
+./mt_diag
+./mt_diag --request  # run if the check reports an unknown grant
+./mt_probe --secs 20
+./mt_probe --tap --secs 20
+cd ../..
 ```
-sudo ./spikes/a-radio/mac-keepalive.sh 192.168.1.118
+
+Then start with compilation and platform boundaries:
+
+```sh
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Five arms, 60 s each, ~5.5 min total; the script prints UTC arm boundaries.
-When it finishes, also capture context for the writeup:
+The crate does not compile on Darwin yet. `src/lib.rs` exports `daemon` on all
+platforms, while `src/daemon.rs` imports the Linux-only `runtime` and `session`
+modules. Establish honest `cfg` boundaries and move the shared source-session
+logic needed by macOS. Do not add Mac stubs that claim input works.
 
+After the Mac source can pair, coordinate with fabrico and pair against the
+Ubuntu host. The Ubuntu side runs:
+
+```sh
+sudo zflow pair listen macbook
 ```
-pmset -g | grep -Ei 'powernap|sleep|network'
-ifconfig awdl0 | grep status
+
+The Mac connects to `192.168.1.118:43120`. Compare the six-digit codes before
+either side saves trust.
+
+For raw-contact testing, keep an Ubuntu terminal open with the daemon log and
+libinput events visible:
+
+```sh
+journalctl -u zflowd.service -f
+sudo libinput debug-events
 ```
 
-Then, as separate labeled repeats worth doing if fabrico has time: rerun with
-`sudo ifconfig awdl0 down` applied right before (it re-enables itself, note
-whether it came back mid-run). Append everything, including the arm-boundary
-timestamps, to `spikes/a-radio/RESULT.md` under a "mac-originated" heading;
-the Linux side joins its probe log against your timestamps.
+Perform these gestures on the Magic Trackpad:
 
-## Job 3: spike D, raw trackpad contact frames (the flagship-feature gate)
+- slow one-finger pointer movement;
+- slow three-finger horizontal movement with a pause halfway;
+- slow three-finger swipe up and down with a pause halfway;
+- rapid direction reversal followed by finger lift.
 
-Read `spikes/d-multitouch-mac/README.md` for the plan and kill criteria.
-Short version: prove the private MultitouchSupport.framework still delivers
-raw contact frames on this exact machine and macOS version, with 3+ fingers,
-and that frames keep arriving while a `kCGEventTapOptionDefault` event tap is
-swallowing mouse/scroll events. Fast path: build and run the
-OpenMultitouchSupport demo (github.com/Kyome22/OpenMultitouchSupport); needs
-Xcode command line tools. Record macOS version, chip, frame rate observed, and
-the tap-coexistence result in `spikes/d-multitouch-mac/RESULT.md`.
+Ubuntu passes when GNOME follows the fingers, libinput reports progressive
+updates, and the journal contains no new touch-jump warning. Stop the Mac
+source during an active contact and during a held key. Ubuntu must release
+both within the lease bound, and the Mac must regain local input.
 
-## Ground rules
+## Record and deliver
 
-- Results in RESULT.md files, committed and pushed; that's how the sessions
-  share state.
-- sudo actions: the two listed above (fast ping intervals, awdl0) are
-  expected; ask fabrico before anything else privileged.
-- Job 3's framework is private API; that's a settled, deliberate decision
-  (see SPEC.md Gestures section), not something to relitigate.
-- If something contradicts a documented finding, write down what you saw
-  rather than adjusting the earlier numbers.
+Record the Mac build, TCC grants, input devices, frame rates, gesture results,
+failure results, and known defects in a new result document under `spikes/`.
+Include exact commands and log excerpts. Never commit private keys, pairing
+state, machine certificates, or TCC database contents.
+
+Run formatting and the tests available on the Mac before each checkpoint:
+
+```sh
+cargo fmt --all -- --check
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+git diff --check
+```
+
+Commit coherent checkpoints and push them to `origin/main`. Tell fabrico the
+commit hash so the Ubuntu session can pull and run its Linux regression suite.

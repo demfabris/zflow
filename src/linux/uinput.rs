@@ -1,19 +1,26 @@
-use std::{collections::BTreeSet, ffi::CString, io};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::CString,
+    io,
+};
 
 use evdev::{
-    AttributeSet, BusType, EventType, InputEvent, InputId, KeyCode, PropType, RelativeAxisCode,
-    uinput::VirtualDevice,
+    AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventType, InputEvent, InputId, KeyCode,
+    PropType, RelativeAxisCode, UinputAbsSetup, uinput::VirtualDevice,
 };
 use thiserror::Error;
 
-use crate::core::{HidUsage, MotionDelta, PointerButton};
+use crate::core::{ContactId, HidUsage, MotionDelta, PointerButton, TouchContact, TouchState};
 
 use super::{
-    MappingError, VirtualDeviceRole, ZFLOW_DEVICE_VERSION, ZFLOW_VENDOR_ID, hid_to_evdev_key,
-    mapped_evdev_keys, mapped_pointer_buttons, pointer_button_to_evdev,
+    MAX_TOUCHPAD_CONTACTS, MappingError, VirtualDeviceRole, ZFLOW_DEVICE_VERSION, ZFLOW_VENDOR_ID,
+    hid_to_evdev_key, mapped_evdev_keys, mapped_pointer_buttons, pointer_button_to_evdev,
 };
 
 const WHEEL_CLICK_UNITS: i64 = 120;
+const TOUCHPAD_MAX_X: i32 = 2_999;
+const TOUCHPAD_MAX_Y: i32 = 2_199;
+const TOUCHPAD_RESOLUTION: i32 = 30;
 
 #[derive(Debug, Error)]
 pub enum InjectionError {
@@ -35,6 +42,10 @@ pub enum InjectionError {
         #[source]
         source: io::Error,
     },
+    #[error("touch state has {actual} contacts; virtual touchpad supports at most {maximum}")]
+    TooManyTouchContacts { actual: usize, maximum: usize },
+    #[error("touch input arrived while the experimental virtual touchpad is disabled")]
+    TouchpadDisabled,
 }
 
 #[derive(Debug, Error)]
@@ -302,19 +313,294 @@ impl Drop for VirtualPointer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetContact {
+    slot: usize,
+    tracking_id: i32,
+    x: i32,
+    y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TouchpadState {
+    contacts: BTreeMap<ContactId, TargetContact>,
+    next_tracking_id: i32,
+}
+
+impl Default for TouchpadState {
+    fn default() -> Self {
+        Self {
+            contacts: BTreeMap::new(),
+            next_tracking_id: 1,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtualTouchpad {
+    device: VirtualDevice,
+    state: TouchpadState,
+}
+
+impl VirtualTouchpad {
+    pub fn create() -> Result<Self, InjectionError> {
+        let role = VirtualDeviceRole::Touchpad;
+        let mut keys = AttributeSet::<KeyCode>::new();
+        for key in [
+            KeyCode::BTN_TOUCH,
+            KeyCode::BTN_TOOL_FINGER,
+            KeyCode::BTN_TOOL_DOUBLETAP,
+            KeyCode::BTN_TOOL_TRIPLETAP,
+            KeyCode::BTN_TOOL_QUADTAP,
+            KeyCode::BTN_LEFT,
+        ] {
+            keys.insert(key);
+        }
+        let mut properties = AttributeSet::<PropType>::new();
+        properties.insert(PropType::POINTER);
+        properties.insert(PropType::BUTTONPAD);
+        let phys = CString::new(role.physical_path()).expect("stable zflow phys has no NUL");
+        let axis = |code, maximum| {
+            UinputAbsSetup::new(code, AbsInfo::new(0, 0, maximum, 0, 0, TOUCHPAD_RESOLUTION))
+        };
+        let result = (|| {
+            VirtualDevice::builder()?
+                .name(role.name())
+                .input_id(InputId::new(
+                    BusType::BUS_VIRTUAL,
+                    ZFLOW_VENDOR_ID,
+                    role.product_id(),
+                    ZFLOW_DEVICE_VERSION,
+                ))
+                .with_phys(&phys)?
+                .with_properties(&properties)?
+                .with_keys(&keys)?
+                .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X, TOUCHPAD_MAX_X))?
+                .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y, TOUCHPAD_MAX_Y))?
+                .with_absolute_axis(&UinputAbsSetup::new(
+                    AbsoluteAxisCode::ABS_MT_SLOT,
+                    AbsInfo::new(0, 0, (MAX_TOUCHPAD_CONTACTS - 1) as i32, 0, 0, 0),
+                ))?
+                .with_absolute_axis(&UinputAbsSetup::new(
+                    AbsoluteAxisCode::ABS_MT_TRACKING_ID,
+                    AbsInfo::new(0, 0, 65_535, 0, 0, 0),
+                ))?
+                .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_MT_POSITION_X, TOUCHPAD_MAX_X))?
+                .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_MT_POSITION_Y, TOUCHPAD_MAX_Y))?
+                .build()
+        })();
+        let device = result.map_err(|source| InjectionError::Create { role, source })?;
+        Ok(Self {
+            device,
+            state: TouchpadState::default(),
+        })
+    }
+
+    pub fn replace(&mut self, touch: &TouchState) -> Result<(), InjectionError> {
+        let (events, next) = plan_touchpad_events(&self.state, touch)?;
+        if !events.is_empty() {
+            self.device
+                .emit(&events)
+                .map_err(|source| InjectionError::Emit {
+                    role: VirtualDeviceRole::Touchpad,
+                    source,
+                })?;
+        }
+        self.state = next;
+        Ok(())
+    }
+
+    pub fn release_all(&mut self) -> Result<(), InjectionError> {
+        self.replace(&TouchState::default())
+    }
+}
+
+impl Drop for VirtualTouchpad {
+    fn drop(&mut self) {
+        let _ = self.release_all();
+    }
+}
+
+fn plan_touchpad_events(
+    previous: &TouchpadState,
+    touch: &TouchState,
+) -> Result<(Vec<InputEvent>, TouchpadState), InjectionError> {
+    if touch.len() > MAX_TOUCHPAD_CONTACTS {
+        return Err(InjectionError::TooManyTouchContacts {
+            actual: touch.len(),
+            maximum: MAX_TOUCHPAD_CONTACTS,
+        });
+    }
+
+    let mut next = TouchpadState {
+        contacts: BTreeMap::new(),
+        next_tracking_id: previous.next_tracking_id,
+    };
+    let mut used_slots = [false; MAX_TOUCHPAD_CONTACTS];
+    for contact in touch.iter() {
+        if let Some(existing) = previous.contacts.get(&contact.id) {
+            used_slots[existing.slot] = true;
+        }
+    }
+    for contact in touch.iter() {
+        let target = if let Some(existing) = previous.contacts.get(&contact.id) {
+            TargetContact {
+                x: scale_touch_axis(contact, true),
+                y: scale_touch_axis(contact, false),
+                ..*existing
+            }
+        } else {
+            let slot = used_slots
+                .iter()
+                .position(|used| !used)
+                .expect("contact limit guarantees a free touchpad slot");
+            used_slots[slot] = true;
+            let tracking_id = next.next_tracking_id;
+            next.next_tracking_id = if tracking_id == 65_535 {
+                1
+            } else {
+                tracking_id + 1
+            };
+            TargetContact {
+                slot,
+                tracking_id,
+                x: scale_touch_axis(contact, true),
+                y: scale_touch_axis(contact, false),
+            }
+        };
+        next.contacts.insert(contact.id, target);
+    }
+
+    if next.contacts == previous.contacts {
+        return Ok((Vec::new(), next));
+    }
+
+    let mut events = Vec::new();
+    for (id, old) in &previous.contacts {
+        if !next.contacts.contains_key(id) {
+            push_absolute(&mut events, AbsoluteAxisCode::ABS_MT_SLOT, old.slot as i32);
+            push_absolute(&mut events, AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1);
+        }
+    }
+    for (id, current) in &next.contacts {
+        let old = previous.contacts.get(id);
+        if old == Some(current) {
+            continue;
+        }
+        push_absolute(
+            &mut events,
+            AbsoluteAxisCode::ABS_MT_SLOT,
+            current.slot as i32,
+        );
+        if old.is_none() {
+            push_absolute(
+                &mut events,
+                AbsoluteAxisCode::ABS_MT_TRACKING_ID,
+                current.tracking_id,
+            );
+        }
+        if old.is_none_or(|old| old.x != current.x) {
+            push_absolute(&mut events, AbsoluteAxisCode::ABS_MT_POSITION_X, current.x);
+        }
+        if old.is_none_or(|old| old.y != current.y) {
+            push_absolute(&mut events, AbsoluteAxisCode::ABS_MT_POSITION_Y, current.y);
+        }
+    }
+
+    let old_count = previous.contacts.len();
+    let new_count = next.contacts.len();
+    let old_tool = touch_tool_key(old_count);
+    let new_tool = touch_tool_key(new_count);
+    if old_tool != new_tool {
+        if let Some(key) = old_tool {
+            push_key(&mut events, key, false);
+        }
+        if let Some(key) = new_tool {
+            push_key(&mut events, key, true);
+        }
+    }
+    if (old_count == 0) != (new_count == 0) {
+        push_key(&mut events, KeyCode::BTN_TOUCH, new_count != 0);
+    }
+    if let Some(primary) = next.contacts.values().min_by_key(|contact| contact.slot) {
+        push_absolute(&mut events, AbsoluteAxisCode::ABS_X, primary.x);
+        push_absolute(&mut events, AbsoluteAxisCode::ABS_Y, primary.y);
+    }
+    Ok((events, next))
+}
+
+fn scale_touch_axis(contact: &TouchContact, horizontal: bool) -> i32 {
+    let (value, maximum, source_extent) = if horizontal {
+        (
+            contact.x,
+            TOUCHPAD_MAX_X,
+            contact.source_dimensions.map(|size| size.width),
+        )
+    } else {
+        (
+            contact.y,
+            TOUCHPAD_MAX_Y,
+            contact.source_dimensions.map(|size| size.height),
+        )
+    };
+    let Some(source_extent) = source_extent.filter(|extent| *extent > 0) else {
+        return value.clamp(0, maximum);
+    };
+    let value = i64::from(value.clamp(0, i32::try_from(source_extent).unwrap_or(i32::MAX)));
+    ((value * i64::from(maximum) + i64::from(source_extent) / 2) / i64::from(source_extent)) as i32
+}
+
+fn touch_tool_key(count: usize) -> Option<KeyCode> {
+    match count {
+        0 => None,
+        1 => Some(KeyCode::BTN_TOOL_FINGER),
+        2 => Some(KeyCode::BTN_TOOL_DOUBLETAP),
+        3 => Some(KeyCode::BTN_TOOL_TRIPLETAP),
+        _ => Some(KeyCode::BTN_TOOL_QUADTAP),
+    }
+}
+
+fn push_absolute(events: &mut Vec<InputEvent>, axis: AbsoluteAxisCode, value: i32) {
+    events.push(InputEvent::new(EventType::ABSOLUTE.0, axis.0, value));
+}
+
+fn push_key(events: &mut Vec<InputEvent>, key: KeyCode, pressed: bool) {
+    events.push(InputEvent::new(
+        EventType::KEY.0,
+        key.code(),
+        i32::from(pressed),
+    ));
+}
+
 #[derive(Debug)]
 pub struct VirtualInput {
     pub keyboard: VirtualKeyboard,
     pub pointer: VirtualPointer,
+    pub touchpad: Option<VirtualTouchpad>,
 }
 
 impl VirtualInput {
-    pub fn create() -> Result<Self, InjectionError> {
+    pub fn create(experimental_touchpad: bool) -> Result<Self, InjectionError> {
         // If pointer creation fails, keyboard drops immediately and uinput
         // removes it; callers never observe half a virtual device pair.
         let keyboard = VirtualKeyboard::create()?;
         let pointer = VirtualPointer::create()?;
-        Ok(Self { keyboard, pointer })
+        let touchpad = experimental_touchpad
+            .then(VirtualTouchpad::create)
+            .transpose()?;
+        Ok(Self {
+            keyboard,
+            pointer,
+            touchpad,
+        })
+    }
+
+    pub fn replace_touch(&mut self, touch: &TouchState) -> Result<(), InjectionError> {
+        match &mut self.touchpad {
+            Some(touchpad) => touchpad.replace(touch),
+            None if touch.is_empty() => Ok(()),
+            None => Err(InjectionError::TouchpadDisabled),
+        }
     }
 
     pub fn release_all(&mut self) -> Result<(), ReleaseAllError> {
@@ -323,6 +609,11 @@ impl VirtualInput {
             failures.push(error);
         }
         if let Err(error) = self.pointer.release_all() {
+            failures.push(error);
+        }
+        if let Some(touchpad) = &mut self.touchpad
+            && let Err(error) = touchpad.release_all()
+        {
             failures.push(error);
         }
         if failures.is_empty() {
@@ -374,6 +665,24 @@ fn legacy_wheel_delta(remainder: &mut i64, high_resolution: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{SourceDimensions, TouchContact, TouchTool};
+
+    fn touch(id: u32, x: i32, y: i32) -> TouchContact {
+        TouchContact {
+            id: ContactId(id),
+            x,
+            y,
+            pressure: None,
+            major: None,
+            minor: None,
+            orientation_millidegrees: None,
+            tool: TouchTool::Finger,
+            source_dimensions: Some(SourceDimensions {
+                width: 1_299,
+                height: 722,
+            }),
+        }
+    }
 
     #[test]
     fn legacy_wheel_accumulates_fractional_detents_in_both_directions() {
@@ -399,5 +708,55 @@ mod tests {
                 value: i64::MAX
             }
         ));
+    }
+
+    #[test]
+    fn touchpad_plan_preserves_slots_and_releases_lifted_contacts() {
+        let initial = TouchState::new([touch(10, 100, 200), touch(20, 900, 500)]).unwrap();
+        let (landing, state) = plan_touchpad_events(&TouchpadState::default(), &initial).unwrap();
+        assert!(landing.iter().any(|event| {
+            event.event_type() == EventType::KEY
+                && event.code() == KeyCode::BTN_TOOL_DOUBLETAP.code()
+                && event.value() == 1
+        }));
+        assert_eq!(state.contacts[&ContactId(10)].slot, 0);
+        assert_eq!(state.contacts[&ContactId(20)].slot, 1);
+
+        let moved = TouchState::new([touch(10, 200, 300), touch(20, 900, 500)]).unwrap();
+        let (movement, state) = plan_touchpad_events(&state, &moved).unwrap();
+        assert!(movement.iter().any(|event| {
+            event.event_type() == EventType::ABSOLUTE
+                && event.code() == AbsoluteAxisCode::ABS_MT_POSITION_X.0
+        }));
+        assert_eq!(state.contacts[&ContactId(10)].slot, 0);
+
+        let remaining = TouchState::new([touch(20, 900, 500)]).unwrap();
+        let (lift, state) = plan_touchpad_events(&state, &remaining).unwrap();
+        assert!(lift.iter().any(|event| {
+            event.event_type() == EventType::ABSOLUTE
+                && event.code() == AbsoluteAxisCode::ABS_MT_TRACKING_ID.0
+                && event.value() == -1
+        }));
+        assert_eq!(state.contacts[&ContactId(20)].slot, 1);
+    }
+
+    #[test]
+    fn touchpad_plan_scales_source_dimensions_and_emits_final_lift() {
+        let initial = TouchState::new([touch(1, 1_299, 722)]).unwrap();
+        let (landing, state) = plan_touchpad_events(&TouchpadState::default(), &initial).unwrap();
+        assert!(landing.iter().any(|event| {
+            event.code() == AbsoluteAxisCode::ABS_MT_POSITION_X.0 && event.value() == TOUCHPAD_MAX_X
+        }));
+        assert!(landing.iter().any(|event| {
+            event.code() == AbsoluteAxisCode::ABS_MT_POSITION_Y.0 && event.value() == TOUCHPAD_MAX_Y
+        }));
+
+        let (lift, empty) = plan_touchpad_events(&state, &TouchState::default()).unwrap();
+        assert!(empty.contacts.is_empty());
+        assert!(lift.iter().any(|event| {
+            event.event_type() == EventType::KEY
+                && event.code() == KeyCode::BTN_TOUCH.code()
+                && event.value() == 0
+        }));
     }
 }

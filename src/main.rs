@@ -39,6 +39,9 @@ enum Command {
         /// Enable or disable injection outside an unlocked authenticated session.
         #[arg(long = "prelogin", value_enum, value_name = "on|off")]
         allow_prelogin: Option<Toggle>,
+        /// Enable or disable experimental raw touchpad forwarding.
+        #[arg(long = "experimental-touchpad", value_enum, value_name = "on|off")]
+        experimental_touchpad: Option<Toggle>,
     },
     /// Show daemon and ownership state.
     Status {
@@ -161,6 +164,7 @@ impl From<Command> for zflow::cli::Command {
                 escape_chord,
                 udev_rules,
                 allow_prelogin,
+                experimental_touchpad,
             } => Self::Setup {
                 state_dir,
                 control_socket,
@@ -170,6 +174,8 @@ impl From<Command> for zflow::cli::Command {
                 escape_chord,
                 udev_rules,
                 allow_prelogin: allow_prelogin.map(|value| matches!(value, Toggle::On)),
+                experimental_touchpad: experimental_touchpad
+                    .map(|value| matches!(value, Toggle::On)),
             },
             Command::Status { json } => Self::Status { json },
             Command::Doctor => Self::Doctor,

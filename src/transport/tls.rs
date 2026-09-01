@@ -352,10 +352,10 @@ fn pairing_server_transport_config() -> quinn::TransportConfig {
 
 fn pairing_transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
-    // The initiator opens one type-safe metadata stream. Pairing still has no
-    // input channels, datagrams, unidirectional streams, or bulk surface.
+    // The initiator opens one metadata stream. Each side may open one bounded
+    // unidirectional stream for the post-exchange readiness handshake.
     config
-        .max_concurrent_uni_streams(0_u8.into())
+        .max_concurrent_uni_streams(1_u8.into())
         .datagram_receive_buffer_size(None)
         .datagram_send_buffer_size(0)
         .keep_alive_interval(None);

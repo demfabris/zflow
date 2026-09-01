@@ -235,13 +235,16 @@ pub enum CaptureTransition {
 pub struct CaptureFrame {
     pub transitions: Vec<CaptureTransition>,
     pub motion: MotionDelta,
+    pub touch_snapshot: Option<crate::core::TouchState>,
     /// Mappable kernel events consumed while assembling this frame.
     pub event_count: u64,
 }
 
 impl CaptureFrame {
     pub fn is_empty(&self) -> bool {
-        self.transitions.is_empty() && self.motion == MotionDelta::default()
+        self.transitions.is_empty()
+            && self.motion == MotionDelta::default()
+            && self.touch_snapshot.is_none()
     }
 }
 
@@ -255,6 +258,8 @@ pub enum MappingError {
     InvalidKeyValue(i32),
     #[error("SYN_DROPPED requires the capture device state to be reconciled")]
     SynchronizationLost,
+    #[error("failed to map multitouch state")]
+    InvalidTouchState,
 }
 
 pub fn evdev_key_to_hid(key: KeyCode) -> Result<HidUsage, MappingError> {
@@ -442,6 +447,7 @@ impl FrameAccumulator {
                 scroll_x,
                 scroll_y,
             },
+            touch_snapshot: None,
             event_count: self.event_count,
         };
         *self = Self::default();

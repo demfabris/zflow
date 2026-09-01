@@ -164,7 +164,6 @@ async fn complete(
         peer_candidates,
         authentication_code: identity.pairing_code(&peer_spki, &transcript),
     };
-    connection.close();
     Ok(observation)
 }
 

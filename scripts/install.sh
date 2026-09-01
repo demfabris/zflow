@@ -119,7 +119,7 @@ if [[ "$install_built" == false ]]; then
     build_binaries
 fi
 
-for command in awk cut getent grep groupadd install modprobe runuser systemctl systemd-analyze udevadm useradd; do
+for command in awk cut getent grep groupadd install modprobe runuser setfacl systemctl systemd-analyze udevadm useradd; do
     require_command "$command"
 done
 
@@ -182,6 +182,9 @@ udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
 udevadm trigger --action=change --subsystem-match=input
 udevadm settle
 [[ -c /dev/uinput ]] || die "uinput loaded but /dev/uinput is missing"
+setfacl --remove-all /dev/uinput
+chown "root:$SERVICE_GROUP" /dev/uinput
+chmod 0660 /dev/uinput
 runuser -u "$SERVICE_USER" -- /usr/bin/test -w /dev/uinput \
     || die "$SERVICE_USER cannot write /dev/uinput after applying udev rules"
 

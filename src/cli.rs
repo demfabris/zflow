@@ -34,6 +34,7 @@ pub enum Command {
         escape_chord: Vec<String>,
         udev_rules: Option<PathBuf>,
         allow_prelogin: Option<bool>,
+        experimental_touchpad: Option<bool>,
     },
     Status {
         json: bool,
@@ -85,6 +86,7 @@ struct SetupOptions {
     escape_chord: Vec<String>,
     udev_rules: Option<PathBuf>,
     allow_prelogin: Option<bool>,
+    experimental_touchpad: Option<bool>,
 }
 
 pub fn run(path: PathBuf, command: Command) -> Result<()> {
@@ -98,6 +100,7 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
             escape_chord,
             udev_rules,
             allow_prelogin,
+            experimental_touchpad,
         } => setup(
             path,
             SetupOptions {
@@ -109,6 +112,7 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
                 escape_chord,
                 udev_rules,
                 allow_prelogin,
+                experimental_touchpad,
             },
         ),
         Command::Status { json } => status(path, json),
@@ -161,6 +165,7 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
         escape_chord,
         udev_rules,
         allow_prelogin,
+        experimental_touchpad,
     } = options;
     let existed = path.exists();
     let mut config = if existed {
@@ -192,6 +197,9 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
     }
     if let Some(allow_prelogin) = allow_prelogin {
         config.input.allow_prelogin_input = allow_prelogin;
+    }
+    if let Some(experimental_touchpad) = experimental_touchpad {
+        config.input.experimental_touchpad = experimental_touchpad;
     }
 
     config.validate()?;
@@ -273,6 +281,14 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
             "disabled"
         }
     );
+    println!(
+        "experimental touchpad: {}",
+        if config.input.experimental_touchpad {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     for warning in chord_warnings(&config.input.activation_chord) {
         println!("warning: activation chord {warning}");
     }
@@ -294,6 +310,9 @@ fn restart_required_fields(previous: &Config, next: &Config) -> Vec<&'static str
     if previous.transport.listen != next.transport.listen {
         fields.push("transport.listen");
     }
+    if previous.input.experimental_touchpad != next.input.experimental_touchpad {
+        fields.push("input.experimental_touchpad");
+    }
     fields
 }
 
@@ -311,6 +330,7 @@ struct OfflineStatus<'a> {
     capture_devices: usize,
     paired_peers: usize,
     allow_prelogin_input: bool,
+    experimental_touchpad: bool,
     control_socket: &'a std::path::Path,
 }
 
@@ -318,7 +338,9 @@ fn status(path: PathBuf, json: bool) -> Result<()> {
     let config = Config::load(&path)?;
     if config.daemon.control_socket.exists() {
         match daemon_request(&config.daemon.control_socket, Request::Status)? {
-            Response::Status(status) => return print_daemon_status(&status, json),
+            Response::Status(status) => {
+                return print_daemon_status(&status, config.input.experimental_touchpad, json);
+            }
             Response::Error { message } => bail!("daemon rejected status request: {message}"),
             response => bail!("unexpected daemon response: {response:?}"),
         }
@@ -334,6 +356,7 @@ fn status(path: PathBuf, json: bool) -> Result<()> {
         capture_devices: config.input.capture_devices.len(),
         paired_peers: config.peers.len(),
         allow_prelogin_input: config.input.allow_prelogin_input,
+        experimental_touchpad: config.input.experimental_touchpad,
         control_socket: &config.daemon.control_socket,
     };
     if json {
@@ -345,13 +368,23 @@ fn status(path: PathBuf, json: bool) -> Result<()> {
         println!("capture devices: {}", status.capture_devices);
         println!("paired peers: {}", status.paired_peers);
         println!("pre-login input: {}", status.allow_prelogin_input);
+        println!("experimental touchpad: {}", status.experimental_touchpad);
     }
     Ok(())
 }
 
-fn print_daemon_status(status: &DaemonStatus, json: bool) -> Result<()> {
+fn print_daemon_status(
+    status: &DaemonStatus,
+    experimental_touchpad: bool,
+    json: bool,
+) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(status)?);
+        let mut value = serde_json::to_value(status)?;
+        value
+            .as_object_mut()
+            .expect("DaemonStatus serializes as an object")
+            .insert("experimental_touchpad".into(), experimental_touchpad.into());
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("daemon: online");
         println!("identity: {}", status.identity);
@@ -366,6 +399,7 @@ fn print_daemon_status(status: &DaemonStatus, json: bool) -> Result<()> {
         if let Some(activation) = status.activation_id {
             println!("activation: {activation}");
         }
+        println!("experimental touchpad: {experimental_touchpad}");
     }
     Ok(())
 }
@@ -600,14 +634,23 @@ fn doctor_linux(config: &Config, failed: &mut bool) {
     }
 
     match crate::runtime::probe_virtual_device_readiness() {
-        Ok(readiness) if readiness.is_ready() => {
-            println!("ok  virtual input: keyboard and pointer are ready on seat0");
+        Ok(readiness) if readiness.is_ready_for(config.input.experimental_touchpad) => {
+            if config.input.experimental_touchpad {
+                println!(
+                    "ok  virtual input: keyboard, pointer, and experimental touchpad are ready on seat0"
+                );
+            } else {
+                println!("ok  virtual input: keyboard and pointer are ready on seat0");
+            }
         }
         Ok(readiness) => {
             *failed = true;
             println!(
-                "fail virtual input: keyboard_ready={}, pointer_ready={}",
-                readiness.keyboard, readiness.pointer
+                "fail virtual input: keyboard_ready={}, pointer_ready={}, touchpad_ready={}, touchpad_required={}",
+                readiness.keyboard,
+                readiness.pointer,
+                readiness.touchpad,
+                config.input.experimental_touchpad
             );
         }
         Err(error) => {
@@ -1538,11 +1581,45 @@ mod tests {
                 escape_chord: Vec::new(),
                 udev_rules: None,
                 allow_prelogin: Some(false),
+                experimental_touchpad: None,
             },
         )
         .unwrap();
 
         assert!(!Config::load(&path).unwrap().input.allow_prelogin_input);
+    }
+
+    #[test]
+    fn setup_persists_experimental_touchpad_as_restart_required() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let mut config = Config::default();
+        config.daemon.state_dir = directory.path().join("state");
+        config.daemon.control_socket = directory.path().join("missing.sock");
+        config.save(&path).unwrap();
+
+        setup(
+            path.clone(),
+            SetupOptions {
+                state_dir: None,
+                control_socket: None,
+                listen: None,
+                devices: Vec::new(),
+                activation_chord: Vec::new(),
+                escape_chord: Vec::new(),
+                udev_rules: None,
+                allow_prelogin: None,
+                experimental_touchpad: Some(true),
+            },
+        )
+        .unwrap();
+
+        let saved = Config::load(&path).unwrap();
+        assert!(saved.input.experimental_touchpad);
+        assert_eq!(
+            restart_required_fields(&config, &saved),
+            ["input.experimental_touchpad"]
+        );
     }
 
     #[test]
@@ -1568,6 +1645,7 @@ mod tests {
                 escape_chord: Vec::new(),
                 udev_rules: None,
                 allow_prelogin: None,
+                experimental_touchpad: None,
             },
         )
         .unwrap();
@@ -1615,6 +1693,7 @@ mod tests {
                 escape_chord: Vec::new(),
                 udev_rules: Some(rules.clone()),
                 allow_prelogin: None,
+                experimental_touchpad: None,
             },
         )
         .unwrap_err();
@@ -1651,6 +1730,7 @@ mod tests {
                 escape_chord: Vec::new(),
                 udev_rules: None,
                 allow_prelogin: None,
+                experimental_touchpad: None,
             },
         )
         .unwrap();
@@ -1667,6 +1747,7 @@ mod tests {
                 escape_chord: Vec::new(),
                 udev_rules: None,
                 allow_prelogin: Some(false),
+                experimental_touchpad: None,
             },
         );
 
@@ -1703,6 +1784,7 @@ mod tests {
                 escape_chord: Vec::new(),
                 udev_rules: None,
                 allow_prelogin: Some(false),
+                experimental_touchpad: None,
             },
         );
 
@@ -1732,6 +1814,7 @@ mod tests {
                 escape_chord: Vec::new(),
                 udev_rules: None,
                 allow_prelogin: None,
+                experimental_touchpad: None,
             },
         );
 
@@ -1770,6 +1853,7 @@ mod tests {
                 escape_chord: Vec::new(),
                 udev_rules: Some(rules_path.clone()),
                 allow_prelogin: None,
+                experimental_touchpad: None,
             },
         );
 

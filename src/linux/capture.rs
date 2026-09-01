@@ -9,13 +9,16 @@ use std::{
 use evdev::{Device, InputEvent, KeyCode};
 use thiserror::Error;
 
-use super::{AggregateInputState, CaptureFrame, DeviceInfo, FrameAccumulator, MappingError};
+use super::{
+    AggregateInputState, CaptureFrame, DeviceInfo, FrameAccumulator, MappingError, TouchAccumulator,
+};
 
 #[derive(Debug)]
 struct CaptureNode {
     path: PathBuf,
     device: Device,
     frames: FrameAccumulator,
+    touch: Option<TouchAccumulator>,
 }
 
 impl CaptureNode {
@@ -23,11 +26,13 @@ impl CaptureNode {
         let device = Device::open(&info.path)?;
         device.set_nonblocking(true)?;
         let held = device.get_key_state()?.iter().collect();
+        let touch = TouchAccumulator::from_device(&device)?;
         Ok((
             Self {
                 path: info.path.clone(),
                 device,
                 frames: FrameAccumulator::default(),
+                touch,
             },
             held,
         ))
@@ -320,12 +325,28 @@ impl CaptureSet {
         let mut frames = Vec::new();
         for event in events {
             self.aggregate.observe(path, event);
+            let touch = self.nodes[index]
+                .touch
+                .as_mut()
+                .map(|touch| touch.push(event))
+                .transpose()
+                .map_err(|_| CaptureReadError::Mapping {
+                    path: path.to_owned(),
+                    source: MappingError::InvalidTouchState,
+                })?
+                .flatten();
             match self.nodes[index].frames.push(event) {
-                Ok(Some(frame)) => frames.push(CapturedDeviceFrame {
-                    device_path: path.to_owned(),
-                    frame,
-                    captured_at: Instant::now(),
-                }),
+                Ok(Some(mut frame)) => {
+                    if let Some((state, event_count)) = touch {
+                        frame.touch_snapshot = Some(state);
+                        frame.event_count = frame.event_count.saturating_add(event_count);
+                    }
+                    frames.push(CapturedDeviceFrame {
+                        device_path: path.to_owned(),
+                        frame,
+                        captured_at: Instant::now(),
+                    });
+                }
                 Ok(None) => {}
                 Err(source) => {
                     return Err(CaptureReadError::Mapping {

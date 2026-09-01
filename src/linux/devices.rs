@@ -11,16 +11,20 @@ use thiserror::Error;
 pub const ZFLOW_VENDOR_ID: u16 = 0x1209;
 pub const ZFLOW_KEYBOARD_PRODUCT_ID: u16 = 0x5a01;
 pub const ZFLOW_POINTER_PRODUCT_ID: u16 = 0x5a02;
+pub const ZFLOW_TOUCHPAD_PRODUCT_ID: u16 = 0x5a03;
 pub const ZFLOW_DEVICE_VERSION: u16 = 1;
 pub const ZFLOW_KEYBOARD_NAME: &str = "zflow remote keyboard";
 pub const ZFLOW_POINTER_NAME: &str = "zflow remote pointer";
+pub const ZFLOW_TOUCHPAD_NAME: &str = "zflow remote touchpad";
 pub const ZFLOW_KEYBOARD_PHYS: &str = "zflow/remote/keyboard";
 pub const ZFLOW_POINTER_PHYS: &str = "zflow/remote/pointer";
+pub const ZFLOW_TOUCHPAD_PHYS: &str = "zflow/remote/touchpad";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualDeviceRole {
     Keyboard,
     Pointer,
+    Touchpad,
 }
 
 impl VirtualDeviceRole {
@@ -28,6 +32,7 @@ impl VirtualDeviceRole {
         match self {
             Self::Keyboard => ZFLOW_KEYBOARD_PRODUCT_ID,
             Self::Pointer => ZFLOW_POINTER_PRODUCT_ID,
+            Self::Touchpad => ZFLOW_TOUCHPAD_PRODUCT_ID,
         }
     }
 
@@ -35,6 +40,7 @@ impl VirtualDeviceRole {
         match self {
             Self::Keyboard => ZFLOW_KEYBOARD_NAME,
             Self::Pointer => ZFLOW_POINTER_NAME,
+            Self::Touchpad => ZFLOW_TOUCHPAD_NAME,
         }
     }
 
@@ -42,6 +48,7 @@ impl VirtualDeviceRole {
         match self {
             Self::Keyboard => ZFLOW_KEYBOARD_PHYS,
             Self::Pointer => ZFLOW_POINTER_PHYS,
+            Self::Touchpad => ZFLOW_TOUCHPAD_PHYS,
         }
     }
 }
@@ -101,13 +108,17 @@ impl DeviceInfo {
         {
             return None;
         }
-        [VirtualDeviceRole::Keyboard, VirtualDeviceRole::Pointer]
-            .into_iter()
-            .find(|role| {
-                self.product == role.product_id()
-                    && self.name.as_deref() == Some(role.name())
-                    && self.physical_path.as_deref() == Some(role.physical_path())
-            })
+        [
+            VirtualDeviceRole::Keyboard,
+            VirtualDeviceRole::Pointer,
+            VirtualDeviceRole::Touchpad,
+        ]
+        .into_iter()
+        .find(|role| {
+            self.product == role.product_id()
+                && self.name.as_deref() == Some(role.name())
+                && self.physical_path.as_deref() == Some(role.physical_path())
+        })
     }
 
     pub fn is_zflow_virtual(&self) -> bool {
@@ -374,24 +385,30 @@ mod tests {
 
     #[test]
     fn exact_virtual_identifiers_are_always_excluded() {
-        let mut virtual_keyboard = info("/dev/input/event8", ZFLOW_KEYBOARD_NAME);
-        virtual_keyboard.bus = BusType::BUS_VIRTUAL.0;
-        virtual_keyboard.vendor = ZFLOW_VENDOR_ID;
-        virtual_keyboard.product = ZFLOW_KEYBOARD_PRODUCT_ID;
-        virtual_keyboard.version = ZFLOW_DEVICE_VERSION;
-        virtual_keyboard.physical_path = Some(ZFLOW_KEYBOARD_PHYS.into());
-        assert_eq!(
-            virtual_keyboard.zflow_role(),
-            Some(VirtualDeviceRole::Keyboard)
-        );
+        for (index, role) in [
+            VirtualDeviceRole::Keyboard,
+            VirtualDeviceRole::Pointer,
+            VirtualDeviceRole::Touchpad,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = format!("/dev/input/event{}", index + 8);
+            let mut virtual_device = info(&path, role.name());
+            virtual_device.bus = BusType::BUS_VIRTUAL.0;
+            virtual_device.vendor = ZFLOW_VENDOR_ID;
+            virtual_device.product = role.product_id();
+            virtual_device.version = ZFLOW_DEVICE_VERSION;
+            virtual_device.physical_path = Some(role.physical_path().into());
+            assert_eq!(virtual_device.zflow_role(), Some(role));
 
-        let scan = DeviceScan {
-            devices: vec![virtual_keyboard],
-            failures: vec![],
-        };
-        let error =
-            select_devices(&[DeviceSelector::path("/dev/input/event8")], &scan).unwrap_err();
-        assert!(matches!(error, SelectionError::NoMatch { .. }));
+            let scan = DeviceScan {
+                devices: vec![virtual_device],
+                failures: vec![],
+            };
+            let error = select_devices(&[DeviceSelector::path(path)], &scan).unwrap_err();
+            assert!(matches!(error, SelectionError::NoMatch { .. }));
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ capture_devices = []
 activation_chord = ["KEY_LEFTCTRL", "KEY_LEFTMETA", "KEY_F12"]
 escape_chord = ["KEY_LEFTCTRL", "KEY_LEFTMETA", "KEY_BACKSPACE"]
 allow_prelogin_input = false
+experimental_touchpad = false
 
 [transport]
 listen = "[::]:43119"

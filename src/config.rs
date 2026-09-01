@@ -62,6 +62,7 @@ pub struct InputConfig {
     pub activation_chord: Vec<String>,
     pub escape_chord: Vec<String>,
     pub allow_prelogin_input: bool,
+    pub experimental_touchpad: bool,
 }
 
 impl Default for InputConfig {
@@ -79,6 +80,7 @@ impl Default for InputConfig {
                 "KEY_BACKSPACE".into(),
             ],
             allow_prelogin_input: false,
+            experimental_touchpad: false,
         }
     }
 }

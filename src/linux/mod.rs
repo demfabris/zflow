@@ -9,6 +9,7 @@ mod devices;
 mod mapping;
 mod ownership;
 mod seat;
+mod touch;
 mod uinput;
 
 pub use capture::*;
@@ -16,4 +17,5 @@ pub use devices::*;
 pub use mapping::*;
 pub use ownership::*;
 pub use seat::*;
+pub use touch::*;
 pub use uinput::*;

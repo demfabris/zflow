@@ -1,9 +1,8 @@
 # zflow
 
 zflow is a headless input-sharing service for Linux. It captures an explicit
-set of physical evdev devices, sends bounded keyboard and pointer state over
-authenticated QUIC, and injects it through a stable uinput keyboard and
-pointer on the other machine.
+set of physical evdev devices, sends bounded input state over authenticated
+QUIC, and injects it through stable uinput devices on the other machine.
 
 This is a working headless prototype, not yet a qualified alpha. The supported
 prototype launch path is the packaged systemd service. There is no GUI yet,
@@ -20,7 +19,7 @@ Run the installer on both Linux machines:
 sudo zflow devices
 ```
 
-Select every keyboard and pointer node that must move together. Repeat
+Select every keyboard, mouse, and touchpad node that must move together. Repeat
 `--device` in one command so the capture set is updated atomically:
 
 ```sh
@@ -32,6 +31,19 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger --action=change --subsystem-match=input
 sudo zflow doctor
 ```
+
+Raw touchpad forwarding is experimental. Enable it on both machines, then
+restart the daemons so they create and negotiate the virtual touchpads:
+
+```sh
+sudo zflow setup --experimental-touchpad on
+sudo systemctl restart zflowd.service
+sudo zflow doctor
+```
+
+`zflow doctor` should report the keyboard, pointer, and experimental touchpad
+as ready. On the receiving machine, `sudo libinput list-devices` should list
+`zflow remote touchpad` with `pointer gesture` capabilities.
 
 Setup records stable physical attributes. It refuses to write a broad udev
 rule for hardware without a unique physical path. The service account is not

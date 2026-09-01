@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::linux::{DeviceInfo, VirtualDeviceRole, ZFLOW_KEYBOARD_NAME, ZFLOW_POINTER_NAME};
+use crate::linux::{
+    DeviceInfo, VirtualDeviceRole, ZFLOW_KEYBOARD_NAME, ZFLOW_POINTER_NAME, ZFLOW_TOUCHPAD_NAME,
+};
 
 /// Parsed udev database properties. The parser accepts both the `E:KEY=value`
 /// records stored below `/run/udev/data` and the `KEY=value` form printed by
@@ -39,11 +41,16 @@ impl UdevProperties {
 pub struct VirtualDeviceReadiness {
     pub keyboard: bool,
     pub pointer: bool,
+    pub touchpad: bool,
 }
 
 impl VirtualDeviceReadiness {
     pub fn is_ready(self) -> bool {
         self.keyboard && self.pointer
+    }
+
+    pub fn is_ready_for(self, experimental_touchpad: bool) -> bool {
+        self.is_ready() && (!experimental_touchpad || self.touchpad)
     }
 
     pub fn observe(&mut self, device: &DeviceInfo, properties: &UdevProperties) {
@@ -68,6 +75,12 @@ impl VirtualDeviceReadiness {
                     && device.name.as_deref() == Some(ZFLOW_POINTER_NAME)
                     && properties.get("ZFLOW_DEVICE_ROLE") == Some("remote-pointer")
                     && properties.is_one("ID_INPUT_MOUSE");
+            }
+            VirtualDeviceRole::Touchpad => {
+                self.touchpad |= common
+                    && device.name.as_deref() == Some(ZFLOW_TOUCHPAD_NAME)
+                    && properties.get("ZFLOW_DEVICE_ROLE") == Some("remote-touchpad")
+                    && properties.is_one("ID_INPUT_TOUCHPAD");
             }
         }
     }
@@ -178,7 +191,7 @@ mod tests {
     use super::*;
     use crate::linux::{
         ZFLOW_DEVICE_VERSION, ZFLOW_KEYBOARD_PHYS, ZFLOW_KEYBOARD_PRODUCT_ID, ZFLOW_POINTER_PHYS,
-        ZFLOW_POINTER_PRODUCT_ID, ZFLOW_VENDOR_ID,
+        ZFLOW_POINTER_PRODUCT_ID, ZFLOW_TOUCHPAD_PHYS, ZFLOW_TOUCHPAD_PRODUCT_ID, ZFLOW_VENDOR_ID,
     };
 
     fn virtual_info(role: VirtualDeviceRole) -> DeviceInfo {
@@ -194,6 +207,12 @@ mod tests {
                 ZFLOW_POINTER_NAME,
                 ZFLOW_POINTER_PHYS,
                 ZFLOW_POINTER_PRODUCT_ID,
+            ),
+            VirtualDeviceRole::Touchpad => (
+                "/dev/input/event12",
+                ZFLOW_TOUCHPAD_NAME,
+                ZFLOW_TOUCHPAD_PHYS,
+                ZFLOW_TOUCHPAD_PRODUCT_ID,
             ),
         };
         DeviceInfo {
@@ -237,6 +256,14 @@ mod tests {
         );
         readiness.observe(&virtual_info(VirtualDeviceRole::Pointer), &pointer);
         assert!(readiness.is_ready());
+        assert!(readiness.is_ready_for(false));
+        assert!(!readiness.is_ready_for(true));
+
+        let touchpad = UdevProperties::parse(
+            "E:ZFLOW_VIRTUAL_DEVICE=1\nE:ZFLOW_CAPTURE_EXCLUDE=1\nE:ZFLOW_DEVICE_ROLE=remote-touchpad\nE:ID_SEAT=seat0\nE:ID_INPUT=1\nE:ID_INPUT_TOUCHPAD=1\n",
+        );
+        readiness.observe(&virtual_info(VirtualDeviceRole::Touchpad), &touchpad);
+        assert!(readiness.is_ready_for(true));
     }
 
     #[test]

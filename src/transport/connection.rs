@@ -31,6 +31,8 @@ use super::{
 const SERVER_NAME_PLACEHOLDER: &str = "zflow.invalid";
 const CONTROL_STREAM_PREFACE: &[u8] = b"zflow-control-v1\0";
 const PAIRING_STREAM_PREFACE: &[u8] = b"zflow-pair-v1\0";
+const PAIRING_CLIENT_READY: &[u8] = b"zflow-pair-ready-v1\0";
+const PAIRING_SERVER_ACK: &[u8] = b"zflow-pair-ack-v1\0";
 const MAX_CONTROL_FRAME_BYTES: usize = MAX_RELIABLE_PAYLOAD_BYTES + 1_024 + 64;
 const MAX_PAIRING_FRAME_BYTES: usize = MAX_PAIRING_PAYLOAD_BYTES + 64;
 const CRITICAL_STREAM_ERROR: VarInt = VarInt::from_u32(0x100);
@@ -620,6 +622,13 @@ pub struct PairingConnection {
     peer_spki: Arc<[u8]>,
     send: SendStream,
     receive: RecvStream,
+    role: PairingRole,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PairingRole {
+    Client,
+    Server,
 }
 
 impl fmt::Debug for PairingConnection {
@@ -690,9 +699,6 @@ impl PairingConnection {
             .read_exact(&mut frame)
             .await
             .map_err(|error| TransportError::PairingStream(error.to_string()))?;
-        // Both peers finish and consume the whole stream before either caller
-        // closes the connection. Without this barrier, the faster side can
-        // send CONNECTION_CLOSE while the peer's offer is still unread.
         self.send
             .finish()
             .map_err(|error| TransportError::PairingStream(error.to_string()))?;
@@ -707,15 +713,117 @@ impl PairingConnection {
                     "peer stopped the pairing stream with code {code}"
                 )));
             }
-            Err(error) => return Err(TransportError::PairingStream(error.to_string())),
-        }
-        match decode_wire(&frame)?.message {
-            WireMessage::Pairing(offer) => Ok(offer),
-            _ => {
-                close_protocol(&self.connection, b"message on pairing-only stream");
-                Err(TransportError::InvalidPairingFamily)
+            Err(error) => {
+                return Err(TransportError::PairingStream(format!(
+                    "offer acknowledgement failed: {error}"
+                )));
             }
         }
+        let offer = match decode_wire(&frame)?.message {
+            WireMessage::Pairing(offer) => offer,
+            _ => {
+                close_protocol(&self.connection, b"message on pairing-only stream");
+                return Err(TransportError::InvalidPairingFamily);
+            }
+        };
+        self.synchronize().await?;
+        Ok(offer)
+    }
+
+    async fn synchronize(&self) -> Result<(), TransportError> {
+        match self.role {
+            PairingRole::Client => {
+                let mut ready = self.connection.open_uni().await.map_err(|error| {
+                    TransportError::PairingStream(format!(
+                        "client readiness stream failed: {error}"
+                    ))
+                })?;
+                ready
+                    .write_all(PAIRING_CLIENT_READY)
+                    .await
+                    .map_err(|error| {
+                        TransportError::PairingStream(format!(
+                            "client readiness write failed: {error}"
+                        ))
+                    })?;
+                ready.finish().map_err(|error| {
+                    TransportError::PairingStream(format!(
+                        "client readiness finish failed: {error}"
+                    ))
+                })?;
+
+                let mut ack = self.connection.accept_uni().await.map_err(|error| {
+                    TransportError::PairingStream(format!(
+                        "server acknowledgement stream failed: {error}"
+                    ))
+                })?;
+                let received =
+                    ack.read_to_end(PAIRING_SERVER_ACK.len())
+                        .await
+                        .map_err(|error| {
+                            TransportError::PairingStream(format!(
+                                "server acknowledgement read failed: {error}"
+                            ))
+                        })?;
+                if received != PAIRING_SERVER_ACK {
+                    close_protocol(&self.connection, b"invalid pairing acknowledgement");
+                    return Err(TransportError::PairingStream(
+                        "invalid pairing acknowledgement".into(),
+                    ));
+                }
+            }
+            PairingRole::Server => {
+                let mut ready = self.connection.accept_uni().await.map_err(|error| {
+                    TransportError::PairingStream(format!(
+                        "client readiness stream failed: {error}"
+                    ))
+                })?;
+                let received = ready
+                    .read_to_end(PAIRING_CLIENT_READY.len())
+                    .await
+                    .map_err(|error| {
+                        TransportError::PairingStream(format!(
+                            "client readiness read failed: {error}"
+                        ))
+                    })?;
+                if received != PAIRING_CLIENT_READY {
+                    close_protocol(&self.connection, b"invalid pairing readiness");
+                    return Err(TransportError::PairingStream(
+                        "invalid pairing readiness".into(),
+                    ));
+                }
+
+                let mut ack = self.connection.open_uni().await.map_err(|error| {
+                    TransportError::PairingStream(format!(
+                        "server acknowledgement stream failed: {error}"
+                    ))
+                })?;
+                ack.write_all(PAIRING_SERVER_ACK).await.map_err(|error| {
+                    TransportError::PairingStream(format!(
+                        "server acknowledgement write failed: {error}"
+                    ))
+                })?;
+                ack.finish().map_err(|error| {
+                    TransportError::PairingStream(format!(
+                        "server acknowledgement finish failed: {error}"
+                    ))
+                })?;
+                match ack.stopped().await {
+                    Ok(None) => {}
+                    Ok(Some(code)) => {
+                        return Err(TransportError::PairingStream(format!(
+                            "peer stopped the pairing acknowledgement with code {code}"
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(TransportError::PairingStream(format!(
+                            "server acknowledgement delivery failed: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn close(&self) {
@@ -741,6 +849,7 @@ pub async fn connect_pairing(
         peer_spki,
         send,
         receive,
+        role: PairingRole::Client,
     })
 }
 
@@ -765,6 +874,7 @@ pub async fn accept_pairing(
         peer_spki,
         send,
         receive,
+        role: PairingRole::Server,
     })
 }
 

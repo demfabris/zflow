@@ -1055,11 +1055,7 @@ fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {
         discovery.register(Advertisement::new(
             listen.port(),
             addresses,
-            [
-                InputCapability::Keyboard,
-                InputCapability::Pointer,
-                InputCapability::Scroll,
-            ],
+            advertised_capabilities(config),
         )?)?;
         discovery.browse()?;
         Ok::<_, anyhow::Error>(discovery)
@@ -1071,6 +1067,18 @@ fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {
             None
         }
     }
+}
+
+fn advertised_capabilities(config: &Config) -> Vec<InputCapability> {
+    let mut capabilities = vec![
+        InputCapability::Keyboard,
+        InputCapability::Pointer,
+        InputCapability::Scroll,
+    ];
+    if config.input.experimental_touchpad {
+        capabilities.push(InputCapability::Touch);
+    }
+    capabilities
 }
 
 async fn stop_discovery(discovery: &mut Option<Discovery>) {
@@ -1367,7 +1375,8 @@ impl Shared {
         }
         let runtime_changed = old.input.capture_devices != config.input.capture_devices
             || old.input.activation_chord != config.input.activation_chord
-            || old.input.escape_chord != config.input.escape_chord;
+            || old.input.escape_chord != config.input.escape_chord
+            || old.input.experimental_touchpad != config.input.experimental_touchpad;
         if runtime_changed {
             self.reload_runtime(runtime_config).await?;
         }
@@ -1398,6 +1407,7 @@ impl Shared {
         let session_policy_changed = old.transport.checkpoint_ms != config.transport.checkpoint_ms
             || old.transport.lease_ms != config.transport.lease_ms
             || old.playout != config.playout
+            || old.input.experimental_touchpad != config.input.experimental_touchpad
             || (old.input.allow_prelogin_input && !config.input.allow_prelogin_input);
         for (peer, session) in sessions {
             let old_record = old.peers.get(&peer);
@@ -1464,6 +1474,17 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_advertises_touch_only_when_experiment_is_enabled() {
+        let mut config = Config::default();
+        let baseline = advertised_capabilities(&config);
+        assert!(!baseline.contains(&InputCapability::Touch));
+
+        config.input.experimental_touchpad = true;
+        let experimental = advertised_capabilities(&config);
+        assert!(experimental.contains(&InputCapability::Touch));
+    }
 
     #[test]
     fn denied_activation_cannot_claim_the_inbound_owner() {
