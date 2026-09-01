@@ -862,40 +862,28 @@ fn chord_warnings(chord: &[String]) -> Vec<&'static str> {
 }
 
 fn devices(path: PathBuf) -> Result<()> {
-    let config = Config::load(&path).ok();
-    if let Some(config) = &config
-        && config.daemon.control_socket.exists()
-    {
-        match daemon_request(&config.daemon.control_socket, Request::Devices)? {
-            Response::Devices { devices } => {
-                for device in devices {
-                    println!(
-                        "{} {}\n    name: {}\n    phys: {}",
-                        if device.configured { "*" } else { " " },
-                        device.path.display(),
-                        device.name.as_deref().unwrap_or("unnamed"),
-                        device.physical_path.as_deref().unwrap_or("-")
-                    );
-                }
-                return Ok(());
-            }
-            Response::Error { message } => bail!("daemon rejected devices request: {message}"),
-            response => bail!("unexpected daemon response: {response:?}"),
-        }
-    }
-    let configured = config
+    let configured = Config::load(&path)
+        .ok()
         .map(|config| config.input.capture_devices)
         .unwrap_or_default();
 
     #[cfg(target_os = "linux")]
     {
+        let scan =
+            crate::linux::enumerate_devices().context("could not enumerate input devices")?;
+        for failure in &scan.failures {
+            eprintln!("! {}: {}", failure.path.display(), failure.error);
+        }
+        if scan.devices.is_empty() && !scan.failures.is_empty() {
+            bail!("could not open any input devices; run `zflow devices` as root");
+        }
+
         let mut count = 0;
-        for (device_path, device) in evdev::enumerate() {
+        for info in scan.physical_devices() {
             count += 1;
-            let info = crate::linux::DeviceInfo::from_device(device_path, &device);
             let selected = configured
                 .iter()
-                .any(|selector| crate::runtime::capture_selector_matches(selector, &info));
+                .any(|selector| crate::runtime::capture_selector_matches(selector, info));
             let name = info.name.as_deref().unwrap_or("unnamed");
             let phys = info.physical_path.as_deref().unwrap_or("-");
             println!(

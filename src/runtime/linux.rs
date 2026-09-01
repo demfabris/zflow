@@ -670,11 +670,11 @@ impl RuntimeLoop {
             status.capture_selection_complete = selection.is_complete();
             status.unmatched_selectors = selection.unmatched;
             status.ambiguous_selectors = selection.ambiguous;
-            if !selection.is_complete() {
-                status.last_diagnostic = Some(RuntimeDiagnostic::CaptureSelectionIncomplete);
-            }
         }
         runtime.refresh_status();
+        if let Some(diagnostic) = capture_selection_diagnostic(None, selection.is_complete()) {
+            runtime.diagnostic(diagnostic);
+        }
         Ok(runtime)
     }
 
@@ -970,6 +970,7 @@ impl RuntimeLoop {
             }
         };
         let selection = select_configured(&self.config.capture_devices, self.scanner.known());
+        let previous_selection_complete = self.capture_selection_complete;
         self.capture_selection_complete = selection.is_complete();
         {
             let mut status = lock_status(&self.status);
@@ -977,8 +978,10 @@ impl RuntimeLoop {
             status.unmatched_selectors = selection.unmatched;
             status.ambiguous_selectors = selection.ambiguous;
         }
-        if !selection.is_complete() {
-            self.diagnostic(RuntimeDiagnostic::CaptureSelectionIncomplete);
+        if let Some(diagnostic) =
+            capture_selection_diagnostic(Some(previous_selection_complete), selection.is_complete())
+        {
+            self.diagnostic(diagnostic);
         }
 
         if selection_loss_closes_activation(self.ownership.phase(), selection.is_complete()) {
@@ -1409,6 +1412,14 @@ fn activation_capture_blocker(
     }
 }
 
+fn capture_selection_diagnostic(
+    previous_complete: Option<bool>,
+    current_complete: bool,
+) -> Option<RuntimeDiagnostic> {
+    (!current_complete && previous_complete != Some(false))
+        .then_some(RuntimeDiagnostic::CaptureSelectionIncomplete)
+}
+
 fn selection_loss_closes_activation(phase: OwnershipPhase, selection_complete: bool) -> bool {
     !selection_complete && phase != OwnershipPhase::Idle
 }
@@ -1716,6 +1727,20 @@ mod tests {
         assert!(selection.capture_set().is_empty());
         assert_eq!(
             activation_capture_blocker(selection.is_complete(), true),
+            Some(RuntimeDiagnostic::CaptureSelectionIncomplete)
+        );
+    }
+
+    #[test]
+    fn incomplete_capture_selection_diagnostic_is_edge_triggered() {
+        assert_eq!(
+            capture_selection_diagnostic(None, false),
+            Some(RuntimeDiagnostic::CaptureSelectionIncomplete)
+        );
+        assert_eq!(capture_selection_diagnostic(Some(false), false), None);
+        assert_eq!(capture_selection_diagnostic(Some(false), true), None);
+        assert_eq!(
+            capture_selection_diagnostic(Some(true), false),
             Some(RuntimeDiagnostic::CaptureSelectionIncomplete)
         );
     }

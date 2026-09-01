@@ -43,6 +43,9 @@ mio = { version = "1.2.2", default-features = false, features = ["os-ext", "os-p
 nix = { version = "0.30", features = ["socket", "user"] }
 sd-notify = "0.5.0"
 
+[patch.crates-io]
+evdev = { git = "https://github.com/cmr/evdev", rev = "7fee138a341f73b81b9c4f8c59e3527c6a169ea3" }
+
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.23"

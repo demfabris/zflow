@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     net::SocketAddr,
     os::unix::fs::{FileTypeExt, PermissionsExt},
@@ -21,8 +21,8 @@ use tokio::{
 use crate::{
     config::{Config, PeerConfig, PeerPermissions},
     control::{
-        DaemonStatus, DeviceStatus, OwnershipStatus, Request, Response, authorize_peer,
-        read_message, write_message,
+        DaemonStatus, OwnershipStatus, Request, Response, authorize_peer, read_message,
+        write_message,
     },
     core::{
         ActivationId, InputCapability, ReceiverEffect, SessionCloseReason, SessionContext,
@@ -331,31 +331,6 @@ impl Shared {
         }
     }
 
-    async fn devices(&self) -> Vec<DeviceStatus> {
-        let status = self.runtime.status();
-        let configured = self.config.read().await.input.capture_devices.clone();
-        let grabbed: BTreeSet<_> = status
-            .capture_devices
-            .iter()
-            .filter(|device| device.grabbed)
-            .map(|device| device.path.clone())
-            .collect();
-        evdev::enumerate()
-            .map(|(path, device)| {
-                let info = crate::linux::DeviceInfo::from_device(path, &device);
-                DeviceStatus {
-                    configured: configured
-                        .iter()
-                        .any(|selector| crate::runtime::capture_selector_matches(selector, &info)),
-                    grabbed: grabbed.contains(&info.path),
-                    path: info.path,
-                    name: info.name,
-                    physical_path: info.physical_path,
-                }
-            })
-            .collect()
-    }
-
     async fn activate(self: &Arc<Self>, peer: &str) -> Result<()> {
         if self.runtime.status().ownership != OwnershipPhase::Idle {
             bail!("local input ownership is not idle");
@@ -650,9 +625,6 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
                 .await?;
             Ok(Response::Ack)
         }
-        Request::Devices => Ok(Response::Devices {
-            devices: shared.devices().await,
-        }),
         Request::ListPeers => Ok(Response::Peers {
             peers: shared
                 .config

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io, path::PathBuf};
+use std::{collections::BTreeMap, io};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -16,7 +16,6 @@ pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 pub enum Request {
     Status,
     ReloadConfig,
-    Devices,
     Activate {
         peer: String,
     },
@@ -40,9 +39,6 @@ pub enum Request {
 pub enum Response {
     Ack,
     Status(Box<DaemonStatus>),
-    Devices {
-        devices: Vec<DeviceStatus>,
-    },
     Peers {
         peers: BTreeMap<String, PeerPermissions>,
     },
@@ -70,16 +66,6 @@ pub enum OwnershipStatus {
     Arming,
     Remote,
     Releasing,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceStatus {
-    pub path: PathBuf,
-    pub name: Option<String>,
-    pub physical_path: Option<String>,
-    pub configured: bool,
-    pub grabbed: bool,
 }
 
 pub async fn write_message<W, T>(writer: &mut W, message: &T) -> Result<(), ControlError>
