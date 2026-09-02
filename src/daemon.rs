@@ -54,6 +54,8 @@ const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_METRICS_HISTORY: usize = 128;
 const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAX_LOCAL_CLIENTS: usize = 64;
+const SEAT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SEAT_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn run(config_path: PathBuf) -> Result<()> {
     tracing_subscriber::fmt()
@@ -120,6 +122,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         active_outbound: Mutex::new(None),
         inbound_owner: Mutex::new(None),
         seat_gate: RwLock::new(initial_seat.injection_gate()),
+        seat_query: Mutex::new(()),
         session_events,
     });
     let mut discovery = start_discovery(&config, shared.endpoint.local_addr()?);
@@ -292,6 +295,7 @@ struct Shared {
     active_outbound: Mutex<Option<ActiveOutbound>>,
     inbound_owner: Mutex<Option<(String, u64)>>,
     seat_gate: RwLock<InjectionGate>,
+    seat_query: Mutex<()>,
     session_events: mpsc::Sender<SessionEvent>,
 }
 
@@ -845,15 +849,28 @@ async fn race_connect(
 }
 
 async fn watch_seat(shared: Arc<Shared>) {
-    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut interval = tokio::time::interval(SEAT_ACTIVE_POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_query = Instant::now();
     loop {
         interval.tick().await;
-        let gate = match tokio::task::spawn_blocking(query_primary_seat).await {
-            Ok(state) => state.injection_gate(),
-            Err(_) => InjectionGate::Denied,
-        };
-        shared.update_seat_gate(gate).await;
+        let inbound_active = shared.inbound_owner.lock().await.is_some();
+        if !seat_query_due(inbound_active, last_query.elapsed()) {
+            continue;
+        }
+        shared.refresh_seat_gate().await;
+        last_query = Instant::now();
+    }
+}
+
+fn seat_query_due(inbound_active: bool, since_last_query: Duration) -> bool {
+    inbound_active || since_last_query >= SEAT_IDLE_POLL_INTERVAL
+}
+
+async fn query_seat_gate() -> InjectionGate {
+    match tokio::task::spawn_blocking(query_primary_seat).await {
+        Ok(state) => state.injection_gate(),
+        Err(_) => InjectionGate::Denied,
     }
 }
 
@@ -1243,6 +1260,12 @@ impl Shared {
         effects: Vec<ReceiverEffect>,
         received_at: std::time::Instant,
     ) -> Result<bool> {
+        let opens = effects
+            .iter()
+            .any(|effect| matches!(effect, ReceiverEffect::ActivationOpened(_)));
+        if opens {
+            self.refresh_seat_gate().await;
+        }
         let _policy = self.policy.lock().await;
         let session = self
             .sessions
@@ -1255,9 +1278,6 @@ impl Shared {
             return Ok(false);
         };
 
-        let opens = effects
-            .iter()
-            .any(|effect| matches!(effect, ReceiverEffect::ActivationOpened(_)));
         let gate = *self.seat_gate.read().await;
         let permitted = {
             let config = self.config.read().await;
@@ -1444,6 +1464,16 @@ impl Shared {
 
     async fn update_seat_gate(&self, gate: InjectionGate) {
         let _policy = self.policy.lock().await;
+        self.update_seat_gate_locked(gate).await;
+    }
+
+    async fn refresh_seat_gate(&self) {
+        let _query = self.seat_query.lock().await;
+        let gate = query_seat_gate().await;
+        self.update_seat_gate(gate).await;
+    }
+
+    async fn update_seat_gate_locked(&self, gate: InjectionGate) {
         let old = std::mem::replace(&mut *self.seat_gate.write().await, gate);
         if old == gate {
             return;
@@ -1535,5 +1565,12 @@ mod tests {
             "peer",
             InjectionGate::PreLogin
         ));
+    }
+
+    #[test]
+    fn seat_queries_back_off_without_an_inbound_activation() {
+        assert!(!seat_query_due(false, SEAT_ACTIVE_POLL_INTERVAL));
+        assert!(seat_query_due(false, SEAT_IDLE_POLL_INTERVAL));
+        assert!(seat_query_due(true, Duration::ZERO));
     }
 }

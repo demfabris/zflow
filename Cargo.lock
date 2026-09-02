@@ -1878,6 +1878,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "bytes",
+ "cc",
  "clap",
  "evdev",
  "getrandom 0.3.4",

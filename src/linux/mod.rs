@@ -12,6 +12,9 @@ mod seat;
 mod touch;
 mod uinput;
 
+pub use crate::capture::{
+    CaptureFrame, CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS,
+};
 pub use capture::*;
 pub use devices::*;
 pub use mapping::*;

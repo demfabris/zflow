@@ -370,15 +370,18 @@ impl DatagramChannel {
         }
     }
 
-    /// Latest-wins cumulative motion. Quinn discards older unsent datagrams to
-    /// make room; this intentionally never waits for old motion.
+    /// Latest-wins cumulative motion. New motion replaces only older pending
+    /// motion and is drained before pending probes.
     pub fn send_motion(&self, frame: &MotionFrame) -> Result<(), TransportError> {
-        self.send_wire(WireMessage::Motion(frame.clone()))
+        self.send_wire(
+            WireMessage::Motion(frame.clone()),
+            PendingDatagramClass::Motion,
+        )
     }
 
     /// Latest-wins application probe or echo.
     pub fn send_probe(&self, probe: &ProbeMessage) -> Result<(), TransportError> {
-        self.send_wire(WireMessage::Probe(*probe))
+        self.send_wire(WireMessage::Probe(*probe), PendingDatagramClass::Probe)
     }
 
     /// Exact number of pending application datagrams replaced by fresher data.
@@ -386,10 +389,14 @@ impl DatagramChannel {
         self.outgoing.dropped()
     }
 
-    fn send_wire(&self, message: WireMessage) -> Result<(), TransportError> {
+    fn send_wire(
+        &self,
+        message: WireMessage,
+        class: PendingDatagramClass,
+    ) -> Result<(), TransportError> {
         let encoded = encode_wire(&message)?;
         self.check_size(encoded.len())?;
-        if !self.outgoing.enqueue(Bytes::from(encoded)) {
+        if !self.outgoing.enqueue(class, Bytes::from(encoded)) {
             return Err(TransportError::DatagramQueueClosed);
         }
         Ok(())
@@ -444,10 +451,23 @@ impl DatagramChannel {
     }
 }
 
-/// One pending application datagram. The pump uses Quinn's waiting API, so
-/// Quinn never evicts an uncounted datagram; producers replace only this slot.
+#[derive(Debug, Clone, Copy)]
+enum PendingDatagramClass {
+    Motion,
+    Probe,
+}
+
+#[derive(Debug, Default)]
+struct PendingDatagrams {
+    motion: Option<Bytes>,
+    probe: Option<Bytes>,
+}
+
+/// One latest-wins slot per datagram class. Motion is always drained before
+/// probes, and each class can replace only its own pending payload. The pump
+/// uses Quinn's waiting API, so Quinn never evicts an uncounted datagram.
 struct LatestDatagramQueue {
-    pending: Mutex<Option<Bytes>>,
+    pending: Mutex<PendingDatagrams>,
     notify: Notify,
     dropped: AtomicU64,
     closed: AtomicBool,
@@ -456,14 +476,14 @@ struct LatestDatagramQueue {
 impl LatestDatagramQueue {
     fn new() -> Self {
         Self {
-            pending: Mutex::new(None),
+            pending: Mutex::new(PendingDatagrams::default()),
             notify: Notify::new(),
             dropped: AtomicU64::new(0),
             closed: AtomicBool::new(false),
         }
     }
 
-    fn enqueue(&self, datagram: Bytes) -> bool {
+    fn enqueue(&self, class: PendingDatagramClass, datagram: Bytes) -> bool {
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
@@ -474,7 +494,11 @@ impl LatestDatagramQueue {
         if self.closed.load(Ordering::Acquire) {
             return false;
         }
-        if pending.replace(datagram).is_some() {
+        let replaced = match class {
+            PendingDatagramClass::Motion => pending.motion.replace(datagram),
+            PendingDatagramClass::Probe => pending.probe.replace(datagram),
+        };
+        if replaced.is_some() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         drop(pending);
@@ -483,18 +507,22 @@ impl LatestDatagramQueue {
     }
 
     fn take(&self) -> Option<Bytes> {
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.motion.take().or_else(|| pending.probe.take())
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.motion.take();
+        pending.probe.take();
+        drop(pending);
         self.notify.notify_waiters();
     }
 
@@ -920,17 +948,67 @@ fn close_protocol(connection: &Connection, reason: &'static [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::LatestDatagramQueue;
+    use super::{LatestDatagramQueue, PendingDatagramClass};
     use bytes::Bytes;
 
     #[test]
-    fn latest_datagram_queue_counts_replaced_pending_payloads() {
+    fn latest_datagram_queue_keeps_motion_and_probe_pending_independently() {
         let queue = LatestDatagramQueue::new();
-        assert!(queue.enqueue(Bytes::from_static(b"old")));
-        assert!(queue.enqueue(Bytes::from_static(b"new")));
+        assert!(queue.enqueue(PendingDatagramClass::Motion, Bytes::from_static(b"motion")));
+        assert!(queue.enqueue(PendingDatagramClass::Probe, Bytes::from_static(b"probe")));
+        assert_eq!(queue.dropped(), 0);
+        assert_eq!(queue.take(), Some(Bytes::from_static(b"motion")));
+        assert_eq!(queue.take(), Some(Bytes::from_static(b"probe")));
+    }
+
+    #[test]
+    fn latest_datagram_queue_prioritizes_latest_motion_over_probe() {
+        let queue = LatestDatagramQueue::new();
+        assert!(queue.enqueue(
+            PendingDatagramClass::Motion,
+            Bytes::from_static(b"old motion")
+        ));
+        assert!(queue.enqueue(PendingDatagramClass::Probe, Bytes::from_static(b"probe")));
+        assert!(queue.enqueue(
+            PendingDatagramClass::Motion,
+            Bytes::from_static(b"new motion")
+        ));
         assert_eq!(queue.dropped(), 1);
-        assert_eq!(queue.take(), Some(Bytes::from_static(b"new")));
+        assert_eq!(queue.take(), Some(Bytes::from_static(b"new motion")));
+        assert_eq!(queue.take(), Some(Bytes::from_static(b"probe")));
+    }
+
+    #[test]
+    fn latest_datagram_queue_counts_probe_replacements_without_displacing_motion() {
+        let queue = LatestDatagramQueue::new();
+        assert!(queue.enqueue(
+            PendingDatagramClass::Probe,
+            Bytes::from_static(b"old probe")
+        ));
+        assert!(queue.enqueue(PendingDatagramClass::Motion, Bytes::from_static(b"motion")));
+        assert!(queue.enqueue(
+            PendingDatagramClass::Probe,
+            Bytes::from_static(b"new probe")
+        ));
+        assert_eq!(queue.dropped(), 1);
+        assert_eq!(queue.take(), Some(Bytes::from_static(b"motion")));
+        assert_eq!(queue.take(), Some(Bytes::from_static(b"new probe")));
+    }
+
+    #[test]
+    fn latest_datagram_queue_closure_discards_both_classes() {
+        let queue = LatestDatagramQueue::new();
+        assert!(queue.enqueue(PendingDatagramClass::Motion, Bytes::from_static(b"motion")));
+        assert!(queue.enqueue(PendingDatagramClass::Probe, Bytes::from_static(b"probe")));
         queue.close();
-        assert!(!queue.enqueue(Bytes::from_static(b"closed")));
+        assert_eq!(queue.take(), None);
+        assert!(!queue.enqueue(
+            PendingDatagramClass::Motion,
+            Bytes::from_static(b"closed motion")
+        ));
+        assert!(!queue.enqueue(
+            PendingDatagramClass::Probe,
+            Bytes::from_static(b"closed probe")
+        ));
     }
 }

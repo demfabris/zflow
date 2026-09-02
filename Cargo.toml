@@ -36,6 +36,9 @@ toml = "1.1.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[build-dependencies]
+cc = "1.4"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
 libc = "0.2"

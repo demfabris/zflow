@@ -47,10 +47,14 @@ impl SampleWindow {
     }
 
     pub fn summary(&self) -> Option<SampleSummary> {
+        self.clone().into_summary()
+    }
+
+    fn into_summary(self) -> Option<SampleSummary> {
         if self.values.is_empty() {
             return None;
         }
-        let mut sorted: Vec<_> = self.values.iter().copied().collect();
+        let mut sorted = Vec::from(self.values);
         sorted.sort_by(f64::total_cmp);
         Some(SampleSummary {
             count: sorted.len(),
@@ -60,6 +64,39 @@ impl SampleWindow {
             p999: percentile(&sorted, 0.999),
             maximum: *sorted.last().unwrap(),
         })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionMetricsSnapshotData {
+    capture_to_send_us: SampleWindow,
+    receive_to_inject_us: SampleWindow,
+    receive_to_runtime_dispatch_us: SampleWindow,
+    arming_to_grab_us: SampleWindow,
+    rtt_us: SampleWindow,
+    delay_variation_us: SampleWindow,
+    adaptive_delay_variation_percentile_us: SampleWindow,
+    playout_delay_us: SampleWindow,
+    scheduler_lateness_us: SampleWindow,
+    clock_residual_us: SampleWindow,
+    snapshot: SessionMetricsSnapshot,
+}
+
+impl SessionMetricsSnapshotData {
+    pub(crate) fn summarize(mut self) -> SessionMetricsSnapshot {
+        self.snapshot.capture_to_send_us = self.capture_to_send_us.into_summary();
+        self.snapshot.receive_to_inject_us = self.receive_to_inject_us.into_summary();
+        self.snapshot.receive_to_runtime_dispatch_us =
+            self.receive_to_runtime_dispatch_us.into_summary();
+        self.snapshot.arming_to_grab_us = self.arming_to_grab_us.into_summary();
+        self.snapshot.rtt_us = self.rtt_us.into_summary();
+        self.snapshot.delay_variation_us = self.delay_variation_us.into_summary();
+        self.snapshot.adaptive_delay_variation_percentile_us =
+            self.adaptive_delay_variation_percentile_us.into_summary();
+        self.snapshot.playout_delay_us = self.playout_delay_us.into_summary();
+        self.snapshot.scheduler_lateness_us = self.scheduler_lateness_us.into_summary();
+        self.snapshot.clock_residual_us = self.clock_residual_us.into_summary();
+        self.snapshot
     }
 }
 
@@ -201,41 +238,57 @@ impl SessionMetrics {
     }
 
     pub fn snapshot(&self) -> SessionMetricsSnapshot {
-        SessionMetricsSnapshot {
-            capture_to_send_us: self.capture_to_send_us.summary(),
-            receive_to_inject_us: self.receive_to_inject_us.summary(),
-            receive_to_runtime_dispatch_us: self.receive_to_runtime_dispatch_us.summary(),
-            arming_to_grab_us: self.arming_to_grab_us.summary(),
-            switch_time_leakage_events: self.switch_time_leakage_events,
-            rtt_us: self.rtt_us.summary(),
-            delay_variation_us: self.delay_variation_us.summary(),
+        self.snapshot_data().summarize()
+    }
+
+    pub(crate) fn snapshot_data(&self) -> SessionMetricsSnapshotData {
+        SessionMetricsSnapshotData {
+            capture_to_send_us: self.capture_to_send_us.clone(),
+            receive_to_inject_us: self.receive_to_inject_us.clone(),
+            receive_to_runtime_dispatch_us: self.receive_to_runtime_dispatch_us.clone(),
+            arming_to_grab_us: self.arming_to_grab_us.clone(),
+            rtt_us: self.rtt_us.clone(),
+            delay_variation_us: self.delay_variation_us.clone(),
             adaptive_delay_variation_percentile_us: self
                 .adaptive_delay_variation_percentile_us
-                .summary(),
-            playout_delay_us: self.playout_delay_us.summary(),
-            scheduler_lateness_us: self.scheduler_lateness_us.summary(),
-            clock_residual_us: self.clock_residual_us.summary(),
-            clock_offset_us: self.clock_offset_us,
-            clock_skew: self.clock_skew,
-            clock_skew_ppm: self.clock_skew_ppm,
-            clock_reset_count: self.clock_reset_count,
-            loss: self.loss,
-            reordered: self.reordered,
-            duplicate_datagrams: self.duplicate_datagrams,
-            datagram_queue_drops: self.datagram_queue_drops,
-            scheduler_late_events: self.scheduler_late_events,
-            catch_up_steps: self.catch_up_steps,
-            catch_up_pointer_units: self.catch_up_pointer_units,
-            catch_up_scroll_units: self.catch_up_scroll_units,
-            lease_renewals: self.lease_renewals,
-            snapshot_acknowledgements: self.snapshot_acknowledgements,
-            synthetic_releases: self.synthetic_releases,
-            stale_events_rejected: self.stale_events_rejected,
-            epoch_changes: self.epoch_changes,
-            generation_changes: self.generation_changes,
-            explicit_rebases: self.explicit_rebases,
-            rebase_discarded_pointer_units: self.rebase_discarded_pointer_units,
-            rebase_discarded_scroll_units: self.rebase_discarded_scroll_units,
+                .clone(),
+            playout_delay_us: self.playout_delay_us.clone(),
+            scheduler_lateness_us: self.scheduler_lateness_us.clone(),
+            clock_residual_us: self.clock_residual_us.clone(),
+            snapshot: SessionMetricsSnapshot {
+                capture_to_send_us: None,
+                receive_to_inject_us: None,
+                receive_to_runtime_dispatch_us: None,
+                arming_to_grab_us: None,
+                rtt_us: None,
+                delay_variation_us: None,
+                adaptive_delay_variation_percentile_us: None,
+                playout_delay_us: None,
+                scheduler_lateness_us: None,
+                clock_residual_us: None,
+                switch_time_leakage_events: self.switch_time_leakage_events,
+                clock_offset_us: self.clock_offset_us,
+                clock_skew: self.clock_skew,
+                clock_skew_ppm: self.clock_skew_ppm,
+                clock_reset_count: self.clock_reset_count,
+                loss: self.loss,
+                reordered: self.reordered,
+                duplicate_datagrams: self.duplicate_datagrams,
+                datagram_queue_drops: self.datagram_queue_drops,
+                scheduler_late_events: self.scheduler_late_events,
+                catch_up_steps: self.catch_up_steps,
+                catch_up_pointer_units: self.catch_up_pointer_units,
+                catch_up_scroll_units: self.catch_up_scroll_units,
+                lease_renewals: self.lease_renewals,
+                snapshot_acknowledgements: self.snapshot_acknowledgements,
+                synthetic_releases: self.synthetic_releases,
+                stale_events_rejected: self.stale_events_rejected,
+                epoch_changes: self.epoch_changes,
+                generation_changes: self.generation_changes,
+                explicit_rebases: self.explicit_rebases,
+                rebase_discarded_pointer_units: self.rebase_discarded_pointer_units,
+                rebase_discarded_scroll_units: self.rebase_discarded_scroll_units,
+            },
         }
     }
 }
@@ -290,5 +343,18 @@ mod tests {
         let summary = metrics.delay_variation_us.summary().unwrap();
         assert_eq!(summary.count, 2);
         assert_eq!(summary.maximum, 600.0);
+    }
+
+    #[test]
+    fn detached_snapshot_preserves_samples_and_counters() {
+        let mut metrics = SessionMetrics::default();
+        metrics.capture_to_send_us.record(10.0);
+        metrics.capture_to_send_us.record(20.0);
+        metrics.loss = 3;
+
+        let snapshot = metrics.snapshot_data().summarize();
+
+        assert_eq!(snapshot.capture_to_send_us.unwrap().maximum, 20.0);
+        assert_eq!(snapshot.loss, 3);
     }
 }

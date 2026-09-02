@@ -1,19 +1,22 @@
 //! Headless zflow core, platform adapters, transport, and local control plane.
 
+pub mod capture;
 pub mod cli;
 pub mod config;
 pub mod control;
 pub mod core;
+#[cfg(target_os = "linux")]
 pub mod daemon;
 pub mod discovery;
 pub mod identity;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod metrics;
 pub mod pairing;
 #[cfg(target_os = "linux")]
 pub mod runtime;
-#[cfg(target_os = "linux")]
 pub mod session;
 pub mod transport;
 pub mod wire;

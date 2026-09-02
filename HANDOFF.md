@@ -69,6 +69,14 @@ Spike D passed on this MacBook Pro with an external Bluetooth Magic Trackpad:
 Enumerate devices when capture starts and again after device or Bluetooth
 changes. Do not enumerate once at process startup.
 
+The Mac-to-Ubuntu foreground path was implemented and exercised later on
+2026-09-01. Raw contacts drove Ubuntu pointer and swipe behavior, pairing and a
+delayed checkpoint-acknowledgement race were fixed, and abrupt Mac process death
+returned Ubuntu to idle with synthetic releases. The remaining raw-touch defect
+is reproducible libinput touch-jump warnings; the exact three-finger case and
+the non-touch CGEvent path are still pending. See
+`spikes/e-macos-ubuntu/RESULT.md` for commands, logs, metrics, and exclusions.
+
 ## Session goal
 
 Build one foreground Mac source that connects to the existing Ubuntu receiver.
@@ -132,10 +140,11 @@ cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The crate does not compile on Darwin yet. `src/lib.rs` exports `daemon` on all
-platforms, while `src/daemon.rs` imports the Linux-only `runtime` and `session`
-modules. Establish honest `cfg` boundaries and move the shared source-session
-logic needed by macOS. Do not add Mac stubs that claim input works.
+At handoff commit `69e9b46`, the crate did not compile on Darwin because
+`src/lib.rs` exported `daemon` on all platforms while `src/daemon.rs` imported
+Linux-only modules. The later Spike E work established the platform boundaries,
+moved shared capture records, and added the real foreground Mac source described
+above.
 
 After the Mac source can pair, coordinate with fabrico and pair against the
 Ubuntu host. The Ubuntu side runs:

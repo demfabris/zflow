@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
+    capture::{CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS},
     config::{Config, PlayoutMode},
     core::{
         ActiveScroll, ClockConfig, ClockMapper, ControlSequence, HeldState, HidUsage, HidUsagePage,
@@ -19,7 +20,6 @@ use crate::{
         ReliableControlMessage, ScrollUnit, Sender, SenderConfig, SenderTick, SessionCloseReason,
         SessionContext, SessionEpoch, TouchState, TransportGeneration,
     },
-    linux::{CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS},
     metrics::{SessionMetrics, SessionMetricsSnapshot},
     transport::{InputChannels, InputConnection, InputControlMessage, InputDatagram},
     wire::CURRENT_PROTOCOL_VERSION,
@@ -159,7 +159,8 @@ impl SessionHandle {
     }
 
     pub fn metrics_snapshot(&self) -> SessionMetricsSnapshot {
-        let mut snapshot = lock_metrics(&self.metrics).snapshot();
+        let snapshot_data = { lock_metrics(&self.metrics).snapshot_data() };
+        let mut snapshot = snapshot_data.summarize();
         snapshot.datagram_queue_drops = self.connection.dropped_datagrams();
         snapshot
     }
@@ -1702,12 +1703,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        capture::CaptureFrame,
         core::{
             ActivationId, AnchorKind, CumulativeMotion, HidUsage, MotionDelta, PointerButton,
             SnapshotAck,
         },
         identity::Identity,
-        linux::CaptureFrame,
         transport::{
             TransportError, accept_input, connect_input, input_client_config, input_server_config,
         },

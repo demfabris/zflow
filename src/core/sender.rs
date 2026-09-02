@@ -16,6 +16,8 @@ use super::{
     TouchState, TransportGeneration,
 };
 
+const MAX_PENDING_SNAPSHOTS: usize = 64;
+
 const MAX_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_RECEIVER_LEASE: Duration = Duration::from_secs(1);
 
@@ -86,6 +88,8 @@ pub enum SenderError {
     WrongAckGeneration,
     #[error("snapshot acknowledgement does not name an emitted snapshot")]
     UnknownSnapshotAck,
+    #[error("too many checkpoints are awaiting acknowledgement")]
+    PendingSnapshotLimit,
     #[error("transport generation must advance exactly by one")]
     InvalidGenerationAdvance,
     #[error("takeover acknowledgement did not match the pending proposal")]
@@ -373,6 +377,9 @@ impl Sender {
     ) -> Result<ReliableControlMessage, SenderError> {
         self.require_capture_ready()?;
         self.observe_time(now)?;
+        if self.pending_snapshots.len() >= MAX_PENDING_SNAPSHOTS {
+            return Err(SenderError::PendingSnapshotLimit);
+        }
         let snapshot = StateSnapshot {
             held: self.held.clone(),
             motion_anchor: self.anchor(now, AnchorKind::Checkpoint),
@@ -380,8 +387,6 @@ impl Sender {
         let message = self.control(ReliableControl::StateSnapshot(snapshot.clone()))?;
         let ack_deadline =
             (!snapshot.held.is_neutral()).then(|| add_duration(now, self.config.receiver_lease));
-        self.pending_snapshots
-            .retain(|_, pending| pending.ack_deadline.is_some());
         self.pending_snapshots.insert(
             message.sequence,
             PendingSnapshot {
@@ -719,6 +724,30 @@ mod tests {
         assert_eq!(
             sender.last_acknowledged_checkpoint().unwrap().0,
             snapshot.sequence
+        );
+    }
+
+    #[test]
+    fn delayed_neutral_snapshot_ack_survives_a_newer_checkpoint() {
+        let mut sender = sender();
+        sender.enter(MonotonicTimeMicros(0)).unwrap();
+        let SenderTick::Checkpoint(first) = sender.tick(MonotonicTimeMicros(250_000)).unwrap()
+        else {
+            panic!("first checkpoint was not enqueued");
+        };
+        let SenderTick::Checkpoint(_) = sender.tick(MonotonicTimeMicros(500_000)).unwrap() else {
+            panic!("second checkpoint was not enqueued");
+        };
+
+        sender
+            .acknowledge_snapshot(SnapshotAck {
+                snapshot_sequence: first.sequence,
+                accepted_generation: TransportGeneration(1),
+            })
+            .unwrap();
+        assert_eq!(
+            sender.last_acknowledged_checkpoint().unwrap().0,
+            first.sequence
         );
     }
 

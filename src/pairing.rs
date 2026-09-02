@@ -21,6 +21,27 @@ pub struct PairingObservation {
     pub authentication_code: String,
 }
 
+/// Keeps the authenticated pairing transport alive through user confirmation.
+pub struct PairingSession {
+    observation: PairingObservation,
+    _connection: PairingConnection,
+    _endpoint: Option<quinn::Endpoint>,
+}
+
+impl PairingSession {
+    pub fn observation(&self) -> &PairingObservation {
+        &self.observation
+    }
+}
+
+impl std::ops::Deref for PairingSession {
+    type Target = PairingObservation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.observation
+    }
+}
+
 pub fn make_offer(
     device_label: Option<String>,
     input_port: u16,
@@ -75,14 +96,19 @@ impl<'identity> PairingListener<'identity> {
             .context("pairing listener has no local address")
     }
 
-    pub async fn accept(&self) -> Result<PairingObservation> {
+    pub async fn accept(&self) -> Result<PairingSession> {
         let incoming = self
             .endpoint
             .accept()
             .await
             .context("pairing listener closed")?;
         let mut connection = accept_pairing(incoming, &self.server_config).await?;
-        complete(self.identity, &self.local_offer, &mut connection).await
+        let observation = complete(self.identity, &self.local_offer, &mut connection).await?;
+        Ok(PairingSession {
+            observation,
+            _connection: connection,
+            _endpoint: None,
+        })
     }
 }
 
@@ -90,7 +116,7 @@ pub async fn connect(
     identity: &Identity,
     remote: SocketAddr,
     local_offer: &PairingOffer,
-) -> Result<PairingObservation> {
+) -> Result<PairingSession> {
     let bind = match remote.ip() {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -99,7 +125,12 @@ pub async fn connect(
         .with_context(|| format!("could not bind a pairing client for {remote}"))?;
     let config = pairing_client_config(identity)?;
     let mut connection = connect_pairing(&endpoint, remote, &config).await?;
-    complete(identity, local_offer, &mut connection).await
+    let observation = complete(identity, local_offer, &mut connection).await?;
+    Ok(PairingSession {
+        observation,
+        _connection: connection,
+        _endpoint: Some(endpoint),
+    })
 }
 
 async fn complete(

@@ -2,9 +2,10 @@ use std::io;
 
 use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, SynchronizationCode};
 
-use crate::core::{ContactId, SourceDimensions, TouchContact, TouchState, TouchTool};
-
-pub const MAX_TOUCHPAD_CONTACTS: usize = 5;
+use crate::{
+    capture::MAX_TOUCHPAD_CONTACTS,
+    core::{ContactId, SourceDimensions, TouchContact, TouchState, TouchTool},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TouchAxisRange {

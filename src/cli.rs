@@ -1201,15 +1201,16 @@ fn pair_connect(
         advertised,
     )?;
     println!("connecting to pairing listener at {address}");
-    let observation = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
-        .build()?
-        .block_on(async {
-            tokio::time::timeout(timeout, crate::pairing::connect(&identity, address, &offer))
-                .await
-                .context("pairing timed out")?
-        })?;
-    confirm_and_store(path, peer, observation, code)
+        .build()?;
+    let session = runtime.block_on(async {
+        tokio::time::timeout(timeout, crate::pairing::connect(&identity, address, &offer))
+            .await
+            .context("pairing timed out")?
+    })?;
+    confirm_and_store(path, peer, session.observation().clone(), code)
 }
 
 fn pair_listen(
@@ -1227,17 +1228,18 @@ fn pair_listen(
         config.transport.listen.port(),
         advertised,
     )?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()?;
-    let observation = runtime.block_on(async {
+    let session = runtime.block_on(async {
         let listener = crate::pairing::PairingListener::bind(&identity, listen, offer)?;
         println!("pairing listener: {}", listener.local_addr()?);
         tokio::time::timeout(timeout, listener.accept())
             .await
             .context("pairing timed out")?
     })?;
-    confirm_and_store(path, peer, observation, code)
+    confirm_and_store(path, peer, session.observation().clone(), code)
 }
 
 fn confirm_and_store(

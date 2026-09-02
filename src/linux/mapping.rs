@@ -3,7 +3,10 @@ use std::fmt;
 use evdev::{EventType, InputEvent, KeyCode, RelativeAxisCode, SynchronizationCode};
 use thiserror::Error;
 
-use crate::core::{HidUsage, HidUsagePage, MotionDelta, PointerButton};
+use crate::{
+    capture::{CaptureFrame, CaptureTransition, KeyState},
+    core::{HidUsage, HidUsagePage, MotionDelta, PointerButton},
+};
 
 const HID_KEYBOARD: u16 = 0x07;
 const HID_CONSUMER: u16 = 0x0c;
@@ -211,42 +214,6 @@ const KEY_MAP: &[KeyMapping] = &[
     KeyMapping::keyboard(193, 0x72),
     KeyMapping::keyboard(194, 0x73),
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyState {
-    Released,
-    Pressed,
-    Repeat,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureTransition {
-    Key {
-        usage: HidUsage,
-        state: KeyState,
-    },
-    Button {
-        button: PointerButton,
-        state: KeyState,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CaptureFrame {
-    pub transitions: Vec<CaptureTransition>,
-    pub motion: MotionDelta,
-    pub touch_snapshot: Option<crate::core::TouchState>,
-    /// Mappable kernel events consumed while assembling this frame.
-    pub event_count: u64,
-}
-
-impl CaptureFrame {
-    pub fn is_empty(&self) -> bool {
-        self.transitions.is_empty()
-            && self.motion == MotionDelta::default()
-            && self.touch_snapshot.is_none()
-    }
-}
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum MappingError {

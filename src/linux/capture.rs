@@ -9,6 +9,8 @@ use std::{
 use evdev::{Device, InputEvent, KeyCode};
 use thiserror::Error;
 
+use crate::capture::CapturedDeviceFrame;
+
 use super::{
     AggregateInputState, CaptureFrame, DeviceInfo, FrameAccumulator, MappingError, TouchAccumulator,
 };
@@ -153,14 +155,6 @@ pub enum CaptureReadError {
         #[source]
         source: MappingError,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapturedDeviceFrame {
-    pub device_path: PathBuf,
-    pub frame: CaptureFrame,
-    /// When the terminating SYN_REPORT completed in the capture loop.
-    pub captured_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

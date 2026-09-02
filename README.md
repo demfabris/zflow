@@ -5,10 +5,10 @@ set of physical evdev devices, sends bounded input state over authenticated
 QUIC, and injects it through stable uinput devices on the other machine.
 
 This is a working headless prototype, not yet a qualified alpha. The supported
-prototype launch path is the packaged systemd service. There is no GUI yet,
-automatic edge switching is not implemented, and macOS support remains design
-and spike work. The two-host qualification run in `TESTPLAN.md` still gates
-the alpha label.
+Linux launch path is the packaged systemd service. There is no GUI yet and
+automatic edge switching is not implemented. The macOS source is an
+experimental foreground developer tool. The two-host qualification run in
+`TESTPLAN.md` still gates the alpha label.
 
 ## Install and select devices
 
@@ -107,6 +107,38 @@ Revocation is local and immediate:
 ```sh
 sudo zflow peer revoke desk
 ```
+
+### macOS Wi-Fi latency
+
+If macOS input stutters or rubber-bands, measure LAN latency before changing
+zflow buffering. A low baseline with repeated spikes above one 60 Hz frame
+(about 17 ms) can produce the symptom even when signal strength is excellent:
+
+```sh
+ping -c 20 RECEIVER_LAN_IP
+```
+
+On one Mac-to-Ubuntu run, a 2-4 ms baseline repeatedly jumped to 31-76 ms.
+zflow measured 72 ms p95 RTT, 82 ms p99 delay variation, and 198 missing
+datagrams. Temporarily disabling Apple's peer-to-peer Wi-Fi interfaces greatly
+improved the input on that machine:
+
+```sh
+sudo ifconfig awdl0 down
+sudo ifconfig llw0 down
+```
+
+This disables AirDrop and may interrupt Continuity features. Treat it as an
+opt-in diagnostic, not a default setup step. Restore the interfaces after the
+test (or reboot macOS):
+
+```sh
+sudo ifconfig awdl0 up
+sudo ifconfig llw0 up
+```
+
+If latency spikes remain, compare with the Mac on Ethernet before attributing
+the problem to capture or playout behavior.
 
 ## Develop
 
