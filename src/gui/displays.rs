@@ -11,36 +11,28 @@ use tokio::sync::oneshot;
 
 use crate::{config::Config, discovery::local_unicast_addresses};
 
-const SERVICE: &str = "_zflow-display._udp.local.";
-const MAX_DISPLAYS: usize = 8;
+mod desktop;
+pub(super) use desktop::DesktopDetector;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+const SERVICE: &str = "_zflow-display._udp.local.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Display {
+pub(super) struct Desktop {
     pub width: u32,
     pub height: u32,
-    pub scale_milli: u32,
 }
 
-impl Display {
+impl Desktop {
     pub fn valid(&self) -> bool {
-        (1..=16384).contains(&self.width)
-            && (1..=16384).contains(&self.height)
-            && (1000..=8000).contains(&self.scale_milli)
-    }
-
-    pub fn logical_size(&self) -> (u32, u32) {
-        (
-            (self.width * 1000 / self.scale_milli).max(1),
-            (self.height * 1000 / self.scale_milli).max(1),
-        )
+        (1..=16384).contains(&self.width) && (1..=16384).contains(&self.height)
     }
 }
 
 #[derive(Clone)]
 struct Report {
     addresses: Vec<IpAddr>,
-    displays: Vec<Display>,
+    desktop: Desktop,
 }
 
 #[derive(Default)]
@@ -53,42 +45,48 @@ struct State {
 pub(super) struct DisplayDiscovery {
     state: Arc<Mutex<State>>,
     stop: Option<oneshot::Sender<()>>,
-    pub local: Vec<Display>,
+    pub local: Option<Desktop>,
 }
 
 impl DisplayDiscovery {
-    pub fn update(&mut self, ctx: &egui::Context, local: Vec<Display>, enabled: bool) {
-        let local: Vec<_> = local
-            .into_iter()
-            .filter(Display::valid)
-            .take(MAX_DISPLAYS)
-            .collect();
-        if self.local == local && self.stop.is_some() == enabled {
+    pub fn update(&mut self, ctx: &egui::Context, local: Option<Desktop>, enabled: bool) {
+        let local = local.filter(Desktop::valid);
+        let should_run = enabled && local.is_some();
+        if self.local == local && self.stop.is_some() == should_run {
             return;
         }
         self.stop();
-        self.local = local.clone();
-        if !enabled || local.is_empty() {
+        self.local = local;
+        if !enabled {
             return;
         }
+        let Some(local) = local else { return };
         let (sender, receiver) = oneshot::channel();
         self.stop = Some(sender);
         let state = self.state.clone();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let result = (|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(browse(state.clone(), ctx.clone(), local, receiver))
-            })();
-            if let Err(error) = result {
-                let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-                state.reports.clear();
-                state.error = Some(format!("{error:#}"));
-                ctx.request_repaint();
-            }
-        });
+        let worker_ctx = ctx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("zflow-displays".into())
+            .spawn(move || {
+                let result = (|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(browse(state.clone(), worker_ctx.clone(), local, receiver))
+                })();
+                if let Err(error) = result {
+                    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.reports.clear();
+                    state.error = Some(format!("{error:#}"));
+                    worker_ctx.request_repaint();
+                }
+            })
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.error = Some(format!("Could not start desktop discovery: {error}"));
+            ctx.request_repaint();
+        }
     }
 
     pub(super) fn stop(&mut self) {
@@ -98,7 +96,7 @@ impl DisplayDiscovery {
         self.state = Arc::new(Mutex::new(State::default()));
     }
 
-    pub fn remote(&self, config: &Config) -> BTreeMap<String, Vec<Display>> {
+    pub fn remote(&self, config: &Config) -> BTreeMap<String, Desktop> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match_reports(&state.reports, config)
     }
@@ -118,10 +116,7 @@ impl Drop for DisplayDiscovery {
     }
 }
 
-fn match_reports(
-    reports: &BTreeMap<String, Report>,
-    config: &Config,
-) -> BTreeMap<String, Vec<Display>> {
+fn match_reports(reports: &BTreeMap<String, Report>, config: &Config) -> BTreeMap<String, Desktop> {
     let mut matches = BTreeMap::new();
     for (name, peer) in &config.peers {
         let candidates: Vec<_> = reports
@@ -137,7 +132,7 @@ fn match_reports(
             })
             .collect();
         if let [report] = candidates.as_slice() {
-            matches.insert(name.clone(), report.displays.clone());
+            matches.insert(name.clone(), report.desktop);
         }
     }
     matches
@@ -155,25 +150,19 @@ fn has_peer_address(report: &Report, peer: &crate::config::PeerConfig) -> bool {
 fn parse_report(service: &mdns_sd::ResolvedService) -> Option<Report> {
     let properties = service.get_properties();
     if !service.get_fullname().ends_with(&format!(".{SERVICE}"))
-        || properties.len() < 2
-        || properties.len() > MAX_DISPLAYS + 1
+        || properties.len() != 2
         || properties
             .iter()
             .map(|p| p.key().len() + p.val().map_or(0, <[u8]>::len))
             .sum::<usize>()
-            > 768
-        || service.get_property_val_str("v")? != "1"
+            > 128
+        || service.get_property_val_str("v")? != "2"
     {
         return None;
     }
-    let mut displays = Vec::new();
-    for index in 0..properties.len() - 1 {
-        let display: Display =
-            serde_json::from_str(service.get_property_val_str(&format!("d{index}"))?).ok()?;
-        if !display.valid() {
-            return None;
-        }
-        displays.push(display);
+    let desktop: Desktop = serde_json::from_str(service.get_property_val_str("desktop")?).ok()?;
+    if !desktop.valid() {
+        return None;
     }
     Some(Report {
         addresses: service
@@ -182,14 +171,14 @@ fn parse_report(service: &mdns_sd::ResolvedService) -> Option<Report> {
             .take(16)
             .map(|address| address.to_ip_addr())
             .collect(),
-        displays,
+        desktop,
     })
 }
 
 async fn browse(
     state: Arc<Mutex<State>>,
     ctx: egui::Context,
-    local: Vec<Display>,
+    local: Desktop,
     mut stop: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let addresses = local_unicast_addresses()?;
@@ -198,10 +187,10 @@ async fn browse(
         let mut entropy = [0u8; 16];
         getrandom::fill(&mut entropy).map_err(|error| anyhow::anyhow!("Display discovery entropy: {error}"))?;
         let instance: String = entropy.iter().map(|b| format!("{b:02x}")).collect();
-        let mut properties = std::collections::HashMap::from([("v".to_owned(), "1".to_owned())]);
-        for (index, display) in local.iter().enumerate() {
-            properties.insert(format!("d{index}"), serde_json::to_string(display)?);
-        }
+        let properties = std::collections::HashMap::from([
+            ("v".to_owned(), "2".to_owned()),
+            ("desktop".to_owned(), serde_json::to_string(&local)?),
+        ]);
         // This service carries TXT data only. It exposes no input listener.
         let info = ServiceInfo::new(SERVICE, &instance, &format!("{instance}.local."), addresses.as_slice(), 9, properties)?;
         daemon.register(info)?;
@@ -220,9 +209,10 @@ async fn browse(
                     let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
                     match event? {
                         ServiceEvent::ServiceResolved(service) => {
+                            state.reports.remove(service.get_fullname());
                             if let Some(report) = parse_report(&service)
                                 && !report.addresses.iter().any(|address| addresses.contains(address))
-                                && (state.reports.len() < 64 || state.reports.contains_key(service.get_fullname())) {
+                                && state.reports.len() < 64 {
                                     state.reports.insert(service.get_fullname().to_owned(), report);
                                 }
                         }
@@ -246,7 +236,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_records_reject_extra_fields_invalid_sizes_and_too_many_displays() {
+    fn desktop_records_reject_old_versions_extra_fields_and_invalid_sizes() {
         let make = |entries: Vec<(String, String)>| {
             ServiceInfo::new(
                 SERVICE,
@@ -259,19 +249,40 @@ mod tests {
             .unwrap()
             .as_resolved_service()
         };
-        let display = r#"{"width":3840,"height":2160,"scale_milli":2000}"#.to_owned();
-        let valid = vec![("v".into(), "1".into()), ("d0".into(), display.clone())];
+        let display = r#"{"width":2880,"height":1620}"#.to_owned();
+        let valid = vec![
+            ("v".into(), "2".into()),
+            ("desktop".into(), display.clone()),
+        ];
         assert_eq!(
-            parse_report(&make(valid.clone())).unwrap().displays[0].logical_size(),
-            (1920, 1080)
+            parse_report(&make(valid.clone())).unwrap().desktop,
+            Desktop {
+                width: 2880,
+                height: 1620
+            }
         );
         let mut extra = valid.clone();
         extra.push(("identity".into(), "not-allowed".into()));
         assert!(parse_report(&make(extra)).is_none());
+        for invalid in [
+            display.replace("2880", "0"),
+            display.replace("2880", "16385"),
+            display.replace("2880", "-1"),
+            display.replace('}', ",\"identity\":\"nope\"}"),
+            " ".repeat(129) + &display,
+        ] {
+            assert!(
+                parse_report(&make(vec![
+                    ("v".into(), "2".into()),
+                    ("desktop".into(), invalid)
+                ]))
+                .is_none()
+            );
+        }
         assert!(
             parse_report(&make(vec![
                 ("v".into(), "1".into()),
-                ("d0".into(), display.replace("3840", "0"))
+                ("d0".into(), display.clone())
             ]))
             .is_none()
         );
@@ -281,18 +292,25 @@ mod tests {
     }
 
     #[test]
-    fn retina_displays_use_logical_size_without_losing_resolution() {
-        let display = Display {
-            width: 3840,
-            height: 2160,
-            scale_milli: 2000,
-        };
-        assert_eq!(display.logical_size(), (1920, 1080));
-        assert_eq!(display.width, 3840);
+    fn desktop_bounds_match_layout_limits() {
         assert!(
-            !Display {
-                scale_milli: 0,
-                ..display
+            Desktop {
+                width: 16384,
+                height: 16384
+            }
+            .valid()
+        );
+        assert!(
+            !Desktop {
+                width: 16385,
+                height: 16384
+            }
+            .valid()
+        );
+        assert!(
+            !Desktop {
+                width: 1,
+                height: 0
             }
             .valid()
         );
@@ -310,14 +328,16 @@ mod tests {
             "random".into(),
             Report {
                 addresses: vec![address.ip()],
-                displays: vec![Display {
+                desktop: Desktop {
                     width: 3000,
                     height: 2000,
-                    scale_milli: 2000,
-                }],
+                },
             },
         )]);
         assert_eq!(match_reports(&reports, &config).len(), 1);
+        let mut duplicate_reports = reports.clone();
+        duplicate_reports.insert("another-instance".into(), reports["random"].clone());
+        assert!(match_reports(&duplicate_reports, &config).is_empty());
         config.peers.get_mut("mac").unwrap().addresses =
             vec!["[::ffff:192.0.2.1]:43119".parse().unwrap()];
         assert_eq!(match_reports(&reports, &config).len(), 1);

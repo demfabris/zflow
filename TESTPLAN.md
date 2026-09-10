@@ -72,24 +72,24 @@ request timeout. The GUI also checks the server UID. Explicit `--config` stays
 in file-editing mode; service snapshots cannot save or reload a config file.
 
 Tests cover rejected mutation commands and unknown fields, socket credentials,
-snapshot write refusal, Retina scale conversion, invalid display records,
-ambiguous address matches, detected geometry, preserved drag positions, and
-keeping layout saves separate from service settings. Native tests still need
-to cover hotplug, rotated displays, mixed scale factors, remote report removal,
-stale saved addresses, and Local Network permission denial. Window-system scale
-reporting varies by compositor; confirm fractional-scale output on the target.
+snapshot write refusal, invalid desktop records, ambiguous address matches,
+detected geometry, preserved drag positions, and keeping layout saves separate
+from service settings. Native tests still need to cover hotplug, rotated
+displays, mixed scale factors, remote report removal, stale saved addresses,
+and Local Network permission denial.
 
 Before deploying the updated service on a live input-sharing host, ask the user
 before restarting it. Then launch `just run linux` without a disposable config,
 verify the saved Mac pairing appears, and run the updated GUI on Mac. Check that
-the display boxes match the detected resolutions/scales and that dragging and
+one tile appears per computer and that dragging and
 Save layout do not change `/etc/zflow/zflow.toml` or capture input.
 
 September 10 implementation checks: Mac passed 174 tests; Ubuntu passed 221
 with one ignored hardware test. Both passed formatting, Clippy, and GUI builds;
 Ubuntu also built the headless daemon and passed systemd unit verification.
-The native Mac window displayed two detected local monitors with their reported
-pixel sizes and 200% scale, without manual size/position controls.
+The earlier native Mac window displayed two local output tiles. This exposed a
+model mismatch with Synergy's computer tiles. The earlier generic Ubuntu monitor
+list also included an inactive output and rounded 133.33% scaling to 200%.
 
 After user authorization, the release daemon and updated unit were installed on
 Ubuntu and zflowd restarted at 12:36 local time. The desktop user queried the
@@ -101,8 +101,44 @@ permissions were unchanged. The previous daemon and unit remain in
 The Mac pairing stores an IPv4-mapped IPv6 address. Display matching now treats
 that form as equivalent to the plain IPv4 address in mDNS, with a regression
 assertion that preserves ambiguous-peer rejection. The targeted tests and
-Ubuntu GUI build/Clippy passed. The open Ubuntu GUI still needs reopening to
-load this last GUI-only fix; cross-machine display rendering remains pending.
+Ubuntu GUI build/Clippy passed. The open GUIs still need reopening after the
+computer-tile update; cross-machine display rendering remains pending.
+
+### One tile per computer
+
+The editor now groups outputs into one desktop per computer. Core Graphics
+supplies active Mac bounds. GNOME's DisplayConfig supplies active logical
+monitor groups, fractional scales, transforms and layout mode. Detection runs
+off the UI thread, with one query in flight and a three-second GNOME timeout.
+Other Linux desktops and dimensions above 16384 show an error. No fallback
+claims a connected-output list is an active desktop.
+
+Regression tests cover negative origins, mirrored/overlapping bounds, inactive
+GNOME outputs, fractional scaling, rotation, physical layout mode, mixed-scale
+positions, and invalid geometry. Layout tests cover one tile per computer,
+rendered computer labels, old per-output grouping without disk writes, report
+loss/reappearance, saved positions, and discard/reload. Automatic geometry
+updates must not trigger unsaved-change prompts. Network tests reject old v1
+records; v2 accepts one bounded desktop and retains ambiguous-address rejection.
+
+Run the read-only native detector check in the desktop session:
+
+```sh
+cargo test --locked --features gui --lib native_desktop_geometry -- --ignored --nocapture
+```
+
+September 10 computer-tile checks: Mac passed 179 tests with one opt-in test
+ignored; Ubuntu passed 231 with two ignored. Both passed formatting, Clippy
+with warnings denied, and GUI builds. The opt-in native queries also passed
+separately: Mac reported 5696 × 1692 and GNOME reported 2880 × 1620. Linux checks
+used an isolated source snapshot; the Ubuntu checkout, running GUI, and service
+were not changed. The rebuilt GUI binary is ready for the next approved launch.
+
+After permission to reopen both GUIs, confirm one Mac tile and one Ubuntu tile,
+drag Ubuntu to the correct side, save, reopen, and check that the arrangement
+persists. Quit one GUI and verify that its known tile remains with a waiting
+label, then reopen and verify that it updates without duplicating. No input
+capture or monitor-input changes belong to this test.
 
 ## Headless Linux alpha qualification
 

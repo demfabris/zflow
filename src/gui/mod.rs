@@ -158,6 +158,7 @@ fn shell_quote(value: &str) -> String {
 
 pub struct SettingsApp {
     displays: displays::DisplayDiscovery,
+    desktop_detector: displays::DesktopDetector,
     display_refresh: std::time::Instant,
     service_mode: bool,
     service_load:
@@ -206,6 +207,7 @@ impl SettingsApp {
         let layout = layout_editor::LayoutEditor::open(&path);
         let mut app = Self {
             displays: displays::DisplayDiscovery::default(),
+            desktop_detector: displays::DesktopDetector::default(),
             display_refresh: std::time::Instant::now() - std::time::Duration::from_secs(3),
             service_mode,
             service_load: None,
@@ -401,11 +403,9 @@ impl SettingsApp {
     pub fn show(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
         self.poll_service(&ctx);
-        if let Some(doc) = &self.document
-            && !self.displays.local.is_empty()
-        {
-            self.layout.update_displays(
-                &self.displays.local,
+        if let Some(doc) = &self.document {
+            self.layout.update_desktops(
+                self.displays.local.as_ref(),
                 &self.displays.remote(doc.saved()),
                 &doc.draft,
             );
@@ -594,7 +594,8 @@ impl SettingsApp {
                 match self.page {
                     4 => {
                         self.layout.show(ui, &doc.draft);
-                        if let Some(error) = self.displays.error() { muted(ui, &format!("Display discovery unavailable: {error}")); }
+                        if let Some(error) = self.desktop_detector.snapshot().1 { muted(ui, &error); }
+                        if let Some(error) = self.displays.error() { muted(ui, &format!("Desktop discovery unavailable: {error}")); }
                     },
                     5 => {
                         heading(ui, "Nearby computers", "Discover zflow services on your local network. Pairing stays separate.");
@@ -687,22 +688,14 @@ impl SettingsApp {
 }
 
 impl eframe::App for SettingsApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.display_refresh.elapsed() >= std::time::Duration::from_secs(2) {
             self.display_refresh = std::time::Instant::now();
-            if let Some(window) = frame.winit_window() {
-                let local = window
-                    .available_monitors()
-                    .map(|monitor| displays::Display {
-                        width: monitor.size().width,
-                        height: monitor.size().height,
-                        scale_milli: (monitor.scale_factor() * 1000.0).round() as u32,
-                    })
-                    .collect();
-                self.displays
-                    .update(ui.ctx(), local, self.discovery_allowed == Some(true));
-            }
+            self.desktop_detector.refresh(ui.ctx());
         }
+        let (local, _) = self.desktop_detector.snapshot();
+        self.displays
+            .update(ui.ctx(), local, self.discovery_allowed == Some(true));
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(2));
         self.show(ui);

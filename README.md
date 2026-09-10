@@ -42,7 +42,7 @@ still use the Linux service paths.
 
 The file editor provides:
 
-- draggable display rectangles with edge snapping and partial-edge crossing zones;
+- one draggable tile per computer, with edge snapping and partial-edge crossing zones;
 - a live Nearby list of local zflow receiver announcements;
 - paired-peer addresses and permissions, with read-only identity fingerprints;
 - experimental touchpad forwarding, Linux shortcuts, and login-screen access;
@@ -69,36 +69,45 @@ udev permissions. Authenticated connection status, service controls, and
 automatic edge crossing remain future work. The Linux installer still packages
 the headless binaries only.
 
-### Arrange displays
+### Arrange computers
 
-Open Layout and drag each display to match your desk. Nearby edges snap together;
+Open Layout and drag each computer to match your desk. Nearby edges snap together;
 their shared length defines a crossing zone in both directions. A half-height
-overlap connects only that half of each edge. Gaps, corner contact, and displays
-belonging to the same computer do not create cross-computer zones. Overlapping
-drops return to the previous position. You can also nudge a focused display
+overlap connects only that half of each edge. Gaps and corner contact do not
+create crossing zones. Overlapping drops return to the previous position.
+You can also nudge a focused computer
 with arrow keys (10 pixels, or 1 with Shift).
 
-Keep the GUI open on both computers. Each GUI reads connected monitors from the
-window system and updates their resolution and scale every two seconds. Boxes
-use logical desktop dimensions: a 3840 × 2160 display at 200% has a
-1920 × 1080 footprint. Labels show pixel resolution and scale. There are no
-manual size, coordinate, ownership, or add/remove controls. Physical panel
-dimensions in inches are not measured.
+Keep the updated GUI open on both computers. Each tile represents a computer's
+combined active desktop, even with several attached monitors. macOS detection
+uses Core Graphics active display bounds; GNOME detection uses Mutter's current
+logical monitor configuration, including fractional scaling and rotation. A
+3840 × 2160 GNOME output at 133.33% contributes 2880 × 1620 desktop coordinates.
+Detection runs in the background every two seconds. Other Linux desktops show
+an unavailable message; dimensions above 16384 are unsupported. Detection does
+not select monitor inputs or change OS display settings.
 
-With saved discovery enabled, the GUIs exchange display sizes through a separate
-`_zflow-display._udp.local.` TXT-only service. Records contain up to eight displays
-and a random instance name, without machine names, keys, or fingerprints. The
+Tiles show computer names. Hover for desktop dimensions. There are no manual
+size, coordinate, ownership, or add/remove controls. Detection does not measure
+physical panel dimensions in inches. A waiting tile keeps its last known size
+and position; a new remote tile appears after receiving its desktop report.
+
+With saved discovery enabled, the GUIs exchange desktop sizes through a separate
+`_zflow-display._udp.local.` TXT-only service. Version 2 records contain one
+desktop width/height and a random instance name, without machine names, keys, or fingerprints. The
 GUI matches reported IP addresses to a single saved peer; ambiguous or unknown
-addresses do not add displays. Remote sizes remain unverified visual hints and
+addresses do not add computers. Remote sizes remain unverified visual hints and
 cannot authorize input. Update stale peer addresses through configuration if
-DHCP changes them. Missing reports show a waiting message rather than invented
-dimensions. Closing the GUI or disabling discovery stops announcements.
+DHCP changes them. Missing reports show a waiting message. Both GUIs need this
+version; older per-output announcements are ignored. Closing the GUI or
+disabling discovery stops announcements.
 
 Save layout writes `<config-filename>.layout.toml` beside the main config,
 for example `zflow.toml.layout.toml`. The files have separate Save actions.
 This keeps old daemon binaries compatible with the main settings file. The
-layout editor checks geometry and on-disk conflicts before saving. Detected
-monitors replace the earlier manual suggestions on the next explicit layout save.
+layout editor checks geometry and on-disk conflicts before saving. Earlier
+per-output layouts appear grouped by computer; the file changes only on explicit
+Save layout. Detection updates alone do not count as unsaved user edits.
 
 The crossing zones are configuration previews. Saving does **not** activate
 edge capture or cursor handoff. The layout follows the screen-arrangement and
