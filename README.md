@@ -5,10 +5,112 @@ set of physical evdev devices, sends bounded input state over authenticated
 QUIC, and injects it through stable uinput devices on the other machine.
 
 This is a working headless prototype, not yet a qualified alpha. The supported
-Linux launch path is the packaged systemd service. There is no GUI yet and
-automatic edge switching is not implemented. The macOS source is an
+Linux launch path is the packaged systemd service. An optional configuration
+GUI is available; automatic edge switching is not implemented. The macOS source is an
 experimental foreground developer tool. The two-host qualification run in
 `TESTPLAN.md` still gates the alpha label.
+
+## Configuration window
+
+Build the desktop editor with Rust 1.95 or newer. It uses
+[eguicn](https://github.com/demfabris/eguicn) at a pinned Git revision, with
+eframe as the native window backend. Headless builds do not enable GUI dependencies.
+
+```sh
+cargo run --features gui --bin zflow-gui
+# Open a specific configuration or use the dark theme:
+cargo run --features gui --bin zflow-gui -- --config /path/to/zflow.toml --dark
+```
+
+On macOS, the default file is
+`~/Library/Application Support/zflow/zflow.toml`. On Linux it is
+`/etc/zflow/zflow.toml`. Opening a missing file shows defaults without writing
+anything. Save creates it after validation. A new Mac setup must choose a
+writable state directory under Advanced before pairing; the shared defaults
+still use the Linux service paths.
+
+The window provides:
+
+- draggable display rectangles with edge snapping and partial-edge crossing zones;
+- a live Nearby list of local zflow receiver announcements;
+- paired-peer addresses and permissions, with read-only identity fingerprints;
+- experimental touchpad forwarding, Linux shortcuts, and login-screen access;
+- discovery, listen address, receiver buffering, checkpoint interval, and lease;
+- identity and control-socket paths;
+- a Mac launch-command builder for peer selection, address override,
+  `--no-touch`, and opt-in AWDL suppression.
+
+Save configuration writes the selected settings file. It does not restart a service, reload a daemon,
+capture input, or change network interfaces. Restart the affected daemon or
+source yourself. The editor checks for on-disk changes before saving, refuses
+invalid settings, and asks before discarding unsaved edits. Saving preserves
+peer identities and device attributes, but rewrites TOML formatting and comments.
+It does not elevate privileges; use the CLI for administrator-owned Linux files.
+
+Settings apply to the computer whose file you edit. Receiver buffering on the
+Mac does not tune Ubuntu. The configurable shortcuts apply to Linux; the Mac
+source still uses Ctrl+Cmd+Backspace to return input. Mac launch options last
+for the current window, and Copy launch command does not execute anything.
+
+Pairing, revocation, and Linux device enrollment still use the CLI. The editor
+shows existing capture devices without replacing their hardware identities or
+udev permissions. Authenticated connection status, service controls, and
+automatic edge crossing remain future work. The Linux installer still packages
+the headless binaries only.
+
+### Arrange displays
+
+Open Layout and drag each display to match your desk. Nearby edges snap together;
+their shared length defines a crossing zone in both directions. A half-height
+overlap connects only that half of each edge. Gaps, corner contact, and displays
+belonging to the same computer do not create cross-computer zones. Overlapping
+drops return to the previous position. You can also edit X/Y coordinates or
+nudge a focused display with arrow keys (10 pixels, or 1 with Shift).
+
+The initial suggestion contains one 1920 × 1080 display per paired computer,
+plus this computer. These are editable logical sizes, not detected hardware.
+Use Add display for a second monitor and choose which computer owns it. Discovery
+does not report monitor dimensions. Remove display changes only the layout;
+it does not revoke that computer's pairing.
+
+Save layout writes `<config-filename>.layout.toml` beside the main config,
+for example `zflow.toml.layout.toml`. The files have separate Save actions.
+This keeps old daemon binaries compatible with the main settings file. The
+layout editor checks geometry and on-disk conflicts before saving. It retains
+references to removed peers but warns that they are no longer paired.
+
+The crossing zones are configuration previews. Saving does **not** activate
+edge capture or cursor handoff. The layout follows the screen-arrangement and
+edge-range concepts in [Deskflow](https://github.com/deskflow/deskflow/blob/adb4f89453c890033288bf2ed6f36fa76f5caec5/src/lib/server/Config.cpp);
+the Rust geometry and egui canvas are independent implementations, not copied
+Deskflow code. The canvas stays in zflow; eguicn supplies its shadcn-style controls.
+
+### Discover nearby computers
+
+The native GUI starts a background `_zflow._udp.local.` browser when the saved
+discovery setting is on. Pause/Resume controls the current browser; saving the
+Connection discovery option also starts or stops it. Closing the GUI stops
+browsing. Headless UI tests do not start networking.
+
+The Nearby list shows advertised addresses and protocol compatibility. Names
+like `zf-…` are temporary discovery IDs, not computer identities. Even an address
+that matches a saved peer remains unverified until the QUIC connection checks
+the pinned key. Discovery never pairs, grants access, changes stored peer
+addresses, or starts input capture. On Mac, Use address fills the launch override;
+choose the matching paired peer before running its command.
+
+Run `zflowd` with discovery enabled on the other computer. The Mac source and
+configuration GUI do not advertise a receiver because neither can receive input.
+Multicast must reach both computers; you can still enter an address if discovery
+is unavailable. The list holds at most 64 announcements and removes records on
+mDNS removal events. No router, firewall, AWDL, or Bluetooth settings change.
+
+On macOS, check the app's permission in System Settings > Privacy & Security >
+Local Network, then Pause/Resume discovery after allowing access. An empty list
+can mean absent receivers, blocked multicast, or missing permission. Terminal
+tools and GUI apps have different permission rules; finding a receiver with a
+terminal diagnostic does not prove that the app can reach it. See
+[Apple's local-network guidance](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
 
 ## Install and select devices
 
@@ -207,12 +309,34 @@ the problem to capture or playout behavior.
 
 ## Develop
 
+With [just](https://just.systems/) installed, run these from the repository:
+
+```sh
+just                         # List commands
+just run mac                 # Open the GUI on macOS
+just run linux               # Open the GUI on Linux
+just run mac --dark --config "/path with spaces/zflow.toml"
+just build mac               # Build the macOS GUI
+just build linux --release   # Build the Linux GUI in release mode
+just test                    # Run tests, including the GUI
+just fmt                     # Format Rust code
+just lint                    # Run Clippy
+just check                   # Check formatting, lint, and run tests
+```
+
+Run `mac` commands on macOS and `linux` commands on Linux. These commands use
+the host toolchain; they do not cross-compile or connect over SSH. Both GUI
+builds need Rust 1.95 or newer. `run` opens the configuration window without
+starting input capture. `build` produces `target/debug/zflow-gui`, or
+`target/release/zflow-gui` with `--release`; it does not package or install an app.
+
 The protocol model and Linux runtime have deterministic tests that do not need
-root. The one privileged runtime smoke test needs read access to the selected
+root. The privileged runtime check needs read access to the selected
 event devices and write access to `/dev/uinput`.
 
 ```sh
 cargo test --all-targets
+cargo test --features gui gui:: --lib
 cargo clippy --all-targets --all-features -- -D warnings
 cargo run --bin zflow -- simulate
 cargo check --manifest-path fuzz/Cargo.toml --bins

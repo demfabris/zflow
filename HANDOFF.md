@@ -2,6 +2,18 @@
 
 Date: 2026-09-01
 
+This is a historical handoff, not the current task list. As of 2026-09-10,
+the Mac source includes cursor isolation and leased AWDL suppression, with
+normal-exit, crash, and freeze results in TESTPLAN.md. A disabled event tap now
+ends forwarding and restores local input instead of reenabling the tap. The
+optional eguicn GUI edits configuration and a separate display-layout file,
+previews crossing zones, and browses nearby receiver announcements without
+starting capture. Pairing, device enrollment, and automatic cursor handoff
+are not GUI features yet. Consult
+README.md and TESTPLAN.md for current commands and remaining qualification.
+The push instructions and excluded features below describe the September 1
+work only; they do not authorize actions in a later session.
+
 You are the Codex session on fabrico's MacBook Pro. Build and test the first
 Mac-to-Linux zflow path. Push each finished checkpoint to `origin/main` so the
 Ubuntu session can inspect and test it.

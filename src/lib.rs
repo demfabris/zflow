@@ -8,6 +8,8 @@ pub mod core;
 #[cfg(target_os = "linux")]
 pub mod daemon;
 pub mod discovery;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod identity;
 #[cfg(target_os = "linux")]
 pub mod linux;

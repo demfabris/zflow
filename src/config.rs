@@ -209,69 +209,75 @@ impl Config {
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         self.validate()?;
         let text = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| ConfigError::NoParent(path.to_owned()))?;
-        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-            path: parent.to_owned(),
-            source,
-        })?;
+        save_text(path, &text)
+    }
+}
 
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| ConfigError::InvalidPath(path.to_owned()))?;
-        let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
-        #[cfg(unix)]
-        let existing_metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
-            Ok(_) => return Err(ConfigError::UnsafeTarget(path.to_owned())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(ConfigError::Read {
-                    path: path.to_owned(),
-                    source,
-                });
-            }
-        };
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
-            .map_err(|source| ConfigError::Write {
-                path: temporary.clone(),
-                source,
-            })?;
-        let write_result = (|| {
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-            #[cfg(unix)]
-            if let Some(metadata) = existing_metadata {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
-                fs::set_permissions(
-                    &temporary,
-                    fs::Permissions::from_mode(metadata.mode() & 0o777),
-                )?;
-                chown(&temporary, Some(metadata.uid()), Some(metadata.gid()))?;
-            }
-            fs::rename(&temporary, path)?;
-            Ok::<_, std::io::Error>(())
-        })();
-        if let Err(source) = write_result {
-            let _ = fs::remove_file(&temporary);
-            return Err(ConfigError::Write {
+pub(crate) fn save_text(path: &Path, text: &str) -> Result<(), ConfigError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ConfigError::NoParent(path.to_owned()))?;
+    fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+        path: parent.to_owned(),
+        source,
+    })?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ConfigError::InvalidPath(path.to_owned()))?;
+    let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    #[cfg(unix)]
+    let existing_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
+        Ok(_) => return Err(ConfigError::UnsafeTarget(path.to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(ConfigError::Read {
                 path: path.to_owned(),
                 source,
             });
         }
-        Ok(())
+    };
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|source| ConfigError::Write {
+            path: temporary.clone(),
+            source,
+        })?;
+    let write_result = (|| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        if let Some(metadata) = existing_metadata {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+            fs::set_permissions(
+                &temporary,
+                fs::Permissions::from_mode(metadata.mode() & 0o777),
+            )?;
+            chown(&temporary, Some(metadata.uid()), Some(metadata.gid()))?;
+        }
+        fs::rename(&temporary, path)?;
+        Ok::<_, std::io::Error>(())
+    })();
+    if let Err(source) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(ConfigError::Write {
+            path: path.to_owned(),
+            source,
+        });
+    }
+    Ok(())
+}
 
+impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.version != CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion(self.version));

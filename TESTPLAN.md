@@ -4,6 +4,63 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Configuration GUI
+
+Run without elevated permissions or input capture:
+
+```sh
+cargo test --features gui gui:: --lib
+cargo clippy --all-targets --all-features -- -D warnings
+cargo run --features gui --bin zflow-gui -- --config /path/to/test-config.toml
+```
+
+The GUI tests use temporary files and in-memory egui input. They cover real
+navigation, touchpad toggle, Save, discard/reload confirmation, and theme
+widgets; malformed and missing files; invalid addresses and session timing;
+preservation of peer identities and device attributes; external edit/create/
+delete conflicts; and quoted launch commands with opt-in source flags.
+Opening, drawing, and changing a draft must not write settings before Save.
+
+Layout tests cover positive-length shared edges, reciprocal normalized ranges,
+stacked displays, same-computer boundaries, gaps and corner contact, rejected
+overlap, and nearest-edge snapping. In-memory pointer tests drag through multiple
+frames, check total displacement without repeated accumulation, and verify
+rejected drops. Sidecar tests cover round trips, empty layouts, malformed files,
+external changes, and leaving the daemon configuration untouched.
+
+Nearby tests cover offline construction, compatible and incompatible protocol
+records, local-only filtering, a 64-record bound, add/update/removal, failure
+cleanup, cancellation, and preventing old workers from restoring paused records.
+The native GUI opts into networking; the test harness does not.
+
+For native QA, use a disposable configuration to check text editing, tab focus,
+light/dark themes, scrolling, minimum window size, and closing with unsaved
+changes. Invalid input must remain editable and must disable Save. A malformed
+file must show an error, not a replacement configuration. Opening the user's
+real configuration is read-only until Save; do not use it for save tests.
+
+On September 10, the first native Mac window loaded the existing paired-Ubuntu
+configuration and rendered the Computers and Mac source launch sections. No
+settings were saved and no capture/helper process was started. Headless GUI
+tests cover editing and persistence; Linux native-window QA and the wider
+keyboard/accessibility matrix remain pending. This does not qualify monitor
+edge switching, connection monitoring, GUI pairing, or service management.
+
+The later Layout preview rendered the paired Mac/Ubuntu suggestion with a
+shared-edge crossing zone on the native Mac window. Physical monitor sizes
+remain manual. For live discovery QA, confirm the running Linux daemon has
+discovery enabled and compare Nearby with `dns-sd -B _zflow._udp local.` on Mac.
+Check removal, Pause/Resume, malformed records, and multicast denial without
+enabling input capture. A discovered address must never count as verified pairing.
+
+On September 10, both Apple's `dns-sd` and the unchanged `NearbyBrowser` in a
+terminal-launched diagnostic found the running Ubuntu receiver. The worker found
+`192.168.1.118:43119` and two scoped IPv6 addresses within 500 ms. The temporary
+app-bundle preview still showed no records. GUI Local Network permission/signing
+is the remaining lead, not a confirmed denial. User permission verification and
+live GUI discovery remain pending. Do not bypass Local Network protections to
+qualify this test; allow access through the normal system UI and retry.
+
 ## Headless Linux alpha qualification
 
 Before calling the current prototype an alpha, install the package on two Linux hosts and exercise the real service, daemon account, evdev devices, uinput devices, and network path. The qualification run must cover:
