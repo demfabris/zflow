@@ -11,9 +11,7 @@ use thiserror::Error;
 
 use crate::capture::CapturedDeviceFrame;
 
-use super::{
-    AggregateInputState, CaptureFrame, DeviceInfo, FrameAccumulator, MappingError, TouchAccumulator,
-};
+use super::{AggregateInputState, DeviceInfo, FrameAccumulator, MappingError, TouchAccumulator};
 
 #[derive(Debug)]
 struct CaptureNode {

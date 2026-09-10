@@ -46,9 +46,9 @@ tests cover editing and persistence; Linux native-window QA and the wider
 keyboard/accessibility matrix remain pending. This does not qualify monitor
 edge switching, connection monitoring, GUI pairing, or service management.
 
-The later Layout preview rendered the paired Mac/Ubuntu suggestion with a
-shared-edge crossing zone on the native Mac window. Physical monitor sizes
-remain manual. For live discovery QA, confirm the running Linux daemon has
+The earlier Layout preview rendered the paired Mac/Ubuntu suggestion with a
+shared-edge crossing zone on the native Mac window. The current editor detects
+resolution and scaling and removes the manual size/position controls. For live discovery QA, confirm the running Linux daemon has
 discovery enabled and compare Nearby with `dns-sd -B _zflow._udp local.` on Mac.
 Check removal, Pause/Resume, malformed records, and multicast denial without
 enabling input capture. A discovered address must never count as verified pairing.
@@ -60,6 +60,49 @@ app-bundle preview still showed no records. GUI Local Network permission/signing
 is the remaining lead, not a confirmed denial. User permission verification and
 live GUI discovery remain pending. Do not bypass Local Network protections to
 qualify this test; allow access through the normal system UI and retry.
+
+### Desktop service access and detected displays
+
+The Linux default GUI now uses `/run/zflow-gui/peers.sock`, a separate read-only
+endpoint. The original control socket and private config/state paths retain
+their permissions. The endpoint accepts only Snapshot, checks Unix credentials
+against the service/root/active desktop UID, and returns public peer records
+plus the discovery flag. It has a separate eight-client limit and three-second
+request timeout. The GUI also checks the server UID. Explicit `--config` stays
+in file-editing mode; service snapshots cannot save or reload a config file.
+
+Tests cover rejected mutation commands and unknown fields, socket credentials,
+snapshot write refusal, Retina scale conversion, invalid display records,
+ambiguous address matches, detected geometry, preserved drag positions, and
+keeping layout saves separate from service settings. Native tests still need
+to cover hotplug, rotated displays, mixed scale factors, remote report removal,
+stale saved addresses, and Local Network permission denial. Window-system scale
+reporting varies by compositor; confirm fractional-scale output on the target.
+
+Before deploying the updated service on a live input-sharing host, ask the user
+before restarting it. Then launch `just run linux` without a disposable config,
+verify the saved Mac pairing appears, and run the updated GUI on Mac. Check that
+the display boxes match the detected resolutions/scales and that dragging and
+Save layout do not change `/etc/zflow/zflow.toml` or capture input.
+
+September 10 implementation checks: Mac passed 174 tests; Ubuntu passed 221
+with one ignored hardware test. Both passed formatting, Clippy, and GUI builds;
+Ubuntu also built the headless daemon and passed systemd unit verification.
+The native Mac window displayed two detected local monitors with their reported
+pixel sizes and 200% scale, without manual size/position controls.
+
+After user authorization, the release daemon and updated unit were installed on
+Ubuntu and zflowd restarted at 12:36 local time. The desktop user queried the
+new socket and received the saved macbook and xps peer records; the server UID
+matched the zflow account. Config contents and the private config/state/control
+permissions were unchanged. The previous daemon and unit remain in
+`/var/tmp/zflow-rollback.kB4qiU` on Ubuntu for rollback.
+
+The Mac pairing stores an IPv4-mapped IPv6 address. Display matching now treats
+that form as equivalent to the plain IPv4 address in mDNS, with a regression
+assertion that preserves ambiguous-peer rejection. The targeted tests and
+Ubuntu GUI build/Clippy passed. The open Ubuntu GUI still needs reopening to
+load this last GUI-only fix; cross-machine display rendering remains pending.
 
 ## Headless Linux alpha qualification
 

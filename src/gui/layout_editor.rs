@@ -1,9 +1,9 @@
-use eguicn::{Badge, Button, ButtonVariant, Card, Select, Theme, egui};
+use eguicn::{Badge, ButtonVariant, Theme, egui};
 
 use crate::config::Config;
 
 use super::{
-    field, heading,
+    heading,
     layout_model::{Edge, Layout, LayoutDocument, Monitor},
     muted,
 };
@@ -57,7 +57,9 @@ pub(super) struct LayoutEditor {
     error: Option<String>,
     notice: String,
     selected: usize,
-    add_owner: usize,
+    detected: Option<Layout>,
+    display_details: std::collections::BTreeMap<String, String>,
+    waiting: Vec<String>,
     drag: Option<Drag>,
     edited: bool,
 }
@@ -70,7 +72,9 @@ impl LayoutEditor {
             error: None,
             notice: String::new(),
             selected: 0,
-            add_owner: 0,
+            detected: None,
+            display_details: Default::default(),
+            waiting: Vec::new(),
             drag: None,
             edited: false,
         };
@@ -100,9 +104,15 @@ impl LayoutEditor {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.document
-            .as_ref()
-            .is_some_and(|document| document.is_dirty() || (self.edited && document.is_new()))
+        self.document.as_ref().is_some_and(|document| {
+            document.is_dirty()
+                || (self.edited && document.is_new())
+                || (!document.is_new()
+                    && self
+                        .detected
+                        .as_ref()
+                        .is_some_and(|layout| *layout != document.draft))
+        })
     }
 
     fn suggested(&self) -> bool {
@@ -114,6 +124,9 @@ impl LayoutEditor {
     }
 
     fn effective_layout(&self, config: &Config) -> Layout {
+        if let Some(detected) = &self.detected {
+            return detected.clone();
+        }
         if self.suggested() {
             suggested_layout(config)
         } else {
@@ -122,6 +135,74 @@ impl LayoutEditor {
                 .map(|document| document.draft.clone())
                 .unwrap_or_default()
         }
+    }
+
+    pub fn update_displays(
+        &mut self,
+        local: &[super::displays::Display],
+        remote: &std::collections::BTreeMap<String, Vec<super::displays::Display>>,
+        config: &Config,
+    ) {
+        if self.drag.is_some() {
+            return;
+        }
+        let previous = self.document.as_ref().map(|doc| &doc.draft);
+        let mut layout = Layout::default();
+        self.display_details.clear();
+        self.waiting = config
+            .peers
+            .keys()
+            .filter(|name| !remote.contains_key(*name))
+            .cloned()
+            .collect();
+        for (owner, displays) in std::iter::once((None, local)).chain(
+            remote
+                .iter()
+                .map(|(name, displays)| (Some(name.clone()), displays.as_slice())),
+        ) {
+            for (index, display) in displays.iter().enumerate().take(8) {
+                if layout.monitors.len() == 32 {
+                    break;
+                }
+                let id = format!("detected:{}:{index}", owner.as_deref().unwrap_or("local"));
+                let (width, height) = display.logical_size();
+                let old = previous.and_then(|layout| layout.monitors.iter().find(|m| m.id == id));
+                let right = layout
+                    .monitors
+                    .iter()
+                    .map(|m| m.x + m.width as i32)
+                    .max()
+                    .unwrap_or(0);
+                layout.monitors.push(Monitor {
+                    id: id.clone(),
+                    label: format!("Display {}", index + 1),
+                    peer: owner.clone(),
+                    x: old.map_or(right, |m| m.x),
+                    y: old.map_or(0, |m| m.y),
+                    width,
+                    height,
+                });
+                if layout.validate().is_err() {
+                    let monitor = layout.monitors.last_mut().unwrap();
+                    monitor.x = right;
+                    monitor.y = 0;
+                }
+                if layout.validate().is_err() {
+                    layout.monitors.pop();
+                    continue;
+                }
+                self.display_details.insert(
+                    id,
+                    format!(
+                        "{} × {} · {:.0}% scale",
+                        display.width,
+                        display.height,
+                        f64::from(display.scale_milli) / 10.0
+                    ),
+                );
+            }
+        }
+        self.detected = Some(layout);
     }
 
     pub fn can_save(&self, config: &Config) -> bool {
@@ -168,7 +249,6 @@ impl LayoutEditor {
         let Some(_) = &self.document else {
             return;
         };
-        let suggested = self.suggested();
         let mut layout = self.effective_layout(config);
         let before = layout.clone();
         let theme = Theme::from_ui(ui);
@@ -176,10 +256,17 @@ impl LayoutEditor {
             ui.add(Badge::new("Layout preview").variant(ButtonVariant::Secondary));
             muted(ui, "Cursor handoff is not active yet.");
         });
-        if suggested {
+        muted(
+            ui,
+            "Display sizes follow each computer's resolution and scaling. Keep zflow open on both computers.",
+        );
+        if !self.waiting.is_empty() {
             muted(
                 ui,
-                "Suggested positions, using 1920 × 1080 logical pixels per computer. Adjust the sizes to match your display settings, then save the layout.",
+                &format!(
+                    "Waiting for display information: {}.",
+                    self.waiting.join(", ")
+                ),
             );
         }
         ui.add_space(12.0);
@@ -189,117 +276,26 @@ impl LayoutEditor {
             ui,
             "Drag to snap edges. Use arrow keys on a focused display for 10-pixel steps; hold Shift for 1 pixel. Overlapping drops return to the previous position.",
         );
-        ui.add_space(14.0);
-
-        let mut owners: Vec<Option<String>> = vec![None];
-        owners.extend(config.peers.keys().cloned().map(Some));
-        self.add_owner = self.add_owner.min(owners.len() - 1);
-        let owner_labels: Vec<_> = owners
-            .iter()
-            .map(|peer| peer.as_deref().unwrap_or("This computer"))
-            .collect();
-        ui.horizontal(|ui| {
-            Select::new("add-display-owner", &mut self.add_owner, &owner_labels)
-                .width(190.0)
-                .show(ui);
-            if ui
-                .add_enabled(
-                    layout.monitors.len() < 32,
-                    Button::new("Add display").variant(ButtonVariant::Outline),
-                )
-                .clicked()
-            {
-                add_monitor(&mut layout, owners[self.add_owner].clone());
-                self.selected = layout.monitors.len().saturating_sub(1);
-            }
-        });
-        ui.add_space(16.0);
-        self.selected = self.selected.min(layout.monitors.len().saturating_sub(1));
-        let mut remove = false;
-        if let Some(monitor) = layout.monitors.get_mut(self.selected) {
-            Card::new().padding(18).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                Card::header(ui, "Selected display", "Dimensions and positions use logical pixels, not physical panel pixels.");
-                field(ui, "Display name", &mut monitor.label);
-                if let Some(peer) = &monitor.peer && !config.peers.contains_key(peer) {
-                    ui.colored_label(theme.destructive, format!("{peer} is not paired in this configuration. This display cannot authorize a connection."));
-                }
-                let mut selected_owners = owners.clone();
-                if !selected_owners.contains(&monitor.peer) { selected_owners.push(monitor.peer.clone()); }
-                let mut owner = selected_owners.iter().position(|value| value == &monitor.peer).unwrap_or(0);
-                let labels: Vec<_> = selected_owners.iter().map(|peer| peer.as_deref().unwrap_or("This computer")).collect();
-                ui.label("Connected to");
-                if Select::new("selected-display-owner", &mut owner, &labels).show(ui).changed() {
-                    monitor.peer = selected_owners[owner].clone();
-                }
-                ui.add_space(8.0);
-                egui::Grid::new("display-dimensions").num_columns(4).spacing([12.0, 8.0]).show(ui, |ui| {
-                    for (label, value) in [("Width", &mut monitor.width), ("Height", &mut monitor.height)] {
-                        let text = ui.label(label);
-                        ui.add(egui::DragValue::new(value).range(1..=16384).suffix(" px")).labelled_by(text.id);
-                    }
-                    ui.end_row();
-                    for (label, value) in [("X", &mut monitor.x), ("Y", &mut monitor.y)] {
-                        let text = ui.label(label);
-                        ui.add(egui::DragValue::new(value).range(-100000..=100000).suffix(" px")).labelled_by(text.id);
-                    }
-                });
-                ui.add_space(10.0);
-                remove = ui.add(Button::new("Remove display").variant(ButtonVariant::Ghost)).clicked();
-            });
-        }
-        if remove {
-            layout.monitors.remove(self.selected);
-            self.selected = 0;
-        }
-        ui.add_space(16.0);
         let validation = layout.validate().err();
         if let Some(error) = &validation {
             ui.colored_label(theme.destructive, format!("{error:#}"));
-        } else {
-            transitions(ui, &layout);
         }
 
         if layout != before {
             self.document.as_mut().expect("loaded layout").draft = layout.clone();
+            if self.detected.is_some() {
+                self.detected = Some(layout);
+            }
             self.edited = true;
             self.notice.clear();
         }
         ui.add_space(12.0);
-        let mut save = false;
-        ui.horizontal(|ui| {
-            save = ui
-                .add_enabled(
-                    validation.is_none()
-                        && (suggested
-                            || self.is_dirty()
-                            || self.document.as_ref().is_some_and(LayoutDocument::is_new)),
-                    Button::new("Save layout"),
-                )
-                .clicked();
-            muted(
-                ui,
-                if self.is_dirty() {
-                    "Unsaved layout changes"
-                } else if suggested {
-                    "Suggested layout, not saved"
-                } else {
-                    "Layout saved"
-                },
-            );
-        });
-        if save {
-            self.save(config);
-        }
         if !self.notice.is_empty() {
             ui.label(&self.notice);
         }
-        if let Some(document) = &self.document {
-            muted(ui, &document.path.display().to_string());
-        }
         muted(
             ui,
-            "The layout file is separate from daemon settings. Discovery does not report physical displays; add and size each display here.",
+            "Remote display sizes are network hints, not verified identity. Layout changes do not grant input access.",
         );
     }
 
@@ -439,7 +435,10 @@ impl LayoutEditor {
             text_painter.text(
                 rect.center() + egui::vec2(0.0, 17.0),
                 egui::Align2::CENTER_CENTER,
-                format!("{} × {}", monitor.width, monitor.height),
+                self.display_details
+                    .get(&monitor.id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{} × {}", monitor.width, monitor.height)),
                 egui::FontId::monospace(font_size - 2.0),
                 theme.muted_foreground,
             );
@@ -531,25 +530,53 @@ fn add_monitor(layout: &mut Layout, peer: Option<String>) {
     });
 }
 
-fn transitions(ui: &mut egui::Ui, layout: &Layout) {
-    let links = layout.transitions();
-    Card::new().padding(18).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        Card::header(ui, "Crossing zones", "The thick shared edges mark the configured transition space.");
-        if links.is_empty() { muted(ui, "No crossing zones. Place displays from different computers against each other with a shared edge."); }
-        for link in links.iter().filter(|link| link.source < link.target) {
-            let source = &layout.monitors[link.source];
-            let target = &layout.monitors[link.target];
-            let edge = match link.edge { Edge::Left => "left", Edge::Right => "right", Edge::Top => "top", Edge::Bottom => "bottom" };
-            ui.label(format!("{} ({}) ↔ {} ({})", source.label, source.peer.as_deref().unwrap_or("This computer"), target.label, target.peer.as_deref().unwrap_or("This computer")));
-            muted(ui, &format!("{edge} edge: {:.1}–{:.1}% → {:.1}–{:.1}% of the receiving edge", link.source_start * 100.0, link.source_end * 100.0, link.target_start * 100.0, link.target_end * 100.0));
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detected_layout_uses_scale_preserves_drag_and_has_no_guessed_peer_display() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = Config::default();
+        config.peers.insert(
+            "mac".into(),
+            crate::config::PeerConfig::from_spki(b"test", Vec::new(), Default::default()).unwrap(),
+        );
+        let mut editor = LayoutEditor::open(&path);
+        let local = [super::super::displays::Display {
+            width: 3840,
+            height: 2160,
+            scale_milli: 2000,
+        }];
+        editor.update_displays(&local, &Default::default(), &config);
+        assert_eq!(editor.effective_layout(&config).monitors.len(), 1);
+        assert_eq!(editor.waiting, ["mac"]);
+        let remote = std::collections::BTreeMap::from([(
+            "mac".into(),
+            vec![super::super::displays::Display {
+                width: 2560,
+                height: 1600,
+                scale_milli: 2000,
+            }],
+        )]);
+        editor.update_displays(&local, &remote, &config);
+        let mut layout = editor.effective_layout(&config);
+        assert_eq!(
+            (layout.monitors[0].width, layout.monitors[1].width),
+            (1920, 1280)
+        );
+        layout.monitors[1].x = -1280;
+        editor.document.as_mut().unwrap().draft = layout.clone();
+        editor.edited = true;
+        editor.update_displays(&local, &remote, &config);
+        assert_eq!(editor.effective_layout(&config), layout);
+        editor.save(&config);
+        assert!(!path.exists());
+        editor.reload();
+        editor.update_displays(&local, &remote, &config);
+        assert_eq!(editor.effective_layout(&config), layout);
+    }
 
     fn canvas_frame(
         editor: &mut LayoutEditor,

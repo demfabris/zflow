@@ -44,6 +44,7 @@ use crate::{
 };
 
 const SESSION_EVENT_CAPACITY: usize = 1_024;
+mod peer_view;
 const ACCEPT_EVENT_CAPACITY: usize = 64;
 const RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -125,6 +126,9 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         seat_query: Mutex::new(()),
         session_events,
     });
+    if let Err(error) = peer_view::start(shared.clone()) {
+        tracing::warn!(%error, "desktop metadata API unavailable");
+    }
     let mut discovery = start_discovery(&config, shared.endpoint.local_addr()?);
     let daemon_uid = nix::unistd::geteuid().as_raw();
     let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));

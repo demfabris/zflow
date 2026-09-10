@@ -23,13 +23,24 @@ cargo run --features gui --bin zflow-gui -- --config /path/to/zflow.toml --dark
 ```
 
 On macOS, the default file is
-`~/Library/Application Support/zflow/zflow.toml`. On Linux it is
-`/etc/zflow/zflow.toml`. Opening a missing file shows defaults without writing
+`~/Library/Application Support/zflow/zflow.toml`. On Linux, launch without
+`--config` to read paired computers from the local service. The desktop API
+returns public pairing metadata and the discovery flag; it cannot change
+settings, start capture, or return private identity keys. The GUI checks the
+service's Unix credentials, and the service checks the active desktop user's
+credentials. Config, identity, and input-control socket permissions stay unchanged.
+Install the updated systemd unit and daemon before using this mode.
+
+Linux service mode provides Layout, Nearby, and read-only Computers pages.
+Layouts save to `$XDG_CONFIG_HOME/zflow/zflow.toml.layout.toml`, or
+`~/.config/zflow/zflow.toml.layout.toml` when XDG_CONFIG_HOME is unset.
+Use Refresh computers after pairing through the CLI. Use `--config PATH` on
+either platform to open the file editor. Opening a missing file shows defaults without writing
 anything. Save creates it after validation. A new Mac setup must choose a
 writable state directory under Advanced before pairing; the shared defaults
 still use the Linux service paths.
 
-The window provides:
+The file editor provides:
 
 - draggable display rectangles with edge snapping and partial-edge crossing zones;
 - a live Nearby list of local zflow receiver announcements;
@@ -64,20 +75,30 @@ Open Layout and drag each display to match your desk. Nearby edges snap together
 their shared length defines a crossing zone in both directions. A half-height
 overlap connects only that half of each edge. Gaps, corner contact, and displays
 belonging to the same computer do not create cross-computer zones. Overlapping
-drops return to the previous position. You can also edit X/Y coordinates or
-nudge a focused display with arrow keys (10 pixels, or 1 with Shift).
+drops return to the previous position. You can also nudge a focused display
+with arrow keys (10 pixels, or 1 with Shift).
 
-The initial suggestion contains one 1920 × 1080 display per paired computer,
-plus this computer. These are editable logical sizes, not detected hardware.
-Use Add display for a second monitor and choose which computer owns it. Discovery
-does not report monitor dimensions. Remove display changes only the layout;
-it does not revoke that computer's pairing.
+Keep the GUI open on both computers. Each GUI reads connected monitors from the
+window system and updates their resolution and scale every two seconds. Boxes
+use logical desktop dimensions: a 3840 × 2160 display at 200% has a
+1920 × 1080 footprint. Labels show pixel resolution and scale. There are no
+manual size, coordinate, ownership, or add/remove controls. Physical panel
+dimensions in inches are not measured.
+
+With saved discovery enabled, the GUIs exchange display sizes through a separate
+`_zflow-display._udp.local.` TXT-only service. Records contain up to eight displays
+and a random instance name, without machine names, keys, or fingerprints. The
+GUI matches reported IP addresses to a single saved peer; ambiguous or unknown
+addresses do not add displays. Remote sizes remain unverified visual hints and
+cannot authorize input. Update stale peer addresses through configuration if
+DHCP changes them. Missing reports show a waiting message rather than invented
+dimensions. Closing the GUI or disabling discovery stops announcements.
 
 Save layout writes `<config-filename>.layout.toml` beside the main config,
 for example `zflow.toml.layout.toml`. The files have separate Save actions.
 This keeps old daemon binaries compatible with the main settings file. The
-layout editor checks geometry and on-disk conflicts before saving. It retains
-references to removed peers but warns that they are no longer paired.
+layout editor checks geometry and on-disk conflicts before saving. Detected
+monitors replace the earlier manual suggestions on the next explicit layout save.
 
 The crossing zones are configuration previews. Saving does **not** activate
 edge capture or cursor handoff. The layout follows the screen-arrangement and

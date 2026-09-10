@@ -16,11 +16,10 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let path = match args.config {
-        Some(path) => path,
-        None => zflow::gui::default_config_path()?,
+    let mut app = match args.config {
+        Some(path) => zflow::gui::SettingsApp::open(path, args.dark),
+        None => zflow::gui::SettingsApp::open_default(args.dark)?,
     };
-    let mut app = zflow::gui::SettingsApp::open(path, args.dark);
     eframe::run_native(
         "zflow",
         eframe::NativeOptions {

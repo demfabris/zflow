@@ -1,5 +1,6 @@
 //! Configuration-only desktop UI. Opening or saving never starts input capture.
 
+mod displays;
 mod layout_editor;
 mod layout_model;
 mod model;
@@ -156,6 +157,11 @@ fn shell_quote(value: &str) -> String {
 }
 
 pub struct SettingsApp {
+    displays: displays::DisplayDiscovery,
+    display_refresh: std::time::Instant,
+    service_mode: bool,
+    service_load:
+        Option<std::sync::mpsc::Receiver<std::result::Result<crate::peer_view::Snapshot, String>>>,
     path: PathBuf,
     document: Option<ConfigDocument>,
     fields: Option<TextFields>,
@@ -174,9 +180,35 @@ pub struct SettingsApp {
 }
 
 impl SettingsApp {
+    pub fn open_default(dark: bool) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let base = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+                .context("HOME is not set; pass --config PATH")?;
+            Ok(Self::open_mode(base.join("zflow/zflow.toml"), dark, true))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self::open(default_config_path()?, dark))
+        }
+    }
+
     pub fn open(path: PathBuf, dark: bool) -> Self {
+        Self::open_mode(path, dark, false)
+    }
+
+    fn open_mode(path: PathBuf, dark: bool, service_mode: bool) -> Self {
         let layout = layout_editor::LayoutEditor::open(&path);
         let mut app = Self {
+            displays: displays::DisplayDiscovery::default(),
+            display_refresh: std::time::Instant::now() - std::time::Duration::from_secs(3),
+            service_mode,
+            service_load: None,
             path,
             document: None,
             fields: None,
@@ -198,6 +230,11 @@ impl SettingsApp {
     }
 
     fn load(&mut self) {
+        self.displays.stop();
+        if self.service_mode {
+            self.load_service();
+            return;
+        }
         let loaded = if let Some(doc) = &mut self.document {
             doc.reload().map(|()| None)
         } else {
@@ -218,6 +255,60 @@ impl SettingsApp {
                 self.refresh_discovery();
             }
             Err(error) => self.load_error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn load_service(&mut self) {
+        self.document = None;
+        self.fields = None;
+        self.load_error = Some("Reading paired computers from the local service…".into());
+        self.refresh_discovery();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        self.service_load = Some(receiver);
+        #[cfg(target_os = "linux")]
+        std::thread::spawn(move || {
+            let result = (|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(crate::peer_view::fetch())
+            })()
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+        #[cfg(not(target_os = "linux"))]
+        let _ = sender.send(Err("The desktop service API is Linux-only".into()));
+    }
+
+    fn poll_service(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.service_load else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.service_load = None;
+                match result {
+                    Ok(snapshot) => {
+                        let config = snapshot.into_display_config();
+                        self.fields = Some(TextFields::from_config(&config));
+                        self.document =
+                            Some(ConfigDocument::service_snapshot(self.path.clone(), config));
+                        self.load_error = None;
+                        self.layout.reload();
+                        self.refresh_discovery();
+                    }
+                    Err(error) => self.load_error = Some(error),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50))
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.service_load = None;
+                self.load_error = Some(
+                    "The desktop API request stopped. Choose Refresh computers to retry.".into(),
+                );
+            }
         }
     }
 
@@ -247,6 +338,7 @@ impl SettingsApp {
                 self.nearby.start(ctx.clone());
             } else {
                 self.nearby.stop();
+                self.displays.stop();
             }
         }
     }
@@ -274,6 +366,9 @@ impl SettingsApp {
     }
 
     fn sync_fields(&mut self) -> Result<()> {
+        if self.service_mode {
+            return Ok(());
+        }
         let doc = self
             .document
             .as_mut()
@@ -305,6 +400,16 @@ impl SettingsApp {
 
     pub fn show(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
+        self.poll_service(&ctx);
+        if let Some(doc) = &self.document
+            && !self.displays.local.is_empty()
+        {
+            self.layout.update_displays(
+                &self.displays.local,
+                &self.displays.remote(doc.saved()),
+                &doc.draft,
+            );
+        }
         if ctx.input(|input| input.viewport().close_requested())
             && self.dirty()
             && !self.allow_close
@@ -323,7 +428,14 @@ impl SettingsApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("zflow").size(26.0).strong());
                     ui.add_space(12.0);
-                    ui.add(Badge::new("Configuration").variant(ButtonVariant::Secondary));
+                    ui.add(
+                        Badge::new(if self.service_mode {
+                            "System service"
+                        } else {
+                            "Configuration"
+                        })
+                        .variant(ButtonVariant::Secondary),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(
@@ -393,7 +505,7 @@ impl SettingsApp {
                                     Button::new("Save layout"),
                                 )
                                 .clicked();
-                        } else {
+                        } else if !self.service_mode {
                             save = ui
                                 .add_enabled(
                                     self.load_error.is_none()
@@ -407,7 +519,14 @@ impl SettingsApp {
                                 .clicked();
                         }
                         reload = ui
-                            .add(Button::new("Reload from disk").variant(ButtonVariant::Outline))
+                            .add(
+                                Button::new(if self.service_mode {
+                                    "Refresh computers"
+                                } else {
+                                    "Reload from disk"
+                                })
+                                .variant(ButtonVariant::Outline),
+                            )
                             .clicked();
                     });
                 });
@@ -430,6 +549,9 @@ impl SettingsApp {
                     (2, "Connection"),
                     (3, "Advanced"),
                 ] {
+                    if self.service_mode && (1..=3).contains(&index) {
+                        continue;
+                    }
                     if ui
                         .add(
                             Button::new(label)
@@ -454,6 +576,12 @@ impl SettingsApp {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme.background).inner_margin(24)).show(root, |ui| {
             egui::ScrollArea::vertical().id_salt(("page", self.page)).auto_shrink([false, false]).show(ui, |ui| {
                 if let Some(error) = &self.load_error {
+                    if self.service_mode {
+                        heading(ui, "Local service", "Paired computers come from the service. Private settings stay protected.");
+                        ui.colored_label(theme.destructive, error);
+                        muted(ui, "Use the active Ubuntu desktop session and the updated zflowd service, then choose Refresh computers. --config PATH opens a separate file editor.");
+                        return;
+                    }
                     card(ui, "Could not load configuration", "Your file has not been changed.", |ui| { ui.colored_label(theme.destructive, error); muted(ui, "Fix the file or its permissions, then choose Reload from disk. You can choose another file with --config PATH."); });
                     return;
                 }
@@ -464,7 +592,10 @@ impl SettingsApp {
                     ui.add_space(14.0);
                 }
                 match self.page {
-                    4 => self.layout.show(ui, &doc.draft),
+                    4 => {
+                        self.layout.show(ui, &doc.draft);
+                        if let Some(error) = self.displays.error() { muted(ui, &format!("Display discovery unavailable: {error}")); }
+                    },
                     5 => {
                         heading(ui, "Nearby computers", "Discover zflow services on your local network. Pairing stays separate.");
                         if let Some(address) = self.nearby.show(ui, doc.saved()) {
@@ -472,6 +603,16 @@ impl SettingsApp {
                             self.notice = "Address added to the Mac launch override. Choose the matching paired computer; discovery does not verify identity.".into();
                             self.page = 0;
                         }
+                    },
+                    0 if self.service_mode => {
+                        heading(ui, "Paired computers", "Read from the local service. Use the CLI to change pairing or permissions.");
+                        for (name, peer) in &doc.draft.peers {
+                            card(ui, name, "Saved pairing", |ui| {
+                                if let Ok(fingerprint) = peer.fingerprint_hex() { ui.monospace(fingerprint); }
+                                for address in &peer.addresses { ui.label(address.to_string()); }
+                            });
+                        }
+                        if doc.draft.peers.is_empty() { muted(ui, "No paired computers. Pair this machine using zflow pair first."); }
                     },
                     0 => computers(ui, &mut doc.draft, fields),
                     1 => input(ui, &mut doc.draft, fields),
@@ -546,7 +687,24 @@ impl SettingsApp {
 }
 
 impl eframe::App for SettingsApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.display_refresh.elapsed() >= std::time::Duration::from_secs(2) {
+            self.display_refresh = std::time::Instant::now();
+            if let Some(window) = frame.winit_window() {
+                let local = window
+                    .available_monitors()
+                    .map(|monitor| displays::Display {
+                        width: monitor.size().width,
+                        height: monitor.size().height,
+                        scale_milli: (monitor.scale_factor() * 1000.0).round() as u32,
+                    })
+                    .collect();
+                self.displays
+                    .update(ui.ctx(), local, self.discovery_allowed == Some(true));
+            }
+        }
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(2));
         self.show(ui);
     }
 }

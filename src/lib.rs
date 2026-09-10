@@ -17,6 +17,7 @@ pub mod linux;
 pub mod macos;
 pub mod metrics;
 pub mod pairing;
+pub mod peer_view;
 #[cfg(target_os = "linux")]
 pub mod runtime;
 pub mod session;

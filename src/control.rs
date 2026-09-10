@@ -159,4 +159,23 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ControlError::TooLarge(_)));
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn socket_credentials_gate_desktop_metadata_access() {
+        let (client, _server) = tokio::net::UnixStream::pair().unwrap();
+        let uid = peer_uid(&client).unwrap();
+        assert_eq!(authorize_peer(&client, uid, None).unwrap(), uid);
+        assert_eq!(authorize_peer(&client, uid + 1, Some(uid)).unwrap(), uid);
+        if uid != 0 {
+            assert!(matches!(
+                authorize_peer(&client, uid + 1, None),
+                Err(ControlError::Unauthorized(_))
+            ));
+            assert!(matches!(
+                authorize_peer(&client, uid + 1, Some(uid + 2)),
+                Err(ControlError::Unauthorized(_))
+            ));
+        }
+    }
 }

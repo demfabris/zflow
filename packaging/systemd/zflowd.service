@@ -21,7 +21,7 @@ KillMode=control-group
 
 StateDirectory=zflow
 StateDirectoryMode=0700
-RuntimeDirectory=zflow
+RuntimeDirectory=zflow zflow-gui
 RuntimeDirectoryMode=0750
 UMask=0077
 

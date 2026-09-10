@@ -9,6 +9,7 @@ pub struct ConfigDocument {
     pub draft: Config,
     saved: Config,
     disk_contents: Option<Vec<u8>>,
+    read_only: bool,
 }
 
 impl ConfigDocument {
@@ -30,7 +31,18 @@ impl ConfigDocument {
             saved: draft.clone(),
             draft,
             disk_contents,
+            read_only: false,
         })
+    }
+
+    pub fn service_snapshot(path: PathBuf, config: Config) -> Self {
+        Self {
+            path,
+            draft: config.clone(),
+            saved: config,
+            disk_contents: None,
+            read_only: true,
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -42,7 +54,7 @@ impl ConfigDocument {
     }
 
     pub fn is_new(&self) -> bool {
-        self.disk_contents.is_none()
+        !self.read_only && self.disk_contents.is_none()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -54,6 +66,9 @@ impl ConfigDocument {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        if self.read_only {
+            bail!("Service settings are read-only in this window");
+        }
         self.validate()?;
         let next_contents = toml::to_string_pretty(&self.draft)?.into_bytes();
         if read_contents(&self.path)? != self.disk_contents {
@@ -69,6 +84,9 @@ impl ConfigDocument {
     }
 
     pub fn reload(&mut self) -> Result<()> {
+        if self.read_only {
+            bail!("Refresh service settings through the desktop API");
+        }
         let replacement = Self::open(self.path.clone())?;
         *self = replacement;
         Ok(())
@@ -87,6 +105,18 @@ fn read_contents(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
 mod tests {
     use super::*;
     use crate::config::{DeviceSelector, PeerConfig, PeerPermissions};
+
+    #[test]
+    fn service_snapshot_cannot_write_or_read_a_config_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private.toml");
+        let mut document = ConfigDocument::service_snapshot(path.clone(), Config::default());
+        document.draft.transport.discovery = false;
+        assert!(document.save().is_err());
+        assert!(document.reload().is_err());
+        assert!(!path.exists());
+        assert!(!document.is_new());
+    }
 
     #[test]
     fn missing_file_stays_missing_until_explicit_save() {
