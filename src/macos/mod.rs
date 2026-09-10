@@ -1,5 +1,7 @@
 //! Foreground macOS source capture for the first Mac-to-Linux path.
 
+mod awdl;
+
 use std::{
     ffi::CStr,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -38,6 +40,7 @@ pub struct SourceOptions {
     pub peer: String,
     pub address: Option<SocketAddr>,
     pub raw_touch: bool,
+    pub reduce_wifi_latency: bool,
 }
 
 pub async fn run(options: SourceOptions) -> Result<()> {
@@ -93,6 +96,15 @@ pub async fn run(options: SourceOptions) -> Result<()> {
     )
     .await?;
 
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut awdl_lease = if options.reduce_wifi_latency {
+        Some(awdl::AwDlLease::acquire().await?)
+    } else {
+        None
+    };
+
     let mut epoch = [0_u8; 16];
     getrandom::fill(&mut epoch)
         .map_err(|error| anyhow!("could not create the source session epoch: {error}"))?;
@@ -111,12 +123,20 @@ pub async fn run(options: SourceOptions) -> Result<()> {
 
     let mut interval = tokio::time::interval(CAPTURE_POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut awdl_renewal = tokio::time::interval(awdl::RENEW_INTERVAL);
+    awdl_renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut touch_active = false;
     let mut last_touch = Instant::now();
     let mut terminal_error = None;
 
     loop {
         tokio::select! {
+            _ = awdl_renewal.tick(), if awdl_lease.is_some() => {
+                if let Err(error) = awdl_lease.as_mut().expect("active AWDL lease").renew().await {
+                    terminal_error = Some(error);
+                    break;
+                }
+            }
             _ = interval.tick() => {
                 while let Some(event) = capture.poll() {
                     if event.kind == NativeEventKind::Escape as u32 {
@@ -133,7 +153,7 @@ pub async fn run(options: SourceOptions) -> Result<()> {
                         break;
                     }
                 }
-                if capture.escape_requested() || terminal_error.is_some() {
+                if capture.stop_requested() || terminal_error.is_some() {
                     break;
                 }
                 if touch_active && last_touch.elapsed() >= TOUCH_STALE_TIMEOUT {
@@ -141,10 +161,9 @@ pub async fn run(options: SourceOptions) -> Result<()> {
                     touch_active = false;
                 }
             }
-            result = tokio::signal::ctrl_c() => {
-                result.context("could not install the Ctrl+C handler")?;
-                break;
-            }
+            _ = interrupt.recv() => break,
+            _ = terminate.recv() => break,
+            _ = hangup.recv() => break,
             event = events.recv() => {
                 match event.map(|event| event.kind) {
                     Some(SessionEventKind::ReceiverEffects { applied, .. }) => {
@@ -157,7 +176,10 @@ pub async fn run(options: SourceOptions) -> Result<()> {
                         terminal_error = Some(anyhow!("input session closed: {reason}"));
                         break;
                     }
-                    Some(SessionEventKind::OutboundEnded) => {}
+                    Some(SessionEventKind::OutboundEnded) => {
+                        terminal_error = Some(anyhow!("remote input ownership ended"));
+                        break;
+                    }
                     None => {
                         terminal_error = Some(anyhow!("input session event channel closed"));
                         break;
@@ -167,7 +189,10 @@ pub async fn run(options: SourceOptions) -> Result<()> {
         }
     }
 
-    capture.stop();
+    if let Err(error) = capture.stop() {
+        eprintln!("{error:#}");
+        terminal_error.get_or_insert(error);
+    }
     if touch_active {
         let _ = session.capture(touch_frame(TouchState::default()));
     }
@@ -181,7 +206,13 @@ pub async fn run(options: SourceOptions) -> Result<()> {
         session.close(SessionCloseReason::LocalRelease);
     }
     endpoint.close(0_u32.into(), b"foreground source stopped");
-    println!("local input restored");
+    println!("remote input capture stopped");
+    if let Some(lease) = awdl_lease.take()
+        && let Err(error) = lease.release().await
+    {
+        eprintln!("Could not confirm AWDL restoration: {error:#}");
+        terminal_error.get_or_insert(error);
+    }
 
     if let Some(error) = terminal_error {
         return Err(error);
@@ -430,11 +461,18 @@ unsafe extern "C" {
     fn zflow_mac_raw_touch_available() -> i32;
     fn zflow_mac_capture_start(raw_touch: i32) -> i32;
     fn zflow_mac_capture_poll(event: *mut NativeEvent) -> i32;
-    fn zflow_mac_capture_escape_requested() -> i32;
-    fn zflow_mac_capture_stop();
+    fn zflow_mac_capture_stop_requested() -> i32;
+    fn zflow_mac_capture_stop() -> i32;
     fn zflow_mac_capture_last_error() -> *const c_char;
     #[cfg(test)]
     fn zflow_mac_modifier_pressed(keycode: u16, flags: u64) -> u8;
+    #[cfg(test)]
+    fn zflow_mac_should_forward_scroll(
+        raw_touch: u8,
+        raw_contact_active: u8,
+        scroll_phase: i64,
+        momentum_phase: i64,
+    ) -> u8;
 }
 
 struct MacCapture {
@@ -466,17 +504,21 @@ impl MacCapture {
         (unsafe { zflow_mac_capture_poll(&mut event) } == 1).then_some(event)
     }
 
-    fn escape_requested(&self) -> bool {
+    fn stop_requested(&self) -> bool {
         // SAFETY: the bridge exposes this flag atomically.
-        unsafe { zflow_mac_capture_escape_requested() == 1 }
+        unsafe { zflow_mac_capture_stop_requested() == 1 }
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Result<()> {
         if self.running {
             // SAFETY: stop is idempotent after a successful start and joins the native thread.
-            unsafe { zflow_mac_capture_stop() };
+            let status = unsafe { zflow_mac_capture_stop() };
             self.running = false;
+            if status < 0 {
+                bail!("macOS capture ended with an error: {}", Self::last_error());
+            }
         }
+        Ok(())
     }
 
     fn last_error() -> String {
@@ -494,7 +536,9 @@ impl MacCapture {
 
 impl Drop for MacCapture {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            eprintln!("{error:#}");
+        }
     }
 }
 
@@ -537,6 +581,39 @@ mod tests {
     fn caps_lock_uses_the_aggregate_flag() {
         assert!(modifier_pressed(57, ALPHA_SHIFT));
         assert!(!modifier_pressed(57, 0));
+    }
+
+    #[test]
+    fn raw_touch_suppresses_phased_scroll_even_after_lift() {
+        for active in [false, true] {
+            for phase in [1, 2, 4, 8, 16, 32, 128] {
+                assert!(!forward_scroll(true, active, phase, 0));
+                assert!(!forward_scroll(true, active, 0, phase));
+                assert!(!forward_scroll(true, active, phase, phase));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_touch_preserves_unphased_wheel_after_lift() {
+        assert!(forward_scroll(true, false, 0, 0));
+        assert!(!forward_scroll(true, true, 0, 0));
+    }
+
+    #[test]
+    fn pointer_only_capture_preserves_scroll_and_momentum() {
+        for active in [false, true] {
+            for (scroll, momentum) in [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2), (0, 3)] {
+                assert!(forward_scroll(false, active, scroll, momentum));
+            }
+        }
+    }
+
+    fn forward_scroll(raw: bool, active: bool, scroll: i64, momentum: i64) -> bool {
+        // SAFETY: the helper accepts scalar values and does not access capture state.
+        unsafe {
+            zflow_mac_should_forward_scroll(u8::from(raw), u8::from(active), scroll, momentum) == 1
+        }
     }
 
     fn modifier_pressed(keycode: u16, flags: u64) -> bool {

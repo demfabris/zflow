@@ -108,6 +108,32 @@ Revocation is local and immediate:
 sudo zflow peer revoke desk
 ```
 
+### macOS source cursor capture
+
+The experimental Mac source uses an active HID-level event tap. During remote
+control it hides the Mac cursor and disconnects cursor position from physical
+movement, while forwarding relative deltas and raw trackpad contacts. It does
+not warp the cursor back to screen center. On exit it reconnects and shows the
+cursor; if macOS disables the event tap, it ends forwarding and runs cleanup.
+It handles Ctrl+Cmd+Backspace, SIGINT, SIGTERM, and SIGHUP.
+
+For background cursor visibility, the CLI resolves the private
+`SetsCursorInBackground` connection property at runtime, following Deskflow's
+approach. Missing symbols or a failed cursor API call prevent activation.
+Apple documents cursor disconnection for foreground apps; verify the behavior
+on the target macOS version, with another app focused. API success alone does
+not prove cursor immobility or suppression of native trackpad gestures.
+
+On September 10, live tests on a Mac16,5 running macOS 27.0 (26A428) passed
+cursor isolation and recovery after normal exit, SIGKILL, and SIGSTOP. Fabrico
+confirmed cursor visibility and control after each run. A separate observer
+measured cursor position; the earlier AWDL-only tests had not checked it.
+These results cover that Mac and external Magic Trackpad, not the full macOS
+matrix. The AWDL helper does not restore cursor state. Use an external timed
+recovery command for failure tests: the source cannot run cleanup while stopped
+or after a forced kill. See [TESTPLAN.md](TESTPLAN.md) for measurements and
+remaining checks.
+
 ### macOS Wi-Fi latency
 
 If macOS input stutters or rubber-bands, measure LAN latency before changing
@@ -118,24 +144,63 @@ zflow buffering. A low baseline with repeated spikes above one 60 Hz frame
 ping -c 20 RECEIVER_LAN_IP
 ```
 
-On one Mac-to-Ubuntu run, a 2-4 ms baseline repeatedly jumped to 31-76 ms.
-zflow measured 72 ms p95 RTT, 82 ms p99 delay variation, and 198 missing
-datagrams. Temporarily disabling Apple's peer-to-peer Wi-Fi interfaces greatly
-improved the input on that machine:
+On the September 10 Mac-to-Ubuntu test, p95 RTT fell from 70.8 ms to 5.5 ms
+while a temporary loop held `awdl0` and `llw0` down. The motion-sequence loss
+counter estimates missing updates, not Wi-Fi hardware packet drops. That test
+did not isolate the two interfaces.
+
+The foreground Mac source now offers opt-in, session-scoped AWDL suppression.
+Build the source and its separate helper as your normal user:
 
 ```sh
-sudo ifconfig awdl0 down
-sudo ifconfig llw0 down
+cargo build --bin zflow-macos-source
+xcrun --sdk macosx clang \
+  -isysroot "$(xcrun --sdk macosx --show-sdk-path)" \
+  -std=c11 -O2 -Wall -Wextra -Werror \
+  src/macos/awdl_helper.c -o target/debug/zflow-awdl-helper
 ```
 
-This disables AirDrop and may interrupt Continuity features. Treat it as an
-opt-in diagnostic, not a default setup step. Restore the interfaces after the
-test (or reboot macOS):
+After reviewing the helper and installer, authorize its installation:
 
 ```sh
-sudo ifconfig awdl0 up
-sudo ifconfig llw0 up
+sudo bash scripts/install-macos-awdl-helper.sh target/debug/zflow-awdl-helper
 ```
+
+This installs a root-owned setuid executable at
+`/Library/PrivilegedHelperTools/io.zflow.awdl-helper`. It grants local users
+the narrow ability to lease suppression of `awdl0`; it accepts no arbitrary
+commands or interface names. Installation does not change network state.
+The source itself must run without sudo:
+
+```sh
+./target/debug/zflow-macos-source \
+  --config "$HOME/Library/Application Support/zflow/zflow.toml" \
+  --peer ubuntu --reduce-wifi-latency
+```
+
+The helper remembers AWDL's initial up/down state. It holds AWDL down during
+remote capture and restores that state on return, failed activation, or
+disconnect. A pipe and a two-second renewable lease also cover sender crashes
+and stalls. The helper acknowledges heartbeats; a missing acknowledgement ends
+remote capture. Ctrl+Cmd+Backspace, Ctrl+C, and SIGTERM return local control.
+Missing or unsafe helper installation fails before capture starts.
+
+AirDrop and other Continuity features may disconnect while suppression is
+active; restoring AWDL does not promise to resume an interrupted transfer.
+This option leaves `llw0` and Bluetooth unchanged. Without the flag, zflow does
+not launch the helper or change AWDL. The helper serializes leases across
+source processes. An administrator killing or suspending the helper itself
+can prevent restoration; the lease protects against sender failures, not
+failure of the privileged helper. Stop the sender before manually recovering
+with `sudo ifconfig awdl0 up` if AWDL was up before the session.
+
+AWDLToggle's interface-monitoring approach informed this feature. No code was
+copied: its repository had no detected license when inspected. This guardian
+uses interface notifications plus a bounded 100 ms fallback check, with no
+per-tick shell processes. A short AWDL-only run measured 5.93 ms p95 RTT with
+`llw0` up, and fabrico reported smooth input. Normal return, sender crash, and
+sender freeze restored AWDL in live tests. The longer radio soak and remaining
+failure cases in [TESTPLAN.md](TESTPLAN.md) still gate broader qualification.
 
 If latency spikes remain, compare with the Mac on Ethernet before attributing
 the problem to capture or playout behavior.

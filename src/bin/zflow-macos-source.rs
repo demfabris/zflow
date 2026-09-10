@@ -27,6 +27,10 @@ struct Args {
     /// Disable experimental raw Magic Trackpad forwarding.
     #[arg(long)]
     no_touch: bool,
+
+    /// Reduce Wi-Fi latency during remote control by suspending AWDL (admin setup required).
+    #[arg(long)]
+    reduce_wifi_latency: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -38,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         peer: args.peer,
         address: args.address,
         raw_touch: !args.no_touch,
+        reduce_wifi_latency: args.reduce_wifi_latency,
     })
     .await
 }
@@ -45,4 +50,24 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
     anyhow::bail!("zflow-macos-source is supported only on macOS")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wifi_latency_control_requires_explicit_opt_in() {
+        let default =
+            Args::try_parse_from(["zflow-macos-source", "--config", "test.toml"]).unwrap();
+        assert!(!default.reduce_wifi_latency);
+        let enabled = Args::try_parse_from([
+            "zflow-macos-source",
+            "--config",
+            "test.toml",
+            "--reduce-wifi-latency",
+        ])
+        .unwrap();
+        assert!(enabled.reduce_wifi_latency);
+    }
 }

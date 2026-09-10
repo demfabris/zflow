@@ -16,8 +16,13 @@ listen-only CGEventTap counts CG-level mouse/scroll/key events so the log
 shows what kind of input flowed alongside (or instead of) MT callbacks. The
 `--tap` mode adds the zflow operating mode: a second CGEventTap,
 `kCGEventTapOptionDefault` at `kCGSessionEventTap` head insert, that returns
-NULL for mouse-moved, left/right drag, and scroll-wheel events (cursor
-visibly frozen while it runs, hard 20 s timeout as the escape hatch).
+NULL for mouse-moved, left/right drag, and scroll-wheel events, with a hard
+20 s timeout as the escape hatch.
+
+Correction, 2026-09-10: the original report described a frozen cursor, but the
+probe counted swallowed events without measuring cursor position. In later
+source tests, fabrico observed the Mac cursor moving alongside Ubuntu's cursor.
+This spike proves continued raw contact delivery, not exclusive cursor control.
 
 ## Raw numbers
 
@@ -37,7 +42,7 @@ Run 1, no tap, fabrico wiggling 3 fingers on the Magic Trackpad:
 
 Run 2, swallowing tap active (the kill-criteria run):
 
-- 1170 mouse/scroll events swallowed over the window; cursor confirmed dead
+- 1170 mouse/scroll events swallowed over the window; cursor position unmeasured
 - MT frames kept arriving the whole time: 705 callbacks, 702 with contacts,
   427 with 3 contacts, 62.7 Hz, positions in range
 - per-device attribution: device[1] (Magic Trackpad) 705, device[0] 0

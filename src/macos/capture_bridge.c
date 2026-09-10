@@ -76,11 +76,16 @@ static bool g_start_ready;
 static int g_start_status;
 static bool g_request_raw_touch;
 static _Atomic bool g_stop;
-static _Atomic bool g_escape;
 static _Atomic bool g_raw_contact_active;
+static int g_capture_status;
 static char g_error[256] = "no diagnostic";
 static CFRunLoopRef g_run_loop;
 static CFMachPortRef g_event_tap;
+static bool g_cursor_hidden;
+static bool g_cursor_disconnected;
+static bool g_cursor_background;
+static int g_cursor_connection;
+static CGError (*g_set_connection_property)(int, int, CFStringRef, CFTypeRef);
 
 static void *g_multitouch;
 static CFMutableArrayRef g_device_list;
@@ -95,6 +100,68 @@ static bool (*MTDeviceIsBuiltIn)(MTDeviceRef);
 
 static void set_error(const char *message) {
   snprintf(g_error, sizeof(g_error), "%s", message ? message : "unknown error");
+}
+
+static bool cursor_result(CGError error, const char *operation) {
+  if (error == kCGErrorSuccess) return true;
+  snprintf(g_error, sizeof(g_error), "%s (CGError %d)", operation, error);
+  return false;
+}
+
+static bool release_cursor(void) {
+  bool ok = true;
+  if (g_cursor_disconnected) {
+    if (cursor_result(CGAssociateMouseAndMouseCursorPosition(true),
+                      "could not reconnect the Mac cursor"))
+      g_cursor_disconnected = false;
+    else
+      ok = false;
+  }
+  if (g_cursor_hidden) {
+    if (cursor_result(CGDisplayShowCursor(kCGNullDirectDisplay),
+                      "could not show the Mac cursor"))
+      g_cursor_hidden = false;
+    else
+      ok = false;
+  }
+  if (g_cursor_background) {
+    if (cursor_result(g_set_connection_property(
+            g_cursor_connection, g_cursor_connection,
+            CFSTR("SetsCursorInBackground"), kCFBooleanFalse),
+            "could not release background cursor control"))
+      g_cursor_background = false;
+    else
+      ok = false;
+  }
+  return ok;
+}
+
+static bool capture_cursor(void) {
+  if (g_cursor_hidden || g_cursor_disconnected || g_cursor_background) {
+    set_error("previous capture did not release cursor control");
+    return false;
+  }
+  // The CLI needs the same background visibility property used by Deskflow.
+  // Resolve the private API at runtime and refuse capture if it is unavailable.
+  int (*default_connection)(void) = dlsym(RTLD_DEFAULT, "_CGSDefaultConnection");
+  g_set_connection_property = dlsym(RTLD_DEFAULT, "CGSSetConnectionProperty");
+  if (!default_connection || !g_set_connection_property) {
+    set_error("macOS background cursor control is unavailable");
+    return false;
+  }
+  g_cursor_connection = default_connection();
+  if (!cursor_result(g_set_connection_property(
+          g_cursor_connection, g_cursor_connection,
+          CFSTR("SetsCursorInBackground"), kCFBooleanTrue),
+          "could not enable background cursor control")) return false;
+  g_cursor_background = true;
+  if (!cursor_result(CGDisplayHideCursor(kCGNullDirectDisplay),
+                     "could not hide the Mac cursor")) return false;
+  g_cursor_hidden = true;
+  // Keep relative deltas while freezing the local cursor. Do not recenter it.
+  g_cursor_disconnected = true;
+  return cursor_result(CGAssociateMouseAndMouseCursorPosition(false),
+                       "could not disconnect the Mac cursor");
 }
 
 static bool enqueue(const ZFlowMacEvent *event) {
@@ -187,15 +254,28 @@ static void stop_capture_run_loop(void) {
   pthread_mutex_unlock(&g_run_loop_lock);
 }
 
+uint8_t zflow_mac_should_forward_scroll(uint8_t raw_touch,
+                                        uint8_t raw_contact_active,
+                                        int64_t scroll_phase,
+                                        int64_t momentum_phase) {
+  // macOS can keep sending gesture scroll after the raw contacts lift.
+  return !raw_touch ||
+      (!raw_contact_active && scroll_phase == 0 && momentum_phase == 0);
+}
+
 static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
                                  CGEventRef event, void *context) {
   (void)proxy;
   (void)context;
   if (type == kCGEventTapDisabledByTimeout ||
       type == kCGEventTapDisabledByUserInput) {
-    if (g_event_tap) CGEventTapEnable(g_event_tap, true);
+    set_error("macOS disabled input capture; ending remote control");
+    g_capture_status = -1;
+    atomic_store(&g_stop, true);
+    stop_capture_run_loop();
     return event;
   }
+  if (atomic_load(&g_stop)) return event;
 
   ZFlowMacEvent captured = {0};
   switch (type) {
@@ -210,7 +290,6 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
           (flags & kCGEventFlagMaskCommand)) {
         captured.kind = ZFLOW_EVENT_ESCAPE;
         enqueue(&captured);
-        atomic_store(&g_escape, true);
         atomic_store(&g_stop, true);
         stop_capture_run_loop();
         return event;
@@ -249,7 +328,10 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
       }
       return NULL;
     case kCGEventScrollWheel:
-      if (!g_request_raw_touch || !atomic_load(&g_raw_contact_active)) {
+      if (zflow_mac_should_forward_scroll(
+              g_request_raw_touch, atomic_load(&g_raw_contact_active),
+              CGEventGetIntegerValueField(event, kCGScrollWheelEventScrollPhase),
+              CGEventGetIntegerValueField(event, kCGScrollWheelEventMomentumPhase))) {
         captured.kind = ZFLOW_EVENT_MOTION;
         captured.scroll_x = CGEventGetIntegerValueField(
             event, kCGScrollWheelEventPointDeltaAxis2);
@@ -351,7 +433,7 @@ static void *capture_thread(void *context) {
       CGEventMaskBit(kCGEventOtherMouseDragged) |
       CGEventMaskBit(kCGEventScrollWheel);
   g_event_tap = CGEventTapCreate(
-      kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
+      kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
       mask, event_callback, NULL);
   if (!g_event_tap) {
     set_error("CGEventTapCreate failed; Accessibility permission is required");
@@ -361,24 +443,40 @@ static void *capture_thread(void *context) {
   }
 
   CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(NULL, g_event_tap, 0);
+  if (!source) {
+    set_error("could not create the macOS capture run-loop source");
+    CFMachPortInvalidate(g_event_tap);
+    CFRelease(g_event_tap);
+    g_event_tap = NULL;
+    unload_multitouch();
+    signal_started(-1);
+    return NULL;
+  }
   CFRunLoopRef run_loop = CFRunLoopGetCurrent();
   pthread_mutex_lock(&g_run_loop_lock);
   g_run_loop = run_loop;
   pthread_mutex_unlock(&g_run_loop_lock);
   CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
   CGEventTapEnable(g_event_tap, true);
-  signal_started(raw_active ? 1 : 0);
-  if (!atomic_load(&g_stop)) CFRunLoopRun();
+  bool cursor_active = capture_cursor();
+  if (cursor_active) {
+    signal_started(raw_active ? 1 : 0);
+    if (!atomic_load(&g_stop)) CFRunLoopRun();
+  }
 
   pthread_mutex_lock(&g_run_loop_lock);
   g_run_loop = NULL;
   pthread_mutex_unlock(&g_run_loop_lock);
   CGEventTapEnable(g_event_tap, false);
   CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
+  CFMachPortInvalidate(g_event_tap);
   CFRelease(source);
   CFRelease(g_event_tap);
   g_event_tap = NULL;
+  if (!release_cursor()) g_capture_status = -1;
   unload_multitouch();
+  atomic_store(&g_stop, true);
+  if (!cursor_active) signal_started(-1);
   return NULL;
 }
 
@@ -399,8 +497,9 @@ int zflow_mac_capture_start(int raw_touch) {
   g_queue_tail = 0;
   pthread_mutex_unlock(&g_queue_lock);
   atomic_store(&g_stop, false);
-  atomic_store(&g_escape, false);
   atomic_store(&g_raw_contact_active, false);
+  g_capture_status = 0;
+  set_error("no diagnostic");
   pthread_mutex_lock(&g_run_loop_lock);
   g_run_loop = NULL;
   pthread_mutex_unlock(&g_run_loop_lock);
@@ -435,17 +534,18 @@ int zflow_mac_capture_poll(ZFlowMacEvent *event) {
   return 1;
 }
 
-int zflow_mac_capture_escape_requested(void) {
-  return atomic_load(&g_escape) ? 1 : 0;
+int zflow_mac_capture_stop_requested(void) {
+  return atomic_load(&g_stop) ? 1 : 0;
 }
 
-void zflow_mac_capture_stop(void) {
-  if (!g_thread_valid) return;
+int zflow_mac_capture_stop(void) {
+  if (!g_thread_valid) return g_capture_status;
   atomic_store(&g_stop, true);
   stop_capture_run_loop();
   pthread_join(g_thread, NULL);
   g_thread_valid = false;
   atomic_store(&g_raw_contact_active, false);
+  return g_capture_status;
 }
 
 const char *zflow_mac_capture_last_error(void) {

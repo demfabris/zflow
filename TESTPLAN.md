@@ -52,6 +52,69 @@ Test layer surfaces at 1, 2, and 4 logical pixels across selected wlroots compos
 
 ## Signed macOS package (gates macOS beta)
 
+### Developer source cursor qualification
+
+Ask before redirecting input. First run the native fake-cursor tests and Rust
+Mac tests; the native tests replace cursor mutations and event-tap creation.
+They cover balanced hide/show, failed acquisition rollback, cleanup errors,
+relative motion filtering, escape, and tap disablement without capturing input.
+
+```sh
+cargo test --lib macos::
+xcrun --sdk macosx clang \
+  -isysroot "$(xcrun --sdk macosx --show-sdk-path)" \
+  -std=c11 -O2 -Wall -Wextra -Werror \
+  tests/macos_capture_test.c \
+  -framework ApplicationServices -framework CoreFoundation \
+  -o target/debug/macos-capture-test
+./target/debug/macos-capture-test
+```
+
+After consent, use a short bounded run with an external recovery command.
+Measure Mac cursor coordinates from a separate process while moving on Ubuntu;
+require a stationary hidden Mac cursor and continuing remote motion, including
+after long strokes that would reach a Mac display edge. Test with a different
+Mac app focused. Check local clicks, typing, scrolling, and native gestures as
+separate results, in raw-touch and `--no-touch` modes.
+
+Repeat activation and return. Verify cursor visibility and movement after
+Escape, SIGINT, SIGTERM, SIGHUP, disconnect, and event-tap disablement. Force
+SIGKILL and SIGSTOP in separate approved runs with timed external recovery;
+do not infer cursor recovery from AWDL state or receiver key releases.
+
+#### Observed results, 2026-09-10
+
+Tested an unsigned debug source on Mac16,5, macOS 27.0 (26A428), with an external
+Magic Trackpad forwarding raw contacts to Ubuntu/GNOME. Each run used
+`--reduce-wifi-latency`, with AWDL up beforehand and `llw0` left up. Fabrico
+approved each run. A separate Python process sampled `CGEventGetLocation`
+about every 20 ms, checked `ifconfig awdl0`, and controlled the exact child PID.
+
+- Normal return: after 15 seconds, the supervisor sent SIGTERM. All 719 active
+  cursor samples matched the anchor. The source exited 0 and restored AWDL.
+  Fabrico confirmed cursor hiding/return and Ubuntu movement and gestures.
+- Crash: after eight seconds, the supervisor sent SIGKILL. All 383 active
+  samples matched the anchor. The observer saw AWDL up after 26.8 ms and Mac
+  cursor movement after 987 ms. Fabrico confirmed cursor visibility and control.
+  Neither the cursor-reconnect fallback nor source cleanup ran.
+- Freeze: after eight seconds, the supervisor sent SIGSTOP, then SIGCONT four
+  seconds later. All 384 pre-freeze samples matched the anchor. The observer
+  saw cursor movement after 1036 ms, before resume, and AWDL up after 2016 ms
+  while `ps` still reported the source as stopped. Fabrico confirmed that the
+  cursor reappeared during the pause. The source exited 1 after resume because
+  its AWDL helper lease had expired. Neither forced-exit nor cursor-reconnect
+  fallback ran; no source or helper process remained.
+
+Cursor timings describe the first observed physical movement, not an exact OS
+recovery deadline. The source's unconfirmed-AWDL warning after freeze reflects
+a closed acknowledgement pipe; the observer verified restoration independently.
+These runs qualify cursor isolation and the three return paths on this setup.
+Separate local click/key/scroll/gesture leakage checks, `--no-touch`, sleep/wake,
+other macOS versions, and the signed build matrix remain pending. Earlier AWDL
+tests predated cursor disconnection and do not establish cursor isolation.
+
+### Signed build matrix
+
 Test final-path Developer ID and notarized builds on clean supported macOS versions and both CPU families where hardware exists. Cover:
 
 - absent, denied, granted, and reset TCC state on clean virtual machines, with correct zflow attribution in prompts and System Settings;
@@ -78,6 +141,51 @@ For Karabiner, use the pinned upstream client from the named root process. Verif
 zflow keeps macOS lock-screen and LoginWindow target injection out of the product promise until the selected backend passes keyboard and pointer injection in actual secure password fields. LoginWindow source keyboard capture remains unavailable while Secure Event Input is active; the matrix evaluates pointer and scroll as separate event classes.
 
 ## Radio, QoS, and playout (gates the frozen smoothing constants)
+
+### Session-scoped macOS AWDL control
+
+Do not redirect input or change interface state without the tester's consent.
+Build and run `tests/macos_awdl_helper_test.c` without privileges; its fake
+backend must not access network interfaces. Run the Rust Mac tests as well.
+
+```sh
+cargo test --all-targets
+xcrun --sdk macosx clang \
+  -isysroot "$(xcrun --sdk macosx --show-sdk-path)" \
+  -std=c11 -O2 -Wall -Wextra -Werror \
+  tests/macos_awdl_helper_test.c -o target/debug/macos-awdl-helper-test
+./target/debug/macos-awdl-helper-test
+```
+
+After a separate admin-approved helper installation, qualify
+`zflow-macos-source --reduce-wifi-latency` with:
+
+- flag absent: no helper process and no AWDL changes;
+- helper missing or unsafe: refuse activation before local input capture;
+- AWDL initially up and initially down: restore the original state on return;
+- repeated activation/return, Escape, Ctrl+C, SIGTERM, and a failed capture;
+- sender SIGKILL and pipe closure: restore without sender cleanup;
+- sender SIGSTOP: restore within the two-second lease plus scheduling and ioctl
+  overhead, and do not reacquire on stale queued heartbeats after resume;
+- network loss and `OutboundEnded`: stop capture and release suppression;
+- macOS reactivating AWDL during a lease: reassert down without a busy loop;
+- a second sender: refuse its lease without changing the first sender's state;
+- helper failure: restore local input, report any unconfirmed AWDL restoration,
+  and use manual recovery if an administrator killed or suspended the helper;
+- AirDrop/Continuity availability after return, with Bluetooth and `llw0`
+  untouched throughout the run.
+
+Compare latency and gesture behavior with AWDL alone suppressed against the
+earlier two-interface diagnostic. Do not claim AWDL-only latency qualification
+from fake-backend tests. Check held-key release separately from AWDL restoration.
+
+On September 10, the short AWDL-only live run measured RTT p50 3.091 ms, p95
+5.932 ms, and p99 13.725 ms with `llw0` up. Fabrico reported smooth input.
+The cursor qualification results above record subsequent normal-exit, crash,
+and freeze recovery with the installed helper. These short runs do not replace
+the ten-minute radio matrix or qualify AirDrop transfer resumption.
+
+### Radio measurements
 
 Run each radio configuration for at least ten minutes on the target hardware. Record:
 
