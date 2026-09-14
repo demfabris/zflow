@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use eguicn::{Button, ButtonVariant, Card, egui};
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 
 use crate::{
     config::Config,
@@ -27,7 +28,9 @@ struct Running {
     returned: Option<u32>,
     failed: bool,
     capturing: bool,
-    entry_point: Point,
+    entry_region: macos::DesktopRect,
+    span: tracing::Span,
+    started: Instant,
 }
 
 pub(super) struct Sharing {
@@ -65,6 +68,7 @@ impl Sharing {
         self.enabled = false;
         self.previous = None;
         if let Some(running) = &self.running {
+            tracing::info!(parent: &running.span, "stop requested by window or user");
             let _ = running.stop.send(true);
             self.notice = "Returning input to the Mac…".into();
         } else {
@@ -132,6 +136,7 @@ impl Sharing {
         self.path = path.into();
         self.previous = None;
         self.enabled = true;
+        tracing::info!("edge sharing enabled");
         self.notice = "Ready on the Mac. Move through a configured edge to connect.".into();
         Ok(())
     }
@@ -145,20 +150,28 @@ impl Sharing {
                     }
                     SourceStatus::Sharing => {
                         running.capturing = true;
+                        tracing::info!(parent: &running.span, elapsed_ms = running.started.elapsed().as_millis() as u64, "GUI observed capture start");
                         self.notice = format!(
                             "Sharing with {}. Cross back or press Ctrl+Cmd+Backspace to return.",
                             running.handoff.peer
                         );
                     }
                     SourceStatus::Returned { position } => running.returned = Some(position),
+                    SourceStatus::LocalInputRestored => {
+                        self.notice = "Back on the Mac. Finishing connection cleanup…".into();
+                    }
                     SourceStatus::Stopped => {}
                     SourceStatus::Failed(error) => {
+                        tracing::warn!(parent: &running.span, %error, "GUI received crossing failure");
                         running.failed = true;
                         self.notice = error;
                     }
                 }
             }
             if !local_geometry().is_ok_and(|geometry| running.handoff.matches_geometry(&geometry)) {
+                if !running.failed {
+                    tracing::warn!(parent: &running.span, "crossing cancelled: Mac display geometry changed");
+                }
                 let _ = running.stop.send(true);
                 self.enabled = false;
                 running.failed = true;
@@ -168,16 +181,25 @@ impl Sharing {
             }
             if !running.capturing
                 && let Ok(position) = macos::cursor_position()
-                && ((position.x - f64::from(running.entry_point.x)).abs() > 8.0
-                    || (position.y - f64::from(running.entry_point.y)).abs() > 8.0)
+                && !running.entry_region.contains(position)
             {
+                if !running.failed {
+                    tracing::warn!(parent: &running.span,
+                        elapsed_ms = running.started.elapsed().as_millis() as u64,
+                        entry_region = ?running.entry_region,
+                        current_x = position.x, current_y = position.y,
+                        "crossing cancelled: Mac cursor left the configured edge during preparation");
+                }
                 let _ = running.stop.send(true);
                 self.enabled = false;
+                running.failed = true;
                 self.notice =
-                    "Crossing cancelled because the Mac cursor moved. Sharing is off.".into();
+                    "Crossing cancelled because the Mac cursor left the configured edge. Sharing is off.".into();
             }
             if running.thread.is_finished() {
                 let mut running = self.running.take().unwrap();
+                let span = running.span.clone();
+                let _entered = span.enter();
                 let joined = running.thread.join();
                 while let Ok(status) = running.events.try_recv() {
                     match status {
@@ -191,27 +213,22 @@ impl Sharing {
                 }
                 self.previous = None;
                 if joined.is_err() {
+                    tracing::error!("crossing worker panicked");
                     self.enabled = false;
                     self.notice = "The sharing worker stopped unexpectedly. Sharing is off.".into();
                 } else if running.failed {
                     self.enabled = false;
-                } else if let Some(position) = running.returned.filter(|_| self.enabled) {
-                    match running.handoff.return_position(position).and_then(|point| {
-                        macos::warp_cursor(macos::CursorPosition {
-                            x: f64::from(point.x),
-                            y: f64::from(point.y),
-                        })
-                    }) {
-                        Ok(()) => self.notice = "Back on the Mac. Edge sharing is ready.".into(),
-                        Err(error) => {
-                            self.enabled = false;
-                            self.notice = format!("Returned input to the Mac: {error:#}");
-                        }
-                    }
+                } else if running.returned.is_some() && self.enabled {
+                    tracing::info!(
+                        elapsed_ms = running.started.elapsed().as_millis() as u64,
+                        "connection cleanup completed; edge sharing rearmed"
+                    );
+                    self.notice = "Back on the Mac. Edge sharing is ready.".into();
                 } else {
                     self.enabled = false;
                     self.notice = "Sharing is off. Input is on the Mac.".into();
                 }
+                tracing::info!(enabled = self.enabled, failed = running.failed, returned = running.returned.is_some(), notice = %self.notice, "crossing worker finished");
             }
         }
         if self.enabled
@@ -220,6 +237,7 @@ impl Sharing {
         {
             self.last_poll = Instant::now();
             if let Err(error) = self.observe(ctx) {
+                tracing::warn!(error = %format!("{error:#}"), "edge observation failed; sharing disabled");
                 self.enabled = false;
                 self.previous = None;
                 self.notice = format!("Sharing stopped: {error:#}");
@@ -248,6 +266,23 @@ impl Sharing {
         else {
             return Ok(());
         };
+        static NEXT_CROSSING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let span = tracing::info_span!("crossing",
+            crossing = NEXT_CROSSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            peer = %handoff.peer);
+        let started = Instant::now();
+        tracing::info!(parent: &span, remote_entry_edge = ?handoff.edge, "configured edge reached");
+        tracing::debug!(parent: &span, x = position.x, y = position.y,
+            start = handoff.start, end = handoff.end, position = handoff.position,
+            remote_width = handoff.expected_width, remote_height = handoff.expected_height,
+            "crossing geometry");
+        let entry_region = macos::DesktopRect {
+            x: f64::from(handoff.entry_region.x),
+            y: f64::from(handoff.entry_region.y),
+            width: f64::from(handoff.entry_region.width),
+            height: f64::from(handoff.entry_region.height),
+        };
+        tracing::debug!(parent: &span, ?entry_region, "capture admission region");
         let options = SourceOptions {
             config_path: self.path.clone(),
             peer: handoff.peer.clone(),
@@ -255,6 +290,8 @@ impl Sharing {
             raw_touch: true,
             reduce_wifi_latency: self.reduce_wifi_latency,
             handoff: Some(macos::HandoffOptions {
+                return_mapping: handoff.return_mapping.clone(),
+                entry_region,
                 edge: handoff.edge,
                 start: handoff.start,
                 end: handoff.end,
@@ -270,6 +307,7 @@ impl Sharing {
         let (stop, stopped) = watch::channel(false);
         let (status, events) = mpsc::unbounded_channel();
         let ctx = ctx.clone();
+        let worker_span = span.clone();
         let thread = std::thread::Builder::new()
             .name("zflow-sharing".into())
             .spawn(move || {
@@ -278,7 +316,9 @@ impl Sharing {
                     .build()
                 {
                     Ok(runtime) => {
-                        let _ = runtime.block_on(macos::run_controlled(options, stopped, status));
+                        let _ = runtime.block_on(
+                            macos::run_controlled(options, stopped, status).instrument(worker_span),
+                        );
                     }
                     Err(error) => {
                         let _ = status.send(SourceStatus::Failed(format!(
@@ -297,7 +337,9 @@ impl Sharing {
             returned: None,
             failed: false,
             capturing: false,
-            entry_point: current,
+            entry_region,
+            span,
+            started,
         });
         Ok(())
     }

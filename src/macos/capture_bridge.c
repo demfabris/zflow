@@ -137,7 +137,7 @@ static bool g_start_ready;
 static int g_start_status;
 static bool g_request_raw_touch;
 static bool g_check_entry;
-static ZFlowMacPosition g_entry_position;
+static ZFlowMacRect g_entry_region;
 static bool g_forwarded_keys[128];
 static bool g_forwarded_buttons[33];
 static _Atomic bool g_stop;
@@ -145,6 +145,8 @@ static _Atomic bool g_raw_contact_active;
 static int g_capture_status;
 static char g_error[256] = "no diagnostic";
 static CFRunLoopRef g_run_loop;
+static bool g_return_pending;
+static ZFlowMacPosition g_return_position;
 static CFMachPortRef g_event_tap;
 static bool g_cursor_hidden;
 static bool g_cursor_disconnected;
@@ -201,6 +203,42 @@ static bool release_cursor(void) {
   return ok;
 }
 
+static bool take_return_position(ZFlowMacPosition *position) {
+  pthread_mutex_lock(&g_run_loop_lock);
+  g_run_loop = NULL;
+  bool pending = g_return_pending;
+  if (pending) *position = g_return_position;
+  g_return_pending = false;
+  pthread_mutex_unlock(&g_run_loop_lock);
+  return pending;
+}
+
+static bool release_cursor_at(const ZFlowMacPosition *position) {
+  bool ok = true;
+  if (position) {
+    ZFlowMacRect displays[ZFLOW_MAX_DISPLAYS];
+    int count = zflow_mac_desktop_rectangles(displays, ZFLOW_MAX_DISPLAYS);
+    bool on_display = false;
+    for (int i = 0; i < count; i++) {
+      ZFlowMacRect display = displays[i];
+      if (position->x >= display.x && position->x < display.x + display.width &&
+          position->y >= display.y && position->y < display.y + display.height)
+        on_display = true;
+    }
+    if (!g_cursor_disconnected || !isfinite(position->x) ||
+        !isfinite(position->y) || !on_display) {
+      set_error("could not return cursor: capture ended or return point is outside the active displays");
+      ok = false;
+    } else if (!cursor_result(CGWarpMouseCursorPosition(
+                   CGPointMake(position->x, position->y)),
+                   "could not place the returning Mac cursor")) {
+      ok = false;
+    }
+  }
+  if (!release_cursor()) ok = false;
+  return ok;
+}
+
 static bool capture_cursor(void) {
   if (g_cursor_hidden || g_cursor_disconnected || g_cursor_background) {
     set_error("previous capture did not release cursor control");
@@ -235,12 +273,21 @@ static bool capture_entry_allowed(void) {
     set_error("release held keys and buttons before crossing to the other computer");
     return false;
   }
+  double right = g_entry_region.x + g_entry_region.width;
+  double bottom = g_entry_region.y + g_entry_region.height;
+  if (!isfinite(g_entry_region.x) || !isfinite(g_entry_region.y) ||
+      !isfinite(g_entry_region.width) || !isfinite(g_entry_region.height) ||
+      g_entry_region.width <= 0 || g_entry_region.height <= 0 ||
+      !isfinite(right) || !isfinite(bottom) ||
+      right <= g_entry_region.x || bottom <= g_entry_region.y) {
+    set_error("crossing cancelled because the configured crossing edge is invalid");
+    return false;
+  }
   ZFlowMacPosition current;
   if (zflow_mac_cursor_position(&current) != 0 ||
-      !isfinite(g_entry_position.x) || !isfinite(g_entry_position.y) ||
-      fabs(current.x - g_entry_position.x) > 8.0 ||
-      fabs(current.y - g_entry_position.y) > 8.0) {
-    set_error("crossing cancelled because the Mac cursor moved while connecting");
+      current.x < g_entry_region.x || current.x >= right ||
+      current.y < g_entry_region.y || current.y >= bottom) {
+    set_error("crossing cancelled because the Mac cursor left the configured crossing edge");
     return false;
   }
   return true;
@@ -570,16 +617,15 @@ static void *capture_thread(void *context) {
     if (!atomic_load(&g_stop)) CFRunLoopRun();
   }
 
-  pthread_mutex_lock(&g_run_loop_lock);
-  g_run_loop = NULL;
-  pthread_mutex_unlock(&g_run_loop_lock);
+  ZFlowMacPosition return_position;
+  bool returning = take_return_position(&return_position);
   CGEventTapEnable(g_event_tap, false);
   CFRunLoopRemoveSource(run_loop, source, kCFRunLoopCommonModes);
   CFMachPortInvalidate(g_event_tap);
   CFRelease(source);
   CFRelease(g_event_tap);
   g_event_tap = NULL;
-  if (!release_cursor()) g_capture_status = -1;
+  if (!release_cursor_at(returning ? &return_position : NULL)) g_capture_status = -1;
   unload_multitouch();
   atomic_store(&g_stop, true);
   if (!cursor_active) signal_started(-1);
@@ -593,7 +639,7 @@ int zflow_mac_raw_touch_available(void) {
   return available ? 1 : 0;
 }
 
-int zflow_mac_capture_start(int raw_touch, const ZFlowMacPosition *entry) {
+int zflow_mac_capture_start(int raw_touch, const ZFlowMacRect *entry) {
   if (g_thread_valid) {
     set_error("capture is already running");
     return -1;
@@ -605,10 +651,11 @@ int zflow_mac_capture_start(int raw_touch, const ZFlowMacPosition *entry) {
   set_error("no diagnostic");
   pthread_mutex_lock(&g_run_loop_lock);
   g_run_loop = NULL;
+  g_return_pending = false;
   pthread_mutex_unlock(&g_run_loop_lock);
   g_request_raw_touch = raw_touch != 0;
   g_check_entry = entry != NULL;
-  if (entry) g_entry_position = *entry;
+  if (entry) g_entry_region = *entry;
   memset(g_forwarded_keys, 0, sizeof(g_forwarded_keys));
   memset(g_forwarded_buttons, 0, sizeof(g_forwarded_buttons));
   g_start_ready = false;
@@ -645,14 +692,41 @@ int zflow_mac_capture_stop_requested(void) {
   return atomic_load(&g_stop) ? 1 : 0;
 }
 
-int zflow_mac_capture_stop(void) {
-  if (!g_thread_valid) return g_capture_status;
+int zflow_mac_capture_stop_at(const ZFlowMacPosition *position) {
+  const char *request_error = NULL;
+  if (!g_thread_valid) {
+    if (position) {
+      set_error("could not return cursor: capture already ended");
+      return -1;
+    }
+    return g_capture_status;
+  }
+  pthread_mutex_lock(&g_run_loop_lock);
+  if (position) {
+    if (!isfinite(position->x) || !isfinite(position->y)) {
+      request_error = "could not return cursor: return point is not finite";
+    } else if (!g_run_loop || atomic_load(&g_stop)) {
+      request_error = "could not return cursor: capture already ended";
+    } else {
+      g_return_position = *position;
+      g_return_pending = true;
+    }
+  }
   atomic_store(&g_stop, true);
-  stop_capture_run_loop();
+  if (g_run_loop) CFRunLoopStop(g_run_loop);
+  pthread_mutex_unlock(&g_run_loop_lock);
   pthread_join(g_thread, NULL);
   g_thread_valid = false;
   atomic_store(&g_raw_contact_active, false);
+  if (request_error) {
+    set_error(request_error);
+    g_capture_status = -1;
+  }
   return g_capture_status;
+}
+
+int zflow_mac_capture_stop(void) {
+  return zflow_mac_capture_stop_at(NULL);
 }
 
 const char *zflow_mac_capture_last_error(void) {

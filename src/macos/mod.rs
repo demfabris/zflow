@@ -28,7 +28,7 @@ use crate::{
     desktop::{DesktopRequest, DesktopResponse, Edge},
     identity::Identity,
     session::{SessionEventKind, SessionOptions, start_session},
-    transport::{connect_input, input_client_config},
+    transport::{InputClientConfig, connect_input, input_client_config},
     wire::CURRENT_PROTOCOL_VERSION,
 };
 
@@ -49,6 +49,8 @@ pub struct SourceOptions {
 #[derive(Clone, Debug)]
 pub struct HandoffOptions {
     pub entry_position: CursorPosition,
+    pub entry_region: DesktopRect,
+    pub return_mapping: crate::desktop::ReturnMapping,
     pub edge: Edge,
     pub start: u32,
     pub end: u32,
@@ -80,6 +82,7 @@ pub async fn run(options: SourceOptions) -> Result<()> {
 pub enum SourceStatus {
     Connecting,
     Sharing,
+    LocalInputRestored,
     Returned { position: u32 },
     Stopped,
     Failed(String),
@@ -103,7 +106,21 @@ pub struct DesktopRect {
 
 impl DesktopRect {
     pub fn contains(self, position: CursorPosition) -> bool {
-        position.x >= self.x
+        [
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self.x + self.width,
+            self.y + self.height,
+            position.x,
+            position.y,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            && self.width > 0.0
+            && self.height > 0.0
+            && position.x >= self.x
             && position.y >= self.y
             && position.x < self.x + self.width
             && position.y < self.y + self.height
@@ -174,6 +191,9 @@ pub async fn run_controlled(
     mut stop: watch::Receiver<bool>,
     status: mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<()> {
+    let started = Instant::now();
+    tracing::info!(peer = %options.peer, raw_touch = options.raw_touch,
+        reduce_wifi_latency = options.reduce_wifi_latency, "source worker started");
     let _ = status.send(SourceStatus::Connecting);
     let result = run_source(options, &mut stop, &status).await;
     let final_status = match &result {
@@ -185,9 +205,18 @@ pub async fn run_controlled(
             }
             SourceStatus::Stopped
         }
-        Err(error) => SourceStatus::Failed(format!("{error:#}")),
+        Err(error) => {
+            tracing::error!(error = %format!("{error:#}"), "source worker failed");
+            eprintln!("Remote input failed: {error:#}");
+            SourceStatus::Failed(format!("{error:#}"))
+        }
     };
     let _ = status.send(final_status);
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        success = result.is_ok(),
+        "source worker completed"
+    );
     result.map(|_| ())
 }
 
@@ -219,6 +248,25 @@ impl Drop for SourceGuard {
 }
 
 struct SourceEndpoint(Endpoint);
+
+impl SourceEndpoint {
+    async fn shutdown(&self) -> Result<()> {
+        let started = Instant::now();
+        tracing::debug!("QUIC endpoint shutdown started");
+        self.0.close(0_u32.into(), b"foreground source stopped");
+        // Keep the worker runtime alive until Quinn has sent the disconnect.
+        // Otherwise a new crossing can reach Ubuntu before the old session ends.
+        let result = tokio::time::timeout(Duration::from_secs(2), self.0.wait_idle())
+            .await
+            .context("timed out closing the input connection; sharing remains off");
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "QUIC endpoint shutdown completed"
+        );
+        result
+    }
+}
 
 impl Drop for SourceEndpoint {
     fn drop(&mut self) {
@@ -269,21 +317,63 @@ async fn run_source(
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
     let endpoint = SourceEndpoint(Endpoint::client(bind_address)?);
+    let result = run_endpoint(
+        &endpoint.0,
+        &client_config,
+        address,
+        config,
+        options,
+        stop,
+        status,
+    )
+    .await;
+    if let Err(error) = endpoint.shutdown().await {
+        if result.is_ok() {
+            return Err(error);
+        }
+        eprintln!("Could not finish input connection shutdown: {error:#}");
+    }
+    result
+}
+
+async fn run_endpoint(
+    endpoint: &Endpoint,
+    client_config: &InputClientConfig,
+    address: SocketAddr,
+    config: Config,
+    options: SourceOptions,
+    stop: &mut watch::Receiver<bool>,
+    status: &mpsc::UnboundedSender<SourceStatus>,
+) -> Result<Option<u32>> {
+    let raw_available = config.input.experimental_touchpad;
+    let connecting = Instant::now();
+    tracing::info!(peer = %options.peer, %address, "input connection starting");
     println!("connecting to {} at {address}", options.peer);
     let connection = tokio::select! {
         biased;
-        _ = stop_requested(stop) => return Ok(None),
+        _ = stop_requested(stop) => {
+            tracing::info!(elapsed_ms = connecting.elapsed().as_millis() as u64, "cancelled during connection");
+            return Ok(None);
+        },
         result = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        connect_input(&endpoint.0, address, &client_config),
+        connect_input(endpoint, address, client_config),
     )
         => result.context("input connection timed out")??,
     };
+    tracing::info!(
+        elapsed_ms = connecting.elapsed().as_millis() as u64,
+        "QUIC connection established"
+    );
 
     let (session_events, mut events) = mpsc::channel(128);
+    let negotiating = Instant::now();
     let session = tokio::select! {
         biased;
-        _ = stop_requested(stop) => return Ok(None),
+        _ = stop_requested(stop) => {
+            tracing::info!("cancelled during session negotiation");
+            return Ok(None);
+        },
         result = start_session(
         connection,
         options.peer.clone(),
@@ -292,6 +382,11 @@ async fn run_source(
         session_events,
         ) => result?,
     };
+    tracing::info!(
+        session_id = session.id(),
+        elapsed_ms = negotiating.elapsed().as_millis() as u64,
+        "input session negotiated"
+    );
 
     let mut awdl_lease = None;
     let mut prepared = None;
@@ -315,6 +410,8 @@ async fn run_source(
             };
         }
         if let Some(handoff) = &options.handoff {
+            let preparing = Instant::now();
+            tracing::info!("desktop preparation starting");
             let mut token_bytes = [0_u8; 8];
             getrandom::fill(&mut token_bytes)
                 .map_err(|error| anyhow!("could not create a desktop handoff token: {error}"))?;
@@ -328,12 +425,16 @@ async fn run_source(
             prepared = Some(token);
             let response = tokio::select! {
                 biased;
-                _ = stop_requested(stop) => return Ok(()),
+                _ = stop_requested(stop) => {
+                    tracing::info!(elapsed_ms = preparing.elapsed().as_millis() as u64, "cancelled during desktop preparation");
+                    return Ok(());
+                },
                 response = session.desktop_request(request) => response.context(
-                    "Could not prepare desktop handoff. Update zflow on both computers and enable desktop handoff in the Ubuntu app"
+                    "Could not prepare desktop handoff. On Ubuntu, run just install-linux to update and restart the installed zflowd service; just run updates only the GUI. If the GNOME integration was newly installed, log out and back in, then enable desktop handoff in the Ubuntu app"
                 )?,
             };
             validate_prepared(handoff, response)?;
+            tracing::info!(elapsed_ms = preparing.elapsed().as_millis() as u64, "desktop preparation completed");
         }
         if *stop.borrow() || stop.has_changed().is_err() {
             return Ok(());
@@ -342,7 +443,10 @@ async fn run_source(
             bail!("release held keys and buttons before crossing to the other computer");
         }
         if let Some(handoff) = &options.handoff {
-            validate_entry_position(handoff.entry_position, cursor_position()?)?;
+            let current = cursor_position()?;
+            tracing::debug!(expected_x = handoff.entry_position.x, expected_y = handoff.entry_position.y,
+                current_x = current.x, current_y = current.y, "checking cursor before capture");
+            validate_entry_position(handoff.entry_region, current)?;
             if local_desktop.as_ref() != Some(&active_desktop_rectangles()?) {
                 bail!("the Mac desktop changed while connecting; refresh and save its layout");
             }
@@ -358,7 +462,16 @@ async fn run_source(
         })?;
         activation_started = true;
 
-        let mut capture = MacCapture::start(raw_available, options.handoff.as_ref().map(|h| h.entry_position))?;
+        let capture_start = Instant::now();
+        tracing::debug!("native capture starting");
+        let mut capture = MacCapture::start(raw_available, options.handoff.as_ref().map(|h| h.entry_region))
+            .inspect_err(|error| {
+                tracing::warn!(elapsed_ms = capture_start.elapsed().as_millis() as u64,
+                    cursor = ?cursor_position().ok().map(|p| (p.x, p.y)),
+                    error = %error, "native capture start rejected");
+            })?;
+        tracing::info!(elapsed_ms = capture_start.elapsed().as_millis() as u64,
+            connection_to_capture_ms = connecting.elapsed().as_millis() as u64, "native capture started");
         let _ = status.send(SourceStatus::Sharing);
         println!(
             "remote input active: raw_touch={}; escape with Ctrl+Cmd+Backspace or Ctrl+C",
@@ -372,6 +485,10 @@ async fn run_source(
         let mut touch_active = false;
         let mut last_touch = Instant::now();
         let mut terminal_error = None;
+        let mut stop_reason = "stop requested";
+        let mut captured_events = 0_u64;
+        let mut last_capture_poll = Instant::now();
+        let mut max_poll_gap = Duration::ZERO;
         let desktop_poll = poll_desktop(&session, prepared);
         tokio::pin!(desktop_poll);
 
@@ -383,6 +500,8 @@ async fn run_source(
                     match response {
                         Ok(DesktopResponse::Active) => desktop_poll.set(poll_desktop(&session, prepared)),
                         Ok(DesktopResponse::Returned { position }) => {
+                            stop_reason = "GNOME return edge";
+                            tracing::info!(position, "receiver reported return edge");
                             if let Some(handoff) = &options.handoff
                                 && (position < handoff.start || position > handoff.end)
                             {
@@ -393,14 +512,17 @@ async fn run_source(
                             break;
                         },
                         Ok(DesktopResponse::Unavailable { reason }) => {
+                            stop_reason = "desktop unavailable";
                             terminal_error = Some(anyhow!("receiver desktop unavailable: {reason}"));
                             break;
                         },
                         Ok(_) => {
+                            stop_reason = "unexpected desktop response";
                             terminal_error = Some(anyhow!("unexpected receiver desktop response"));
                             break;
                         },
                         Err(error) => {
+                            stop_reason = "desktop request failed";
                             terminal_error = Some(error);
                             break;
                         }
@@ -408,13 +530,18 @@ async fn run_source(
                 },
                 _ = awdl_renewal.tick(), if awdl_lease.is_some() => {
                     if let Err(error) = awdl_lease.as_mut().expect("active AWDL lease").renew().await {
+                        stop_reason = "AWDL renewal failed";
                         terminal_error = Some(error);
                         break;
                     }
                 }
                 _ = interval.tick() => {
+                    max_poll_gap = max_poll_gap.max(last_capture_poll.elapsed());
+                    last_capture_poll = Instant::now();
                     while let Some(event) = capture.poll() {
+                        captured_events += 1;
                         if event.kind == NativeEventKind::Escape as u32 {
+                            stop_reason = "native escape event";
                             break;
                         }
                         if event.kind == NativeEventKind::Touch as u32 {
@@ -426,12 +553,16 @@ async fn run_source(
                         }) {
                             Ok(()) => {},
                             Err(error) => {
+                                stop_reason = "capture forwarding failed";
                                 terminal_error = Some(error);
                                 break;
                             }
                         }
                     }
                     if capture.stop_requested() || terminal_error.is_some() {
+                        if terminal_error.is_none() && stop_reason != "native escape event" {
+                            stop_reason = "native capture requested stop";
+                        }
                         break;
                     }
                     if touch_active && last_touch.elapsed() >= TOUCH_STALE_TIMEOUT {
@@ -454,14 +585,17 @@ async fn run_source(
                             break;
                         }
                         Some(SessionEventKind::Closed { reason }) => {
+                            stop_reason = "input session closed";
                             terminal_error = Some(anyhow!("input session closed: {reason}"));
                             break;
                         }
                         Some(SessionEventKind::OutboundEnded) => {
+                            stop_reason = "remote ownership ended";
                             terminal_error = Some(anyhow!("remote input ownership ended"));
                             break;
                         }
                         None => {
+                            stop_reason = "session event channel closed";
                             terminal_error = Some(anyhow!("input session event channel closed"));
                             break;
                         }
@@ -470,9 +604,29 @@ async fn run_source(
             }
         }
 
-        if let Err(error) = capture.stop() {
+        tracing::info!(reason = stop_reason, captured_events,
+            active_ms = capture_start.elapsed().as_millis() as u64,
+            max_capture_poll_gap_ms = max_poll_gap.as_millis() as u64,
+            error = ?terminal_error.as_ref().map(|error| format!("{error:#}")), "stopping native capture");
+        let return_point = returned.and_then(|position| {
+            let result = options.handoff.as_ref().context("missing desktop return mapping")
+                .and_then(|handoff| handoff.return_mapping.position(position))
+                .and_then(|point| {
+                    anyhow::ensure!(local_desktop.as_ref() == Some(&active_desktop_rectangles()?),
+                        "the Mac desktop changed before returning input");
+                    Ok(CursorPosition { x: f64::from(point.x), y: f64::from(point.y) })
+                });
+            match result {
+                Ok(point) => Some(point),
+                Err(error) => { terminal_error.get_or_insert(error); None }
+            }
+        });
+        if let Err(error) = capture.stop_at(return_point) {
             eprintln!("{error:#}");
             terminal_error.get_or_insert(error);
+        } else if return_point.is_some() {
+            tracing::info!(point = ?return_point, "Mac cursor positioned before local input resumed");
+            let _ = status.send(SourceStatus::LocalInputRestored);
         }
         if touch_active {
             let _ = session.capture(touch_frame(TouchState::default()));
@@ -482,6 +636,7 @@ async fn run_source(
     }.await;
     let mut result = result;
     if activation_started {
+        let releasing = Instant::now();
         let released = tokio::time::timeout(
             Duration::from_millis(200),
             session.end_outbound(SessionCloseReason::LocalRelease),
@@ -489,6 +644,11 @@ async fn run_source(
         .await
         .context("timed out releasing remote input")
         .and_then(|result| result);
+        tracing::info!(
+            elapsed_ms = releasing.elapsed().as_millis() as u64,
+            success = released.is_ok(),
+            "remote input release completed"
+        );
         if let Err(error) = released {
             eprintln!("Could not confirm remote input release: {error:#}");
             if result.is_ok() && returned.is_some() {
@@ -498,10 +658,17 @@ async fn run_source(
         }
     }
     if let Some(token) = prepared {
+        let finishing = Instant::now();
         let finished = session
             .desktop_request(DesktopRequest::Finish { token })
             .await;
-        if let Err(error) = validate_finished(finished) {
+        let finished = validate_finished(finished);
+        tracing::info!(
+            elapsed_ms = finishing.elapsed().as_millis() as u64,
+            success = finished.is_ok(),
+            "desktop handoff cleanup completed"
+        );
+        if let Err(error) = finished {
             eprintln!("Could not confirm desktop handoff cleanup: {error:#}");
             if result.is_ok() && returned.is_some() {
                 result = Err(error);
@@ -509,7 +676,6 @@ async fn run_source(
         }
     }
     session.close(SessionCloseReason::LocalRelease);
-    endpoint.0.close(0_u32.into(), b"foreground source stopped");
     if let Some(lease) = awdl_lease.take()
         && let Err(error) = lease.release().await
     {
@@ -543,15 +709,11 @@ fn handoff_token(random: [u8; 8]) -> u64 {
     (u64::from_ne_bytes(random) & crate::desktop::MAX_TOKEN).max(1)
 }
 
-fn validate_entry_position(expected: CursorPosition, current: CursorPosition) -> Result<()> {
-    if !expected.x.is_finite()
-        || !expected.y.is_finite()
-        || !current.x.is_finite()
-        || !current.y.is_finite()
-        || (expected.x - current.x).abs() > 8.0
-        || (expected.y - current.y).abs() > 8.0
-    {
-        bail!("crossing cancelled because the Mac cursor moved while connecting");
+fn validate_entry_position(region: DesktopRect, current: CursorPosition) -> Result<()> {
+    if !region.contains(current) {
+        bail!(
+            "crossing cancelled because the Mac cursor left the configured edge while connecting"
+        );
     }
     Ok(())
 }
@@ -822,10 +984,10 @@ unsafe extern "C" {
     fn zflow_mac_warp_cursor(position: CursorPosition) -> i32;
     fn zflow_mac_input_is_neutral() -> i32;
     fn zflow_mac_raw_touch_available() -> i32;
-    fn zflow_mac_capture_start(raw_touch: i32, entry: *const CursorPosition) -> i32;
+    fn zflow_mac_capture_start(raw_touch: i32, entry: *const DesktopRect) -> i32;
+    fn zflow_mac_capture_stop_at(position: *const CursorPosition) -> i32;
     fn zflow_mac_capture_poll(event: *mut NativeEvent) -> i32;
     fn zflow_mac_capture_stop_requested() -> i32;
-    fn zflow_mac_capture_stop() -> i32;
     fn zflow_mac_capture_last_error() -> *const c_char;
     #[cfg(test)]
     fn zflow_mac_modifier_pressed(keycode: u16, flags: u64) -> u8;
@@ -849,7 +1011,7 @@ impl MacCapture {
         unsafe { zflow_mac_raw_touch_available() == 1 }
     }
 
-    fn start(raw_touch: bool, entry: Option<CursorPosition>) -> Result<Self> {
+    fn start(raw_touch: bool, entry: Option<DesktopRect>) -> Result<Self> {
         // SAFETY: start initializes the native thread before returning.
         let status = unsafe {
             zflow_mac_capture_start(
@@ -878,9 +1040,15 @@ impl MacCapture {
     }
 
     fn stop(&mut self) -> Result<()> {
+        self.stop_at(None)
+    }
+
+    fn stop_at(&mut self, position: Option<CursorPosition>) -> Result<()> {
         if self.running {
             // SAFETY: stop is idempotent after a successful start and joins the native thread.
-            let status = unsafe { zflow_mac_capture_stop() };
+            let status = unsafe {
+                zflow_mac_capture_stop_at(position.as_ref().map_or(std::ptr::null(), |point| point))
+            };
             self.running = false;
             if status < 0 {
                 bail!("macOS capture ended with an error: {}", Self::last_error());
@@ -916,6 +1084,62 @@ mod tests {
 
     const ALPHA_SHIFT: u64 = 0x0001_0000;
 
+    #[tokio::test]
+    async fn source_worker_shutdown_notifies_peer_before_its_runtime_exits() {
+        use crate::transport::{accept_input, input_server_config};
+
+        let left_dir = tempfile::tempdir().unwrap();
+        let right_dir = tempfile::tempdir().unwrap();
+        let left = Identity::load_or_create(left_dir.path()).unwrap();
+        let right = Identity::load_or_create(right_dir.path()).unwrap();
+        let client_config = input_client_config(&left, right.spki()).unwrap();
+        let server_config = input_server_config(&right, left.spki()).unwrap();
+        let server =
+            Endpoint::server(server_config.quinn_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        // A crossing uses a fresh thread and runtime. Observe each disconnect
+        // from a separate runtime, including when the client runtime is gone.
+        for _ in 0..3 {
+            let client_config = client_config.clone();
+            let (accepted, ready) = tokio::sync::oneshot::channel();
+            let worker = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let endpoint = SourceEndpoint(
+                            Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap(),
+                        );
+                        let _connection = connect_input(&endpoint.0, address, &client_config)
+                            .await
+                            .unwrap();
+                        ready.await.unwrap();
+                        endpoint.shutdown().await.unwrap();
+                    });
+            });
+            let connection = tokio::time::timeout(Duration::from_secs(3), async {
+                accept_input(server.accept().await.unwrap(), &server_config)
+                    .await
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            accepted.send(()).unwrap();
+            tokio::task::spawn_blocking(move || worker.join().unwrap())
+                .await
+                .unwrap();
+            let reason = tokio::time::timeout(Duration::from_millis(250), connection.closed())
+                .await
+                .expect("the peer must not wait for the old connection's idle timeout");
+            assert!(matches!(
+                reason,
+                quinn::ConnectionError::ApplicationClosed(_)
+            ));
+        }
+        server.close(0_u32.into(), b"test finished");
+    }
+
     #[test]
     fn handoff_tokens_fit_the_receiver_javascript_integer_range() {
         assert_eq!(handoff_token([0; 8]), 1);
@@ -924,57 +1148,68 @@ mod tests {
     }
 
     #[test]
-    fn entry_admission_rejects_cursor_movement_during_connection_setup() {
-        let expected = CursorPosition {
-            x: -1000.0,
-            y: 200.0,
+    fn entry_admission_allows_recorded_along_edge_motion_but_rejects_departure() {
+        let region = DesktopRect {
+            x: 0.0,
+            y: 62.0,
+            width: 9.0,
+            height: 1620.0,
         };
+        for y in [928.8125, 917.8125, 62.0, 1681.99] {
+            assert!(validate_entry_position(region, CursorPosition { x: 0.0, y }).is_ok());
+        }
+        for point in [
+            CursorPosition {
+                x: 9.0,
+                y: 917.8125,
+            },
+            CursorPosition {
+                x: -1.0,
+                y: 917.8125,
+            },
+            CursorPosition { x: 0.0, y: 61.99 },
+            CursorPosition { x: 0.0, y: 1682.0 },
+            CursorPosition {
+                x: f64::NAN,
+                y: 917.8125,
+            },
+        ] {
+            assert!(validate_entry_position(region, point).is_err());
+        }
         assert!(
-            validate_entry_position(
-                expected,
-                CursorPosition {
-                    x: -992.0,
-                    y: 192.0
-                }
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_entry_position(
-                expected,
-                CursorPosition {
-                    x: -991.0,
-                    y: 200.0
-                }
-            )
-            .is_err()
-        );
-        assert!(
-            validate_entry_position(
-                expected,
-                CursorPosition {
-                    x: -1000.0,
-                    y: 209.0
-                }
-            )
-            .is_err()
-        );
-        assert!(
-            validate_entry_position(
-                expected,
-                CursorPosition {
-                    x: f64::NAN,
-                    y: 200.0
-                }
-            )
-            .is_err()
+            !DesktopRect {
+                width: f64::INFINITY,
+                ..region
+            }
+            .contains(CursorPosition { x: 0.0, y: 100.0 })
         );
     }
 
     #[test]
     fn handoff_requires_prepared_geometry_to_match_saved_target() {
         let handoff = HandoffOptions {
+            return_mapping: crate::desktop::ReturnMapping {
+                geometry: crate::desktop::Geometry {
+                    monitors: vec![crate::desktop::Rect {
+                        x: -100,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                    }],
+                },
+                edge: Edge::Right,
+                local_start: 0.0,
+                local_end: 1.0,
+                remote_start: 0.0,
+                remote_end: 1.0,
+            },
             entry_position: CursorPosition { x: -1.0, y: 50.0 },
+            entry_region: DesktopRect {
+                x: -9.0,
+                y: 0.0,
+                width: 9.0,
+                height: 100.0,
+            },
             edge: Edge::Left,
             start: 0,
             end: crate::desktop::FRACTION_MAX,

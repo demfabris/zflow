@@ -56,9 +56,61 @@ the native-desktop and privileged input tests remained ignored. The containers
 had no network and read-only access to the build artifacts. The Mac release app
 bundle passed plist and signature checks. A native window inspection used a
 disposable missing configuration with sharing off; it did not grant permissions,
-pair real computers, or redirect input. The saved physical Ubuntu SSH address
-failed host-key verification, so this session did not deploy the new service or
-complete the live GNOME handoff run.
+pair real computers, or redirect input. The initial Ubuntu SSH attempt failed
+host-key verification. Later investigation matched the LAN server's key to the
+existing `ubuntu` known-host entry and connected as `demfabris` using
+`ssh -o HostKeyAlias=ubuntu -o StrictHostKeyChecking=yes demfabris@192.168.1.118`.
+Ubuntu ran a September 10 installed daemon alongside the September 14 GUI;
+its journal rejected edge handoff with `unknown message family 7`. GNOME 50.1
+had the extension files but had not loaded the new extension. The installer
+now restarts an existing daemon after replacement, and `just install-linux`
+builds and installs both binaries. The user completed installation and
+logout/login; SSH confirmed the updated daemon and an ACTIVE GNOME extension.
+The user reported a successful round trip followed by a failed reconnect.
+Ubuntu logged `peer macbook already has an established input connection`.
+
+The Mac source now closes and drains its QUIC endpoint before its per-crossing
+runtime exits, including cancellation and negotiation failure paths. A bounded
+shutdown failure prevents rearming. A regression uses three short-lived client
+runtimes and confirms that the remote sees each disconnect. Fifteen Mac tests
+and 48 GUI tests passed (one native desktop test ignored). Twenty consecutive
+authenticated Snapshot connections to the real Ubuntu desktop passed with
+orderly shutdown; these checks did not capture input. Receiver cleanup also
+releases its lease before waiting for sessions and ignores obsolete broker IDs;
+four Linux desktop tests passed, including the two new cleanup regressions.
+The subsequent manual run still had abrupt transitions and stopped sharing;
+the Mac reported cursor movement during connection preparation, and a later
+Finish request timed out. This workflow remains unqualified. `just debug mac`
+and `just debug linux` now save timestamped logs grouped by crossing and include
+stage durations, cancellation displacement, capture-loop gaps and stop reasons.
+`just debug-daemon` enables receiver request, seat-check and compositor timings
+until reboot. Request diagnostics distinguish cancellation, timeout, closed
+response channels and unavailable queues. Successful fast polling stays at trace
+level. Focused Mac/receiver tests and Clippy passed; the debug launcher help path
+produced a private log file. Reproduce the same crossings with these builds and
+compare both logs and the Ubuntu journal before changing admission limits.
+
+The 17:17:16 UTC reproduction confirmed along-edge cancellation: the Mac stayed
+at x=0 while y moved from 928.8125 to 917.8125 during preparation. Its GUI
+cancelled at 40 ms; Ubuntu finished Prepare in 20 ms and then cleaned up after
+the Mac disconnected. Admission now uses a narrow rectangle along the configured
+crossing range, clipped to the entry monitor. It keeps the eight-pixel inward
+allowance but accepts motion along that edge. GUI, Rust preflight, and both native
+startup checks use the same rectangle. Fifteen Mac tests, four geometry tests,
+and native fake-cursor tests cover the recorded motion, all four orientations,
+partial ranges, monitor gaps, inward retreat and invalid rectangles. Live
+crossing verification with this Mac build remains pending.
+
+The next manual run improved crossing admission but exposed a delayed return
+warp. At 17:23:00 UTC, native capture stopped at .207 while the GUI positioned
+the Mac cursor at .811, after Finish and QUIC shutdown. Cursor positioning now
+happens inside native capture cleanup, before reconnecting and showing the local
+cursor. The GUI only rearms after network cleanup; it never positions the cursor
+at that later point. Shared return mapping retains four-edge, partial-overlap
+and monitor-gap checks. Native regressions assert warp-before-reconnect ordering,
+one warp only, and input restoration after invalid, late or failed warp requests.
+These checks passed along with the focused Mac/geometry tests and Clippy.
+The user still needs to verify the returning cursor with the updated Mac build.
 
 ## Configuration GUI
 

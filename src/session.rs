@@ -155,6 +155,28 @@ pub struct SessionHandle {
     desktop_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
+pub(crate) fn desktop_operation(request: &crate::desktop::DesktopRequest) -> &'static str {
+    use crate::desktop::DesktopRequest::*;
+    match request {
+        Snapshot => "snapshot",
+        Prepare { .. } => "prepare",
+        Poll { .. } => "poll",
+        Finish { .. } => "finish",
+    }
+}
+
+pub(crate) fn desktop_response_kind(response: &crate::desktop::DesktopResponse) -> &'static str {
+    use crate::desktop::DesktopResponse::*;
+    match response {
+        Snapshot { .. } => "snapshot",
+        Prepared { .. } => "prepared",
+        Active => "active",
+        Returned { .. } => "returned",
+        Finished => "finished",
+        Unavailable { .. } => "unavailable",
+    }
+}
+
 impl SessionHandle {
     /// One scoped desktop operation. A timeout closes transport so a late warp cannot
     /// leave the source believing that a cancelled handoff completed.
@@ -163,13 +185,22 @@ impl SessionHandle {
         request: crate::desktop::DesktopRequest,
     ) -> Result<crate::desktop::DesktopResponse> {
         request.validate()?;
+        let operation = desktop_operation(&request);
+        let started = Instant::now();
+        let id = self
+            .desktop_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         struct CancelOnDrop {
             handle: SessionHandle,
             completed: bool,
+            id: u64,
+            operation: &'static str,
+            started: Instant,
         }
         impl Drop for CancelOnDrop {
             fn drop(&mut self) {
                 if !self.completed {
+                    tracing::debug!(peer = %self.handle.peer, session_id = self.handle.id, request_id = self.id, operation = self.operation, elapsed_ms = self.started.elapsed().as_millis() as u64, "desktop request wait canceled; closing transport");
                     self.handle.close(SessionCloseReason::BackendUnavailable);
                 }
             }
@@ -177,15 +208,26 @@ impl SessionHandle {
         let mut guard = CancelOnDrop {
             handle: self.clone(),
             completed: false,
+            id,
+            operation,
+            started,
         };
-        let id = self
-            .desktop_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         anyhow::ensure!(id != 0, "Desktop request ID exhausted");
         let (reply, receiver) = oneshot::channel();
-        self.commands
+        if let Err(error) = self
+            .commands
             .try_send(SessionCommand::Desktop { id, request, reply })
-            .map_err(|_| anyhow!("Desktop request queue unavailable"))?;
+        {
+            guard.completed = true;
+            self.close(SessionCloseReason::BackendUnavailable);
+            tracing::warn!(peer = %self.peer, session_id = self.id, request_id = id, operation, %error, "desktop request queue unavailable");
+            bail!("Desktop {operation} request queue unavailable: {error}");
+        }
+        if operation != "poll" {
+            tracing::debug!(peer = %self.peer, session_id = self.id, request_id = id, operation, "desktop request queued");
+        } else {
+            tracing::trace!(peer = %self.peer, session_id = self.id, request_id = id, operation, "desktop request queued");
+        }
         match tokio::time::timeout(
             Duration::from_millis(crate::desktop::REQUEST_TIMEOUT_MS),
             receiver,
@@ -194,11 +236,34 @@ impl SessionHandle {
         {
             Ok(Ok(response)) => {
                 guard.completed = true;
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let outcome = desktop_response_kind(&response);
+                if operation != "poll" || elapsed_ms >= 150 || outcome != "active" {
+                    tracing::debug!(peer = %self.peer, session_id = self.id, request_id = id, operation, outcome, elapsed_ms, "desktop request completed");
+                } else {
+                    tracing::trace!(peer = %self.peer, session_id = self.id, request_id = id, operation, outcome, elapsed_ms, "desktop request completed");
+                }
+                if let crate::desktop::DesktopResponse::Unavailable { reason } = &response {
+                    tracing::warn!(peer = %self.peer, session_id = self.id, request_id = id, operation, %reason, "desktop receiver unavailable");
+                }
                 Ok(response)
             }
-            _ => {
+            Ok(Err(_)) => {
+                guard.completed = true;
                 self.close(SessionCloseReason::BackendUnavailable);
-                bail!("Desktop request timed out or session closed")
+                tracing::warn!(peer = %self.peer, session_id = self.id, request_id = id, operation, elapsed_ms = started.elapsed().as_millis() as u64, "desktop response channel closed before reply");
+                bail!(
+                    "Desktop {operation} response channel closed before reply; input session ended"
+                )
+            }
+            Err(_) => {
+                guard.completed = true;
+                self.close(SessionCloseReason::BackendUnavailable);
+                tracing::warn!(peer = %self.peer, session_id = self.id, request_id = id, operation, elapsed_ms = started.elapsed().as_millis() as u64, timeout_ms = crate::desktop::REQUEST_TIMEOUT_MS, "desktop request timed out");
+                bail!(
+                    "Desktop {operation} request timed out after {} ms",
+                    crate::desktop::REQUEST_TIMEOUT_MS
+                )
             }
         }
     }
@@ -318,6 +383,7 @@ pub async fn start_session(
         let reason = result
             .err()
             .map_or_else(|| "session closed".to_owned(), |error| error.to_string());
+        tracing::debug!(%peer, session_id = id, %reason, "input session actor stopped");
         let _ = events
             .send(SessionEvent {
                 session_id: id,
@@ -402,6 +468,7 @@ async fn run_session(
         if let Some((id, receiver, started)) = desktop_reply.as_mut() {
             match receiver.try_recv() {
                 Ok(response) => {
+                    tracing::trace!(%peer, session_id, request_id = *id, outcome = desktop_response_kind(&response), elapsed_ms = started.elapsed().as_millis() as u64, "desktop reply sending to peer");
                     channels.control_send.send_desktop(crate::desktop::DesktopMessage::Response { id: *id, response }).await?;
                     desktop_reply = None;
                 }
@@ -419,6 +486,7 @@ async fn run_session(
                 && (!matches!(request, crate::desktop::DesktopRequest::Finish { .. }) || receiver.active_context().is_none());
             if ready && desktop_reply.is_none() {
                 let (id, request, started) = desktop_incoming.take().unwrap();
+                tracing::trace!(%peer, session_id, request_id = id, operation = desktop_operation(&request), elapsed_ms = started.elapsed().as_millis() as u64, "desktop request dispatching to receiver");
                 let (reply, receipt) = oneshot::channel();
                 emit_event(&events, SessionEvent { session_id, peer: peer.clone(), kind: SessionEventKind::Desktop {request, reply} })?;
                 desktop_reply = Some((id, receipt, started));
@@ -432,8 +500,10 @@ async fn run_session(
                 match command {
                     SessionCommand::Desktop {id,request,reply} => {
                         if desktop_waiter.is_some() {
+                            tracing::debug!(%peer, session_id, request_id = id, operation = desktop_operation(&request), "desktop request rejected while previous reply pending");
                             let _ = reply.send(crate::desktop::DesktopResponse::unavailable("A desktop request is already pending"));
                         } else {
+                            tracing::trace!(%peer, session_id, request_id = id, operation = desktop_operation(&request), "desktop request sending to peer");
                             channels.control_send.send_desktop(crate::desktop::DesktopMessage::Request {id,request}).await?;
                             desktop_waiter=Some((id,reply));
                         }
@@ -517,10 +587,12 @@ async fn run_session(
                 let message = received?;
                 match message {
                     InputControlMessage::Desktop(crate::desktop::DesktopMessage::Request {id,request}) => {
+                        tracing::trace!(%peer, session_id, request_id = id, operation = desktop_operation(&request), "desktop request received from peer");
                         anyhow::ensure!(desktop_incoming.is_none() && desktop_reply.is_none(), "Overlapping desktop requests");
                         desktop_incoming=Some((id,request,Instant::now()));
                     }
                     InputControlMessage::Desktop(crate::desktop::DesktopMessage::Response {id,response}) => {
+                        tracing::trace!(%peer, session_id, request_id = id, outcome = desktop_response_kind(&response), "desktop response received from peer");
                         let (expected,reply)=desktop_waiter.take().context("Unexpected desktop response")?;
                         anyhow::ensure!(id == expected, "Desktop response ID does not match request");
                         let _=reply.send(response);
@@ -2801,9 +2873,41 @@ mod tests {
         })
         .await
         .expect("Bridge loss must release the held key");
-        assert!(pending.await.unwrap().is_err());
+        let error = pending.await.unwrap().unwrap_err().to_string();
+        assert!(
+            error.contains("response channel closed before reply"),
+            "{error}"
+        );
         tokio::time::timeout(Duration::from_secs(1), right.connection.closed())
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn desktop_request_diagnostics_distinguish_timeout_and_closed_queue() {
+        use crate::desktop::DesktopRequest;
+        let (left, _right, _events, _client, _server) = desktop_test_pair().await;
+        let mut source = left.clone();
+        let (commands, _held_receiver) = mpsc::channel(1);
+        source.commands = commands;
+        let error = source
+            .desktop_request(DesktopRequest::Snapshot)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("request timed out after 1000 ms"), "{error}");
+
+        let (commands, receiver) = mpsc::channel(1);
+        source.commands = commands;
+        drop(receiver);
+        let error = source
+            .desktop_request(DesktopRequest::Snapshot)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("request queue unavailable: channel closed"),
+            "{error}"
+        );
     }
 }

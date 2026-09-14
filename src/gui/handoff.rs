@@ -1,6 +1,6 @@
 use anyhow::{Result, ensure};
 
-use crate::desktop::{Edge, FRACTION_MAX, Geometry, Point, Rect};
+use crate::desktop::{Edge, FRACTION_MAX, Geometry, Point, Rect, ReturnMapping};
 
 use super::layout_model::{self, Layout};
 
@@ -13,35 +13,13 @@ pub(super) struct Handoff {
     pub position: u32,
     pub expected_width: u32,
     pub expected_height: u32,
-    local_edge: Edge,
-    local_start: f64,
-    local_end: f64,
-    remote_start: f64,
-    remote_end: f64,
-    geometry: Geometry,
+    pub entry_region: Rect,
+    pub return_mapping: ReturnMapping,
 }
 
 impl Handoff {
     pub fn matches_geometry(&self, geometry: &Geometry) -> bool {
-        self.geometry == *geometry
-    }
-
-    pub fn return_position(&self, position: u32) -> Result<Point> {
-        ensure!(
-            position >= self.start && position <= self.end,
-            "The receiver returned an invalid crossing position"
-        );
-        let remote = f64::from(position) / f64::from(FRACTION_MAX);
-        let progress =
-            ((remote - self.remote_start) / (self.remote_end - self.remote_start)).clamp(0.0, 1.0);
-        let along = self.local_start + progress * (self.local_end - self.local_start);
-        let bounds = self.geometry.bounds()?;
-        let point = edge_point(bounds, self.local_edge, along);
-        ensure!(
-            contains(&self.geometry, point),
-            "The return point is outside the active Mac displays; check the layout"
-        );
-        Ok(point)
+        self.return_mapping.geometry == *geometry
     }
 }
 
@@ -132,15 +110,89 @@ pub(super) fn crossing(
             position: fraction(target),
             expected_width: layout.monitors[transition.target].width,
             expected_height: layout.monitors[transition.target].height,
-            local_edge,
-            local_start: transition.source_start,
-            local_end: transition.source_end,
-            remote_start: transition.target_start,
-            remote_end: transition.target_end,
-            geometry: geometry.clone(),
+            entry_region: entry_region(
+                geometry,
+                local_edge,
+                transition.source_start,
+                transition.source_end,
+                current,
+            )?,
+            return_mapping: ReturnMapping {
+                edge: local_edge,
+                local_start: transition.source_start,
+                local_end: transition.source_end,
+                remote_start: transition.target_start,
+                remote_end: transition.target_end,
+                geometry: geometry.clone(),
+            },
         });
     }
     None
+}
+
+fn entry_region(
+    geometry: &Geometry,
+    edge: Edge,
+    start: f64,
+    end: f64,
+    entry: Point,
+) -> Option<Rect> {
+    let bounds = geometry.bounds().ok()?;
+    let monitor = geometry
+        .monitors
+        .iter()
+        .find(|monitor| monitor.contains(entry))?;
+    // Keep the original eight-pixel inward allowance, but let the pointer
+    // travel along the connected part of this monitor during preparation.
+    let vertical = matches!(edge, Edge::Left | Edge::Right);
+    let span = if vertical {
+        bounds.height
+    } else {
+        bounds.width
+    };
+    let along_start = (start * f64::from(span)).round() as i32;
+    let along_end = (end * f64::from(span)).round() as i32;
+    let depth = 9.min(if vertical {
+        bounds.width
+    } else {
+        bounds.height
+    }) as i32;
+    let (x, y, right, bottom) = match edge {
+        Edge::Left => (
+            bounds.x,
+            bounds.y + along_start,
+            bounds.x + depth,
+            bounds.y + along_end,
+        ),
+        Edge::Right => (
+            bounds.x + bounds.width as i32 - depth,
+            bounds.y + along_start,
+            bounds.x + bounds.width as i32,
+            bounds.y + along_end,
+        ),
+        Edge::Top => (
+            bounds.x + along_start,
+            bounds.y,
+            bounds.x + along_end,
+            bounds.y + depth,
+        ),
+        Edge::Bottom => (
+            bounds.x + along_start,
+            bounds.y + bounds.height as i32 - depth,
+            bounds.x + along_end,
+            bounds.y + bounds.height as i32,
+        ),
+    };
+    let x = x.max(monitor.x);
+    let y = y.max(monitor.y);
+    let right = right.min(monitor.x + monitor.width as i32);
+    let bottom = bottom.min(monitor.y + monitor.height as i32);
+    (right > x && bottom > y).then_some(Rect {
+        x,
+        y,
+        width: (right - x) as u32,
+        height: (bottom - y) as u32,
+    })
 }
 
 fn fraction(value: f64) -> u32 {
@@ -153,37 +205,6 @@ fn opposite(edge: Edge) -> Edge {
         Edge::Right => Edge::Left,
         Edge::Top => Edge::Bottom,
         Edge::Bottom => Edge::Top,
-    }
-}
-
-fn edge_point(bounds: Rect, edge: Edge, along: f64) -> Point {
-    let inset_x = 3.min((bounds.width.saturating_sub(1) / 2) as i32);
-    let inset_y = 3.min((bounds.height.saturating_sub(1) / 2) as i32);
-    let x = bounds.x
-        + (along * f64::from(bounds.width))
-            .floor()
-            .clamp(0.0, f64::from(bounds.width - 1)) as i32;
-    let y = bounds.y
-        + (along * f64::from(bounds.height))
-            .floor()
-            .clamp(0.0, f64::from(bounds.height - 1)) as i32;
-    match edge {
-        Edge::Left => Point {
-            x: bounds.x + inset_x,
-            y,
-        },
-        Edge::Right => Point {
-            x: bounds.x + bounds.width as i32 - 1 - inset_x,
-            y,
-        },
-        Edge::Top => Point {
-            x,
-            y: bounds.y + inset_y,
-        },
-        Edge::Bottom => Point {
-            x,
-            y: bounds.y + bounds.height as i32 - 1 - inset_y,
-        },
     }
 }
 
@@ -259,10 +280,22 @@ mod tests {
             (0, 500_000, 250_000)
         );
         assert_eq!(
-            handoff.return_position(250_000).unwrap(),
+            handoff.return_mapping.position(250_000).unwrap(),
             Point { x: 996, y: 550 }
         );
-        assert!(handoff.return_position(500_001).is_err());
+        assert!(handoff.return_mapping.position(500_001).is_err());
+        assert_eq!(
+            handoff.entry_region,
+            Rect {
+                x: 991,
+                y: 300,
+                width: 9,
+                height: 500
+            }
+        );
+        assert!(handoff.entry_region.contains(Point { x: 999, y: 539 }));
+        assert!(!handoff.entry_region.contains(Point { x: 999, y: 299 }));
+        assert!(!handoff.entry_region.contains(Point { x: 990, y: 550 }));
     }
 
     #[test]
@@ -362,7 +395,23 @@ mod tests {
             validate(&layout, &geometry).unwrap();
             let handoff = crossing(&layout, &geometry, previous, current).unwrap();
             assert_eq!(handoff.edge, edge);
-            assert_eq!(handoff.return_position(handoff.position).unwrap(), returned);
+            assert!(handoff.entry_region.contains(current));
+            let along = match edge {
+                Edge::Left | Edge::Right => Point {
+                    y: current.y + 100,
+                    ..current
+                },
+                Edge::Top | Edge::Bottom => Point {
+                    x: current.x + 100,
+                    ..current
+                },
+            };
+            assert!(handoff.entry_region.contains(along));
+            assert!(!handoff.entry_region.contains(previous));
+            assert_eq!(
+                handoff.return_mapping.position(handoff.position).unwrap(),
+                returned
+            );
             assert!(crossing(&layout, &geometry, current, previous).is_none());
         }
     }
@@ -392,6 +441,16 @@ mod tests {
             Point { x: 999, y: 0 },
         )
         .unwrap();
-        assert!(handoff.return_position(750_000).is_err());
+        assert!(handoff.return_mapping.position(750_000).is_err());
+        assert_eq!(
+            handoff.entry_region,
+            Rect {
+                x: 991,
+                y: -200,
+                width: 9,
+                height: 300
+            }
+        );
+        assert!(!handoff.entry_region.contains(Point { x: 999, y: 100 }));
     }
 }

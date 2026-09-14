@@ -14,7 +14,10 @@ still gates the alpha label.
 
 Build the Mac app with `./scripts/build-macos-app.sh`, then open
 `target/release/zflow.app`. On Ubuntu, install the updated service and app with
-`./scripts/install.sh --gui`, then open zflow from the application menu.
+`just install-linux` (or `./scripts/install.sh --gui`), then open zflow from the
+application menu. Run this installation again after updating the code so the
+background daemon also gets the update. `just run linux` only builds and opens
+the GUI.
 Building the desktop app requires Rust 1.95 or newer. The Mac build uses an
 ad-hoc signature for local development; `--sign IDENTITY` selects your signing
 identity. OS permission behavior still needs validation for the chosen signature.
@@ -40,7 +43,9 @@ identity. OS permission behavior still needs validation for the chosen signature
 Ubuntu's GNOME extension supplies actual cursor position, entry placement,
 and directional return barriers while zflow keeps its existing uinput devices.
 The source authenticates the receiver and checks its current desktop size
-before capture. Return waits for Ubuntu's input-release acknowledgement.
+before capture. On return, the Mac places its cursor before restoring local
+input. Edge sharing rearms after Ubuntu acknowledges input release and the
+connection finishes closing.
 Desktop changes, expired handoffs, permission loss, or connection failure stop
 sharing. Refresh and save the layout after display changes, then enable again.
 Other Linux desktops do not provide this automatic return path yet.
@@ -388,7 +393,11 @@ With [just](https://just.systems/) installed, run these from the repository:
 ```sh
 just                         # List commands
 just run mac                 # Open the GUI on macOS
+just install-linux           # Install/update the Linux daemon and GUI; requires sudo
 just run linux               # Open the GUI on Linux
+just debug mac               # Run with diagnostics saved under target/logs
+just debug linux             # Run the Ubuntu GUI with diagnostics
+just debug-daemon            # Enable daemon debug logs until Ubuntu reboots; requires sudo
 just run mac --dark --config "/path with spaces/zflow.toml"
 just build mac               # Build the macOS GUI
 just build linux --release   # Build the Linux GUI in release mode
@@ -404,6 +413,28 @@ the host toolchain; they do not cross-compile or connect over SSH. Both GUI
 builds need Rust 1.95 or newer. `run` opens the configuration window without
 starting input capture. `build` produces `target/debug/zflow-gui`, or
 `target/release/zflow-gui` with `--release`; it does not package or install an app.
+
+On Ubuntu, run `just install-linux` after pulling changes. It builds the service
+and GUI, preserves your configuration and pairing, and restarts `zflowd` with
+the updated binary. Then enable desktop handoff in the Ubuntu app. A newly
+installed GNOME integration requires logging out and back in if GNOME does
+not recognize it yet.
+
+For crossing problems, close the existing apps, run `just install-linux` and
+`just debug-daemon` on Ubuntu, then use `just debug linux` and `just debug mac`.
+Enable desktop handoff and edge sharing again. Each debug run saves a timestamped
+log under `target/logs` with private file permissions. The Mac log groups each
+crossing's connection, preparation, capture, return and cleanup timings, including
+cursor displacement at cancellation. Ubuntu's GUI records GNOME calls; daemon
+logs include request queues and active-seat checks. Successful fast polls require
+trace logging; debug output includes slow polls and failures.
+
+Read the daemon log with `journalctl -u zflowd -o short-iso-precise --since "10 minutes ago"`.
+`RUST_LOG` overrides the GUI's default debug filter. `just debug-daemon` writes a
+service override under `/run/systemd/system/zflowd.service.d/debug.conf`, which
+disappears at reboot. To stop daemon debug logging earlier, remove that file with
+`sudo rm /run/systemd/system/zflowd.service.d/debug.conf`, then run
+`sudo systemctl daemon-reload` and `sudo systemctl restart zflowd`.
 
 `just check` requires Node.js for the GNOME extension tests. The protocol model and Linux runtime have deterministic tests that do not need
 root. The privileged runtime check needs read access to the selected

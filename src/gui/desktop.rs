@@ -37,6 +37,7 @@ impl DesktopReceiver {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
         let generation_ref = self.generation.clone();
+        tracing::debug!(generation, "starting desktop GUI receiver");
         let state = self.state.clone();
         let ctx = ctx.clone();
         let (cancel, receipt) = tokio::sync::oneshot::channel();
@@ -58,6 +59,9 @@ impl DesktopReceiver {
                     })
             })();
             if generation_ref.load(std::sync::atomic::Ordering::SeqCst) == generation {
+                if let Err(error) = &result {
+                    tracing::warn!(generation, error = %format_args!("{error:#}"), "desktop GUI receiver stopped");
+                }
                 *state.lock().unwrap_or_else(|e| e.into_inner()) = State {
                     active: false,
                     message: match result {
@@ -70,6 +74,7 @@ impl DesktopReceiver {
         });
     }
     pub fn stop(&mut self) {
+        tracing::debug!("stopping desktop GUI receiver");
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(cancel) = self.cancel.take() {
@@ -141,6 +146,7 @@ async fn run(
     }
     state.lock().unwrap_or_else(|e| e.into_inner()).message =
         "Ready to receive through the GNOME desktop".into();
+    tracing::info!(generation = expected, "desktop GUI receiver ready");
     ctx.request_repaint();
     loop {
         let request: DesktopRequest = crate::control::read_message(&mut stream).await?;
@@ -160,19 +166,53 @@ async fn call(
     proxy: &zbus::Proxy<'_>,
     request: &crate::desktop::DesktopRequest,
 ) -> anyhow::Result<crate::desktop::DesktopResponse> {
-    let json = serde_json::to_string(request)?;
-    let response: String = tokio::time::timeout(
-        std::time::Duration::from_millis(450),
-        proxy.call("Call", &(json,)),
-    )
-    .await??;
-    anyhow::ensure!(
-        response.len() <= crate::desktop::MAX_MESSAGE_BYTES,
-        "GNOME response exceeded limit"
-    );
-    let response: crate::desktop::DesktopResponse = serde_json::from_str(&response)?;
-    response.validate()?;
-    Ok(response)
+    let started = std::time::Instant::now();
+    let operation = crate::session::desktop_operation(request);
+    tracing::trace!(operation, "GNOME desktop RPC started");
+    let result = async {
+        let json = serde_json::to_string(request)?;
+        let response: String = tokio::time::timeout(
+            std::time::Duration::from_millis(450),
+            proxy.call("Call", &(json,)),
+        )
+        .await??;
+        anyhow::ensure!(
+            response.len() <= crate::desktop::MAX_MESSAGE_BYTES,
+            "GNOME response exceeded limit"
+        );
+        let response: crate::desktop::DesktopResponse = serde_json::from_str(&response)?;
+        response.validate()?;
+        Ok::<_, anyhow::Error>(response)
+    }
+    .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(response) => {
+            let outcome = crate::session::desktop_response_kind(response);
+            if operation != "poll" || elapsed_ms >= 150 || outcome != "active" {
+                tracing::debug!(
+                    operation,
+                    outcome,
+                    elapsed_ms,
+                    "GNOME desktop RPC completed"
+                );
+            } else {
+                tracing::trace!(
+                    operation,
+                    outcome,
+                    elapsed_ms,
+                    "GNOME desktop RPC completed"
+                );
+            }
+            if let crate::desktop::DesktopResponse::Unavailable { reason } = response {
+                tracing::warn!(operation, elapsed_ms, %reason, "GNOME desktop RPC unavailable");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(operation, elapsed_ms, error = %format_args!("{error:#}"), "GNOME desktop RPC failed")
+        }
+    }
+    result
 }
 
 #[cfg(not(target_os = "linux"))]

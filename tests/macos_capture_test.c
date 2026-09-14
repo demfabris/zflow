@@ -1,6 +1,7 @@
 #include <ApplicationServices/ApplicationServices.h>
 #include <assert.h>
 #include <dlfcn.h>
+#include <float.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -49,19 +50,24 @@ static bool background;
 static int hide_count;
 static int tap_calls;
 static CGPoint warped_position;
+static CGPoint cursor_position = {-1200, -50};
 static int held_key = -1;
 static int held_button = -1;
 static CGEventFlags held_flags;
 static int permission_prompts;
+static bool expect_return_warp;
+static CGError record(char call);
 
 static CGError fake_warp(CGPoint position) {
-  warped_position = position;
-  return kCGErrorSuccess;
+  if (expect_return_warp) assert(!connected && hide_count == 1 && background);
+  CGError error = record('W');
+  if (error == kCGErrorSuccess) warped_position = position;
+  return error;
 }
 
 static CGPoint fake_location(CGEventRef event) {
   assert(event);
-  return CGPointMake(-1200, -50);
+  return cursor_position;
 }
 
 static CGError fake_display_list(uint32_t capacity, CGDirectDisplayID *ids,
@@ -118,11 +124,41 @@ static void desktop_and_permission_tests(void) {
   held_flags = kCGEventFlagMaskAlphaShift; assert(zflow_mac_input_is_neutral());
   held_flags = 0;
   g_check_entry = true;
-  g_entry_position = position;
+  g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
   assert(capture_entry_allowed());
   held_key = 10; assert(!capture_entry_allowed()); held_key = -1;
   held_button = 1; assert(!capture_entry_allowed()); held_button = -1;
-  g_entry_position.x += 9; assert(!capture_entry_allowed());
+  cursor_position.y -= 11; assert(capture_entry_allowed());
+  cursor_position.y = 50; assert(capture_entry_allowed());
+  cursor_position.x = -1191; assert(!capture_entry_allowed());
+  assert(strstr(g_error, "left the configured crossing edge"));
+  cursor_position.x = -1200;
+  cursor_position.y = 100; assert(!capture_entry_allowed());
+  cursor_position.y = -100; assert(capture_entry_allowed());
+  cursor_position.y = -100.1; assert(!capture_entry_allowed());
+
+  g_entry_region = (ZFlowMacRect){-1250, -50, 100, 9};
+  cursor_position = CGPointMake(-1200, -50); assert(capture_entry_allowed());
+  cursor_position.x += 11; assert(capture_entry_allowed());
+  cursor_position.x = -1150; assert(!capture_entry_allowed());
+  cursor_position = CGPointMake(-1200, -41); assert(!capture_entry_allowed());
+
+  ZFlowMacRect invalid_regions[] = {
+    {NAN, -100, 9, 200}, {-1200, INFINITY, 9, 200},
+    {-1200, -100, NAN, 200}, {-1200, -100, 9, INFINITY},
+    {-1200, -100, 0, 200}, {-1200, -100, 9, 0},
+    {-1200, -100, -9, 200}, {-1200, -100, 9, -200},
+    {DBL_MAX, -100, DBL_MAX, 200}, {-1200, DBL_MAX, 9, DBL_MAX},
+  };
+  cursor_position = CGPointMake(-1200, -50);
+  for (size_t i = 0; i < sizeof(invalid_regions) / sizeof(invalid_regions[0]); i++) {
+    g_entry_region = invalid_regions[i];
+    assert(!capture_entry_allowed());
+    assert(strstr(g_error, "configured crossing edge is invalid"));
+  }
+  g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
+  cursor_position.x = NAN; assert(!capture_entry_allowed());
+  cursor_position = CGPointMake(-1200, -50);
   g_check_entry = false;
   assert(!zflow_mac_accessibility_authorized(0));
   assert(permission_prompts == 0);
@@ -239,7 +275,88 @@ static void reset(void) {
   atomic_store(&g_raw_contact_active, false);
   g_capture_status = 0;
   g_request_raw_touch = false;
+  expect_return_warp = false;
+  g_return_pending = false;
   g_queue_head = g_queue_tail = 0;
+}
+
+static void idle_test_source(void *context) { (void)context; }
+
+static void *fake_capture_cleanup(void *context) {
+  (void)context;
+  CFRunLoopSourceContext source_context = {0};
+  source_context.perform = idle_test_source;
+  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &source_context);
+  assert(source);
+  CFRunLoopRef loop = CFRunLoopGetCurrent();
+  CFRunLoopAddSource(loop, source, kCFRunLoopDefaultMode);
+  pthread_mutex_lock(&g_run_loop_lock);
+  g_run_loop = loop;
+  pthread_mutex_unlock(&g_run_loop_lock);
+  signal_started(0);
+  if (!atomic_load(&g_stop)) CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1, false);
+  ZFlowMacPosition position;
+  bool returning = take_return_position(&position);
+  if (!release_cursor_at(returning ? &position : NULL)) g_capture_status = -1;
+  CFRunLoopRemoveSource(loop, source, kCFRunLoopDefaultMode);
+  CFRelease(source);
+  atomic_store(&g_stop, true);
+  return NULL;
+}
+
+static void start_fake_capture_cleanup(void) {
+  assert(capture_cursor());
+  g_start_ready = false;
+  assert(pthread_create(&g_thread, NULL, fake_capture_cleanup, NULL) == 0);
+  g_thread_valid = true;
+  pthread_mutex_lock(&g_start_lock);
+  while (!g_start_ready) pthread_cond_wait(&g_start_condition, &g_start_lock);
+  pthread_mutex_unlock(&g_start_lock);
+}
+
+static void return_cursor_tests(void) {
+  const ZFlowMacPosition target = {-1200, -50};
+  reset();
+  expect_return_warp = true;
+  start_fake_capture_cleanup();
+  assert(zflow_mac_capture_stop_at(&target) == 0);
+  assert(strcmp(calls, "BHDWCSb") == 0);
+  assert(warped_position.x == target.x && warped_position.y == target.y);
+  assert(!g_return_pending && !g_thread_valid);
+  assert(zflow_mac_capture_stop() == 0);
+  assert(zflow_mac_capture_stop_at(&target) == -1);
+  assert(strcmp(calls, "BHDWCSb") == 0);
+
+  reset();
+  start_fake_capture_cleanup();
+  atomic_store(&g_stop, true);
+  stop_capture_run_loop();
+  assert(zflow_mac_capture_stop_at(&target) == -1);
+  assert(strcmp(calls, "BHDCSb") == 0);
+  assert(connected && hide_count == 0 && !background);
+
+  const ZFlowMacPosition invalid[] = {{NAN, 0}, {0, INFINITY},
+                                    {1920, 0}, {-1200, -201}};
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    reset();
+    start_fake_capture_cleanup();
+    assert(zflow_mac_capture_stop_at(&invalid[i]) == -1);
+    assert(strcmp(calls, "BHDCSb") == 0);
+    assert(connected && hide_count == 0 && !background);
+  }
+
+  reset();
+  expect_return_warp = true;
+  start_fake_capture_cleanup();
+  fail_call = 'W';
+  assert(zflow_mac_capture_stop_at(&target) == -1);
+  assert(strcmp(calls, "BHDWCSb") == 0);
+  assert(connected && hide_count == 0 && !background);
+
+  reset();
+  start_fake_capture_cleanup();
+  assert(zflow_mac_capture_stop() == 0);
+  assert(strcmp(calls, "BHDCSb") == 0);
 }
 
 static void cursor_lifecycle_tests(void) {
@@ -338,6 +455,7 @@ int main(void) {
   desktop_and_permission_tests();
   startup_release_tests();
   cursor_lifecycle_tests();
+  return_cursor_tests();
   event_tests();
   reset();
   assert(zflow_mac_capture_start(0, NULL) == -1);

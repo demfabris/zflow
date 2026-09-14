@@ -94,6 +94,81 @@ impl Geometry {
     }
 }
 
+/// Maps an acknowledged receiver return to the saved local desktop.
+#[derive(Clone, Debug)]
+pub struct ReturnMapping {
+    pub geometry: Geometry,
+    pub edge: Edge,
+    pub local_start: f64,
+    pub local_end: f64,
+    pub remote_start: f64,
+    pub remote_end: f64,
+}
+
+impl ReturnMapping {
+    pub fn position(&self, position: u32) -> Result<Point> {
+        ensure!(
+            [
+                self.local_start,
+                self.local_end,
+                self.remote_start,
+                self.remote_end
+            ]
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                && self.local_start < self.local_end
+                && self.remote_start < self.remote_end,
+            "Invalid desktop return mapping"
+        );
+        ensure!(
+            position >= (self.remote_start * f64::from(FRACTION_MAX)).round() as u32
+                && position <= (self.remote_end * f64::from(FRACTION_MAX)).round() as u32,
+            "The receiver returned an invalid crossing position"
+        );
+        let remote = f64::from(position) / f64::from(FRACTION_MAX);
+        let progress =
+            ((remote - self.remote_start) / (self.remote_end - self.remote_start)).clamp(0.0, 1.0);
+        let along = self.local_start + progress * (self.local_end - self.local_start);
+        let point = edge_point(self.geometry.bounds()?, self.edge, along);
+        ensure!(
+            self.geometry.monitors.iter().any(|r| r.contains(point)),
+            "The return point is outside the active Mac displays; check the layout"
+        );
+        Ok(point)
+    }
+}
+
+fn edge_point(bounds: Rect, edge: Edge, along: f64) -> Point {
+    let inset_x = 3.min((bounds.width.saturating_sub(1) / 2) as i32);
+    let inset_y = 3.min((bounds.height.saturating_sub(1) / 2) as i32);
+    let x = bounds.x
+        + (along * f64::from(bounds.width))
+            .floor()
+            .clamp(0.0, f64::from(bounds.width - 1)) as i32;
+    let y = bounds.y
+        + (along * f64::from(bounds.height))
+            .floor()
+            .clamp(0.0, f64::from(bounds.height - 1)) as i32;
+    match edge {
+        Edge::Left => Point {
+            x: bounds.x + inset_x,
+            y,
+        },
+        Edge::Right => Point {
+            x: bounds.x + bounds.width as i32 - 1 - inset_x,
+            y,
+        },
+        Edge::Top => Point {
+            x,
+            y: bounds.y + inset_y,
+        },
+        Edge::Bottom => Point {
+            x,
+            y: bounds.y + bounds.height as i32 - 1 - inset_y,
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopRequest {

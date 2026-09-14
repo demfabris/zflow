@@ -224,7 +224,8 @@ done
 shopt -u nullglob
 
 systemctl daemon-reload
-systemctl enable --now zflowd.service
+systemctl enable zflowd.service
+systemctl restart zflowd.service
 
 printf '\nzflow is installed and zflowd is running.\n'
 if [[ "$install_gui" == true ]]; then

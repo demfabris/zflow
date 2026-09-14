@@ -7,7 +7,37 @@ default:
 
 # Run the GUI on this host (mac or linux); forward extra arguments to the app.
 run platform *args: (_platform platform)
+    @if [[ "$1" == linux ]]; then printf '%s\n' 'Ubuntu: run just install-linux after updating code, then enable desktop handoff in the app.'; fi
     shift; cargo run --locked --features gui --bin zflow-gui -- "$@"
+
+# Install or update the Linux service and GUI, then restart the service (requires sudo).
+install-linux:
+    ./scripts/install.sh --gui
+
+# Run with crossing diagnostics and save terminal output under target/logs.
+debug platform *args: (_platform platform)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    umask 077
+    platform="$1"
+    shift
+    mkdir -p target/logs
+    logfile="target/logs/zflow-$platform-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
+    printf 'Saving diagnostics to %s/%s\n' "$PWD" "$logfile"
+    {
+        printf 'zflow diagnostics: platform=%s revision=%s\n' "$platform" "$(git describe --always --dirty)"
+        cargo run --locked --features gui --bin zflow-gui -- --debug "$@"
+    } 2>&1 | tee "$logfile"
+
+# Enable Linux daemon diagnostics until reboot; requires sudo and restarts the service.
+debug-daemon: (_platform "linux")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sudo install -d -m 0755 /run/systemd/system/zflowd.service.d
+    printf '[Service]\nEnvironment="RUST_LOG=warn,zflow=debug"\n' | sudo tee /run/systemd/system/zflowd.service.d/debug.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl restart zflowd.service
+    printf 'Daemon debug logging enabled until reboot. Read with: journalctl -u zflowd -f -o short-iso-precise\n'
 
 # Build the GUI on this host (mac or linux); append --release for a release build.
 build platform *args: (_platform platform)
