@@ -7,6 +7,7 @@ pub mod control;
 pub mod core;
 #[cfg(target_os = "linux")]
 pub mod daemon;
+pub mod desktop;
 pub mod discovery;
 #[cfg(feature = "gui")]
 pub mod gui;

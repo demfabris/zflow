@@ -228,7 +228,7 @@ impl LayoutEditor {
         self.notice = match document.save() {
             Ok(()) => {
                 self.edited = false;
-                "Layout saved. It does not enable automatic input switching.".into()
+                "Layout saved. Enable sharing on the Mac to use these crossing zones.".into()
             }
             Err(error) => format!("Could not save layout: {error:#}"),
         };

@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         address: args.address,
         raw_touch: !args.no_touch,
         reduce_wifi_latency: args.reduce_wifi_latency,
+        handoff: None,
     })
     .await
 }

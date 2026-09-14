@@ -60,6 +60,7 @@ pub enum InputControlMessage {
     NegotiationOffer(NegotiationOffer),
     NegotiatedSession(NegotiatedSession),
     Reliable(ReliableControlMessage),
+    Desktop(crate::desktop::DesktopMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +178,13 @@ impl ControlSender {
     ) -> Result<(), TransportError> {
         self.send_wire(WireMessage::ReliableControl(message.clone()))
             .await
+    }
+
+    pub async fn send_desktop(
+        &mut self,
+        message: crate::desktop::DesktopMessage,
+    ) -> Result<(), TransportError> {
+        self.send_wire(WireMessage::Desktop(message)).await
     }
 
     async fn send_wire(&mut self, message: WireMessage) -> Result<(), TransportError> {
@@ -314,6 +322,7 @@ impl ControlReceiver {
                 Ok(InputControlMessage::NegotiatedSession(session))
             }
             WireMessage::ReliableControl(message) => Ok(InputControlMessage::Reliable(message)),
+            WireMessage::Desktop(message) => Ok(InputControlMessage::Desktop(message)),
             _ => {
                 close_protocol(&self.connection, b"message on wrong channel");
                 Err(TransportError::InvalidControlFamily)

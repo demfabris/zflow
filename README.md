@@ -4,11 +4,52 @@ zflow is a headless input-sharing service for Linux. It captures an explicit
 set of physical evdev devices, sends bounded input state over authenticated
 QUIC, and injects it through stable uinput devices on the other machine.
 
-This is a working headless prototype, not yet a qualified alpha. The supported
-Linux launch path is the packaged systemd service. An optional configuration
-GUI is available; automatic edge switching is not implemented. The macOS source is an
-experimental foreground developer tool. The two-host qualification run in
-`TESTPLAN.md` still gates the alpha label.
+This is a working prototype, not yet a qualified alpha. The supported Linux
+launch path is the packaged systemd service. The desktop app provides pairing
+and experimental Mac-to-GNOME edge switching. The Mac sends input; it cannot
+receive input from Linux. The two-host qualification run in `TESTPLAN.md`
+still gates the alpha label.
+
+## Mac → Ubuntu setup
+
+Build the Mac app with `./scripts/build-macos-app.sh`, then open
+`target/release/zflow.app`. On Ubuntu, install the updated service and app with
+`./scripts/install.sh --gui`, then open zflow from the application menu.
+Building the desktop app requires Rust 1.95 or newer. The Mac build uses an
+ad-hoc signature for local development; `--sign IDENTITY` selects your signing
+identity. OS permission behavior still needs validation for the chosen signature.
+
+1. On a new Mac setup, choose **Save configuration**. The app chooses a state
+   directory beside the configuration file; it does not require a Linux path.
+2. In Computers on Ubuntu, choose **Allow pairing**. On Mac, choose Ubuntu in
+   Nearby, or enter its IP address with port 43120, then **Pair with address**.
+3. Compare the six-digit codes and enter the other computer's code on each
+   screen. Confirm on both computers. Each side saves its own confirmation;
+   retry with the same computer name if one side cancels or expires.
+4. On Ubuntu, choose **Install GNOME integration**. A first installation may
+   require logging out and back in before GNOME loads the extension. Then
+   choose **Enable desktop handoff**. This requires an unlocked GNOME session.
+5. Keep both apps open. On the Mac, arrange the computer tiles in Layout and
+   choose **Save layout**. Grant the Mac app Accessibility and Local Network
+   permissions through System Settings when needed.
+6. On Mac, choose **Enable edge sharing**. Move through a configured edge with
+   keys and mouse buttons released. Cross the matching Ubuntu edge to return.
+   **Ctrl+Cmd+Backspace** returns input and turns sharing off. Closing the Mac
+   app also stops sharing.
+
+Ubuntu's GNOME extension supplies actual cursor position, entry placement,
+and directional return barriers while zflow keeps its existing uinput devices.
+The source authenticates the receiver and checks its current desktop size
+before capture. Return waits for Ubuntu's input-release acknowledgement.
+Desktop changes, expired handoffs, permission loss, or connection failure stop
+sharing. Refresh and save the layout after display changes, then enable again.
+Other Linux desktops do not provide this automatic return path yet.
+
+Sharing starts disabled. Layout saves and discovery do not start capture.
+Each crossing opens a fresh authenticated connection; after a failed crossing,
+resolve the displayed error and enable sharing again. This implementation has
+automated geometry, protocol, cancellation and simulated GNOME checks. The
+new full workflow still requires live two-computer qualification.
 
 ## Configuration window
 
@@ -25,20 +66,20 @@ cargo run --features gui --bin zflow-gui -- --config /path/to/zflow.toml --dark
 On macOS, the default file is
 `~/Library/Application Support/zflow/zflow.toml`. On Linux, launch without
 `--config` to read paired computers from the local service. The desktop API
-returns public pairing metadata and the discovery flag; it cannot change
-settings, start capture, or return private identity keys. The GUI checks the
+returns public pairing metadata, supports user-confirmed pairing, and connects
+the explicitly enabled GNOME desktop integration. It cannot return private
+identity keys or edit arbitrary service settings. The GUI checks the
 service's Unix credentials, and the service checks the active desktop user's
 credentials. Config, identity, and input-control socket permissions stay unchanged.
 Install the updated systemd unit and daemon before using this mode.
 
-Linux service mode provides Layout, Nearby, and read-only Computers pages.
+Linux service mode provides Layout, Nearby, pairing, and desktop handoff controls.
 Layouts save to `$XDG_CONFIG_HOME/zflow/zflow.toml.layout.toml`, or
 `~/.config/zflow/zflow.toml.layout.toml` when XDG_CONFIG_HOME is unset.
-Use Refresh computers after pairing through the CLI. Use `--config PATH` on
+GUI pairing refreshes the computer list after confirmation. Use `--config PATH` on
 either platform to open the file editor. Opening a missing file shows defaults without writing
-anything. Save creates it after validation. A new Mac setup must choose a
-writable state directory under Advanced before pairing; the shared defaults
-still use the Linux service paths.
+anything. Save creates it after validation. New Mac files use a `state` directory
+beside their configuration; existing identity paths remain unchanged.
 
 The file editor provides:
 
@@ -48,12 +89,13 @@ The file editor provides:
 - experimental touchpad forwarding, Linux shortcuts, and login-screen access;
 - discovery, listen address, receiver buffering, checkpoint interval, and lease;
 - identity and control-socket paths;
-- a Mac launch-command builder for peer selection, address override,
+- Mac edge sharing and status, plus an Advanced launch-command builder for peer selection, address override,
   `--no-touch`, and opt-in AWDL suppression.
 
 Save configuration writes the selected settings file. It does not restart a service, reload a daemon,
-capture input, or change network interfaces. Restart the affected daemon or
-source yourself. The editor checks for on-disk changes before saving, refuses
+capture input, or change network interfaces. Restart an affected Linux daemon;
+Mac GUI sharing reads the saved settings on its next activation. Stop sharing
+before editing settings. The editor checks for on-disk changes before saving, refuses
 invalid settings, and asks before discarding unsaved edits. Saving preserves
 peer identities and device attributes, but rewrites TOML formatting and comments.
 It does not elevate privileges; use the CLI for administrator-owned Linux files.
@@ -63,11 +105,11 @@ Mac does not tune Ubuntu. The configurable shortcuts apply to Linux; the Mac
 source still uses Ctrl+Cmd+Backspace to return input. Mac launch options last
 for the current window, and Copy launch command does not execute anything.
 
-Pairing, revocation, and Linux device enrollment still use the CLI. The editor
+Revocation and Linux device enrollment still use the CLI. The editor
 shows existing capture devices without replacing their hardware identities or
-udev permissions. Authenticated connection status, service controls, and
-automatic edge crossing remain future work. The Linux installer still packages
-the headless binaries only.
+udev permissions. Linux service start/restart and protected configuration edits
+still use administrator tools. `install.sh --gui` includes the desktop app;
+the default installer continues to install the headless binaries only.
 
 ### Arrange computers
 
@@ -109,8 +151,10 @@ layout editor checks geometry and on-disk conflicts before saving. Earlier
 per-output layouts appear grouped by computer; the file changes only on explicit
 Save layout. Detection updates alone do not count as unsaved user edits.
 
-The crossing zones are configuration previews. Saving does **not** activate
-edge capture or cursor handoff. The layout follows the screen-arrangement and
+Saving does **not** activate capture. **Enable edge sharing** on the Mac uses
+the saved crossing zones with the enabled GNOME desktop integration. Its
+authenticated geometry check rejects stale display sizes and entry points in
+monitor gaps. The layout follows the screen-arrangement and
 edge-range concepts in [Deskflow](https://github.com/deskflow/deskflow/blob/adb4f89453c890033288bf2ed6f36fa76f5caec5/src/lib/server/Config.cpp);
 the Rust geometry and egui canvas are independent implementations, not copied
 Deskflow code. The canvas stays in zflow; eguicn supplies its shadcn-style controls.
@@ -126,8 +170,8 @@ The Nearby list shows advertised addresses and protocol compatibility. Names
 like `zf-…` are temporary discovery IDs, not computer identities. Even an address
 that matches a saved peer remains unverified until the QUIC connection checks
 the pinned key. Discovery never pairs, grants access, changes stored peer
-addresses, or starts input capture. On Mac, Use address fills the launch override;
-choose the matching paired peer before running its command.
+addresses, or starts input capture. On Mac, **Pair this computer** fills the
+pairing address; the user still compares and confirms the codes on both screens.
 
 Run `zflowd` with discovery enabled on the other computer. The Mac source and
 configuration GUI do not advertise a receiver because neither can receive input.
@@ -349,6 +393,7 @@ just run mac --dark --config "/path with spaces/zflow.toml"
 just build mac               # Build the macOS GUI
 just build linux --release   # Build the Linux GUI in release mode
 just test                    # Run tests, including the GUI
+just test-desktop            # Test the GNOME extension with Node.js
 just fmt                     # Format Rust code
 just lint                    # Run Clippy
 just check                   # Check formatting, lint, and run tests
@@ -360,7 +405,7 @@ builds need Rust 1.95 or newer. `run` opens the configuration window without
 starting input capture. `build` produces `target/debug/zflow-gui`, or
 `target/release/zflow-gui` with `--release`; it does not package or install an app.
 
-The protocol model and Linux runtime have deterministic tests that do not need
+`just check` requires Node.js for the GNOME extension tests. The protocol model and Linux runtime have deterministic tests that do not need
 root. The privileged runtime check needs read access to the selected
 event devices and write access to `/dev/uinput`.
 

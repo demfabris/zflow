@@ -190,7 +190,7 @@ impl NearbyBrowser {
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(address.to_string());
                         if cfg!(target_os = "macos") {
-                            if ui.add_enabled(record.compatible, Button::new("Use address")
+                            if ui.add_enabled(record.compatible, Button::new("Pair this computer")
                                 .variant(ButtonVariant::Outline)).clicked()
                             {
                                 selected = Some(*address);

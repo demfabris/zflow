@@ -17,6 +17,8 @@ readonly SLEEP_HOOK_FILE="/usr/lib/systemd/system-sleep/zflow"
 readonly SLEEP_MARKER="/run/zflowd-resume-after-sleep"
 readonly ZFLOW_BIN="/usr/local/bin/zflow"
 readonly ZFLOWD_BIN="/usr/local/bin/zflowd"
+readonly ZFLOW_GUI_BIN="/usr/local/bin/zflow-gui"
+readonly DESKTOP_FILE="/usr/local/share/applications/io.zflow.zflow.desktop"
 
 purge=false
 
@@ -65,7 +67,9 @@ rm -f -- \
     "$SLEEP_HOOK_FILE" \
     "$SLEEP_MARKER" \
     "$ZFLOW_BIN" \
-    "$ZFLOWD_BIN"
+    "$ZFLOWD_BIN" \
+    "$ZFLOW_GUI_BIN" \
+    "$DESKTOP_FILE"
 rmdir -- "$DROPIN_DIR" 2>/dev/null || true
 
 if [[ "$purge" == true ]]; then

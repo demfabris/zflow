@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Build and install the headless Linux service from this checkout.
+# Build and install the Linux service, optionally with its desktop app.
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+readonly SCRIPT_DIR REPO_ROOT
 readonly SERVICE_USER="zflow"
 readonly SERVICE_GROUP="zflow"
 readonly BIN_DIR="/usr/local/bin"
@@ -19,7 +20,9 @@ readonly VIRTUAL_RULE_FILE="$UDEV_RULE_DIR/70-zflow.rules"
 readonly CAPTURE_RULE_FILE="$UDEV_RULE_DIR/71-zflow-capture.rules"
 readonly MODULE_FILE="/etc/modules-load.d/zflow.conf"
 readonly SLEEP_HOOK_FILE="/usr/lib/systemd/system-sleep/zflow"
+readonly DESKTOP_FILE="/usr/local/share/applications/io.zflow.zflow.desktop"
 install_built=false
+install_gui=false
 
 die() {
     printf 'install: %s\n' "$*" >&2
@@ -75,23 +78,30 @@ ensure_service_account() {
 }
 
 build_binaries() {
-    printf 'Building zflow and zflowd...\n'
-    cargo build \
-        --locked \
-        --release \
-        --manifest-path "$REPO_ROOT/Cargo.toml" \
-        --bin zflow \
-        --bin zflowd
+    local cargo_args=(build --locked --release --manifest-path "$REPO_ROOT/Cargo.toml"
+        --target-dir "$REPO_ROOT/target" --bin zflow --bin zflowd)
+    if [[ "$install_gui" == true ]]; then
+        printf 'Building zflow, zflowd, and the desktop app...\n'
+        cargo_args+=(--features gui --bin zflow-gui)
+    else
+        printf 'Building zflow and zflowd...\n'
+    fi
+    cargo "${cargo_args[@]}"
 }
 
+for argument in "$@"; do
+    case "$argument" in
+        --gui) install_gui=true ;;
+        --install-built) install_built=true ;;
+        -h|--help)
+            printf 'usage: ./scripts/install.sh [--gui]\n'
+            printf 'Add --gui to install the desktop app alongside the service.\n'
+            exit 0
+            ;;
+        *) die "usage: ./scripts/install.sh [--gui]" ;;
+    esac
+done
 [[ "$(uname -s)" == "Linux" ]] || die "Linux is required"
-
-case "${1:-}" in
-    "") ;;
-    --install-built) install_built=true ;;
-    *) die "usage: ./scripts/install.sh" ;;
-esac
-[[ $# -le 1 ]] || die "usage: ./scripts/install.sh"
 
 for source in \
     "$REPO_ROOT/Cargo.toml" \
@@ -105,12 +115,18 @@ for source in \
     "$REPO_ROOT/packaging/udev/71-zflow-capture.rules"; do
     require_regular_source "$source"
 done
+if [[ "$install_gui" == true ]]; then
+    require_regular_source "$REPO_ROOT/packaging/linux/io.zflow.zflow.desktop"
+fi
 
 if [[ "$EUID" -ne 0 ]]; then
     [[ "$install_built" == false ]] || die "--install-built requires root"
     require_command cargo
     require_command sudo
     build_binaries
+    if [[ "$install_gui" == true ]]; then
+        exec sudo -- "$SCRIPT_DIR/install.sh" --install-built --gui
+    fi
     exec sudo -- "$SCRIPT_DIR/install.sh" --install-built
 fi
 
@@ -125,6 +141,11 @@ done
 
 [[ -x "$REPO_ROOT/target/release/zflow" ]] || die "cargo did not produce target/release/zflow"
 [[ -x "$REPO_ROOT/target/release/zflowd" ]] || die "cargo did not produce target/release/zflowd"
+if [[ "$install_gui" == true ]]; then
+    [[ -x "$REPO_ROOT/target/release/zflow-gui" ]] || die "cargo did not produce target/release/zflow-gui"
+    refuse_symlink "$BIN_DIR/zflow-gui"
+    refuse_symlink "$DESKTOP_FILE"
+fi
 
 ensure_service_account
 
@@ -151,6 +172,11 @@ install -o root -g root -m 0644 \
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/udev/70-zflow.rules" "$VIRTUAL_RULE_FILE"
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/modules-load.d/zflow.conf" "$MODULE_FILE"
 install -o root -g root -m 0755 "$REPO_ROOT/packaging/system-sleep/zflow" "$SLEEP_HOOK_FILE"
+if [[ "$install_gui" == true ]]; then
+    install -d -o root -g root -m 0755 "$(dirname -- "$DESKTOP_FILE")"
+    install -o root -g root -m 0755 "$REPO_ROOT/target/release/zflow-gui" "$BIN_DIR/zflow-gui"
+    install -o root -g root -m 0644 "$REPO_ROOT/packaging/linux/io.zflow.zflow.desktop" "$DESKTOP_FILE"
+fi
 
 if [[ -e "$CONFIG_FILE" ]]; then
     [[ -f "$CONFIG_FILE" ]] || die "configuration is not a regular file: $CONFIG_FILE"
@@ -201,6 +227,10 @@ systemctl daemon-reload
 systemctl enable --now zflowd.service
 
 printf '\nzflow is installed and zflowd is running.\n'
+if [[ "$install_gui" == true ]]; then
+    printf 'Open zflow from your applications menu to pair and arrange computers.\n'
+    printf 'You can also launch it with: %s/zflow-gui\n' "$BIN_DIR"
+fi
 printf 'Next steps:\n'
 printf '  1. List input devices:\n'
 printf '     sudo %s/zflow devices\n' "$BIN_DIR"

@@ -44,6 +44,7 @@ use crate::{
 };
 
 const SESSION_EVENT_CAPACITY: usize = 1_024;
+mod desktop;
 mod peer_view;
 const ACCEPT_EVENT_CAPACITY: usize = 64;
 const RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
@@ -122,6 +123,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
         inbound_owner: Mutex::new(None),
+        desktop: desktop::Hub::default(),
         seat_gate: RwLock::new(initial_seat.injection_gate()),
         seat_query: Mutex::new(()),
         session_events,
@@ -298,6 +300,7 @@ struct Shared {
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
     inbound_owner: Mutex<Option<(String, u64)>>,
+    desktop: desktop::Hub,
     seat_gate: RwLock<InjectionGate>,
     seat_query: Mutex<()>,
     session_events: mpsc::Sender<SessionEvent>,
@@ -1161,6 +1164,14 @@ impl Drop for SocketGuard {
 impl Shared {
     async fn handle_session_event(self: &Arc<Self>, event: SessionEvent) -> Result<()> {
         match event.kind {
+            SessionEventKind::Desktop { request, reply } => {
+                let shared = self.clone();
+                tokio::spawn(async move {
+                    let response =
+                        desktop::request(shared, event.peer, event.session_id, request).await;
+                    let _ = reply.send(response);
+                });
+            }
             SessionEventKind::ReceiverEffects {
                 effects,
                 received_at,
@@ -1211,6 +1222,11 @@ impl Shared {
                 }
             }
             SessionEventKind::Closed { reason } => {
+                let shared = self.clone();
+                let peer = event.peer.clone();
+                tokio::spawn(async move {
+                    shared.desktop.closed(&peer, event.session_id).await;
+                });
                 let final_metrics = {
                     let mut sessions = self.sessions.lock().await;
                     let final_metrics = sessions
@@ -1288,7 +1304,7 @@ impl Shared {
             receiver_authorized(&config, peer, gate)
         };
         if opens {
-            if !permitted {
+            if !permitted || !self.desktop.allows_session(peer, session_id).await {
                 self.close_session(peer, session_id, SessionCloseReason::PermissionRevoked)
                     .await;
                 return Ok(false);

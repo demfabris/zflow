@@ -9,6 +9,15 @@ static void *fake_dlsym(void *, const char *);
 static CGError fake_associate(boolean_t);
 static CGError fake_hide(CGDirectDisplayID);
 static CGError fake_show(CGDirectDisplayID);
+static CGError fake_warp(CGPoint);
+static CGPoint fake_location(CGEventRef);
+static CGError fake_display_list(uint32_t, CGDirectDisplayID *, uint32_t *);
+static CGRect fake_display_bounds(CGDirectDisplayID);
+static bool fake_key_state(CGEventSourceStateID, CGKeyCode);
+static bool fake_button_state(CGEventSourceStateID, CGMouseButton);
+static CGEventFlags fake_flags_state(CGEventSourceStateID);
+static Boolean fake_trusted(void);
+static Boolean fake_trusted_options(CFDictionaryRef);
 static CFMachPortRef fake_tap(CGEventTapLocation, CGEventTapPlacement,
                              CGEventTapOptions, CGEventMask,
                              CGEventTapCallBack, void *);
@@ -20,6 +29,15 @@ static CFMachPortRef fake_tap(CGEventTapLocation, CGEventTapPlacement,
 #define CGDisplayHideCursor fake_hide
 #define CGDisplayShowCursor fake_show
 #define CGEventTapCreate fake_tap
+#define CGWarpMouseCursorPosition fake_warp
+#define CGEventGetLocation fake_location
+#define CGGetActiveDisplayList fake_display_list
+#define CGDisplayBounds fake_display_bounds
+#define CGEventSourceKeyState fake_key_state
+#define CGEventSourceButtonState fake_button_state
+#define CGEventSourceFlagsState fake_flags_state
+#define AXIsProcessTrusted fake_trusted
+#define AXIsProcessTrustedWithOptions fake_trusted_options
 #include "../src/macos/capture_bridge.c"
 
 static char calls[64];
@@ -30,6 +48,120 @@ static bool connected;
 static bool background;
 static int hide_count;
 static int tap_calls;
+static CGPoint warped_position;
+static int held_key = -1;
+static int held_button = -1;
+static CGEventFlags held_flags;
+static int permission_prompts;
+
+static CGError fake_warp(CGPoint position) {
+  warped_position = position;
+  return kCGErrorSuccess;
+}
+
+static CGPoint fake_location(CGEventRef event) {
+  assert(event);
+  return CGPointMake(-1200, -50);
+}
+
+static CGError fake_display_list(uint32_t capacity, CGDirectDisplayID *ids,
+                                 uint32_t *count) {
+  assert(capacity >= 2);
+  ids[0] = 1; ids[1] = 2; *count = 2;
+  return kCGErrorSuccess;
+}
+
+static CGRect fake_display_bounds(CGDirectDisplayID display) {
+  return display == 1 ? CGRectMake(0, 0, 1920, 1080)
+                      : CGRectMake(-1920, -200, 1920, 1080);
+}
+
+static bool fake_key_state(CGEventSourceStateID state, CGKeyCode key) {
+  assert(state == kCGEventSourceStateHIDSystemState);
+  return key == held_key;
+}
+
+static bool fake_button_state(CGEventSourceStateID state, CGMouseButton button) {
+  assert(state == kCGEventSourceStateHIDSystemState);
+  return (int)button == held_button;
+}
+
+static CGEventFlags fake_flags_state(CGEventSourceStateID state) {
+  assert(state == kCGEventSourceStateHIDSystemState);
+  return held_flags;
+}
+
+static Boolean fake_trusted(void) { return false; }
+
+static Boolean fake_trusted_options(CFDictionaryRef options) {
+  assert(CFDictionaryGetValue(options, kAXTrustedCheckOptionPrompt) == kCFBooleanTrue);
+  permission_prompts++;
+  return false;
+}
+
+static void desktop_and_permission_tests(void) {
+  ZFlowMacPosition position;
+  assert(zflow_mac_cursor_position(&position) == 0);
+  assert(position.x == -1200 && position.y == -50);
+  assert(zflow_mac_cursor_position(NULL) == -1);
+  ZFlowMacRect rectangles[64];
+  assert(zflow_mac_desktop_rectangles(rectangles, 64) == 2);
+  assert(rectangles[1].x == -1920 && rectangles[1].y == -200);
+  assert(zflow_mac_desktop_rectangles(rectangles, 1) == -1);
+  assert(zflow_mac_warp_cursor(position) == 0);
+  assert(warped_position.x == -1200 && warped_position.y == -50);
+  assert(zflow_mac_warp_cursor((ZFlowMacPosition){NAN, 0}) == -1);
+  assert(zflow_mac_input_is_neutral());
+  held_key = 55; assert(!zflow_mac_input_is_neutral()); held_key = -1;
+  held_button = 0; assert(!zflow_mac_input_is_neutral()); held_button = -1;
+  held_flags = kCGEventFlagMaskCommand; assert(!zflow_mac_input_is_neutral());
+  held_flags = kCGEventFlagMaskAlphaShift; assert(zflow_mac_input_is_neutral());
+  held_flags = 0;
+  g_check_entry = true;
+  g_entry_position = position;
+  assert(capture_entry_allowed());
+  held_key = 10; assert(!capture_entry_allowed()); held_key = -1;
+  held_button = 1; assert(!capture_entry_allowed()); held_button = -1;
+  g_entry_position.x += 9; assert(!capture_entry_allowed());
+  g_check_entry = false;
+  assert(!zflow_mac_accessibility_authorized(0));
+  assert(permission_prompts == 0);
+  assert(!zflow_mac_accessibility_authorized(1));
+  assert(permission_prompts == 1);
+}
+
+static void startup_release_tests(void) {
+  g_check_entry = true;
+  memset(g_forwarded_keys, 0, sizeof(g_forwarded_keys));
+  memset(g_forwarded_buttons, 0, sizeof(g_forwarded_buttons));
+  atomic_store(&g_stop, false);
+  g_queue_head = g_queue_tail = 0;
+  CGEventRef key = CGEventCreateKeyboardEvent(NULL, 0, false);
+  assert(key);
+  assert(event_callback(NULL, kCGEventKeyUp, key, NULL) == key);
+  assert(event_callback(NULL, kCGEventKeyDown, key, NULL) == NULL);
+  assert(event_callback(NULL, kCGEventKeyUp, key, NULL) == NULL);
+  CFRelease(key);
+  CGEventRef button = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
+                                             CGPointMake(0, 0), kCGMouseButtonLeft);
+  assert(button);
+  assert(event_callback(NULL, kCGEventLeftMouseUp, button, NULL) == button);
+  assert(event_callback(NULL, kCGEventLeftMouseDown, button, NULL) == NULL);
+  assert(event_callback(NULL, kCGEventLeftMouseUp, button, NULL) == NULL);
+  CFRelease(button);
+  ZFlowMacEvent captured;
+  int count = 0;
+  while (zflow_mac_capture_poll(&captured)) count++;
+  assert(count == 4);
+  ZFlowMacEvent pre_capture = {.kind = ZFLOW_EVENT_TOUCH, .contact_count = 1};
+  assert(enqueue(&pre_capture));
+  clear_capture_queue();
+  assert(!zflow_mac_capture_poll(&captured));
+  assert(enqueue(&pre_capture));
+  assert(zflow_mac_capture_poll(&captured));
+  assert(captured.kind == ZFLOW_EVENT_TOUCH && captured.contact_count == 1);
+  g_check_entry = false;
+}
 
 static CGError record(char call) {
   assert(call_count + 1 < sizeof(calls));
@@ -203,10 +335,12 @@ static void event_tests(void) {
 }
 
 int main(void) {
+  desktop_and_permission_tests();
+  startup_release_tests();
   cursor_lifecycle_tests();
   event_tests();
   reset();
-  assert(zflow_mac_capture_start(0) == -1);
+  assert(zflow_mac_capture_start(0, NULL) == -1);
   assert(tap_calls == 1 && call_count == 0);
   assert(!g_thread_valid);
   puts("macOS cursor lifecycle and event-filter tests passed (fake cursor APIs)");

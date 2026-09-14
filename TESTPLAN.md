@@ -4,9 +4,65 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## GUI pairing and Mac-to-GNOME handoff, September 14
+
+The GUI now supports pairing, explicit Mac source start/stop, saved-layout edge
+entry, and automatic return through the GNOME extension. These implementation
+checks do not qualify the live workflow:
+
+- `just check` includes the Rust GUI/session tests and `node tests/gnome_desktop_test.mjs`.
+  The extension tests execute its actual JavaScript with simulated compositor
+  operations; they do not prove GNOME API behavior on hardware.
+- QUIC loopback tests exercise Prepare, input, Leave and Finish. Withholding the
+  runtime's Leave acknowledgement must prevent Finish from completing. Cancelling
+  Prepare and dropping a desktop broker must close the session and release input.
+- Mapping checks cover all four edges, partial overlaps, negative desktop
+  origins, monitor gaps and changed dimensions. A return point in a Mac monitor
+  gap must not warp the cursor there.
+- Native fake-capture tests cover GUI cancellation and admission: held keys or
+  buttons, movement away from the entry point during connection setup, unmatched
+  local key/button releases, and contacts collected before cursor isolation.
+- GUI file-pairing tests use real loopback QUIC. They verify no peer record exists
+  before matching confirmation, directional permissions, mismatch rejection and
+  retry without replacing an existing identity or expanding permissions.
+
+For live qualification, install matching daemon/GUI builds on Ubuntu and open
+the bundled Mac app. Complete the README's setup without terminal pairing or
+capture commands. On Ubuntu, use Install GNOME integration and Enable desktop
+handoff; a first extension installation may require logout/login. On Mac, use
+normal Accessibility and Local Network permission prompts.
+
+Verify discovery, both pairing confirmations, two computer tiles, Save layout,
+Enable edge sharing, pointer/typing/scrolling on Ubuntu, then automatic return.
+Repeat all four orientations and partial overlap ranges. Verify clicks, held
+keys at entry, raw touch on/off, independent Mac input while sharing is disabled,
+and input recovery after Stop, Escape, window close, network loss, receiver app
+exit, lock/logout and monitor changes. Check that the cursor is on the correct
+active monitor and inside the intended edge after each return. Old receivers
+must reject desktop requests before Mac capture begins.
+
+Sharing must remain disabled when opening either window, saving settings,
+discovering receivers, or confirming a pairing. A failed handoff must display an
+error and require the user to enable sharing again. Record the GNOME/macOS
+versions and signature used for the actual test; simulated extension tests and
+cross-compilation do not replace this run.
+
+September 14 implementation verification: Mac passed 200 Rust tests with one
+native-desktop test ignored, plus formatting, Clippy, native fake-capture tests
+and the GNOME extension simulation. Linux GUI binaries and tests compiled and
+linked with cargo-zigbuild. Those Linux tests ran in temporary Debian bookworm
+amd64 containers: 238 library tests and eight QUIC integration tests passed;
+the native-desktop and privileged input tests remained ignored. The containers
+had no network and read-only access to the build artifacts. The Mac release app
+bundle passed plist and signature checks. A native window inspection used a
+disposable missing configuration with sharing off; it did not grant permissions,
+pair real computers, or redirect input. The saved physical Ubuntu SSH address
+failed host-key verification, so this session did not deploy the new service or
+complete the live GNOME handoff run.
+
 ## Configuration GUI
 
-Run without elevated permissions or input capture:
+Run without elevated permissions. Opening the window leaves sharing disabled:
 
 ```sh
 cargo test --features gui gui:: --lib
@@ -63,12 +119,15 @@ qualify this test; allow access through the normal system UI and retry.
 
 ### Desktop service access and detected displays
 
-The Linux default GUI now uses `/run/zflow-gui/peers.sock`, a separate read-only
+The Linux default GUI uses `/run/zflow-gui/peers.sock`, a separate desktop
 endpoint. The original control socket and private config/state paths retain
-their permissions. The endpoint accepts only Snapshot, checks Unix credentials
+their permissions. The endpoint accepts Snapshot, user-confirmed pairing and
+an explicitly enabled desktop broker. It checks Unix credentials
 against the service/root/active desktop UID, and returns public peer records
 plus the discovery flag. It has a separate eight-client limit and three-second
-request timeout. The GUI also checks the server UID. Explicit `--config` stays
+initial-request timeout; pairing has its own bounded confirmation window and
+the desktop broker rechecks authorization during its connection. The GUI also
+checks the server UID. Explicit `--config` stays
 in file-editing mode; service snapshots cannot save or reload a config file.
 
 Tests cover rejected mutation commands and unknown fields, socket credentials,

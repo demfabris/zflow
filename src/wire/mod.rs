@@ -70,6 +70,7 @@ pub enum Family {
     Probe = 4,
     Discovery = 5,
     Pairing = 6,
+    Desktop = 7,
 }
 
 impl Family {
@@ -81,6 +82,7 @@ impl Family {
             Self::Probe => MAX_PROBE_PAYLOAD_BYTES,
             Self::Discovery => MAX_DISCOVERY_PAYLOAD_BYTES,
             Self::Pairing => MAX_PAIRING_PAYLOAD_BYTES,
+            Self::Desktop => crate::desktop::MAX_MESSAGE_BYTES + 8,
         }
     }
 
@@ -92,7 +94,7 @@ impl Family {
         match self {
             Self::Negotiation => matches!(message_type, 1 | 2),
             Self::ReliableControl => (1..=17).contains(&message_type),
-            Self::Motion | Self::Discovery | Self::Pairing => message_type == 1,
+            Self::Motion | Self::Discovery | Self::Pairing | Self::Desktop => message_type == 1,
             Self::Probe => matches!(message_type, 1 | 2),
         }
     }
@@ -109,6 +111,7 @@ impl TryFrom<u8> for Family {
             4 => Ok(Self::Probe),
             5 => Ok(Self::Discovery),
             6 => Ok(Self::Pairing),
+            7 => Ok(Self::Desktop),
             other => Err(WireError::UnknownFamily(other)),
         }
     }
@@ -123,6 +126,7 @@ pub enum WireMessage {
     Probe(ProbeMessage),
     Discovery(DiscoveryAnnouncement),
     Pairing(PairingOffer),
+    Desktop(crate::desktop::DesktopMessage),
 }
 
 impl WireMessage {
@@ -134,6 +138,7 @@ impl WireMessage {
             Self::Probe(_) => Family::Probe,
             Self::Discovery(_) => Family::Discovery,
             Self::Pairing(_) => Family::Pairing,
+            Self::Desktop(_) => Family::Desktop,
         }
     }
 }
@@ -335,6 +340,26 @@ fn prepare_payload(
             let value = WireDiscoveryAnnouncement::try_from(announcement).map_err(bounds)?;
             EncodedPayload {
                 family: Family::Discovery,
+                message_type: 1,
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                session: None,
+                channel: ChannelFields::None,
+                payload: codec::encode(selected_codec, &value)?,
+            }
+        }
+        WireMessage::Desktop(message) => {
+            message
+                .validate()
+                .map_err(|e| WireError::Bounds(e.to_string()))?;
+            let json =
+                serde_json::to_string(message).map_err(|e| WireError::Bounds(e.to_string()))?;
+            let value =
+                bounds::BoundedString::<{ crate::desktop::MAX_MESSAGE_BYTES }>::try_from_string(
+                    json, "desktop",
+                )
+                .map_err(bounds)?;
+            EncodedPayload {
+                family: Family::Desktop,
                 message_type: 1,
                 protocol_version: CURRENT_PROTOCOL_VERSION,
                 session: None,
@@ -586,6 +611,17 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
         Family::Discovery => {
             let value: WireDiscoveryAnnouncement = codec::decode(header.codec, payload)?;
             Ok(WireMessage::Discovery(value.try_into().map_err(bounds)?))
+        }
+        Family::Desktop => {
+            let value: bounds::BoundedString<{ crate::desktop::MAX_MESSAGE_BYTES }> =
+                codec::decode(header.codec, payload)?;
+            let message: crate::desktop::DesktopMessage =
+                serde_json::from_str(&value.into_string())
+                    .map_err(|e| WireError::Bounds(e.to_string()))?;
+            message
+                .validate()
+                .map_err(|e| WireError::Bounds(e.to_string()))?;
+            Ok(WireMessage::Desktop(message))
         }
         Family::Pairing => {
             let value: WirePairingOffer = codec::decode(header.codec, payload)?;
@@ -1046,6 +1082,49 @@ mod tests {
             Err(WireError::InvalidEnvelope(
                 "reliable control type disagrees with its payload"
             ))
+        );
+    }
+    #[test]
+    fn desktop_metadata_round_trips_with_bounded_json() {
+        use crate::desktop::*;
+        for codec in [Codec::Postcard, Codec::Bincode] {
+            let message = WireMessage::Desktop(DesktopMessage::Request {
+                id: 1,
+                request: DesktopRequest::Prepare {
+                    token: MAX_TOKEN,
+                    edge: Edge::Right,
+                    start: 0,
+                    end: FRACTION_MAX,
+                    position: 500_000,
+                },
+            });
+            let bytes = encode_with_codec(&message, codec).unwrap();
+            assert_eq!(decode(&bytes).unwrap().message, message);
+            let mut invalid = bytes;
+            // Unknown families fail before metadata is interpreted.
+            invalid[4] = 255;
+            assert!(matches!(
+                decode(&invalid),
+                Err(WireError::UnknownFamily(255))
+            ));
+        }
+        assert!(
+            encode(&WireMessage::Desktop(DesktopMessage::Request {
+                id: 1,
+                request: DesktopRequest::Poll {
+                    token: MAX_TOKEN + 1
+                }
+            }))
+            .is_err()
+        );
+        assert!(
+            encode(&WireMessage::Desktop(DesktopMessage::Response {
+                id: 1,
+                response: DesktopResponse::Unavailable {
+                    reason: "x".repeat(2000)
+                }
+            }))
+            .is_err()
         );
     }
 }

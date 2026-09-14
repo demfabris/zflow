@@ -1,4 +1,4 @@
-//! Read-only desktop view of paired computers. No configuration or input commands.
+//! Desktop peer metadata, user-confirmed pairing, and desktop session attachment.
 
 use std::collections::BTreeMap;
 
@@ -12,6 +12,45 @@ pub const SOCKET_PATH: &str = "/run/zflow-gui/peers.sock";
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Snapshot {},
+    Desktop {},
+    Pair {
+        remote: Option<std::net::SocketAddr>,
+    },
+    PairConfirm {
+        name: String,
+        authentication_code: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PairingEvent {
+    Ready,
+    Confirm {
+        peer_label: Option<String>,
+        authentication_code: String,
+    },
+    Paired,
+    Error {
+        message: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+pub async fn connect_service() -> anyhow::Result<tokio::net::UnixStream> {
+    use anyhow::{Context, bail};
+    let expected = nix::unistd::User::from_name("zflow")?
+        .context("The zflow service account is not installed")?
+        .uid
+        .as_raw();
+    let stream = tokio::net::UnixStream::connect(SOCKET_PATH).await.context(
+        "Cannot reach the desktop API. Install the updated zflow service and restart it",
+    )?;
+    let uid = crate::control::peer_uid(&stream)?;
+    if uid != expected && uid != 0 {
+        bail!("The desktop API is not owned by the zflow service");
+    }
+    Ok(stream)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,18 +82,9 @@ impl Snapshot {
 
 #[cfg(target_os = "linux")]
 pub async fn fetch() -> anyhow::Result<Snapshot> {
-    use anyhow::{Context, bail};
-    let expected = nix::unistd::User::from_name("zflow")?
-        .context("The zflow service account is not installed")?
-        .uid
-        .as_raw();
+    use anyhow::Context;
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        let mut stream = tokio::net::UnixStream::connect(SOCKET_PATH).await
-            .context("Cannot reach the desktop API. Install the updated zflow service and restart it")?;
-        let uid = crate::control::peer_uid(&stream)?;
-        if uid != expected && uid != 0 {
-            bail!("The desktop API is not owned by the zflow service");
-        }
+        let mut stream = connect_service().await?;
         crate::control::write_message(&mut stream, &Request::Snapshot {}).await?;
         let snapshot: Snapshot = crate::control::read_message(&mut stream).await
             .context("The service denied access or returned an invalid response. Use the active local desktop session")?;
@@ -68,12 +98,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_protocol_rejects_control_and_write_commands() {
+    fn desktop_protocol_rejects_arbitrary_control_keys_and_permissions() {
         for json in [
             r#"{"command":"activate","peer":"desk"}"#,
             r#"{"command":"local"}"#,
             r#"{"command":"reload_config"}"#,
             r#"{"command":"snapshot","path":"/etc/zflow"}"#,
+            r#"{"command":"pair","remote":null,"identity":"attacker"}"#,
+            r#"{"command":"pair_confirm","name":"desk","authentication_code":"123456","permissions":{"inject_prelogin":true}}"#,
         ] {
             assert!(serde_json::from_str::<Request>(json).is_err());
         }

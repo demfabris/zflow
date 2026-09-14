@@ -3,6 +3,7 @@
 > Specification v0.3, draft, 2026-08-31
 >
 > Implementation status: the headless Linux prototype is implemented. It is not yet a qualified alpha: the privileged, packaged two-host qualification run in [TESTPLAN.md](TESTPLAN.md) has not run.
+> September 14 desktop implementation: GUI pairing and experimental Mac-to-GNOME edge handoff are implemented. A user-enabled GNOME extension places the receiver cursor and reports return barriers through the active desktop GUI and authenticated session. This path still requires live qualification; the broader portal-based desktop matrices below remain future work.
 >
 > v0.3 records three maintainer decisions after adversarial review: on-demand device grabs, raw-contact capture in the signed macOS baseline behind a flag, and the split of release matrices into [TESTPLAN.md](TESTPLAN.md).
 

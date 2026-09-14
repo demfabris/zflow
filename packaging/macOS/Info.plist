@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>zflow</string>
+    <key>CFBundleDisplayName</key>
+    <string>zflow</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.zflow.zflow</string>
+    <key>CFBundleExecutable</key>
+    <string>zflow-gui</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Find your computers and share keyboard and pointer input with the computers you pair.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_zflow._udp</string>
+        <string>_zflow-display._udp</string>
+    </array>
+</dict>
+</plist>

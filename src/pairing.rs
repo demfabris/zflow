@@ -107,9 +107,79 @@ impl<'identity> PairingListener<'identity> {
         Ok(PairingSession {
             observation,
             _connection: connection,
-            _endpoint: None,
+            _endpoint: Some(self.endpoint.clone()),
         })
     }
+}
+
+/// Opens a temporary pairing transport. The returned session owns its endpoint.
+pub async fn begin(
+    identity: &Identity,
+    remote: Option<SocketAddr>,
+    input_port: u16,
+) -> Result<PairingSession> {
+    let label = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|label| label.len() <= 255 && validate_label(Some(label)).is_ok());
+    let offer = make_offer(label, input_port, Vec::new())?;
+    if let Some(remote) = remote {
+        crate::discovery::UntrustedCandidate::explicit(remote)?;
+        connect(identity, remote, &offer).await
+    } else {
+        PairingListener::bind(
+            identity,
+            SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), DEFAULT_PAIRING_PORT),
+            offer,
+        )?
+        .accept()
+        .await
+    }
+}
+
+/// Adds only the identity observed on this authenticated transport after a
+/// matching code. A pairing request cannot replace an existing trusted peer.
+pub fn add_confirmed_peer(
+    config: &mut crate::config::Config,
+    observation: &PairingObservation,
+    name: &str,
+    code: &str,
+    receiver: bool,
+) -> Result<()> {
+    let name = name.trim();
+    validate_label(Some(name))?;
+    if name.len() > 255 {
+        bail!("Computer names must be at most 255 bytes");
+    }
+    if code != observation.authentication_code {
+        bail!("Pairing codes do not match; no computer was added");
+    }
+    let record = crate::config::PeerConfig::from_spki(
+        &observation.peer_spki,
+        observation.peer_candidates.clone(),
+        crate::config::PeerPermissions {
+            connect: true,
+            send_normal: receiver,
+            receive_normal: !receiver,
+            inject_prelogin: false,
+        },
+    )?;
+    if let Some(existing) = config.peers.get_mut(name) {
+        if existing.spki_der_hex != record.spki_der_hex {
+            bail!("A different computer named {name} is already paired; choose another name");
+        }
+        // Retrying after cancelling on the other computer keeps permissions.
+        existing.addresses = record.addresses;
+        return Ok(());
+    }
+    if let Some((existing_name, _)) = config
+        .peers
+        .iter()
+        .find(|(_, peer)| peer.spki_der_hex == record.spki_der_hex)
+    {
+        bail!("This computer is already paired as {existing_name}; use that name to pair again");
+    }
+    config.peers.insert(name.to_owned(), record);
+    Ok(())
 }
 
 pub async fn connect(
@@ -254,5 +324,46 @@ mod tests {
     fn offer_requires_a_real_input_port() {
         assert!(make_offer(None, 0, Vec::new()).is_err());
         assert!(make_offer(Some("bad\u{1b}label".into()), 43119, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn gui_pairing_requires_code_and_retries_without_replacing_trust() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(directory.path()).unwrap();
+        let observation = PairingObservation {
+            peer_spki: identity.spki().to_vec(),
+            peer_label: None,
+            peer_candidates: vec!["192.0.2.1:43119".parse().unwrap()],
+            authentication_code: "123456".into(),
+        };
+        let mut config = crate::config::Config::default();
+        assert!(add_confirmed_peer(&mut config, &observation, "Ubuntu", "000000", false).is_err());
+        assert!(config.peers.is_empty());
+        add_confirmed_peer(&mut config, &observation, "Ubuntu", "123456", false).unwrap();
+        let saved = config.clone();
+        let permissions = config.peers["Ubuntu"].permissions;
+        assert!(permissions.connect && permissions.receive_normal);
+        assert!(!permissions.send_normal && !permissions.inject_prelogin);
+        add_confirmed_peer(&mut config, &observation, "Ubuntu", "123456", true).unwrap();
+        assert!(
+            add_confirmed_peer(&mut config, &observation, "Duplicate", "123456", false).is_err()
+        );
+        assert_eq!(config, saved);
+        let other_directory = tempfile::tempdir().unwrap();
+        let other_identity = Identity::load_or_create(other_directory.path()).unwrap();
+        let other_observation = PairingObservation {
+            peer_spki: other_identity.spki().to_vec(),
+            ..observation.clone()
+        };
+        assert!(
+            add_confirmed_peer(&mut config, &other_observation, "Ubuntu", "123456", false).is_err()
+        );
+        assert_eq!(config, saved);
+
+        let mut receiver = crate::config::Config::default();
+        add_confirmed_peer(&mut receiver, &observation, "Mac", "123456", true).unwrap();
+        let permissions = receiver.peers["Mac"].permissions;
+        assert!(permissions.connect && permissions.send_normal);
+        assert!(!permissions.receive_normal && !permissions.inject_prelogin);
     }
 }

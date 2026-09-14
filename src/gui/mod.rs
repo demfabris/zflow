@@ -1,10 +1,17 @@
-//! Configuration-only desktop UI. Opening or saving never starts input capture.
+//! Desktop setup and explicit input-sharing controls.
 
+#[cfg(target_os = "linux")]
+mod desktop;
 mod displays;
+#[cfg(any(target_os = "macos", test))]
+mod handoff;
 mod layout_editor;
 mod layout_model;
 mod model;
 mod nearby;
+mod pairing;
+#[cfg(target_os = "macos")]
+mod sharing;
 
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 
@@ -178,6 +185,13 @@ pub struct SettingsApp {
     nearby: nearby::NearbyBrowser,
     discovery_context: Option<egui::Context>,
     discovery_allowed: Option<bool>,
+    pairing: pairing::PairingUi,
+    #[cfg(target_os = "macos")]
+    sharing: sharing::Sharing,
+    #[cfg(target_os = "linux")]
+    receiver: desktop::DesktopReceiver,
+    #[cfg(target_os = "linux")]
+    extension_install: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 }
 
 impl SettingsApp {
@@ -226,12 +240,20 @@ impl SettingsApp {
             nearby: nearby::NearbyBrowser::default(),
             discovery_context: None,
             discovery_allowed: None,
+            pairing: pairing::PairingUi::default(),
+            #[cfg(target_os = "macos")]
+            sharing: sharing::Sharing::default(),
+            #[cfg(target_os = "linux")]
+            receiver: desktop::DesktopReceiver::default(),
+            #[cfg(target_os = "linux")]
+            extension_install: None,
         };
         app.load();
         app
     }
 
     fn load(&mut self) {
+        self.pairing.stop();
         self.displays.stop();
         if self.service_mode {
             self.load_service();
@@ -248,6 +270,9 @@ impl SettingsApp {
                     self.document = Some(document);
                 }
                 let document = self.document.as_ref().expect("loaded document");
+                if document.draft.peers.is_empty() {
+                    self.page = 0;
+                }
                 self.path = document.path.clone();
                 self.fields = Some(TextFields::from_config(&document.draft));
                 self.load_error = None;
@@ -400,6 +425,71 @@ impl SettingsApp {
         self.refresh_discovery();
     }
 
+    fn runtime_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.sharing.is_active()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.receiver.is_active()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn receiver_panel(&mut self, ui: &mut egui::Ui) {
+        if let Some(receiver) = &self.extension_install {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.extension_install = None;
+                    self.notice = match result {
+                        Ok(()) => {
+                            "GNOME integration installed. Enable desktop handoff below.".into()
+                        }
+                        Err(error) => error,
+                    };
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.extension_install = None;
+                    self.notice = "The GNOME integration installer stopped. Try again.".into();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ui
+                    .ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100)),
+            }
+        }
+        let status = self.receiver.status();
+        Card::new().padding(16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            Card::header(ui, "Receive from your Mac", &status);
+            if self.receiver.is_active() {
+                if ui.add(Button::new("Disable desktop handoff").variant(ButtonVariant::Destructive)).clicked() {
+                    self.receiver.stop();
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.pairing.is_active() && self.extension_install.is_none(), Button::new("Enable desktop handoff")).clicked() {
+                        self.receiver.start(ui.ctx());
+                    }
+                    if ui.add_enabled(self.extension_install.is_none(), Button::new("Install GNOME integration").variant(ButtonVariant::Outline)).clicked() {
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        self.extension_install = Some(receiver);
+                        let ctx = ui.ctx().clone();
+                        if let Err(error) = std::thread::Builder::new().name("zflow-extension-install".into()).spawn(move || {
+                            let _ = sender.send(desktop::install_extension().map_err(|error| format!("{error:#}")));
+                            ctx.request_repaint();
+                        }) { self.notice = format!("Could not start installer: {error}"); }
+                    }
+                });
+                ui.label("Install the GNOME integration once. Pair your Mac, then enable desktop handoff and keep this window open.");
+            }
+        });
+    }
+
     pub fn show(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
         self.poll_service(&ctx);
@@ -455,9 +545,27 @@ impl SettingsApp {
                 });
                 muted(
                     ui,
-                    "Configure your computers. This window does not capture or redirect input.",
+                    "Pair your computers, arrange the layout, then enable sharing.",
                 );
             });
+        if self.discovery_context.is_some() && self.load_error.is_none() {
+            #[cfg(target_os = "macos")]
+            {
+                let editable = !self.dirty() && !self.pairing.is_active();
+                if let Some(doc) = &self.document {
+                    egui::Panel::top("sharing").show(root, |ui| {
+                        self.sharing
+                            .show(ui, &doc.path, doc.saved(), editable && !doc.is_new());
+                    });
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if self.service_mode {
+                egui::Panel::top("desktop-receiver").show(root, |ui| self.receiver_panel(ui));
+            }
+        }
+        let runtime_active = self.runtime_active();
+        let editing_allowed = !runtime_active && !self.pairing.is_active();
         let mut save = false;
         let mut save_layout = false;
         let mut reload = false;
@@ -497,7 +605,8 @@ impl SettingsApp {
                         if self.page == 4 {
                             save_layout = ui
                                 .add_enabled(
-                                    self.load_error.is_none()
+                                    editing_allowed
+                                        && self.load_error.is_none()
                                         && self
                                             .document
                                             .as_ref()
@@ -508,7 +617,8 @@ impl SettingsApp {
                         } else if !self.service_mode {
                             save = ui
                                 .add_enabled(
-                                    self.load_error.is_none()
+                                    editing_allowed
+                                        && self.load_error.is_none()
                                         && validation.is_none()
                                         && self
                                             .document
@@ -519,7 +629,8 @@ impl SettingsApp {
                                 .clicked();
                         }
                         reload = ui
-                            .add(
+                            .add_enabled(
+                                editing_allowed,
                                 Button::new(if self.service_mode {
                                     "Refresh computers"
                                 } else {
@@ -570,9 +681,10 @@ impl SettingsApp {
                 ui.add_space(4.0);
                 muted(
                     ui,
-                    "Arrange crossing zones in Layout. Automatic cursor handoff is not active yet.",
+                    "Save your layout, enable desktop handoff on Ubuntu, then enable sharing on the Mac.",
                 );
             });
+        let mut paired = false;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme.background).inner_margin(24)).show(root, |ui| {
             egui::ScrollArea::vertical().id_salt(("page", self.page)).auto_shrink([false, false]).show(ui, |ui| {
                 if let Some(error) = &self.load_error {
@@ -588,44 +700,54 @@ impl SettingsApp {
                 let Some(doc) = self.document.as_mut() else { return; };
                 let fields = self.fields.as_mut().expect("loaded text fields");
                 if doc.is_new() {
-                    muted(ui, "This file does not exist yet. Review the defaults and choose Save to create it. Device setup and pairing still use the CLI.");
+                    muted(ui, "Choose Save configuration to create your settings, then pair a computer below.");
                     ui.add_space(14.0);
                 }
-                match self.page {
+                ui.add_enabled_ui(editing_allowed, |ui| match self.page {
                     4 => {
                         self.layout.show(ui, &doc.draft);
                         if let Some(error) = self.desktop_detector.snapshot().1 { muted(ui, &error); }
                         if let Some(error) = self.displays.error() { muted(ui, &format!("Desktop discovery unavailable: {error}")); }
                     },
                     5 => {
-                        heading(ui, "Nearby computers", "Discover zflow services on your local network. Pairing stays separate.");
+                        heading(ui, "Nearby computers", "Choose a computer, then compare the pairing codes on both screens.");
                         if let Some(address) = self.nearby.show(ui, doc.saved()) {
-                            self.launch.address = address.to_string();
-                            self.notice = "Address added to the Mac launch override. Choose the matching paired computer; discovery does not verify identity.".into();
+                            self.pairing.set_address(address);
+                            self.notice = "Pairing address selected. Allow pairing on the other computer, then choose Pair with address.".into();
                             self.page = 0;
                         }
                     },
                     0 if self.service_mode => {
-                        heading(ui, "Paired computers", "Read from the local service. Use the CLI to change pairing or permissions.");
+                        heading(ui, "Paired computers", "Computers saved by the local service.");
                         for (name, peer) in &doc.draft.peers {
                             card(ui, name, "Saved pairing", |ui| {
                                 if let Ok(fingerprint) = peer.fingerprint_hex() { ui.monospace(fingerprint); }
                                 for address in &peer.addresses { ui.label(address.to_string()); }
                             });
                         }
-                        if doc.draft.peers.is_empty() { muted(ui, "No paired computers. Pair this machine using zflow pair first."); }
+                        if doc.draft.peers.is_empty() { muted(ui, "No paired computers yet. Allow pairing below."); }
                     },
                     0 => computers(ui, &mut doc.draft, fields),
                     1 => input(ui, &mut doc.draft, fields),
                     2 => connection(ui, &mut doc.draft, fields),
                     _ => advanced(ui, fields),
+                });
+                if self.page == 0 {
+                    ui.add_space(12.0);
+                    let target = if self.service_mode { pairing::PairingTarget::Service }
+                        else { pairing::PairingTarget::File { path: doc.path.clone(), config: Box::new(doc.saved().clone()) } };
+                    let saved = self.service_mode || (!doc.is_new() && !doc.is_dirty() && *fields == TextFields::from_config(&doc.draft));
+                    paired = self.pairing.show(ui, target, saved && !runtime_active);
                 }
-                if self.page == 0 && cfg!(target_os = "macos") {
+                if self.page == 3 && cfg!(target_os = "macos") {
                     let dirty = doc.is_dirty() || *fields != TextFields::from_config(&doc.draft) || doc.is_new();
                     launch_panel(ui, &doc.path, &doc.draft, &mut self.launch, dirty);
                 }
             });
         });
+        if paired {
+            self.load();
+        }
         if save {
             self.save();
         }
@@ -706,20 +828,10 @@ fn computers(ui: &mut egui::Ui, config: &mut Config, fields: &mut TextFields) {
     heading(
         ui,
         "Your computers",
-        "Paired identities and access. Connection status is not monitored in this version.",
+        "Paired identities and access. Start sharing with the controls above.",
     );
     if config.peers.is_empty() {
-        card(
-            ui,
-            "No paired computers",
-            "Pair from the terminal, then reload this file.",
-            |ui| {
-                muted(
-                    ui,
-                    "Use zflow --config PATH pair listen NAME on one computer and pair connect NAME IP:43120 on the other. Compare the codes on both machines.",
-                );
-            },
-        );
+        return;
     }
     for (name, peer) in &mut config.peers {
         ui.push_id(name, |ui| {
@@ -742,7 +854,7 @@ fn computers(ui: &mut egui::Ui, config: &mut Config, fields: &mut TextFields) {
     }
     muted(
         ui,
-        "Pairing and revocation still use zflow pair and zflow peer revoke. This editor preserves pinned identities.",
+        "Pair another computer below. Use zflow peer revoke to remove an existing identity.",
     );
 }
 

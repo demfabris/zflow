@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(version, about = "zflow configuration window (does not capture input)")]
+#[command(version, about = "zflow setup and input sharing")]
 struct Args {
     /// Configuration file to edit. No file is written until you choose Save.
     #[arg(long)]

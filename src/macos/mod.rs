@@ -7,12 +7,13 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::raw::c_char,
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::Endpoint;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     capture::{
@@ -24,6 +25,7 @@ use crate::{
         SessionContext, SessionEpoch, SourceDimensions, TouchContact, TouchState, TouchTool,
         TransportGeneration,
     },
+    desktop::{DesktopRequest, DesktopResponse, Edge},
     identity::Identity,
     session::{SessionEventKind, SessionOptions, start_session},
     transport::{connect_input, input_client_config},
@@ -34,16 +36,205 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const TOUCH_STALE_TIMEOUT: Duration = Duration::from_millis(150);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SourceOptions {
     pub config_path: PathBuf,
     pub peer: String,
     pub address: Option<SocketAddr>,
     pub raw_touch: bool,
     pub reduce_wifi_latency: bool,
+    pub handoff: Option<HandoffOptions>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HandoffOptions {
+    pub entry_position: CursorPosition,
+    pub edge: Edge,
+    pub start: u32,
+    pub end: u32,
+    pub position: u32,
+    pub expected_width: u32,
+    pub expected_height: u32,
 }
 
 pub async fn run(options: SourceOptions) -> Result<()> {
+    let (stop, stopped) = watch::channel(false);
+    let (status, _events) = mpsc::unbounded_channel();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let signals = tokio::spawn(async move {
+        tokio::select! {
+            _ = terminate.recv() => {},
+            _ = interrupt.recv() => {},
+            _ = hangup.recv() => {},
+        }
+        let _ = stop.send(true);
+    });
+    let result = run_controlled(options, stopped, status).await;
+    signals.abort();
+    result
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceStatus {
+    Connecting,
+    Sharing,
+    Returned { position: u32 },
+    Stopped,
+    Failed(String),
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CursorPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DesktopRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl DesktopRect {
+    pub fn contains(self, position: CursorPosition) -> bool {
+        position.x >= self.x
+            && position.y >= self.y
+            && position.x < self.x + self.width
+            && position.y < self.y + self.height
+    }
+}
+
+/// `prompt` asks macOS to show its normal Accessibility permission UI.
+pub fn accessibility_authorized(prompt: bool) -> bool {
+    // SAFETY: the bridge creates and releases its own permission options.
+    unsafe { zflow_mac_accessibility_authorized(i32::from(prompt)) == 1 }
+}
+
+pub fn cursor_position() -> Result<CursorPosition> {
+    let mut position = CursorPosition::default();
+    // SAFETY: the output has the bridge's two-double C layout.
+    if unsafe { zflow_mac_cursor_position(&mut position) } != 0 {
+        bail!("could not read the Mac cursor position");
+    }
+    Ok(position)
+}
+
+pub fn active_desktop_rectangles() -> Result<Vec<DesktopRect>> {
+    let mut rectangles = vec![DesktopRect::default(); 64];
+    // SAFETY: the bridge receives writable storage for all 64 rectangles.
+    let count = unsafe { zflow_mac_desktop_rectangles(rectangles.as_mut_ptr(), 64) };
+    if !(1..=64).contains(&count) {
+        bail!("could not read active Mac displays");
+    }
+    rectangles.truncate(count as usize);
+    rectangles.sort_by(|left, right| {
+        left.x
+            .total_cmp(&right.x)
+            .then(left.y.total_cmp(&right.y))
+            .then(left.width.total_cmp(&right.width))
+            .then(left.height.total_cmp(&right.height))
+    });
+    Ok(rectangles)
+}
+
+/// Move the local cursor after source cleanup, using global desktop coordinates.
+pub fn warp_cursor(position: CursorPosition) -> Result<()> {
+    let _guard = SourceGuard::acquire()?;
+    if !position.x.is_finite()
+        || !position.y.is_finite()
+        || !active_desktop_rectangles()?
+            .iter()
+            .any(|rect| rect.contains(position))
+    {
+        bail!("cursor return position is outside the active Mac displays");
+    }
+    // SAFETY: finite, visible coordinates were checked; no source can start
+    // while this operation holds the source guard.
+    if unsafe { zflow_mac_warp_cursor(position) } != 0 {
+        bail!("could not return the Mac cursor to its display");
+    }
+    Ok(())
+}
+
+pub fn input_is_neutral() -> bool {
+    // SAFETY: this reads physical key, button and modifier state without capture.
+    unsafe { zflow_mac_input_is_neutral() == 1 }
+}
+
+/// Stop by setting the watch value to true or dropping its sender, then await
+/// completion so cursor, session and optional radio cleanup can finish.
+pub async fn run_controlled(
+    options: SourceOptions,
+    mut stop: watch::Receiver<bool>,
+    status: mpsc::UnboundedSender<SourceStatus>,
+) -> Result<()> {
+    let _ = status.send(SourceStatus::Connecting);
+    let result = run_source(options, &mut stop, &status).await;
+    let final_status = match &result {
+        Ok(returned) => {
+            if let Some(position) = returned {
+                let _ = status.send(SourceStatus::Returned {
+                    position: *position,
+                });
+            }
+            SourceStatus::Stopped
+        }
+        Err(error) => SourceStatus::Failed(format!("{error:#}")),
+    };
+    let _ = status.send(final_status);
+    result.map(|_| ())
+}
+
+async fn stop_requested(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow_and_update() || stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+static SOURCE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct SourceGuard;
+
+impl SourceGuard {
+    fn acquire() -> Result<Self> {
+        SOURCE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow!("a macOS input source is already running"))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        SOURCE_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+struct SourceEndpoint(Endpoint);
+
+impl Drop for SourceEndpoint {
+    fn drop(&mut self) {
+        self.0.close(0_u32.into(), b"foreground source stopped");
+    }
+}
+
+async fn run_source(
+    options: SourceOptions,
+    stop: &mut watch::Receiver<bool>,
+    status: &mpsc::UnboundedSender<SourceStatus>,
+) -> Result<Option<u32>> {
+    if *stop.borrow() || stop.has_changed().is_err() {
+        return Ok(None);
+    }
+    let _guard = SourceGuard::acquire()?;
     let mut config = Config::load(&options.config_path)?;
     let peer = config
         .peers
@@ -77,147 +268,314 @@ pub async fn run(options: SourceOptions) -> Result<()> {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
-    let endpoint = Endpoint::client(bind_address)?;
+    let endpoint = SourceEndpoint(Endpoint::client(bind_address)?);
     println!("connecting to {} at {address}", options.peer);
-    let connection = tokio::time::timeout(
+    let connection = tokio::select! {
+        biased;
+        _ = stop_requested(stop) => return Ok(None),
+        result = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        connect_input(&endpoint, address, &client_config),
+        connect_input(&endpoint.0, address, &client_config),
     )
-    .await
-    .context("input connection timed out")??;
+        => result.context("input connection timed out")??,
+    };
 
     let (session_events, mut events) = mpsc::channel(128);
-    let session = start_session(
+    let session = tokio::select! {
+        biased;
+        _ = stop_requested(stop) => return Ok(None),
+        result = start_session(
         connection,
         options.peer.clone(),
         TransportGeneration(1),
         SessionOptions::from_config(&config)?,
         session_events,
-    )
-    .await?;
-
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let mut awdl_lease = if options.reduce_wifi_latency {
-        Some(awdl::AwDlLease::acquire().await?)
-    } else {
-        None
+        ) => result?,
     };
 
-    let mut epoch = [0_u8; 16];
-    getrandom::fill(&mut epoch)
-        .map_err(|error| anyhow!("could not create the source session epoch: {error}"))?;
-    session.begin_outbound(SessionContext {
-        protocol_version: CURRENT_PROTOCOL_VERSION,
-        session_epoch: SessionEpoch(epoch),
-        transport_generation: session.generation(),
-        activation_id: ActivationId(1),
-    })?;
+    let mut awdl_lease = None;
+    let mut prepared = None;
+    let mut activation_started = false;
+    let mut returned = None;
+    let local_desktop = options
+        .handoff
+        .as_ref()
+        .map(|_| active_desktop_rectangles())
+        .transpose()?;
 
-    let mut capture = MacCapture::start(raw_available)?;
-    println!(
-        "remote input active: raw_touch={}; escape with Ctrl+Cmd+Backspace or Ctrl+C",
-        capture.raw_touch
-    );
-
-    let mut interval = tokio::time::interval(CAPTURE_POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut awdl_renewal = tokio::time::interval(awdl::RENEW_INTERVAL);
-    awdl_renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut touch_active = false;
-    let mut last_touch = Instant::now();
-    let mut terminal_error = None;
-
-    loop {
-        tokio::select! {
-            _ = awdl_renewal.tick(), if awdl_lease.is_some() => {
-                if let Err(error) = awdl_lease.as_mut().expect("active AWDL lease").renew().await {
-                    terminal_error = Some(error);
-                    break;
-                }
+    let result = async {
+        if *stop.borrow() || stop.has_changed().is_err() {
+            return Ok(());
+        }
+        if options.reduce_wifi_latency {
+            awdl_lease = tokio::select! {
+                biased;
+                _ = stop_requested(stop) => return Ok(()),
+                result = awdl::AwDlLease::acquire() => Some(result?),
+            };
+        }
+        if let Some(handoff) = &options.handoff {
+            let mut token_bytes = [0_u8; 8];
+            getrandom::fill(&mut token_bytes)
+                .map_err(|error| anyhow!("could not create a desktop handoff token: {error}"))?;
+            let token = handoff_token(token_bytes);
+            let request = DesktopRequest::Prepare {
+                token, edge: handoff.edge, start: handoff.start,
+                end: handoff.end, position: handoff.position,
+            };
+            request.validate()?;
+            // Even a cancelled request may already have reached the receiver.
+            prepared = Some(token);
+            let response = tokio::select! {
+                biased;
+                _ = stop_requested(stop) => return Ok(()),
+                response = session.desktop_request(request) => response.context(
+                    "Could not prepare desktop handoff. Update zflow on both computers and enable desktop handoff in the Ubuntu app"
+                )?,
+            };
+            validate_prepared(handoff, response)?;
+        }
+        if *stop.borrow() || stop.has_changed().is_err() {
+            return Ok(());
+        }
+        if options.handoff.is_some() && !input_is_neutral() {
+            bail!("release held keys and buttons before crossing to the other computer");
+        }
+        if let Some(handoff) = &options.handoff {
+            validate_entry_position(handoff.entry_position, cursor_position()?)?;
+            if local_desktop.as_ref() != Some(&active_desktop_rectangles()?) {
+                bail!("the Mac desktop changed while connecting; refresh and save its layout");
             }
-            _ = interval.tick() => {
-                while let Some(event) = capture.poll() {
-                    if event.kind == NativeEventKind::Escape as u32 {
-                        break;
+        }
+        let mut epoch = [0_u8; 16];
+        getrandom::fill(&mut epoch)
+            .map_err(|error| anyhow!("could not create the source session epoch: {error}"))?;
+        session.begin_outbound(SessionContext {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            session_epoch: SessionEpoch(epoch),
+            transport_generation: session.generation(),
+            activation_id: ActivationId(1),
+        })?;
+        activation_started = true;
+
+        let mut capture = MacCapture::start(raw_available, options.handoff.as_ref().map(|h| h.entry_position))?;
+        let _ = status.send(SourceStatus::Sharing);
+        println!(
+            "remote input active: raw_touch={}; escape with Ctrl+Cmd+Backspace or Ctrl+C",
+            capture.raw_touch
+        );
+
+        let mut interval = tokio::time::interval(CAPTURE_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut awdl_renewal = tokio::time::interval(awdl::RENEW_INTERVAL);
+        awdl_renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut touch_active = false;
+        let mut last_touch = Instant::now();
+        let mut terminal_error = None;
+        let desktop_poll = poll_desktop(&session, prepared);
+        tokio::pin!(desktop_poll);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop_requested(stop) => break,
+                response = &mut desktop_poll, if prepared.is_some() => {
+                    match response {
+                        Ok(DesktopResponse::Active) => desktop_poll.set(poll_desktop(&session, prepared)),
+                        Ok(DesktopResponse::Returned { position }) => {
+                            if let Some(handoff) = &options.handoff
+                                && (position < handoff.start || position > handoff.end)
+                            {
+                                terminal_error = Some(anyhow!("receiver returned outside the configured edge range"));
+                            } else {
+                                returned = Some(position);
+                            }
+                            break;
+                        },
+                        Ok(DesktopResponse::Unavailable { reason }) => {
+                            terminal_error = Some(anyhow!("receiver desktop unavailable: {reason}"));
+                            break;
+                        },
+                        Ok(_) => {
+                            terminal_error = Some(anyhow!("unexpected receiver desktop response"));
+                            break;
+                        },
+                        Err(error) => {
+                            terminal_error = Some(error);
+                            break;
+                        }
                     }
-                    if event.kind == NativeEventKind::Touch as u32 {
-                        last_touch = Instant::now();
-                        touch_active = event.contact_count > 0;
-                    }
-                    if let Some(frame) = native_frame(event)?
-                        && let Err(error) = session.capture(frame)
-                    {
+                },
+                _ = awdl_renewal.tick(), if awdl_lease.is_some() => {
+                    if let Err(error) = awdl_lease.as_mut().expect("active AWDL lease").renew().await {
                         terminal_error = Some(error);
                         break;
                     }
                 }
-                if capture.stop_requested() || terminal_error.is_some() {
-                    break;
+                _ = interval.tick() => {
+                    while let Some(event) = capture.poll() {
+                        if event.kind == NativeEventKind::Escape as u32 {
+                            break;
+                        }
+                        if event.kind == NativeEventKind::Touch as u32 {
+                            last_touch = Instant::now();
+                            touch_active = event.contact_count > 0;
+                        }
+                        match native_frame(event).and_then(|frame| {
+                            frame.map_or(Ok(()), |frame| session.capture(frame))
+                        }) {
+                            Ok(()) => {},
+                            Err(error) => {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    if capture.stop_requested() || terminal_error.is_some() {
+                        break;
+                    }
+                    if touch_active && last_touch.elapsed() >= TOUCH_STALE_TIMEOUT {
+                        if let Err(error) = session.capture(touch_frame(TouchState::default())) {
+                            terminal_error = Some(error);
+                            break;
+                        }
+                        touch_active = false;
+                    }
                 }
-                if touch_active && last_touch.elapsed() >= TOUCH_STALE_TIMEOUT {
-                    session.capture(touch_frame(TouchState::default()))?;
-                    touch_active = false;
-                }
-            }
-            _ = interrupt.recv() => break,
-            _ = terminate.recv() => break,
-            _ = hangup.recv() => break,
-            event = events.recv() => {
-                match event.map(|event| event.kind) {
-                    Some(SessionEventKind::ReceiverEffects { applied, .. }) => {
-                        let message = "foreground macOS source does not inject received input".to_owned();
-                        let _ = applied.send(Err(message.clone()));
-                        terminal_error = Some(anyhow!(message));
-                        break;
-                    }
-                    Some(SessionEventKind::Closed { reason }) => {
-                        terminal_error = Some(anyhow!("input session closed: {reason}"));
-                        break;
-                    }
-                    Some(SessionEventKind::OutboundEnded) => {
-                        terminal_error = Some(anyhow!("remote input ownership ended"));
-                        break;
-                    }
-                    None => {
-                        terminal_error = Some(anyhow!("input session event channel closed"));
-                        break;
+                event = events.recv() => {
+                    match event.map(|event| event.kind) {
+                        Some(SessionEventKind::Desktop { reply, .. }) => {
+                            let _ = reply.send(DesktopResponse::unavailable("Mac source cannot receive desktop handoffs"));
+                        }
+                        Some(SessionEventKind::ReceiverEffects { applied, .. }) => {
+                            let message = "foreground macOS source does not inject received input".to_owned();
+                            let _ = applied.send(Err(message.clone()));
+                            terminal_error = Some(anyhow!(message));
+                            break;
+                        }
+                        Some(SessionEventKind::Closed { reason }) => {
+                            terminal_error = Some(anyhow!("input session closed: {reason}"));
+                            break;
+                        }
+                        Some(SessionEventKind::OutboundEnded) => {
+                            terminal_error = Some(anyhow!("remote input ownership ended"));
+                            break;
+                        }
+                        None => {
+                            terminal_error = Some(anyhow!("input session event channel closed"));
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
 
-    if let Err(error) = capture.stop() {
-        eprintln!("{error:#}");
-        terminal_error.get_or_insert(error);
+        if let Err(error) = capture.stop() {
+            eprintln!("{error:#}");
+            terminal_error.get_or_insert(error);
+        }
+        if touch_active {
+            let _ = session.capture(touch_frame(TouchState::default()));
+        }
+        println!("remote input capture stopped");
+        terminal_error.map_or(Ok(()), Err)
+    }.await;
+    let mut result = result;
+    if activation_started {
+        let released = tokio::time::timeout(
+            Duration::from_millis(200),
+            session.end_outbound(SessionCloseReason::LocalRelease),
+        )
+        .await
+        .context("timed out releasing remote input")
+        .and_then(|result| result);
+        if let Err(error) = released {
+            eprintln!("Could not confirm remote input release: {error:#}");
+            if result.is_ok() && returned.is_some() {
+                result = Err(error);
+            }
+            session.close(SessionCloseReason::LocalRelease);
+        }
     }
-    if touch_active {
-        let _ = session.capture(touch_frame(TouchState::default()));
+    if let Some(token) = prepared {
+        let finished = session
+            .desktop_request(DesktopRequest::Finish { token })
+            .await;
+        if let Err(error) = validate_finished(finished) {
+            eprintln!("Could not confirm desktop handoff cleanup: {error:#}");
+            if result.is_ok() && returned.is_some() {
+                result = Err(error);
+            }
+        }
     }
-    if tokio::time::timeout(
-        Duration::from_millis(200),
-        session.end_outbound(SessionCloseReason::LocalRelease),
-    )
-    .await
-    .is_err()
-    {
-        session.close(SessionCloseReason::LocalRelease);
-    }
-    endpoint.close(0_u32.into(), b"foreground source stopped");
-    println!("remote input capture stopped");
+    session.close(SessionCloseReason::LocalRelease);
+    endpoint.0.close(0_u32.into(), b"foreground source stopped");
     if let Some(lease) = awdl_lease.take()
         && let Err(error) = lease.release().await
     {
         eprintln!("Could not confirm AWDL restoration: {error:#}");
-        terminal_error.get_or_insert(error);
+        if result.is_ok() {
+            result = Err(error);
+        }
     }
 
-    if let Some(error) = terminal_error {
-        return Err(error);
+    result.map(|_| returned)
+}
+
+fn validate_prepared(handoff: &HandoffOptions, response: DesktopResponse) -> Result<()> {
+    response.validate()?;
+    match response {
+        DesktopResponse::Prepared { geometry, .. } => {
+            let bounds = geometry.bounds()?;
+            if bounds.width != handoff.expected_width || bounds.height != handoff.expected_height {
+                bail!(
+                    "receiver desktop changed size; refresh and save the computer layout before sharing"
+                );
+            }
+            Ok(())
+        }
+        DesktopResponse::Unavailable { reason } => bail!("receiver desktop unavailable: {reason}"),
+        _ => bail!("receiver did not prepare its desktop for input"),
+    }
+}
+
+fn handoff_token(random: [u8; 8]) -> u64 {
+    (u64::from_ne_bytes(random) & crate::desktop::MAX_TOKEN).max(1)
+}
+
+fn validate_entry_position(expected: CursorPosition, current: CursorPosition) -> Result<()> {
+    if !expected.x.is_finite()
+        || !expected.y.is_finite()
+        || !current.x.is_finite()
+        || !current.y.is_finite()
+        || (expected.x - current.x).abs() > 8.0
+        || (expected.y - current.y).abs() > 8.0
+    {
+        bail!("crossing cancelled because the Mac cursor moved while connecting");
     }
     Ok(())
+}
+
+fn validate_finished(response: Result<DesktopResponse>) -> Result<()> {
+    match response? {
+        DesktopResponse::Finished => Ok(()),
+        DesktopResponse::Unavailable { reason } => {
+            bail!("receiver could not finish desktop handoff: {reason}")
+        }
+        _ => bail!("receiver did not confirm desktop handoff cleanup"),
+    }
+}
+
+async fn poll_desktop(
+    session: &crate::session::SessionHandle,
+    token: Option<u64>,
+) -> Result<DesktopResponse> {
+    tokio::time::sleep(Duration::from_millis(16)).await;
+    session
+        .desktop_request(DesktopRequest::Poll {
+            token: token.context("desktop handoff has no token")?,
+        })
+        .await
 }
 
 fn native_frame(event: NativeEvent) -> Result<Option<CapturedDeviceFrame>> {
@@ -458,8 +816,13 @@ struct NativeEvent {
 }
 
 unsafe extern "C" {
+    fn zflow_mac_accessibility_authorized(prompt: i32) -> i32;
+    fn zflow_mac_cursor_position(position: *mut CursorPosition) -> i32;
+    fn zflow_mac_desktop_rectangles(rectangles: *mut DesktopRect, capacity: u32) -> i32;
+    fn zflow_mac_warp_cursor(position: CursorPosition) -> i32;
+    fn zflow_mac_input_is_neutral() -> i32;
     fn zflow_mac_raw_touch_available() -> i32;
-    fn zflow_mac_capture_start(raw_touch: i32) -> i32;
+    fn zflow_mac_capture_start(raw_touch: i32, entry: *const CursorPosition) -> i32;
     fn zflow_mac_capture_poll(event: *mut NativeEvent) -> i32;
     fn zflow_mac_capture_stop_requested() -> i32;
     fn zflow_mac_capture_stop() -> i32;
@@ -486,9 +849,14 @@ impl MacCapture {
         unsafe { zflow_mac_raw_touch_available() == 1 }
     }
 
-    fn start(raw_touch: bool) -> Result<Self> {
+    fn start(raw_touch: bool, entry: Option<CursorPosition>) -> Result<Self> {
         // SAFETY: start initializes the native thread before returning.
-        let status = unsafe { zflow_mac_capture_start(i32::from(raw_touch)) };
+        let status = unsafe {
+            zflow_mac_capture_start(
+                i32::from(raw_touch),
+                entry.as_ref().map_or(std::ptr::null(), |position| position),
+            )
+        };
         if status < 0 {
             bail!("could not start macOS capture: {}", Self::last_error());
         }
@@ -547,6 +915,181 @@ mod tests {
     use super::*;
 
     const ALPHA_SHIFT: u64 = 0x0001_0000;
+
+    #[test]
+    fn handoff_tokens_fit_the_receiver_javascript_integer_range() {
+        assert_eq!(handoff_token([0; 8]), 1);
+        assert_eq!(handoff_token([u8::MAX; 8]), crate::desktop::MAX_TOKEN);
+        assert!(handoff_token([0x80; 8]) <= crate::desktop::MAX_TOKEN);
+    }
+
+    #[test]
+    fn entry_admission_rejects_cursor_movement_during_connection_setup() {
+        let expected = CursorPosition {
+            x: -1000.0,
+            y: 200.0,
+        };
+        assert!(
+            validate_entry_position(
+                expected,
+                CursorPosition {
+                    x: -992.0,
+                    y: 192.0
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_entry_position(
+                expected,
+                CursorPosition {
+                    x: -991.0,
+                    y: 200.0
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_entry_position(
+                expected,
+                CursorPosition {
+                    x: -1000.0,
+                    y: 209.0
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_entry_position(
+                expected,
+                CursorPosition {
+                    x: f64::NAN,
+                    y: 200.0
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn handoff_requires_prepared_geometry_to_match_saved_target() {
+        let handoff = HandoffOptions {
+            entry_position: CursorPosition { x: -1.0, y: 50.0 },
+            edge: Edge::Left,
+            start: 0,
+            end: crate::desktop::FRACTION_MAX,
+            position: 500_000,
+            expected_width: 2880,
+            expected_height: 1620,
+        };
+        let prepared = DesktopResponse::Prepared {
+            geometry: crate::desktop::Geometry {
+                monitors: vec![crate::desktop::Rect {
+                    x: -2880,
+                    y: -200,
+                    width: 2880,
+                    height: 1620,
+                }],
+            },
+            position: crate::desktop::Point { x: -2879, y: 610 },
+        };
+        assert!(validate_prepared(&handoff, prepared.clone()).is_ok());
+        assert!(
+            validate_prepared(
+                &HandoffOptions {
+                    expected_width: 3840,
+                    ..handoff.clone()
+                },
+                prepared
+            )
+            .is_err()
+        );
+        assert!(validate_prepared(&handoff, DesktopResponse::Active).is_err());
+        assert!(
+            validate_prepared(&handoff, DesktopResponse::unavailable("missing extension")).is_err()
+        );
+    }
+
+    #[test]
+    fn handoff_return_requires_explicit_finish_acknowledgement() {
+        assert!(validate_finished(Ok(DesktopResponse::Finished)).is_ok());
+        assert!(validate_finished(Ok(DesktopResponse::Active)).is_err());
+        assert!(
+            validate_finished(Ok(DesktopResponse::unavailable("receiver still active"))).is_err()
+        );
+        assert!(validate_finished(Err(anyhow!("disconnected"))).is_err());
+    }
+
+    #[test]
+    fn source_guard_excludes_concurrent_sources_and_releases_on_drop() {
+        let guard = SourceGuard::acquire().unwrap();
+        assert!(SourceGuard::acquire().is_err());
+        drop(guard);
+        assert!(SourceGuard::acquire().is_ok());
+    }
+
+    #[test]
+    fn desktop_positions_preserve_negative_origins_and_exclude_outer_boundary() {
+        let rect = DesktopRect {
+            x: -1920.0,
+            y: -200.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        assert!(rect.contains(CursorPosition {
+            x: -1919.0,
+            y: -199.0
+        }));
+        assert!(!rect.contains(CursorPosition { x: 0.0, y: 0.0 }));
+        assert!(!rect.contains(CursorPosition { x: -1.0, y: 880.0 }));
+        assert!(!rect.contains(CursorPosition {
+            x: f64::NAN,
+            y: 0.0
+        }));
+    }
+
+    #[tokio::test]
+    async fn controlled_source_cancels_before_config_or_capture() {
+        for close_sender in [false, true] {
+            let (stop, receiver) = watch::channel(!close_sender);
+            if close_sender {
+                drop(stop);
+            }
+            let (status, mut events) = mpsc::unbounded_channel();
+            run_controlled(
+                SourceOptions {
+                    config_path: PathBuf::from("/nonexistent-zflow-test-config"),
+                    peer: "unused".into(),
+                    address: None,
+                    raw_touch: false,
+                    reduce_wifi_latency: false,
+                    handoff: None,
+                },
+                receiver,
+                status,
+            )
+            .await
+            .unwrap();
+            assert_eq!(events.recv().await, Some(SourceStatus::Connecting));
+            assert_eq!(events.recv().await, Some(SourceStatus::Stopped));
+            assert_eq!(events.recv().await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_ignores_false_updates_and_accepts_sender_loss() {
+        let (sender, mut receiver) = watch::channel(false);
+        sender.send(false).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), stop_requested(&mut receiver))
+                .await
+                .is_err()
+        );
+        drop(sender);
+        tokio::time::timeout(Duration::from_millis(50), stop_requested(&mut receiver))
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn maps_main_return_to_hid_return() {

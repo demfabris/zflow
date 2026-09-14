@@ -17,6 +17,10 @@ build platform *args: (_platform platform)
 test *args:
     cargo test --locked --all-targets --all-features "$@"
 
+# Exercise the shipped GNOME extension with a simulated compositor (requires Node.js).
+test-desktop:
+    node tests/gnome_desktop_test.mjs
+
 # Format Rust code.
 fmt:
     cargo fmt --all
@@ -30,7 +34,7 @@ lint:
     cargo clippy --locked --all-targets --all-features -- -D warnings
 
 # Check formatting, lint, and run tests.
-check: fmt-check lint test
+check: fmt-check lint test test-desktop
 
 [private]
 _platform platform:

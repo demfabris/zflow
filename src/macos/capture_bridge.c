@@ -11,6 +11,67 @@
 
 #define ZFLOW_QUEUE_CAPACITY 1024
 #define ZFLOW_MAX_CONTACTS 5
+#define ZFLOW_MAX_DISPLAYS 64
+
+typedef struct { double x, y; } ZFlowMacPosition;
+typedef struct { double x, y, width, height; } ZFlowMacRect;
+
+int zflow_mac_accessibility_authorized(int prompt) {
+  if (!prompt) return AXIsProcessTrusted() ? 1 : 0;
+  const void *keys[] = {kAXTrustedCheckOptionPrompt};
+  const void *values[] = {kCFBooleanTrue};
+  CFDictionaryRef options = CFDictionaryCreate(
+      NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+      &kCFTypeDictionaryValueCallBacks);
+  if (!options) return 0;
+  bool trusted = AXIsProcessTrustedWithOptions(options);
+  CFRelease(options);
+  return trusted ? 1 : 0;
+}
+
+int zflow_mac_cursor_position(ZFlowMacPosition *position) {
+  if (!position) return -1;
+  CGEventRef event = CGEventCreate(NULL);
+  if (!event) return -1;
+  CGPoint point = CGEventGetLocation(event);
+  CFRelease(event);
+  if (!isfinite(point.x) || !isfinite(point.y)) return -1;
+  *position = (ZFlowMacPosition){point.x, point.y};
+  return 0;
+}
+
+int zflow_mac_desktop_rectangles(ZFlowMacRect *rectangles, uint32_t capacity) {
+  CGDirectDisplayID displays[ZFLOW_MAX_DISPLAYS];
+  uint32_t count = 0;
+  if (!rectangles || capacity < ZFLOW_MAX_DISPLAYS ||
+      CGGetActiveDisplayList(ZFLOW_MAX_DISPLAYS, displays, &count) != kCGErrorSuccess ||
+      count == 0 || count > ZFLOW_MAX_DISPLAYS) return -1;
+  for (uint32_t i = 0; i < count; i++) {
+    CGRect bounds = CGDisplayBounds(displays[i]);
+    if (!isfinite(bounds.origin.x) || !isfinite(bounds.origin.y) ||
+        !isfinite(bounds.size.width) || !isfinite(bounds.size.height) ||
+        bounds.size.width <= 0 || bounds.size.height <= 0) return -1;
+    rectangles[i] = (ZFlowMacRect){bounds.origin.x, bounds.origin.y,
+                                  bounds.size.width, bounds.size.height};
+  }
+  return (int)count;
+}
+
+int zflow_mac_warp_cursor(ZFlowMacPosition position) {
+  if (!isfinite(position.x) || !isfinite(position.y)) return -1;
+  return CGWarpMouseCursorPosition(CGPointMake(position.x, position.y)) ==
+                 kCGErrorSuccess ? 0 : -1;
+}
+
+int zflow_mac_input_is_neutral(void) {
+  for (CGKeyCode key = 0; key < 128; key++)
+    if (CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, key)) return 0;
+  for (CGMouseButton button = 0; button < 32; button++)
+    if (CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, button)) return 0;
+  CGEventFlags held = kCGEventFlagMaskShift | kCGEventFlagMaskControl |
+      kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand | kCGEventFlagMaskSecondaryFn;
+  return (CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & held) == 0;
+}
 
 typedef struct { float x, y; } MTPoint;
 typedef struct { MTPoint pos, vel; } MTReadout;
@@ -75,6 +136,10 @@ static bool g_thread_valid;
 static bool g_start_ready;
 static int g_start_status;
 static bool g_request_raw_touch;
+static bool g_check_entry;
+static ZFlowMacPosition g_entry_position;
+static bool g_forwarded_keys[128];
+static bool g_forwarded_buttons[33];
 static _Atomic bool g_stop;
 static _Atomic bool g_raw_contact_active;
 static int g_capture_status;
@@ -164,6 +229,31 @@ static bool capture_cursor(void) {
                        "could not disconnect the Mac cursor");
 }
 
+static bool capture_entry_allowed(void) {
+  if (!g_check_entry) return true;
+  if (!zflow_mac_input_is_neutral()) {
+    set_error("release held keys and buttons before crossing to the other computer");
+    return false;
+  }
+  ZFlowMacPosition current;
+  if (zflow_mac_cursor_position(&current) != 0 ||
+      !isfinite(g_entry_position.x) || !isfinite(g_entry_position.y) ||
+      fabs(current.x - g_entry_position.x) > 8.0 ||
+      fabs(current.y - g_entry_position.y) > 8.0) {
+    set_error("crossing cancelled because the Mac cursor moved while connecting");
+    return false;
+  }
+  return true;
+}
+
+static bool owns_transition(bool *held, bool pressed) {
+  // A release whose press happened before tap installation belongs to the
+  // local session, including a quick click during capture startup.
+  if (!pressed && !*held) return false;
+  *held = pressed;
+  return true;
+}
+
 static bool enqueue(const ZFlowMacEvent *event) {
   pthread_mutex_lock(&g_queue_lock);
   size_t next = (g_queue_head + 1) % ZFLOW_QUEUE_CAPACITY;
@@ -175,6 +265,13 @@ static bool enqueue(const ZFlowMacEvent *event) {
   g_queue_head = next;
   pthread_mutex_unlock(&g_queue_lock);
   return true;
+}
+
+static void clear_capture_queue(void) {
+  pthread_mutex_lock(&g_queue_lock);
+  g_queue_head = 0;
+  g_queue_tail = 0;
+  pthread_mutex_unlock(&g_queue_lock);
 }
 
 static int contact_callback(MTDeviceRef device, MTTouch *touches, int count,
@@ -299,6 +396,8 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
       captured.pressed = type == kCGEventFlagsChanged
           ? zflow_mac_modifier_pressed(keycode, flags)
           : type == kCGEventKeyDown;
+      if (g_check_entry && keycode < 128 &&
+          !owns_transition(&g_forwarded_keys[keycode], captured.pressed)) return event;
       enqueue(&captured);
       return NULL;
     }
@@ -314,6 +413,8 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
       captured.pressed = type == kCGEventLeftMouseDown ||
                          type == kCGEventRightMouseDown ||
                          type == kCGEventOtherMouseDown;
+      if (g_check_entry && captured.button < 33 &&
+          !owns_transition(&g_forwarded_buttons[captured.button], captured.pressed)) return event;
       enqueue(&captured);
       return NULL;
     case kCGEventMouseMoved:
@@ -458,8 +559,13 @@ static void *capture_thread(void *context) {
   pthread_mutex_unlock(&g_run_loop_lock);
   CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
   CGEventTapEnable(g_event_tap, true);
-  bool cursor_active = capture_cursor();
+  // Check after installing the tap: a press during raw-device startup must
+  // stay local instead of sending only its release to the other computer.
+  bool cursor_active = capture_entry_allowed() && capture_cursor();
   if (cursor_active) {
+    // Raw-device startup can report contacts while input still belongs to the
+    // Mac. Do not replay that local part of the stroke after remote entry.
+    clear_capture_queue();
     signal_started(raw_active ? 1 : 0);
     if (!atomic_load(&g_stop)) CFRunLoopRun();
   }
@@ -487,15 +593,12 @@ int zflow_mac_raw_touch_available(void) {
   return available ? 1 : 0;
 }
 
-int zflow_mac_capture_start(int raw_touch) {
+int zflow_mac_capture_start(int raw_touch, const ZFlowMacPosition *entry) {
   if (g_thread_valid) {
     set_error("capture is already running");
     return -1;
   }
-  pthread_mutex_lock(&g_queue_lock);
-  g_queue_head = 0;
-  g_queue_tail = 0;
-  pthread_mutex_unlock(&g_queue_lock);
+  clear_capture_queue();
   atomic_store(&g_stop, false);
   atomic_store(&g_raw_contact_active, false);
   g_capture_status = 0;
@@ -504,6 +607,10 @@ int zflow_mac_capture_start(int raw_touch) {
   g_run_loop = NULL;
   pthread_mutex_unlock(&g_run_loop_lock);
   g_request_raw_touch = raw_touch != 0;
+  g_check_entry = entry != NULL;
+  if (entry) g_entry_position = *entry;
+  memset(g_forwarded_keys, 0, sizeof(g_forwarded_keys));
+  memset(g_forwarded_buttons, 0, sizeof(g_forwarded_buttons));
   g_start_ready = false;
   g_start_status = -1;
   if (pthread_create(&g_thread, NULL, capture_thread, NULL) != 0) {

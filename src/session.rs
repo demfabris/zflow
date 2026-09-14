@@ -114,6 +114,10 @@ pub struct SessionEvent {
 }
 
 pub enum SessionEventKind {
+    Desktop {
+        request: crate::desktop::DesktopRequest,
+        reply: oneshot::Sender<crate::desktop::DesktopResponse>,
+    },
     ReceiverEffects {
         effects: Vec<ReceiverEffect>,
         received_at: Instant,
@@ -126,6 +130,11 @@ pub enum SessionEventKind {
 }
 
 enum SessionCommand {
+    Desktop {
+        id: u64,
+        request: crate::desktop::DesktopRequest,
+        reply: oneshot::Sender<crate::desktop::DesktopResponse>,
+    },
     BeginOutbound(SessionContext),
     Capture(CapturedDeviceFrame),
     EndOutbound {
@@ -143,9 +152,57 @@ pub struct SessionHandle {
     commands: mpsc::Sender<SessionCommand>,
     connection: crate::transport::DatagramChannel,
     metrics: Arc<Mutex<SessionMetrics>>,
+    desktop_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SessionHandle {
+    /// One scoped desktop operation. A timeout closes transport so a late warp cannot
+    /// leave the source believing that a cancelled handoff completed.
+    pub async fn desktop_request(
+        &self,
+        request: crate::desktop::DesktopRequest,
+    ) -> Result<crate::desktop::DesktopResponse> {
+        request.validate()?;
+        struct CancelOnDrop {
+            handle: SessionHandle,
+            completed: bool,
+        }
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.handle.close(SessionCloseReason::BackendUnavailable);
+                }
+            }
+        }
+        let mut guard = CancelOnDrop {
+            handle: self.clone(),
+            completed: false,
+        };
+        let id = self
+            .desktop_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        anyhow::ensure!(id != 0, "Desktop request ID exhausted");
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .try_send(SessionCommand::Desktop { id, request, reply })
+            .map_err(|_| anyhow!("Desktop request queue unavailable"))?;
+        match tokio::time::timeout(
+            Duration::from_millis(crate::desktop::REQUEST_TIMEOUT_MS),
+            receiver,
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                guard.completed = true;
+                Ok(response)
+            }
+            _ => {
+                self.close(SessionCloseReason::BackendUnavailable);
+                bail!("Desktop request timed out or session closed")
+            }
+        }
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -242,6 +299,7 @@ pub async fn start_session(
         commands,
         connection: connection.clone(),
         metrics: metrics.clone(),
+        desktop_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
     };
 
     tokio::spawn(async move {
@@ -314,6 +372,13 @@ async fn run_session(
     let _ = ready.send(Ok(()));
 
     let clock = MonotonicClock::new();
+    let mut desktop_waiter: Option<(u64, oneshot::Sender<crate::desktop::DesktopResponse>)> = None;
+    let mut desktop_incoming: Option<(u64, crate::desktop::DesktopRequest, Instant)> = None;
+    let mut desktop_reply: Option<(
+        u64,
+        oneshot::Receiver<crate::desktop::DesktopResponse>,
+        Instant,
+    )> = None;
     let mut sender = None;
     let mut capture_merge = CaptureMerger::default();
     let mut receiver = Receiver::new(receiver_config, clock.now())?;
@@ -334,12 +399,45 @@ async fn run_session(
 
     let run_result: Result<()> = async {
     loop {
+        if let Some((id, receiver, started)) = desktop_reply.as_mut() {
+            match receiver.try_recv() {
+                Ok(response) => {
+                    channels.control_send.send_desktop(crate::desktop::DesktopMessage::Response { id: *id, response }).await?;
+                    desktop_reply = None;
+                }
+                Err(oneshot::error::TryRecvError::Closed) => bail!("Desktop receiver stopped"),
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    anyhow::ensure!(started.elapsed() < Duration::from_millis(crate::desktop::REQUEST_TIMEOUT_MS), "Desktop receiver timed out");
+                }
+            }
+        }
+        if let Some((_, request, started)) = &desktop_incoming {
+            anyhow::ensure!(started.elapsed() < Duration::from_millis(crate::desktop::REQUEST_TIMEOUT_MS), "Desktop operation ordering timed out");
+            // Finish follows Leave on this stream. Wait through playout and the
+            // daemon's backend receipt before acknowledging desktop cleanup.
+            let ready = pending_controls.is_empty()
+                && (!matches!(request, crate::desktop::DesktopRequest::Finish { .. }) || receiver.active_context().is_none());
+            if ready && desktop_reply.is_none() {
+                let (id, request, started) = desktop_incoming.take().unwrap();
+                let (reply, receipt) = oneshot::channel();
+                emit_event(&events, SessionEvent { session_id, peer: peer.clone(), kind: SessionEventKind::Desktop {request, reply} })?;
+                desktop_reply = Some((id, receipt, started));
+            }
+        }
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else {
                     break;
                 };
                 match command {
+                    SessionCommand::Desktop {id,request,reply} => {
+                        if desktop_waiter.is_some() {
+                            let _ = reply.send(crate::desktop::DesktopResponse::unavailable("A desktop request is already pending"));
+                        } else {
+                            channels.control_send.send_desktop(crate::desktop::DesktopMessage::Request {id,request}).await?;
+                            desktop_waiter=Some((id,reply));
+                        }
+                    }
                     SessionCommand::BeginOutbound(context) => {
                         if sender.is_some() {
                             bail!("outbound activation is already open");
@@ -418,6 +516,15 @@ async fn run_session(
                 let received_at = Instant::now();
                 let message = received?;
                 match message {
+                    InputControlMessage::Desktop(crate::desktop::DesktopMessage::Request {id,request}) => {
+                        anyhow::ensure!(desktop_incoming.is_none() && desktop_reply.is_none(), "Overlapping desktop requests");
+                        desktop_incoming=Some((id,request,Instant::now()));
+                    }
+                    InputControlMessage::Desktop(crate::desktop::DesktopMessage::Response {id,response}) => {
+                        let (expected,reply)=desktop_waiter.take().context("Unexpected desktop response")?;
+                        anyhow::ensure!(id == expected, "Desktop response ID does not match request");
+                        let _=reply.send(response);
+                    }
                     InputControlMessage::NegotiationOffer(_) | InputControlMessage::NegotiatedSession(_) => {
                         bail!("peer repeated session negotiation");
                     }
@@ -2422,5 +2529,281 @@ mod tests {
     fn transport_errors_remain_sendable() {
         fn assert_send<T: Send>() {}
         assert_send::<TransportError>();
+    }
+    async fn desktop_test_pair() -> (
+        SessionHandle,
+        SessionHandle,
+        mpsc::Receiver<SessionEvent>,
+        quinn::Endpoint,
+        quinn::Endpoint,
+    ) {
+        fn spawn(
+            channels: InputChannels,
+            id: u64,
+            events: mpsc::Sender<SessionEvent>,
+        ) -> (SessionHandle, oneshot::Receiver<Result<(), String>>) {
+            let (commands, command_rx) = mpsc::channel(512);
+            let (ready, receipt) = oneshot::channel();
+            let connection = channels.datagrams.clone();
+            let metrics = Arc::new(Mutex::new(SessionMetrics::default()));
+            let handle = SessionHandle {
+                id,
+                peer: Arc::from("test"),
+                generation: TransportGeneration(1),
+                commands,
+                connection: connection.clone(),
+                metrics: metrics.clone(),
+                desktop_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            };
+            tokio::spawn(async move {
+                let _ = run_session(
+                    id,
+                    "test".into(),
+                    channels,
+                    command_rx,
+                    options(),
+                    events,
+                    metrics,
+                    ready,
+                )
+                .await;
+                connection.close();
+            });
+            (handle, receipt)
+        }
+        let (left, right, client, server) = input_channel_pair().await;
+        let (events, event_rx) = mpsc::channel(64);
+        let (left, left_ready) = spawn(left, 1, events.clone());
+        let (right, right_ready) = spawn(right, 2, events);
+        let (a, b) = tokio::join!(left_ready, right_ready);
+        a.unwrap().unwrap();
+        b.unwrap().unwrap();
+        (left, right, event_rx, client, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn desktop_finish_waits_for_applied_leave() {
+        use crate::desktop::*;
+        let (left, right, mut events, _client, _server) = desktop_test_pair().await;
+        let source = left.clone();
+        let prepare = tokio::spawn(async move {
+            source
+                .desktop_request(DesktopRequest::Prepare {
+                    token: 7,
+                    edge: Edge::Left,
+                    start: 0,
+                    end: FRACTION_MAX,
+                    position: 500_000,
+                })
+                .await
+        });
+        let event = events.recv().await.unwrap();
+        let SessionEventKind::Desktop { request, reply } = event.kind else {
+            panic!("expected prepare");
+        };
+        assert!(matches!(request, DesktopRequest::Prepare { token: 7, .. }));
+        reply
+            .send(DesktopResponse::Prepared {
+                geometry: Geometry {
+                    monitors: vec![Rect {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    }],
+                },
+                position: Point { x: 3, y: 540 },
+            })
+            .unwrap();
+        assert!(matches!(
+            prepare.await.unwrap().unwrap(),
+            DesktopResponse::Prepared { .. }
+        ));
+        left.begin_outbound(context()).unwrap();
+        left.capture(CapturedDeviceFrame {
+            device_path: "fake".into(),
+            captured_at: Instant::now(),
+            frame: CaptureFrame {
+                transitions: vec![CaptureTransition::Key {
+                    usage: HidUsage::keyboard(4),
+                    state: KeyState::Pressed,
+                }],
+                ..CaptureFrame::default()
+            },
+        })
+        .unwrap();
+        loop {
+            let event = events.recv().await.unwrap();
+            if let SessionEventKind::ReceiverEffects {
+                effects, applied, ..
+            } = event.kind
+            {
+                let key = effects
+                    .iter()
+                    .any(|e| matches!(e, ReceiverEffect::Key { pressed: true, .. }));
+                applied.send(Ok(())).unwrap();
+                if key {
+                    break;
+                }
+            }
+        }
+        left.end_outbound(SessionCloseReason::LocalRelease)
+            .await
+            .unwrap();
+        let source = left.clone();
+        let finish = tokio::spawn(async move {
+            source
+                .desktop_request(DesktopRequest::Finish { token: 7 })
+                .await
+        });
+        let mut saw_release = false;
+        loop {
+            let event = events.recv().await.unwrap();
+            match event.kind {
+                SessionEventKind::ReceiverEffects {
+                    effects, applied, ..
+                } => {
+                    if effects
+                        .iter()
+                        .any(|e| matches!(e, ReceiverEffect::ActivationClosed { .. }))
+                    {
+                        assert!(
+                            effects
+                                .iter()
+                                .any(|e| matches!(e, ReceiverEffect::Key { pressed: false, .. }))
+                        );
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        assert!(!finish.is_finished(), "Finish overtook backend cleanup");
+                        saw_release = true;
+                    }
+                    applied.send(Ok(())).unwrap();
+                }
+                SessionEventKind::Desktop { request, reply } => {
+                    assert!(saw_release, "Finish overtook Leave");
+                    assert_eq!(request, DesktopRequest::Finish { token: 7 });
+                    reply.send(DesktopResponse::Finished).unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(finish.await.unwrap().unwrap(), DesktopResponse::Finished);
+        left.close(SessionCloseReason::LocalRelease);
+        right.close(SessionCloseReason::LocalRelease);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_desktop_prepare_closes_transport() {
+        use crate::desktop::*;
+        let (left, right, mut events, _client, _server) = desktop_test_pair().await;
+        let source = left.clone();
+        let prepare = tokio::spawn(async move {
+            source
+                .desktop_request(DesktopRequest::Prepare {
+                    token: 1,
+                    edge: Edge::Left,
+                    start: 0,
+                    end: FRACTION_MAX,
+                    position: 1,
+                })
+                .await
+        });
+        let event = events.recv().await.unwrap();
+        let SessionEventKind::Desktop { reply, .. } = event.kind else {
+            panic!("expected desktop request");
+        };
+        prepare.abort();
+        let _ = prepare.await;
+        tokio::time::timeout(Duration::from_secs(1), right.connection.closed())
+            .await
+            .unwrap();
+        drop(reply);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unavailable_desktop_is_explicit_and_dropped_bridge_closes_session() {
+        use crate::desktop::*;
+        let (left, right, mut events, _client, _server) = desktop_test_pair().await;
+        let source = left.clone();
+        let pending =
+            tokio::spawn(async move { source.desktop_request(DesktopRequest::Snapshot).await });
+        let event = events.recv().await.unwrap();
+        let SessionEventKind::Desktop { reply, .. } = event.kind else {
+            panic!("expected desktop request");
+        };
+        reply
+            .send(DesktopResponse::unavailable("Start the GNOME receiver"))
+            .unwrap();
+        assert!(matches!(
+            pending.await.unwrap().unwrap(),
+            DesktopResponse::Unavailable { .. }
+        ));
+        left.begin_outbound(context()).unwrap();
+        left.capture(CapturedDeviceFrame {
+            device_path: "fake".into(),
+            captured_at: Instant::now(),
+            frame: CaptureFrame {
+                transitions: vec![CaptureTransition::Key {
+                    usage: HidUsage::keyboard(4),
+                    state: KeyState::Pressed,
+                }],
+                ..CaptureFrame::default()
+            },
+        })
+        .unwrap();
+        loop {
+            if let SessionEventKind::ReceiverEffects {
+                effects, applied, ..
+            } = events.recv().await.unwrap().kind
+            {
+                let pressed = effects
+                    .iter()
+                    .any(|e| matches!(e, ReceiverEffect::Key { pressed: true, .. }));
+                applied.send(Ok(())).unwrap();
+                if pressed {
+                    break;
+                }
+            }
+        }
+        let source = left.clone();
+        let pending = tokio::spawn(async move {
+            source
+                .desktop_request(DesktopRequest::Poll { token: 7 })
+                .await
+        });
+        let event = events.recv().await.unwrap();
+        let SessionEventKind::Desktop { reply, .. } = event.kind else {
+            panic!("expected desktop request");
+        };
+        drop(reply);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let SessionEventKind::ReceiverEffects {
+                    effects, applied, ..
+                } = events.recv().await.unwrap().kind
+                {
+                    let released = effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            ReceiverEffect::Key {
+                                pressed: false,
+                                synthetic: true,
+                                ..
+                            }
+                        )
+                    });
+                    applied.send(Ok(())).unwrap();
+                    if released {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("Bridge loss must release the held key");
+        assert!(pending.await.unwrap().is_err());
+        tokio::time::timeout(Duration::from_secs(1), right.connection.closed())
+            .await
+            .unwrap();
     }
 }

@@ -24,7 +24,7 @@ impl ConfigDocument {
                 config.validate()?;
                 config
             }
-            None => Config::default(),
+            None => new_config(&path),
         };
         Ok(Self {
             path,
@@ -93,6 +93,16 @@ impl ConfigDocument {
     }
 }
 
+fn new_config(path: &std::path::Path) -> Config {
+    let mut config = Config::default();
+    if cfg!(target_os = "macos") {
+        let directory = path.parent().expect("absolute configuration path");
+        config.daemon.state_dir = directory.join("state");
+        config.daemon.control_socket = directory.join("control.sock");
+    }
+    config
+}
+
 fn read_contents(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(contents) => Ok(Some(contents)),
@@ -130,7 +140,7 @@ mod tests {
         document.save().unwrap();
         assert!(!document.is_new());
         assert!(!document.is_dirty());
-        assert_eq!(Config::load(&path).unwrap(), Config::default());
+        assert_eq!(Config::load(&path).unwrap(), new_config(&path));
     }
 
     #[test]
