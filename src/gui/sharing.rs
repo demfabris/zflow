@@ -27,6 +27,7 @@ struct Running {
     handoff: Handoff,
     returned: Option<u32>,
     failed: bool,
+    cancelled: bool,
     capturing: bool,
     entry_region: macos::DesktopRect,
     span: tracing::Span,
@@ -161,6 +162,12 @@ impl Sharing {
                         self.notice = "Back on the Mac. Finishing connection cleanup…".into();
                     }
                     SourceStatus::Stopped => {}
+                    SourceStatus::Cancelled(reason) => {
+                        if !running.failed {
+                            running.cancelled = true;
+                            self.notice = format!("Crossing cancelled: {reason}");
+                        }
+                    }
                     SourceStatus::Failed(error) => {
                         tracing::warn!(parent: &running.span, %error, "GUI received crossing failure");
                         running.failed = true;
@@ -180,21 +187,20 @@ impl Sharing {
                         .into();
             }
             if !running.capturing
+                && !running.failed
+                && !running.cancelled
                 && let Ok(position) = macos::cursor_position()
                 && !running.entry_region.contains(position)
             {
-                if !running.failed {
-                    tracing::warn!(parent: &running.span,
-                        elapsed_ms = running.started.elapsed().as_millis() as u64,
-                        entry_region = ?running.entry_region,
-                        current_x = position.x, current_y = position.y,
-                        "crossing cancelled: Mac cursor left the configured edge during preparation");
-                }
+                tracing::warn!(parent: &running.span,
+                    elapsed_ms = running.started.elapsed().as_millis() as u64,
+                    entry_region = ?running.entry_region,
+                    current_x = position.x, current_y = position.y,
+                    "crossing cancelled: Mac cursor left the configured edge during preparation");
                 let _ = running.stop.send(true);
-                self.enabled = false;
-                running.failed = true;
+                running.cancelled = true;
                 self.notice =
-                    "Crossing cancelled because the Mac cursor left the configured edge. Sharing is off.".into();
+                    "Crossing cancelled because the Mac cursor left the configured edge.".into();
             }
             if running.thread.is_finished() {
                 let mut running = self.running.take().unwrap();
@@ -204,6 +210,12 @@ impl Sharing {
                 while let Ok(status) = running.events.try_recv() {
                     match status {
                         SourceStatus::Returned { position } => running.returned = Some(position),
+                        SourceStatus::Cancelled(reason) => {
+                            if !running.failed {
+                                running.cancelled = true;
+                                self.notice = format!("Crossing cancelled: {reason}");
+                            }
+                        }
                         SourceStatus::Failed(error) => {
                             running.failed = true;
                             self.notice = error;
@@ -218,6 +230,8 @@ impl Sharing {
                     self.notice = "The sharing worker stopped unexpectedly. Sharing is off.".into();
                 } else if running.failed {
                     self.enabled = false;
+                } else if running.cancelled && self.enabled {
+                    tracing::info!("crossing cancelled; edge sharing remains armed");
                 } else if running.returned.is_some() && self.enabled {
                     tracing::info!(
                         elapsed_ms = running.started.elapsed().as_millis() as u64,
@@ -228,7 +242,7 @@ impl Sharing {
                     self.enabled = false;
                     self.notice = "Sharing is off. Input is on the Mac.".into();
                 }
-                tracing::info!(enabled = self.enabled, failed = running.failed, returned = running.returned.is_some(), notice = %self.notice, "crossing worker finished");
+                tracing::info!(enabled = self.enabled, failed = running.failed, cancelled = running.cancelled, returned = running.returned.is_some(), notice = %self.notice, "crossing worker finished");
             }
         }
         if self.enabled
@@ -336,6 +350,7 @@ impl Sharing {
             handoff,
             returned: None,
             failed: false,
+            cancelled: false,
             capturing: false,
             entry_region,
             span,

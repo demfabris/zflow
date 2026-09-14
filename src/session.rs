@@ -238,7 +238,10 @@ impl SessionHandle {
                 guard.completed = true;
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let outcome = desktop_response_kind(&response);
-                if operation != "poll" || elapsed_ms >= 150 || outcome != "active" {
+                if operation != "poll"
+                    || elapsed_ms >= crate::desktop::POLL_HOLD_MS + 150
+                    || outcome != "active"
+                {
                     tracing::debug!(peer = %self.peer, session_id = self.id, request_id = id, operation, outcome, elapsed_ms, "desktop request completed");
                 } else {
                     tracing::trace!(peer = %self.peer, session_id = self.id, request_id = id, operation, outcome, elapsed_ms, "desktop request completed");

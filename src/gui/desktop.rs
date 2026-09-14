@@ -189,7 +189,10 @@ async fn call(
     match &result {
         Ok(response) => {
             let outcome = crate::session::desktop_response_kind(response);
-            if operation != "poll" || elapsed_ms >= 150 || outcome != "active" {
+            if operation != "poll"
+                || elapsed_ms >= crate::desktop::POLL_HOLD_MS + 150
+                || outcome != "active"
+            {
                 tracing::debug!(
                     operation,
                     outcome,

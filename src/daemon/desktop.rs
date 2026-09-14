@@ -211,7 +211,10 @@ pub(super) async fn request(
         .await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let outcome = desktop_response_kind(&response);
-    if operation != "poll" || elapsed_ms >= 150 || outcome != "active" {
+    if operation != "poll"
+        || elapsed_ms >= crate::desktop::POLL_HOLD_MS + 150
+        || outcome != "active"
+    {
         tracing::debug!(%peer, session_id, operation, outcome, elapsed_ms, "desktop receiver operation completed");
     } else {
         tracing::trace!(%peer, session_id, operation, outcome, elapsed_ms, "desktop receiver operation completed");
@@ -243,8 +246,9 @@ pub(super) async fn request(
 }
 
 /// A GUI explicitly opts in by keeping this credential-checked stream open.
-/// Every RPC and idle interval rechecks the active seat. The compositor barrier
-/// and daemon reservation both expire after two seconds without a source Poll.
+/// Polls use the active seat refreshed on the idle interval; other RPCs recheck it.
+/// The compositor barrier and daemon reservation both expire after two seconds
+/// without a source Poll.
 pub(super) async fn serve(
     shared: Arc<Shared>,
     mut stream: UnixStream,
@@ -260,6 +264,7 @@ pub(super) async fn serve(
     tracing::info!(broker_id = id, "desktop GUI broker connected");
     let result=async {
         write_message(&mut stream,&DesktopResponse::Finished).await?;
+        let mut seat=tokio::task::spawn_blocking(query_primary_seat).await?;
         let mut interval=tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
@@ -277,8 +282,12 @@ pub(super) async fn serve(
                         tracing::debug!(broker_id = id, %peer, ?session_id, operation, queue_ms, "desktop broker operation started");
                     }
                     let seat_started = Instant::now();
-                    let seat=tokio::task::spawn_blocking(query_primary_seat).await?;
-                    let seat_before_ms = seat_started.elapsed().as_millis() as u64;
+                    let seat_before_ms = if operation == "poll" {
+                        0
+                    } else {
+                        seat=tokio::task::spawn_blocking(query_primary_seat).await?;
+                        seat_started.elapsed().as_millis() as u64
+                    };
                     if seat_before_ms >= 150 {
                         tracing::debug!(broker_id = id, %peer, ?session_id, operation, seat_before_ms, "slow desktop seat check before operation");
                     }
@@ -308,11 +317,15 @@ pub(super) async fn serve(
                     let compositor_ms = compositor_started.elapsed().as_millis() as u64;
                     let outcome = desktop_response_kind(&response);
                     let seat_started = Instant::now();
-                    let seat=tokio::task::spawn_blocking(query_primary_seat).await?;
-                    let seat_after_ms = seat_started.elapsed().as_millis() as u64;
+                    let seat_after_ms = if operation == "poll" {
+                        0
+                    } else {
+                        seat=tokio::task::spawn_blocking(query_primary_seat).await?;
+                        seat_started.elapsed().as_millis() as u64
+                    };
                     authorize_peer(&stream,daemon_uid,seat.active_authenticated_uid())?;
                     let elapsed_ms = job.queued_at.elapsed().as_millis() as u64;
-                    if operation != "poll" || elapsed_ms >= 150 || outcome != "active" {
+                    if operation != "poll" || elapsed_ms >= crate::desktop::POLL_HOLD_MS + 150 || outcome != "active" {
                         tracing::debug!(broker_id = id, %peer, ?session_id, operation, outcome, queue_ms, seat_before_ms, compositor_ms, seat_after_ms, elapsed_ms, "desktop broker operation completed");
                     } else {
                         tracing::trace!(broker_id = id, %peer, ?session_id, operation, outcome, queue_ms, seat_before_ms, compositor_ms, seat_after_ms, elapsed_ms, "desktop broker operation completed");
@@ -325,7 +338,7 @@ pub(super) async fn serve(
                     }
                 }
                 _=interval.tick() => {
-                    let seat=tokio::task::spawn_blocking(query_primary_seat).await?;
+                    seat=tokio::task::spawn_blocking(query_primary_seat).await?;
                     authorize_peer(&stream,daemon_uid,seat.active_authenticated_uid())?;
                     let expired={
                         let mut lease=shared.desktop.lease.lock().await;

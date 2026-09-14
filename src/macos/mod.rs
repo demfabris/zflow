@@ -86,6 +86,19 @@ pub enum SourceStatus {
     Returned { position: u32 },
     Stopped,
     Failed(String),
+    Cancelled(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct AdmissionCancelled(String);
+
+fn failure_status(error: &anyhow::Error) -> SourceStatus {
+    if error.is::<AdmissionCancelled>() {
+        SourceStatus::Cancelled(format!("{error:#}"))
+    } else {
+        SourceStatus::Failed(format!("{error:#}"))
+    }
 }
 
 #[repr(C)]
@@ -206,9 +219,14 @@ pub async fn run_controlled(
             SourceStatus::Stopped
         }
         Err(error) => {
-            tracing::error!(error = %format!("{error:#}"), "source worker failed");
-            eprintln!("Remote input failed: {error:#}");
-            SourceStatus::Failed(format!("{error:#}"))
+            let outcome = failure_status(error);
+            if matches!(outcome, SourceStatus::Cancelled(_)) {
+                tracing::info!(error = %format!("{error:#}"), "crossing cancelled");
+            } else {
+                tracing::error!(error = %format!("{error:#}"), "source worker failed");
+                eprintln!("Remote input failed: {error:#}");
+            }
+            outcome
         }
     };
     let _ = status.send(final_status);
@@ -317,8 +335,8 @@ async fn run_source(
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
     let endpoint = SourceEndpoint(Endpoint::client(bind_address)?);
-    let result = run_endpoint(
-        &endpoint.0,
+    run_endpoint(
+        &endpoint,
         &client_config,
         address,
         config,
@@ -326,69 +344,66 @@ async fn run_source(
         stop,
         status,
     )
-    .await;
-    if let Err(error) = endpoint.shutdown().await {
-        if result.is_ok() {
-            return Err(error);
-        }
-        eprintln!("Could not finish input connection shutdown: {error:#}");
-    }
-    result
+    .await
 }
 
 async fn run_endpoint(
-    endpoint: &Endpoint,
+    endpoint: &SourceEndpoint,
     client_config: &InputClientConfig,
     address: SocketAddr,
     config: Config,
-    options: SourceOptions,
+    mut options: SourceOptions,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<Option<u32>> {
+    let mut awdl_lease = None;
+    let result = async {
     let raw_available = config.input.experimental_touchpad;
     let connecting = Instant::now();
     tracing::info!(peer = %options.peer, %address, "input connection starting");
     println!("connecting to {} at {address}", options.peer);
-    let connection = tokio::select! {
-        biased;
-        _ = stop_requested(stop) => {
-            tracing::info!(elapsed_ms = connecting.elapsed().as_millis() as u64, "cancelled during connection");
-            return Ok(None);
-        },
-        result = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        connect_input(endpoint, address, client_config),
-    )
-        => result.context("input connection timed out")??,
-    };
-    tracing::info!(
-        elapsed_ms = connecting.elapsed().as_millis() as u64,
-        "QUIC connection established"
-    );
-
     let (session_events, mut events) = mpsc::channel(128);
-    let negotiating = Instant::now();
-    let session = tokio::select! {
-        biased;
-        _ = stop_requested(stop) => {
-            tracing::info!("cancelled during session negotiation");
-            return Ok(None);
-        },
-        result = start_session(
-        connection,
-        options.peer.clone(),
-        TransportGeneration(1),
-        SessionOptions::from_config(&config)?,
-        session_events,
-        ) => result?,
+    let session = {
+        let setup = async {
+            let connection = tokio::time::timeout(
+                CONNECT_TIMEOUT, connect_input(&endpoint.0, address, client_config),
+            ).await.context("input connection timed out")??;
+            tracing::info!(elapsed_ms = connecting.elapsed().as_millis() as u64,
+                "QUIC connection established");
+            let negotiating = Instant::now();
+            let session = start_session(connection, options.peer.clone(), TransportGeneration(1),
+                SessionOptions::from_config(&config)?, session_events).await?;
+            tracing::info!(session_id = session.id(),
+                elapsed_ms = negotiating.elapsed().as_millis() as u64, "input session negotiated");
+            Ok::<_, anyhow::Error>(session)
+        };
+        let acquisition = awdl::AwDlLease::acquire();
+        tokio::pin!(setup, acquisition);
+        let mut acquired = !options.reduce_wifi_latency;
+        let mut connected = None;
+        let mut renewal = tokio::time::interval(awdl::RENEW_INTERVAL);
+        renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop_requested(stop) => {
+                    tracing::info!(elapsed_ms = connecting.elapsed().as_millis() as u64,
+                        "cancelled during connection setup");
+                    return Ok(None);
+                },
+                result = &mut acquisition, if !acquired => {
+                    awdl_lease = Some(result?);
+                    acquired = true;
+                },
+                result = &mut setup, if connected.is_none() => connected = Some(result?),
+                _ = renewal.tick(), if awdl_lease.is_some() => {
+                    if let Some(lease) = awdl_lease.as_mut() { lease.renew().await?; }
+                },
+            }
+            if acquired && let Some(session) = connected.take() { break session; }
+        }
     };
-    tracing::info!(
-        session_id = session.id(),
-        elapsed_ms = negotiating.elapsed().as_millis() as u64,
-        "input session negotiated"
-    );
 
-    let mut awdl_lease = None;
     let mut prepared = None;
     let mut activation_started = false;
     let mut returned = None;
@@ -398,41 +413,47 @@ async fn run_endpoint(
         .map(|_| active_desktop_rectangles())
         .transpose()?;
 
+    let desktop_poll = poll_desktop(&session, None);
+    tokio::pin!(desktop_poll);
+    let mut desktop_poll_pending = false;
     let result = async {
         if *stop.borrow() || stop.has_changed().is_err() {
             return Ok(());
         }
-        if options.reduce_wifi_latency {
-            awdl_lease = tokio::select! {
-                biased;
-                _ = stop_requested(stop) => return Ok(()),
-                result = awdl::AwDlLease::acquire() => Some(result?),
-            };
-        }
-        if let Some(handoff) = &options.handoff {
+        if let Some(handoff) = &mut options.handoff {
             let preparing = Instant::now();
             tracing::info!("desktop preparation starting");
             let mut token_bytes = [0_u8; 8];
             getrandom::fill(&mut token_bytes)
                 .map_err(|error| anyhow!("could not create a desktop handoff token: {error}"))?;
             let token = handoff_token(token_bytes);
+            let current = cursor_position()?;
+            let original_position = handoff.position;
+            let refreshed = handoff.entry_region.contains(current);
+            if refreshed {
+                handoff.position = handoff.return_mapping.fraction(crate::desktop::Point {
+                    x: current.x.floor() as i32,
+                    y: current.y.floor() as i32,
+                })?;
+            }
+            tracing::debug!(original_position, position = handoff.position, refreshed,
+                current_x = current.x, current_y = current.y,
+                displacement_x = current.x - handoff.entry_position.x,
+                displacement_y = current.y - handoff.entry_position.y,
+                "entry fraction sampled before desktop preparation");
             let request = DesktopRequest::Prepare {
                 token, edge: handoff.edge, start: handoff.start,
                 end: handoff.end, position: handoff.position,
             };
             request.validate()?;
-            // Even a cancelled request may already have reached the receiver.
+            if *stop.borrow() || stop.has_changed().is_err() {
+                return Ok(());
+            }
             prepared = Some(token);
-            let response = tokio::select! {
-                biased;
-                _ = stop_requested(stop) => {
-                    tracing::info!(elapsed_ms = preparing.elapsed().as_millis() as u64, "cancelled during desktop preparation");
-                    return Ok(());
-                },
-                response = session.desktop_request(request) => response.context(
-                    "Could not prepare desktop handoff. On Ubuntu, run just install-linux to update and restart the installed zflowd service; just run updates only the GUI. If the GNOME integration was newly installed, log out and back in, then enable desktop handoff in the Ubuntu app"
-                )?,
-            };
+            // Await the bounded reply even after Stop so Finish can use the same transport.
+            let response = session.desktop_request(request).await.context(
+                "Could not prepare desktop handoff. On Ubuntu, run just install-linux to update and restart the installed zflowd service; just run updates only the GUI. If the GNOME integration was newly installed, log out and back in, then enable desktop handoff in the Ubuntu app"
+            )?;
             validate_prepared(handoff, response)?;
             tracing::info!(elapsed_ms = preparing.elapsed().as_millis() as u64, "desktop preparation completed");
         }
@@ -440,7 +461,7 @@ async fn run_endpoint(
             return Ok(());
         }
         if options.handoff.is_some() && !input_is_neutral() {
-            bail!("release held keys and buttons before crossing to the other computer");
+            return Err(AdmissionCancelled("Release held keys and buttons before crossing to the other computer".into()).into());
         }
         if let Some(handoff) = &options.handoff {
             let current = cursor_position()?;
@@ -489,16 +510,20 @@ async fn run_endpoint(
         let mut captured_events = 0_u64;
         let mut last_capture_poll = Instant::now();
         let mut max_poll_gap = Duration::ZERO;
-        let desktop_poll = poll_desktop(&session, prepared);
-        tokio::pin!(desktop_poll);
+        desktop_poll.set(poll_desktop(&session, prepared));
+        desktop_poll_pending = prepared.is_some();
 
         loop {
             tokio::select! {
                 biased;
                 _ = stop_requested(stop) => break,
-                response = &mut desktop_poll, if prepared.is_some() => {
+                response = &mut desktop_poll, if desktop_poll_pending => {
+                    desktop_poll_pending = false;
                     match response {
-                        Ok(DesktopResponse::Active) => desktop_poll.set(poll_desktop(&session, prepared)),
+                        Ok(DesktopResponse::Active) => {
+                            desktop_poll.set(poll_desktop(&session, prepared));
+                            desktop_poll_pending = true;
+                        },
                         Ok(DesktopResponse::Returned { position }) => {
                             stop_reason = "GNOME return edge";
                             tracing::info!(position, "receiver reported return edge");
@@ -651,11 +676,27 @@ async fn run_endpoint(
         );
         if let Err(error) = released {
             eprintln!("Could not confirm remote input release: {error:#}");
-            if result.is_ok() && returned.is_some() {
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<AdmissionCancelled>())
+            {
                 result = Err(error);
             }
             session.close(SessionCloseReason::LocalRelease);
         }
+    }
+    // Keep the poll alive through Leave, then finish it before requesting cleanup.
+    // Late responses cannot change the cursor placement or the capture result.
+    if desktop_poll_pending {
+        let waiting = Instant::now();
+        tracing::debug!("waiting for desktop poll before cleanup");
+        let response = desktop_poll.await;
+        tracing::debug!(
+            elapsed_ms = waiting.elapsed().as_millis() as u64,
+            ?response,
+            "desktop poll wait completed"
+        );
     }
     if let Some(token) = prepared {
         let finishing = Instant::now();
@@ -670,22 +711,44 @@ async fn run_endpoint(
         );
         if let Err(error) = finished {
             eprintln!("Could not confirm desktop handoff cleanup: {error:#}");
-            if result.is_ok() && returned.is_some() {
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<AdmissionCancelled>())
+            {
                 result = Err(error);
             }
         }
     }
     session.close(SessionCloseReason::LocalRelease);
-    if let Some(lease) = awdl_lease.take()
-        && let Err(error) = lease.release().await
-    {
-        eprintln!("Could not confirm AWDL restoration: {error:#}");
-        if result.is_ok() {
-            result = Err(error);
-        }
-    }
 
     result.map(|_| returned)
+    }.await;
+    let release = async {
+        if let Some(lease) = awdl_lease.take() {
+            lease.release().await
+        } else {
+            Ok(())
+        }
+    };
+    let (shutdown, restoration) = tokio::join!(endpoint.shutdown(), release);
+    let mut result = result;
+    for (cleanup, operation) in [
+        (shutdown, "input connection shutdown"),
+        (restoration, "AWDL restoration"),
+    ] {
+        if let Err(error) = cleanup {
+            eprintln!("Could not finish {operation}: {error:#}");
+            if result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.is::<AdmissionCancelled>())
+            {
+                result = Err(error);
+            }
+        }
+    }
+    result
 }
 
 fn validate_prepared(handoff: &HandoffOptions, response: DesktopResponse) -> Result<()> {
@@ -710,10 +773,22 @@ fn handoff_token(random: [u8; 8]) -> u64 {
 }
 
 fn validate_entry_position(region: DesktopRect, current: CursorPosition) -> Result<()> {
+    anyhow::ensure!(
+        region.contains(CursorPosition {
+            x: region.x,
+            y: region.y
+        }),
+        "The configured crossing edge is invalid"
+    );
+    anyhow::ensure!(
+        current.x.is_finite() && current.y.is_finite(),
+        "Could not read the Mac cursor position"
+    );
     if !region.contains(current) {
-        bail!(
-            "crossing cancelled because the Mac cursor left the configured edge while connecting"
-        );
+        return Err(AdmissionCancelled(
+            "The Mac cursor left the configured edge while connecting".into(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -732,12 +807,17 @@ async fn poll_desktop(
     session: &crate::session::SessionHandle,
     token: Option<u64>,
 ) -> Result<DesktopResponse> {
-    tokio::time::sleep(Duration::from_millis(16)).await;
-    session
+    let started = Instant::now();
+    let response = session
         .desktop_request(DesktopRequest::Poll {
             token: token.context("desktop handoff has no token")?,
         })
-        .await
+        .await;
+    // Older receivers reply immediately; limit their poll rate before repeating.
+    if matches!(&response, Ok(DesktopResponse::Active)) {
+        tokio::time::sleep_until((started + Duration::from_millis(50)).into()).await;
+    }
+    response
 }
 
 fn native_frame(event: NativeEvent) -> Result<Option<CapturedDeviceFrame>> {
@@ -1020,7 +1100,7 @@ impl MacCapture {
             )
         };
         if status < 0 {
-            bail!("could not start macOS capture: {}", Self::last_error());
+            return Err(capture_start_error(status, Self::last_error()));
         }
         Ok(Self {
             running: true,
@@ -1067,6 +1147,15 @@ impl MacCapture {
         unsafe { CStr::from_ptr(pointer) }
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+fn capture_start_error(status: i32, reason: String) -> anyhow::Error {
+    // capture_bridge.c uses -2 only for admission cancellation after cleanup.
+    if status == -2 {
+        AdmissionCancelled(reason).into()
+    } else {
+        anyhow!("could not start macOS capture: {reason}")
     }
 }
 
@@ -1138,6 +1227,50 @@ mod tests {
             ));
         }
         server.close(0_u32.into(), b"test finished");
+    }
+
+    #[test]
+    fn admission_cancellation_is_typed_and_survives_context() {
+        let region = DesktopRect {
+            x: 0.0,
+            y: 0.0,
+            width: 9.0,
+            height: 100.0,
+        };
+        let cancelled = validate_entry_position(region, CursorPosition { x: 10.0, y: 50.0 })
+            .unwrap_err()
+            .context("while preparing capture");
+        assert!(matches!(
+            failure_status(&cancelled),
+            SourceStatus::Cancelled(_)
+        ));
+        let native = capture_start_error(-2, "held button".into());
+        assert!(matches!(
+            failure_status(&native),
+            SourceStatus::Cancelled(_)
+        ));
+        for error in [
+            capture_start_error(-1, "crossing cancelled".into()),
+            anyhow!("crossing cancelled"),
+            validate_entry_position(
+                DesktopRect {
+                    width: 0.0,
+                    ..region
+                },
+                CursorPosition { x: 0.0, y: 50.0 },
+            )
+            .unwrap_err(),
+            validate_entry_position(
+                region,
+                CursorPosition {
+                    x: f64::NAN,
+                    y: 50.0,
+                },
+            )
+            .unwrap_err(),
+        ] {
+            assert!(matches!(failure_status(&error), SourceStatus::Failed(_)));
+        }
     }
 
     #[test]

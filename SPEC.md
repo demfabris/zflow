@@ -13,6 +13,13 @@ The first product slice supports Linux-to-Linux keyboard, pointer, and high-reso
 
 Rust owns the core. Linux supports Wayland sessions and the kernel input path. zflow does not support an X11 host mode or Windows. Xwayland applications inside a Wayland session receive input through the compositor's normal path.
 
+The experimental GNOME return path holds a Poll for up to 200 ms and responds
+when the return barrier fires. The Mac starts the next poll after the reply,
+with a 50 ms minimum start-to-start interval for receivers that reply at once.
+The desktop broker uses seat state refreshed on its 250 ms tick for Poll;
+Prepare, Finish and Snapshot refresh that state before and after the compositor
+call. Existing request timeouts and the two-second desktop lease still apply.
+
 ## Reading this specification
 
 The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY define requirements.

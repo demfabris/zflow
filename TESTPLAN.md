@@ -26,6 +26,15 @@ checks do not qualify the live workflow:
   before matching confirmation, directional permissions, mismatch rejection and
   retry without replacing an existing identity or expanding permissions.
 
+Return polling holds each GNOME request for up to 200 ms and replies on a barrier
+hit. The Node compositor checks cover hold expiry, a hit during a pending poll,
+pending-poll cancellation at Finish or lease expiry, and hold-timer removal.
+For live verification, expect about 300 poll requests per minute, `seat_before_ms`
+and `seat_after_ms` equal to zero for polls, and a return response within roughly
+one network round trip of the barrier hit. The daemon refreshes cached seat state
+on its 250 ms tick and keeps fresh seat checks around other desktop operations.
+These are targets; the two-machine measurements remain pending.
+
 For live qualification, install matching daemon/GUI builds on Ubuntu and open
 the bundled Mac app. Complete the README's setup without terminal pairing or
 capture commands. On Ubuntu, use Install GNOME integration and Enable desktop
@@ -42,8 +51,11 @@ active monitor and inside the intended edge after each return. Old receivers
 must reject desktop requests before Mac capture begins.
 
 Sharing must remain disabled when opening either window, saving settings,
-discovering receivers, or confirming a pairing. A failed handoff must display an
-error and require the user to enable sharing again. Record the GNOME/macOS
+discovering receivers, or confirming a pairing. A capture, geometry or cleanup failure must display an
+error and require the user to enable sharing again. Leaving the entry region or
+holding input during admission must cancel only that crossing: keep sharing
+armed, show the cancellation reason, and require a move back inside the Mac
+before another crossing. Stop and Escape still turn sharing off. Record the GNOME/macOS
 versions and signature used for the actual test; simulated extension tests and
 cross-compilation do not replace this run.
 
@@ -85,9 +97,9 @@ and `just debug linux` now save timestamped logs grouped by crossing and include
 stage durations, cancellation displacement, capture-loop gaps and stop reasons.
 `just debug-daemon` enables receiver request, seat-check and compositor timings
 until reboot. Request diagnostics distinguish cancellation, timeout, closed
-response channels and unavailable queues. Successful fast polling stays at trace
-level. Focused Mac/receiver tests and Clippy passed; the debug launcher help path
-produced a private log file. Reproduce the same crossings with these builds and
+response channels and unavailable queues. Successful active polls below 350 ms
+stay at trace level. Focused Mac/receiver tests and Clippy passed; the debug
+launcher help path produced a private log file. Reproduce the same crossings with these builds and
 compare both logs and the Ubuntu journal before changing admission limits.
 
 The 17:17:16 UTC reproduction confirmed along-edge cancellation: the Mac stayed
@@ -111,6 +123,53 @@ and monitor-gap checks. Native regressions assert warp-before-reconnect ordering
 one warp only, and input restoration after invalid, late or failed warp requests.
 These checks passed along with the focused Mac/geometry tests and Clippy.
 The user still needs to verify the returning cursor with the updated Mac build.
+
+### Cursor transition follow-up, September 14
+
+The Mac now samples the cursor again immediately before Prepare and maps it
+through the same inverse mapping used at edge detection. Compare
+`entry fraction sampled before desktop preparation` with `checking cursor before
+capture` to measure the remaining movement during Prepare. Do not add a catch-up
+motion frame until this measurement shows a visible residual jump; the receiver
+applies libinput acceleration to relative motion.
+
+The daemon rejects a second session from the same peer before the old session
+closes, so the Mac still waits for the two-second-bounded QUIC drain before
+rearming. With Reduce Wi-Fi latency enabled, AWDL acquisition overlaps connection
+setup and release overlaps endpoint shutdown. Keep the helper lease renewed
+while a connection is pending. The previous 17:32 Mac log shows about 15 ms for
+acquisition and 25 ms for release with the switch on; measure the updated build
+before claiming a reduction. The under-60-ms rearm target remains unverified.
+
+Complete this live checklist with matching Mac, Linux GUI, daemon and extension
+builds. Use `just debug mac`, `just debug linux` and `just debug-daemon`:
+
+- Cross five times each way, including one 60-second stay on Ubuntu. Record
+  `connection_to_capture_ms` and request-ID growth; target about 300 polls/minute.
+- Press Escape twice. Require `waiting for desktop poll before cleanup`, a
+  successful `remote input release completed`, and successful Finish without
+  `BackendUnavailable` from dropping the poll.
+- Click during connect and overshoot the entry region. Require `crossing
+  cancelled`, `enabled=true` when the worker finishes, and a successful next
+  crossing after moving back inside the Mac. Stop must still disable sharing.
+- Check daemon trace logs for zero `seat_before_ms` and `seat_after_ms` on polls.
+  Seat refreshes should happen on the broker tick rather than on each poll.
+- Measure return-edge report to `edge sharing rearmed`, with Reduce Wi-Fi latency
+  both off and on. Try another crossing within 150 ms and record its result.
+- Minimize the Mac window and cross, then repeat with its window on another Space.
+  Only move the watcher off the paint loop if either test stops detecting edges.
+
+Automated verification for this follow-up: Mac passed 205 Rust tests with one
+native-desktop test ignored; Ubuntu passed 251 with two hardware-dependent tests
+ignored in `~/dev/zflow-review`. Both passed formatting/Clippy checks and GUI
+builds; Ubuntu also built the daemon. The GNOME simulation, native fake-cursor
+tests and AWDL guardian/pipe-process tests passed. Gate logs and task files are
+under `target/plan-tasks` on the Mac. These builds have not replaced the running
+apps or installed Ubuntu daemon/extension.
+
+Live results for these changes remain pending. Existing logs describe the
+previous build; automated checks do not establish crossing latency or hidden
+window behavior. Keep `PLAN.md` until this checklist has measured results.
 
 ## Configuration GUI
 

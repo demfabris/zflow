@@ -98,16 +98,20 @@ pub(super) fn crossing(
         if !entered || along < transition.source_start || along >= transition.source_end {
             continue;
         }
-        let progress =
-            (along - transition.source_start) / (transition.source_end - transition.source_start);
-        let target =
-            transition.target_start + progress * (transition.target_end - transition.target_start);
+        let return_mapping = ReturnMapping {
+            edge: local_edge,
+            local_start: transition.source_start,
+            local_end: transition.source_end,
+            remote_start: transition.target_start,
+            remote_end: transition.target_end,
+            geometry: geometry.clone(),
+        };
         return Some(Handoff {
             peer: peer.clone(),
             edge: opposite(local_edge),
             start: fraction(transition.target_start),
             end: fraction(transition.target_end),
-            position: fraction(target),
+            position: return_mapping.fraction(current).ok()?,
             expected_width: layout.monitors[transition.target].width,
             expected_height: layout.monitors[transition.target].height,
             entry_region: entry_region(
@@ -117,14 +121,7 @@ pub(super) fn crossing(
                 transition.source_end,
                 current,
             )?,
-            return_mapping: ReturnMapping {
-                edge: local_edge,
-                local_start: transition.source_start,
-                local_end: transition.source_end,
-                remote_start: transition.target_start,
-                remote_end: transition.target_end,
-                geometry: geometry.clone(),
-            },
+            return_mapping,
         });
     }
     None

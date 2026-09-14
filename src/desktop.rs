@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const FRACTION_MAX: u32 = 1_000_000;
 pub const MAX_TOKEN: u64 = 9_007_199_254_740_991;
 pub const LEASE_MS: u64 = 2_000;
+// packaging/gnome-extension/extension.js mirrors this hold duration.
+pub const POLL_HOLD_MS: u64 = 200;
 pub const REQUEST_TIMEOUT_MS: u64 = 1_000;
 pub const MAX_MESSAGE_BYTES: usize = 4_096;
 pub const EXTENSION_ID: &str = "zflow@demfabris";
@@ -94,7 +96,7 @@ impl Geometry {
     }
 }
 
-/// Maps an acknowledged receiver return to the saved local desktop.
+/// Maps positions between the saved local edge and the receiver crossing range.
 #[derive(Clone, Debug)]
 pub struct ReturnMapping {
     pub geometry: Geometry,
@@ -106,7 +108,7 @@ pub struct ReturnMapping {
 }
 
 impl ReturnMapping {
-    pub fn position(&self, position: u32) -> Result<Point> {
+    fn validate(&self) -> Result<()> {
         ensure!(
             [
                 self.local_start,
@@ -120,6 +122,28 @@ impl ReturnMapping {
                 && self.remote_start < self.remote_end,
             "Invalid desktop return mapping"
         );
+        Ok(())
+    }
+
+    pub fn fraction(&self, point: Point) -> Result<u32> {
+        self.validate()?;
+        let bounds = self.geometry.bounds()?;
+        let along = match self.edge {
+            Edge::Left | Edge::Right => {
+                (f64::from(point.y) - f64::from(bounds.y)) / f64::from(bounds.height)
+            }
+            Edge::Top | Edge::Bottom => {
+                (f64::from(point.x) - f64::from(bounds.x)) / f64::from(bounds.width)
+            }
+        };
+        let progress =
+            ((along - self.local_start) / (self.local_end - self.local_start)).clamp(0.0, 1.0);
+        let remote = self.remote_start + progress * (self.remote_end - self.remote_start);
+        Ok((remote * f64::from(FRACTION_MAX)).round() as u32)
+    }
+
+    pub fn position(&self, position: u32) -> Result<Point> {
+        self.validate()?;
         ensure!(
             position >= (self.remote_start * f64::from(FRACTION_MAX)).round() as u32
                 && position <= (self.remote_end * f64::from(FRACTION_MAX)).round() as u32,
@@ -309,6 +333,99 @@ mod tests {
             .is_ok()
         );
     }
+    #[test]
+    fn fraction_round_trips_all_edges_and_clamps_partial_ranges() {
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            for (local_start, local_end, remote_start, remote_end) in
+                [(0.0, 1.0, 0.0, 1.0), (0.25, 0.75, 0.125, 0.875)]
+            {
+                let mapping = ReturnMapping {
+                    geometry: Geometry {
+                        monitors: vec![Rect {
+                            x: -1000,
+                            y: -200,
+                            width: 1600,
+                            height: 1000,
+                        }],
+                    },
+                    edge,
+                    local_start,
+                    local_end,
+                    remote_start,
+                    remote_end,
+                };
+                let start = (remote_start * f64::from(FRACTION_MAX)) as u32;
+                let end = (remote_end * f64::from(FRACTION_MAX)) as u32;
+                for position in [start, start + (end - start) / 3, (start + end) / 2, end] {
+                    let point = mapping.position(position).unwrap();
+                    // Flooring a local pixel costs at most 1500 fraction units in these ranges.
+                    assert!(mapping.fraction(point).unwrap().abs_diff(position) <= 1501);
+                }
+                for (point, expected) in [
+                    (
+                        Point {
+                            x: i32::MIN,
+                            y: i32::MIN,
+                        },
+                        start,
+                    ),
+                    (
+                        Point {
+                            x: i32::MAX,
+                            y: i32::MAX,
+                        },
+                        end,
+                    ),
+                ] {
+                    assert_eq!(mapping.fraction(point).unwrap(), expected);
+                }
+            }
+        }
+        let mapping = ReturnMapping {
+            geometry: Geometry {
+                monitors: vec![Rect {
+                    x: -1000,
+                    y: -200,
+                    width: 2000,
+                    height: 1000,
+                }],
+            },
+            edge: Edge::Right,
+            local_start: 0.5,
+            local_end: 1.0,
+            remote_start: 0.0,
+            remote_end: 0.5,
+        };
+        assert_eq!(mapping.fraction(Point { x: 999, y: 550 }).unwrap(), 250_000);
+        assert_eq!(mapping.fraction(Point { x: 999, y: 300 }).unwrap(), 0);
+        assert_eq!(mapping.fraction(Point { x: 999, y: 800 }).unwrap(), 500_000);
+    }
+
+    #[test]
+    fn fraction_and_position_reject_invalid_mapping() {
+        let mut mapping = ReturnMapping {
+            geometry: Geometry {
+                monitors: vec![Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1000,
+                    height: 1000,
+                }],
+            },
+            edge: Edge::Left,
+            local_start: 0.0,
+            local_end: 1.0,
+            remote_start: 0.0,
+            remote_end: 1.0,
+        };
+        for (start, end) in [(0.5, 0.5), (0.8, 0.2), (-0.1, 1.0), (0.0, f64::NAN)] {
+            mapping.local_start = start;
+            mapping.local_end = end;
+            assert!(mapping.fraction(Point { x: 0, y: 500 }).is_err());
+            assert!(mapping.position(500_000).is_err());
+        }
+    }
+
     #[test]
     fn desktop_position_must_be_on_a_monitor() {
         let geometry = Geometry {

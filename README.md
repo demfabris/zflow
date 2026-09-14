@@ -426,8 +426,12 @@ Enable desktop handoff and edge sharing again. Each debug run saves a timestampe
 log under `target/logs` with private file permissions. The Mac log groups each
 crossing's connection, preparation, capture, return and cleanup timings, including
 cursor displacement at cancellation. Ubuntu's GUI records GNOME calls; daemon
-logs include request queues and active-seat checks. Successful fast polls require
-trace logging; debug output includes slow polls and failures.
+logs include request queues and active-seat checks. GNOME holds return polls for
+up to 200 ms and replies when the cursor hits the return barrier. The daemon
+uses seat state refreshed on its 250 ms tick for polls; Prepare, Finish and
+Snapshot query the seat before and after the compositor call. Successful active
+polls below 350 ms require trace logging; debug output includes slower polls,
+returns and failures.
 
 Read the daemon log with `journalctl -u zflowd -o short-iso-precise --since "10 minutes ago"`.
 `RUST_LOG` overrides the GUI's default debug filter. `just debug-daemon` writes a

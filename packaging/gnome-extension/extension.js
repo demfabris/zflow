@@ -9,6 +9,8 @@ const BUS = 'org.gnome.Shell.Extensions.Zflow';
 const PATH = '/org/gnome/Shell/Extensions/Zflow';
 const MAX = 1000000;
 const LEASE_US = 2000000;
+// src/desktop.rs mirrors this hold duration.
+const POLL_HOLD_MS = 200;
 const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>`;
 
 export default class ZflowExtension extends Extension {
@@ -42,6 +44,8 @@ export default class ZflowExtension extends Extension {
     }
 
     _clear() {
+        if (this._lease)
+            for (const reply of this._lease.polls) reply(new Error('Desktop handoff expired or ended'));
         for (const barrier of this._barriers) barrier.destroy();
         this._barriers = [];
         this._lease = null;
@@ -83,7 +87,22 @@ export default class ZflowExtension extends Extension {
         }
         if (r.command !== 'poll') throw new Error('Unknown desktop operation');
         this._lease.renewed = GLib.get_monotonic_time();
-        return this._lease.returned === null ? {status: 'active'} : {status: 'returned', position: this._lease.returned};
+        const lease = this._lease;
+        if (lease.returned !== null) return {status: 'returned', position: lease.returned};
+        return new Promise((resolve, reject) => {
+            const reply = error => {
+                GLib.Source.remove(timer);
+                lease.polls.delete(reply);
+                if (error) reject(error);
+                else resolve({status: 'returned', position: lease.returned});
+            };
+            const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, POLL_HOLD_MS, () => {
+                lease.polls.delete(reply);
+                resolve({status: 'active'});
+                return GLib.SOURCE_REMOVE;
+            });
+            lease.polls.add(reply);
+        });
     }
 
     async _prepare(r, snapshot) {
@@ -115,7 +134,7 @@ export default class ZflowExtension extends Extension {
         if (m.width < 8 || m.height < 8) throw new Error('The entry monitor is too small');
         const point = vertical ? {x: r.edge === 'left' ? left + 3 : right - 4, y: coordinate}
             : {x: coordinate, y: r.edge === 'top' ? top + 3 : bottom - 4};
-        const lease = {token: r.token, renewed: GLib.get_monotonic_time(), returned: null};
+        const lease = {token: r.token, renewed: GLib.get_monotonic_time(), returned: null, polls: new Set()};
         this._lease = lease;
         try {
             Clutter.get_default_backend().get_default_seat().warp_pointer(point.x, point.y);
@@ -129,6 +148,7 @@ export default class ZflowExtension extends Extension {
                     if (this._lease !== lease || lease.returned !== null) return;
                     const axis = vertical ? event.y : event.x;
                     lease.returned = Math.max(r.start, Math.min(r.end, Math.round((axis - origin) * MAX / span)));
+                    for (const reply of lease.polls) reply();
                 });
                 this._barriers.push(barrier);
             }

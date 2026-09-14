@@ -125,23 +125,23 @@ static void desktop_and_permission_tests(void) {
   held_flags = 0;
   g_check_entry = true;
   g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
-  assert(capture_entry_allowed());
-  held_key = 10; assert(!capture_entry_allowed()); held_key = -1;
-  held_button = 1; assert(!capture_entry_allowed()); held_button = -1;
-  cursor_position.y -= 11; assert(capture_entry_allowed());
-  cursor_position.y = 50; assert(capture_entry_allowed());
-  cursor_position.x = -1191; assert(!capture_entry_allowed());
+  assert(capture_entry_allowed() == 0);
+  held_key = 10; assert(capture_entry_allowed() == -2); held_key = -1;
+  held_button = 1; assert(capture_entry_allowed() == -2); held_button = -1;
+  cursor_position.y -= 11; assert(capture_entry_allowed() == 0);
+  cursor_position.y = 50; assert(capture_entry_allowed() == 0);
+  cursor_position.x = -1191; assert(capture_entry_allowed() == -2);
   assert(strstr(g_error, "left the configured crossing edge"));
   cursor_position.x = -1200;
-  cursor_position.y = 100; assert(!capture_entry_allowed());
-  cursor_position.y = -100; assert(capture_entry_allowed());
-  cursor_position.y = -100.1; assert(!capture_entry_allowed());
+  cursor_position.y = 100; assert(capture_entry_allowed() == -2);
+  cursor_position.y = -100; assert(capture_entry_allowed() == 0);
+  cursor_position.y = -100.1; assert(capture_entry_allowed() == -2);
 
   g_entry_region = (ZFlowMacRect){-1250, -50, 100, 9};
-  cursor_position = CGPointMake(-1200, -50); assert(capture_entry_allowed());
-  cursor_position.x += 11; assert(capture_entry_allowed());
-  cursor_position.x = -1150; assert(!capture_entry_allowed());
-  cursor_position = CGPointMake(-1200, -41); assert(!capture_entry_allowed());
+  cursor_position = CGPointMake(-1200, -50); assert(capture_entry_allowed() == 0);
+  cursor_position.x += 11; assert(capture_entry_allowed() == 0);
+  cursor_position.x = -1150; assert(capture_entry_allowed() == -2);
+  cursor_position = CGPointMake(-1200, -41); assert(capture_entry_allowed() == -2);
 
   ZFlowMacRect invalid_regions[] = {
     {NAN, -100, 9, 200}, {-1200, INFINITY, 9, 200},
@@ -153,11 +153,11 @@ static void desktop_and_permission_tests(void) {
   cursor_position = CGPointMake(-1200, -50);
   for (size_t i = 0; i < sizeof(invalid_regions) / sizeof(invalid_regions[0]); i++) {
     g_entry_region = invalid_regions[i];
-    assert(!capture_entry_allowed());
+    assert(capture_entry_allowed() == -1);
     assert(strstr(g_error, "configured crossing edge is invalid"));
   }
   g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
-  cursor_position.x = NAN; assert(!capture_entry_allowed());
+  cursor_position.x = NAN; assert(capture_entry_allowed() == -1);
   cursor_position = CGPointMake(-1200, -50);
   g_check_entry = false;
   assert(!zflow_mac_accessibility_authorized(0));

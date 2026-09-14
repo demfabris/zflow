@@ -267,12 +267,9 @@ static bool capture_cursor(void) {
                        "could not disconnect the Mac cursor");
 }
 
-static bool capture_entry_allowed(void) {
-  if (!g_check_entry) return true;
-  if (!zflow_mac_input_is_neutral()) {
-    set_error("release held keys and buttons before crossing to the other computer");
-    return false;
-  }
+// Admission status: 0 allows capture, -1 fails, -2 cancels the crossing.
+static int capture_entry_allowed(void) {
+  if (!g_check_entry) return 0;
   double right = g_entry_region.x + g_entry_region.width;
   double bottom = g_entry_region.y + g_entry_region.height;
   if (!isfinite(g_entry_region.x) || !isfinite(g_entry_region.y) ||
@@ -280,17 +277,24 @@ static bool capture_entry_allowed(void) {
       g_entry_region.width <= 0 || g_entry_region.height <= 0 ||
       !isfinite(right) || !isfinite(bottom) ||
       right <= g_entry_region.x || bottom <= g_entry_region.y) {
-    set_error("crossing cancelled because the configured crossing edge is invalid");
-    return false;
+    set_error("the configured crossing edge is invalid");
+    return -1;
   }
   ZFlowMacPosition current;
-  if (zflow_mac_cursor_position(&current) != 0 ||
-      current.x < g_entry_region.x || current.x >= right ||
-      current.y < g_entry_region.y || current.y >= bottom) {
-    set_error("crossing cancelled because the Mac cursor left the configured crossing edge");
-    return false;
+  if (zflow_mac_cursor_position(&current) != 0) {
+    set_error("could not read the Mac cursor position");
+    return -1;
   }
-  return true;
+  if (!zflow_mac_input_is_neutral()) {
+    set_error("release held keys and buttons before crossing to the other computer");
+    return -2;
+  }
+  if (current.x < g_entry_region.x || current.x >= right ||
+      current.y < g_entry_region.y || current.y >= bottom) {
+    set_error("the Mac cursor left the configured crossing edge");
+    return -2;
+  }
+  return 0;
 }
 
 static bool owns_transition(bool *held, bool pressed) {
@@ -608,7 +612,8 @@ static void *capture_thread(void *context) {
   CGEventTapEnable(g_event_tap, true);
   // Check after installing the tap: a press during raw-device startup must
   // stay local instead of sending only its release to the other computer.
-  bool cursor_active = capture_entry_allowed() && capture_cursor();
+  int admission = capture_entry_allowed();
+  bool cursor_active = admission == 0 && capture_cursor();
   if (cursor_active) {
     // Raw-device startup can report contacts while input still belongs to the
     // Mac. Do not replay that local part of the stroke after remote entry.
@@ -628,7 +633,7 @@ static void *capture_thread(void *context) {
   if (!release_cursor_at(returning ? &return_position : NULL)) g_capture_status = -1;
   unload_multitouch();
   atomic_store(&g_stop, true);
-  if (!cursor_active) signal_started(-1);
+  if (!cursor_active) signal_started(admission == -2 && g_capture_status == 0 ? -2 : -1);
   return NULL;
 }
 

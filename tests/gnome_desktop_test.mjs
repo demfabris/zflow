@@ -21,7 +21,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
         GLib: {
             PRIORITY_DEFAULT: 0, PRIORITY_DEFAULT_IDLE: 0, SOURCE_CONTINUE: true, SOURCE_REMOVE: false,
             get_monotonic_time: () => now,
-            timeout_add(_priority, _interval, fn) {const id = next++; timers.set(id, fn); return id;},
+            timeout_add(_priority, interval, fn) {const id = next++; timers.set(id, {fn, interval, due: now + interval * 1000}); return id;},
             idle_add(_priority, fn) {queueMicrotask(fn); return next++;},
             Source: {remove(id) {timers.delete(id);}},
         },
@@ -41,7 +41,14 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     vm.runInNewContext(source, context);
     const extension = new context.TestExtension();
     extension.enable();
-    return {extension, barriers, context, sessionMode, handlers, advance(ms) {now += ms * 1000; for (const fn of timers.values()) fn();}};
+    return {extension, barriers, context, sessionMode, handlers, timers, advance(ms) {
+        now += ms * 1000;
+        for (const [id, timer] of timers) {
+            if (timer.due > now) continue;
+            if (timer.fn() === context.GLib.SOURCE_REMOVE) timers.delete(id);
+            else timer.due = now + timer.interval * 1000;
+        }
+    }};
 }
 
 const prepare = (edge = 'left', extra = {}) => ({command: 'prepare', token: 7, edge, start: 0, end: 1000000, position: 500000, ...extra});
@@ -69,7 +76,15 @@ for (const [edge, expectedY, direction] of [['top', 3, 4], ['bottom', 1076, 8]])
     assert.equal(result.position.x, 3);
     assert.equal(result.position.y, 540);
     assert.equal(d.barriers[0].properties.directions, 1, 'left edge permits inward movement');
-    assert.equal((await d.extension._request({command: 'poll', token: 7})).status, 'active');
+    const poll = d.extension._request({command: 'poll', token: 7});
+    let settled = false;
+    poll.then(() => {settled = true;});
+    d.advance(199);
+    await new Promise(setImmediate);
+    assert.equal(settled, false, 'an active poll waits for its hold duration');
+    d.advance(1);
+    assert.equal((await poll).status, 'active');
+    assert.equal(d.timers.size, 1, 'only the lease timer remains after the hold');
     d.barriers[0].hit(d.barriers[0], {x: 0, y: 270});
     assert.equal((await d.extension._request({command: 'poll', token: 7})).position, 250000);
     await assert.rejects(d.extension._request({command: 'finish', token: 8}), /expired|ended/);
@@ -78,10 +93,37 @@ for (const [edge, expectedY, direction] of [['top', 3, 4], ['bottom', 1076, 8]])
 }
 {
     const d = desktop();
+    await d.extension._request(prepare());
+    const poll = d.extension._request({command: 'poll', token: 7});
+    assert.equal(d.timers.size, 2);
+    d.barriers[0].hit(d.barriers[0], {x: 0, y: 270});
+    assert.equal((await poll).position, 250000, 'a pending poll returns the barrier position without advancing time');
+    assert.equal(d.timers.size, 1, 'the barrier hit removes the hold timer');
+    assert.equal(d.extension._lease.polls.size, 0);
+    d.extension.disable();
+}
+{
+    const d = desktop();
+    await d.extension._request(prepare());
+    const poll = d.extension._request({command: 'poll', token: 7});
+    const rejected = assert.rejects(poll, /expired|ended/);
+    // A delayed main loop can observe lease expiry before the hold callback.
+    d.advance(2001);
+    await rejected;
+    assert.equal(d.timers.size, 1, 'lease expiry removes the pending hold timer');
+    assert.ok(d.barriers.every(b => b.destroyed));
+    d.extension.disable();
+}
+{
+    const d = desktop();
     await d.extension._request(prepare('right'));
     assert.equal(d.barriers[0].properties.x1, 1920);
     assert.equal(d.barriers[0].properties.directions, 2, 'right edge permits negative X');
+    const poll = d.extension._request({command: 'poll', token: 7});
+    const rejected = assert.rejects(poll, /expired|ended/);
     const result = await d.extension._request({command: 'finish', token: 7});
+    await rejected;
+    assert.equal(d.timers.size, 1, 'finish removes the pending hold timer');
     assert.equal(result.status, 'finished');
     assert.ok(d.barriers.every(b => b.destroyed));
     await assert.rejects(d.extension._request({command: 'poll', token: 7}), /expired|ended/);
