@@ -104,7 +104,7 @@ class InstallerTest(unittest.TestCase):
         result = subprocess.run(
             [BASH, "-c", f"source {shlex.quote(str(INSTALLER))}\n{HOST_COMMANDS}\n{before}\n{code}"],
             env={**self.env, **(env or {})}, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True,
+            capture_output=True, text=True, errors="backslashreplace",
         )
         output = result.stdout + result.stderr
         if ok:

@@ -226,7 +226,7 @@ install_macos() {
         done
         if pgrep -x zflow-app >/dev/null; then die 'zflow is still running. Quit it and rerun the installer.'; fi
     fi
-    say "Installing $mac_destination…"
+    say "Installing ${mac_destination}…"
     mac_stage=$(as_root mktemp -d "${mac_destination%/*}/.zflow-install.XXXXXXXX")
     as_root ditto "$bundle" "$mac_stage/zflow.app"
     as_root codesign --verify --strict --deep "$mac_stage/zflow.app"
