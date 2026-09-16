@@ -25,6 +25,7 @@ use crate::{
 
 #[derive(Debug)]
 pub enum Command {
+    Settings,
     DesktopAgent {
         install: bool,
     },
@@ -94,6 +95,16 @@ struct SetupOptions {
 
 pub fn run(path: PathBuf, command: Command) -> Result<()> {
     match command {
+        Command::Settings => {
+            #[cfg(target_os = "linux")]
+            {
+                crate::app::gnome::settings()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("Open Settings from the native zflow menu-bar app")
+            }
+        }
         Command::DesktopAgent { install } => {
             #[cfg(target_os = "linux")]
             {

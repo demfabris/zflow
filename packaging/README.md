@@ -1,4 +1,14 @@
-# Linux service packaging
+# Installation
+
+The root `install.sh` is the cross-platform source installer used by the curl
+command in the main README. It downloads a source archive, installs prerequisites
+when needed, and calls the platform scripts below. Use `./install.sh --source .`
+to install a checkout, or add `--skip-dependencies` to manage prerequisites
+yourself. `--headless` skips GNOME setup on Linux. On macOS, `--sign IDENTITY`
+selects an installed Apple signing identity; the default is an ad hoc signature.
+The installer does not publish or notarize builds.
+
+## Linux service
 
 `scripts/install.sh` builds both headless binaries and installs them under
 `/usr/local/bin`. It creates a locked `zflow` account, loads `uinput`, installs
@@ -63,17 +73,30 @@ After installing the system service, run as the logged-in desktop user:
 
 ```sh
 zflow desktop-agent --install
-zflow desktop-agent
+zflow settings
 ```
 
-The install command writes the GNOME extension and
+The install command writes the GNOME extension, the Applications launcher,
+a D-Bus activation entry for `io.zflow.Desktop`, and
 `$XDG_CONFIG_HOME/autostart/io.zflow.desktop-agent.desktop` (falling back to
-`~/.config/autostart`). GNOME may require logout/login before enabling a new
-extension. The agent reconnects to the system service, serves desktop requests,
+`~/.config/autostart`). Log out and back in after installing or updating the
+extension so GNOME loads the new code. The extension adds a panel indicator with sharing and settings actions.
+Its preferences and the standalone app use the same GTK4/libadwaita controls.
+Install GJS, GTK 4.12+ and libadwaita 1.5+ for the window. The service and agent
+remain usable without the GTK runtime.
+
+The agent reconnects to the system service, serves desktop requests,
 and advertises display dimensions without opening a window. It obtains public
 peer/discovery settings through the credential-checked desktop API. It does not
-read the protected system configuration directly. Quit the foreground agent
-with Ctrl+C; future GNOME logins start it automatically.
+read the protected system configuration directly. For a foreground agent, run
+`zflow desktop-agent` and stop it with Ctrl+C.
+Closing the settings window keeps the agent running. **Start at Login**
+controls the autostart entry; opening settings can still start it on demand.
+Panel status checks do not activate a stopped agent.
 
 The system uninstaller does not delete per-user extension or autostart files.
-Remove those from the desktop account when removing desktop integration.
+Remove those from the desktop account when removing desktop integration, plus
+`$XDG_DATA_HOME/applications/io.zflow.zflow.desktop`,
+`$XDG_DATA_HOME/dbus-1/services/io.zflow.Desktop.service`, and
+`$XDG_CACHE_HOME/zflow/desktop`. The data/cache defaults are `~/.local/share`
+and `~/.cache`.

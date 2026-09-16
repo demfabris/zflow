@@ -60,6 +60,7 @@ impl Default for MacosConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
+    pub sharing: bool,
     pub state_dir: PathBuf,
     pub control_socket: PathBuf,
 }
@@ -67,6 +68,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            sharing: true,
             state_dir: PathBuf::from("/var/lib/zflow"),
             control_socket: PathBuf::from("/run/zflow/zflowd.sock"),
         }

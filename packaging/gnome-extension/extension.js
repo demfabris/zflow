@@ -1,3 +1,4 @@
+import {Indicator} from './indicator.js';
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -15,6 +16,7 @@ const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" di
 
 export default class ZflowExtension extends Extension {
     enable() {
+        this._indicator = new Indicator();
         this._lease = null;
         this._barriers = [];
         this._object = Gio.DBusExportedObject.wrapJSObject(XML, this);
@@ -29,6 +31,8 @@ export default class ZflowExtension extends Extension {
     }
 
     disable() {
+        this._indicator?.destroy();
+        this._indicator = null;
         this._clear();
         if (this._timer) GLib.Source.remove(this._timer);
         if (this._monitorsId) Main.layoutManager.disconnect(this._monitorsId);

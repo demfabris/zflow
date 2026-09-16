@@ -73,6 +73,18 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
                         crate::peer_view::Request::PairConfirm { .. } => {
                             bail!("Start pairing before confirming a code")
                         }
+                        request => {
+                            let reply = desktop_command(&mut stream, &shared, daemon_uid, request)
+                                .await
+                                .unwrap_or_else(|error| crate::peer_view::DesktopReply::Error {
+                                    message: format!("{error:#}"),
+                                });
+                            tokio::time::timeout(
+                                Duration::from_secs(3),
+                                write_message(&mut stream, &reply),
+                            )
+                            .await??;
+                        }
                     }
                     Ok::<_, anyhow::Error>(())
                 }
@@ -84,6 +96,57 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
         }
     });
     Ok(())
+}
+
+async fn desktop_command(
+    stream: &mut tokio::net::UnixStream,
+    shared: &Arc<Shared>,
+    daemon_uid: u32,
+    request: crate::peer_view::Request,
+) -> Result<crate::peer_view::DesktopReply> {
+    use crate::peer_view::{DesktopReply, DesktopStatus, Request};
+    let _mutation = shared.config_mutation.lock().await;
+    let seat = tokio::task::spawn_blocking(query_primary_seat).await?;
+    authorize_peer(stream, daemon_uid, seat.active_authenticated_uid())?;
+    let mut config = shared.config.read().await.clone();
+    match request {
+        Request::Status {} => {
+            let receiving_from = shared
+                .inbound_owner
+                .lock()
+                .await
+                .as_ref()
+                .map(|(peer, _)| peer.clone());
+            let sending_to = shared
+                .active_outbound
+                .lock()
+                .await
+                .as_ref()
+                .map(|active| active.peer.clone());
+            let connected = shared.sessions.lock().await.keys().cloned().collect();
+            Ok(DesktopReply::Status(DesktopStatus {
+                sharing: config.daemon.sharing,
+                receiving_from,
+                sending_to,
+                connected,
+                peers: config.peers,
+                discovery: config.transport.discovery,
+            }))
+        }
+        Request::SetSharing { enabled } => {
+            config.daemon.sharing = enabled;
+            shared.apply_config_locked(config, true).await?;
+            Ok(DesktopReply::Ack)
+        }
+        Request::Forget { name } => {
+            if config.peers.remove(&name).is_none() {
+                bail!("Unknown computer {name}");
+            }
+            shared.apply_config_locked(config, true).await?;
+            Ok(DesktopReply::Ack)
+        }
+        _ => bail!("Unsupported desktop operation"),
+    }
 }
 
 async fn pair(

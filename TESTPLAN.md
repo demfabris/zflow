@@ -4,11 +4,72 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Cross-platform source installer, September 16
+
+Run `just test-install` (also included in `just check`). The tests replace
+package managers, privilege brokers, and builds with fixtures. They cover Linux
+package selection, unprivileged builds, graphical/terminal authentication,
+failed downloads and builds, GNOME activation after login, macOS prerequisites,
+and app replacement with recovery of the previous bundle.
+
+All 18 tests passed on the Linux host and under Bash 3.2.57 in an isolated
+container. ShellCheck passed for both install scripts. The Linux release
+binaries built with the locked dependency graph, and `just check` passed.
+The tests did not replace the running service or install packages on the host.
+
+Live installation checks remain:
+
+- Install and update on current Ubuntu, Fedora, and Arch GNOME sessions.
+  Check password approval/cancellation, first-login extension activation,
+  preserved configuration/identity, and settings launch from Applications.
+- Install headless from a terminal, including a machine without Rust.
+- On macOS 26+, test missing Command Line Tools, ad hoc and Apple-signed
+  builds, updating a running app, first-launch permissions, and Open at login
+  from the installed `/Applications/zflow.app` path.
+
+## Native GNOME app and panel, September 16
+
+The GNOME extension retains cursor placement and return barriers and adds a
+panel indicator. The native GTK4/libadwaita app and extension preferences share
+one settings view. A session D-Bus service in the desktop agent forwards a
+limited set of requests to the credential-checked daemon API.
+
+Run `just check` and `just test-gtk`. The GTK check requires a Linux display
+and runs on a private D-Bus session. It exercises actual widgets and D-Bus
+messages against a fake service: pause/resume, rejected-write rollback, login,
+pairing confirmation/cancellation, forgetting, loss of service, and cleanup.
+Rust tests check pause authorization in both directions and the existing
+pre-login boundary, plus daemon pairing acknowledgements and cancellation.
+
+Implementation checks on GNOME Shell 50.1, GTK 4.22.4 and libadwaita 1.9.1:
+`just check` passed (236 library tests, eight QUIC tests, both Node suites).
+`just test-gtk` passed the isolated Rust session-service test and GTK controls.
+The extension loaded in a separate headless GNOME Shell and returned desktop
+geometry through its existing API. Native GTK rendering was inspected for the
+settings window and pairing dialog. The live system daemon was not replaced;
+two-computer pairing and input pause/release still need the checks below.
+
+Live checks after installing the updated service and desktop integration:
+
+- Open zflow from Applications, the panel, and GNOME Extensions preferences.
+  Confirm status, native theme, keyboard focus, and one desktop agent.
+- Pause while receiving and while sending. Held input must release and new
+  connections must stay blocked. Resume must preserve the paired identities.
+- Pair with a Mac and another Linux computer. Cancel before confirmation and
+  enter a wrong code; neither should add trust. Forget an active computer and
+  verify immediate cleanup. Keep pre-login permissions unchanged.
+- Close settings and cross edges repeatedly. Disable/re-enable the extension,
+  restart the daemon, lock/unlock, and change monitors; inspect recovery.
+- Turn Start at Login off, log in again, and verify panel polling does not
+  start the agent. Opening settings should start it. Restore the login setting.
+- Edit the system configuration externally, then change sharing. Reject the
+  stale write. Restart the service and confirm the UI reflects the saved state.
+
 ## Native macOS app and Linux desktop agent, September 16
 
 Current architecture: SwiftUI MenuBarExtra and Settings, a Rust application
-worker behind a C ABI, a headless Linux desktop agent, and an SMAppService AWDL
-daemon authenticated through same-team XPC. The earlier desktop GUI is removed.
+worker behind a C ABI, a Linux desktop agent, and an SMAppService AWDL
+daemon authenticated through same-team XPC. The earlier egui desktop GUI is removed.
 Historical sections below retain their dated measurements, not current commands.
 
 Automated checks:

@@ -5,7 +5,7 @@ set positional-arguments
 default:
     @just --list
 
-# Build and open the Mac app, or run the Linux desktop agent.
+# Build and open the native app.
 run platform *args: (_platform platform)
     #!/usr/bin/env bash
     set -euo pipefail
@@ -15,7 +15,7 @@ run platform *args: (_platform platform)
         ./scripts/build-macos-app.sh --debug
         open target/debug/zflow.app --args "$@"
     else
-        cargo run --locked --bin zflow -- desktop-agent "$@"
+        cargo run --locked --bin zflow -- settings "$@"
     fi
 
 # Install/update the Linux service (requires sudo).
@@ -49,7 +49,7 @@ debug-daemon: (_platform "linux")
     sudo systemctl restart zflowd.service
     printf 'Daemon debug logging enabled until reboot. Read with: journalctl -u zflowd -f -o short-iso-precise\n'
 
-# Package the Mac app or build the Linux service and agent.
+# Package the Mac app or build the Linux service and native app launcher.
 build platform *args: (_platform platform)
     #!/usr/bin/env bash
     set -euo pipefail
@@ -73,6 +73,16 @@ test-native: (_platform "mac")
 # Exercise the shipped GNOME extension with a simulated compositor (requires Node.js).
 test-desktop:
     node tests/gnome_desktop_test.mjs
+    node tests/gnome_panel_test.mjs
+
+# Exercise native GTK controls through D-Bus on the current display.
+test-gtk: (_platform "linux")
+    dbus-run-session -- cargo test --locked app::gnome::tests -- --ignored
+    GTK_A11Y=none GIO_USE_VFS=local dbus-run-session -- gjs -m tests/gnome_settings_test.js
+
+# Exercise installation and recovery without changing the host (requires Python 3).
+test-install:
+    python3 tests/install_test.py
 
 # Format Rust code.
 fmt:
@@ -87,7 +97,7 @@ lint:
     cargo clippy --locked --all-targets -- -D warnings
 
 # Check formatting, lint, and run tests.
-check: fmt-check lint test test-desktop
+check: fmt-check lint test test-desktop test-install
 
 [private]
 _platform platform:

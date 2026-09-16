@@ -12,6 +12,13 @@ pub const SOCKET_PATH: &str = "/run/zflow-gui/peers.sock";
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Snapshot {},
+    Status {},
+    SetSharing {
+        enabled: bool,
+    },
+    Forget {
+        name: String,
+    },
     Desktop {},
     Pair {
         remote: Option<std::net::SocketAddr>,
@@ -60,6 +67,38 @@ pub struct Snapshot {
     pub discovery: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopStatus {
+    pub sharing: bool,
+    pub receiving_from: Option<String>,
+    pub sending_to: Option<String>,
+    pub connected: Vec<String>,
+    pub peers: BTreeMap<String, PeerConfig>,
+    pub discovery: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DesktopReply {
+    Status(DesktopStatus),
+    Ack,
+    Error { message: String },
+}
+
+#[cfg(target_os = "linux")]
+pub async fn request(request: &Request) -> anyhow::Result<DesktopReply> {
+    use anyhow::{Context, bail};
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut stream = connect_service().await?;
+        crate::control::write_message(&mut stream, request).await?;
+        let reply = crate::control::read_message(&mut stream).await
+            .context("The service denied access. Use the active, unlocked desktop session and update the service")?;
+        if let DesktopReply::Error { message } = reply { bail!("{message}"); }
+        Ok(reply)
+    }).await.context("The desktop API did not respond within five seconds")?
+}
+
 impl Snapshot {
     pub fn from_config(config: &Config) -> Self {
         Self {
@@ -100,6 +139,8 @@ mod tests {
     #[test]
     fn desktop_protocol_rejects_arbitrary_control_keys_and_permissions() {
         for json in [
+            r#"{"command":"set_sharing","enabled":true,"permissions":{"inject_prelogin":true}}"#,
+            r#"{"command":"forget","name":"desk","path":"/etc/zflow"}"#,
             r#"{"command":"activate","peer":"desk"}"#,
             r#"{"command":"local"}"#,
             r#"{"command":"reload_config"}"#,

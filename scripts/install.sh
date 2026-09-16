@@ -221,4 +221,4 @@ printf 'Pre-login input stays disabled until you grant it during setup.\n'
 
 printf 'For GNOME handoff, run as your desktop user (without sudo):\n'
 printf '  %s/zflow desktop-agent --install\n' "$BIN_DIR"
-printf '  %s/zflow desktop-agent\n' "$BIN_DIR"
+printf '  %s/zflow settings\n' "$BIN_DIR"

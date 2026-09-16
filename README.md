@@ -1,10 +1,43 @@
 # zflow
 
 zflow shares keyboard, pointer, and trackpad input over authenticated QUIC.
-Linux runs a headless system service. macOS runs a native SwiftUI menu-bar app
-with a small settings window. The Mac currently sends input to Linux; receiving
+Linux runs a system service with a GNOME panel indicator and native
+GTK4/libadwaita settings. macOS runs a native SwiftUI menu-bar app with a small
+settings window. The Mac currently sends input to Linux; receiving
 input on macOS remains future work. This is a working prototype. Live two-host
 qualification in [TESTPLAN.md](TESTPLAN.md) still gates the alpha label.
+
+## Install
+
+Run as your normal user on Linux or macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash
+```
+
+The installer builds from source for now. On Linux it installs build tools with
+apt, dnf, or pacman, sets up the system service, and adds the panel indicator and
+native settings when run from a GNOME session. On macOS it builds the native
+app and installs it in `/Applications`. Builds run under your user account;
+system changes request administrator access through GNOME's password dialog
+when available, or `sudo` in the terminal.
+
+Linux needs systemd 254+; the desktop also needs GNOME 46+, GTK 4.12+, and
+libadwaita 1.5+. macOS needs version 26+, Swift 6.2+, and the macOS 26 SDK.
+If Apple Command Line Tools are missing, finish their graphical installer and
+rerun this command. The script installs Rust when needed.
+
+Repeat the command to update. It keeps your configuration and paired identities;
+updating the Linux service interrupts an active connection. Log out and back in
+after installing or updating the GNOME extension, then enable zflow in GNOME
+Extensions if needed.
+
+Pass options after `bash -s --`, for example `--yes --headless` for a Linux
+service without desktop integration. `--yes` accepts setup, but administrator
+authentication may still be required. Use `--ref TAG_OR_COMMIT` to choose a
+source revision, `--no-launch` to leave the app closed, or `--skip-dependencies`
+to use installed tools. From a checkout, run `./install.sh --source .`.
+See `./install.sh --help` for all options.
 
 ## Mac → Ubuntu setup
 
@@ -29,16 +62,16 @@ normal desktop user:
 ```sh
 ./scripts/install.sh
 zflow desktop-agent --install
-zflow desktop-agent
+zflow settings
 ```
 
 The installer preserves the service configuration and identity. Repeat it
-after updating the code. A newly installed GNOME extension may require logging
-out and back in, then enabling zflow in GNOME Extensions. The desktop agent
+after updating the code. Log out and back in to load new extension code, then
+enable zflow in GNOME Extensions if needed. The desktop agent
 starts automatically on subsequent GNOME logins. Keep it running during use;
 it supplies cursor placement, desktop dimensions, and return barriers.
 
-1. On Ubuntu, start pairing with `sudo zflow pair listen mac`.
+1. On Ubuntu, open **zflow → Pair Computer… → Wait for Connection**.
 2. Open **Settings…** from the Mac's zflow menu-bar icon. Choose **Pair Computer…**
    and select the receiver, or enter its IP address with pairing port `43120`.
 3. Enter the other computer's six-digit code on each side and confirm both.
@@ -76,7 +109,19 @@ Sharing arms only after a paired receiver, a valid touching layout, permissions,
 and any requested helper are ready. GUI writes preserve unrelated settings and
 comments. External edits reload automatically; invalid edits display an error
 while the last valid configuration stays in use. Conflicting writes fail instead
-of overwriting an external edit. Advanced Linux settings remain in
+of overwriting an external edit.
+
+The GNOME window exposes sharing, pairing, forgetting computers, and **Start at
+Login**. Its panel menu shows the current sender or receiver and a sharing
+switch. The extension preferences show the same GTK settings. Closing either
+window leaves the desktop agent running. Pairing closes when its dialog closes.
+
+Linux stores the sharing switch in `[daemon].sharing`; pausing closes active
+input sessions and blocks sending and receiving, including pre-login input,
+until you resume. Paired identities and permissions stay unchanged. Set
+`sharing = true` in that section and restart the service to resume from the CLI.
+
+Advanced Linux settings remain in
 `/etc/zflow/zflow.toml` and are managed through the CLI or a text editor.
 
 ## Arrange computers
@@ -289,15 +334,25 @@ the problem to capture or playout behavior.
 just run mac                 # Build and open the native debug app
 just build mac               # Package the native release app
 just install-linux           # Install/update the Linux service
-just run linux               # Run the GNOME desktop agent
+just run linux               # Open native GNOME settings
 just debug mac               # Native app diagnostics under target/logs
 just debug linux             # Desktop-agent diagnostics
 just debug-daemon            # Linux daemon diagnostics until reboot
 just test                    # Rust tests
 just test-native             # Swift bridge tests (macOS)
 just test-desktop            # GNOME extension tests (Node.js)
-just check                   # Rust formatting, Clippy, tests, GNOME tests
+just test-gtk                # Native GTK controls and D-Bus tests (Linux display)
+just test-install            # Installer and recovery tests (Python 3)
+just check                   # Formatting, Clippy, Rust, GNOME, installer tests
 ```
+
+Linux settings require GJS, GTK 4.12 or newer, and libadwaita 1.5 or newer.
+On Ubuntu, install `gjs gir1.2-gtk-4.0 gir1.2-adw-1`; on Arch, install
+`gjs gtk4 libadwaita`. The GNOME extension supplies the panel/tray icon, without
+an AppIndicator extension. Settings use native GTK widgets through GJS.
+`zflow settings` starts one desktop agent per session; the daemon retains input
+ownership and privileged configuration. Install the updated system service
+before using the new controls.
 
 Mac builds produce `target/{debug,release}/zflow.app`. The Swift sources are in
 `macos/`, and `src/app/` contains UI-independent application services. A small C

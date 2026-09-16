@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use super::model::ConfigDocument;
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -101,6 +102,7 @@ impl Drop for Pairing {
     }
 }
 
+#[cfg(target_os = "macos")]
 async fn run(
     path: PathBuf,
     remote: Option<SocketAddr>,
@@ -130,7 +132,72 @@ async fn run(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(target_os = "linux")]
+async fn run(
+    _path: PathBuf,
+    remote: Option<SocketAddr>,
+    confirmation: oneshot::Receiver<(String, String)>,
+    stage: &Mutex<PairingSnapshot>,
+) -> Result<()> {
+    run_stream(
+        crate::peer_view::connect_service().await?,
+        remote,
+        confirmation,
+        stage,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn run_stream(
+    mut stream: tokio::net::UnixStream,
+    remote: Option<SocketAddr>,
+    confirmation: oneshot::Receiver<(String, String)>,
+    stage: &Mutex<PairingSnapshot>,
+) -> Result<()> {
+    use crate::{
+        control::{read_message, write_message},
+        peer_view::{PairingEvent, Request},
+    };
+    write_message(&mut stream, &Request::Pair { remote }).await?;
+    let mut confirmation = Some(confirmation);
+    loop {
+        match read_message(&mut stream).await? {
+            PairingEvent::Ready => {}
+            PairingEvent::Confirm {
+                peer_label,
+                authentication_code,
+            } => {
+                *stage.lock().unwrap_or_else(|e| e.into_inner()) = PairingSnapshot {
+                    state: "confirm",
+                    code: Some(authentication_code),
+                    name: peer_label,
+                    error: None,
+                };
+                let (name, authentication_code) = confirmation
+                    .take()
+                    .context("Duplicate pairing confirmation")?
+                    .await
+                    .context("Pairing cancelled")?;
+                write_message(
+                    &mut stream,
+                    &Request::PairConfirm {
+                        name,
+                        authentication_code,
+                    },
+                )
+                .await?;
+            }
+            PairingEvent::Paired => {
+                stage.lock().unwrap_or_else(|e| e.into_inner()).state = "paired";
+                return Ok(());
+            }
+            PairingEvent::Error { message } => anyhow::bail!("{message}"),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::config::Config;
@@ -188,6 +255,80 @@ mod tests {
         pairing.cancel();
         assert_eq!(cancelled.try_recv(), Ok(()));
         old_stage.lock().unwrap().state = "paired";
+        assert_eq!(pairing.snapshot().state, "idle");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use crate::{
+        control::{read_message, write_message},
+        peer_view::{PairingEvent, Request},
+    };
+
+    #[tokio::test]
+    async fn pairing_waits_for_daemon_ack_and_cancel_closes_connection() {
+        let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let (confirm, confirmation) = oneshot::channel();
+        let stage = Mutex::new(PairingSnapshot::default());
+        let (result, ()) = tokio::join!(run_stream(client, None, confirmation, &stage), async {
+            assert!(matches!(
+                read_message::<_, Request>(&mut server).await.unwrap(),
+                Request::Pair { remote: None }
+            ));
+            write_message(&mut server, &PairingEvent::Ready)
+                .await
+                .unwrap();
+            write_message(
+                &mut server,
+                &PairingEvent::Confirm {
+                    peer_label: Some("Mac".into()),
+                    authentication_code: "123456".into(),
+                },
+            )
+            .await
+            .unwrap();
+            confirm.send(("Mac".into(), "123456".into())).unwrap();
+            assert!(
+                matches!(read_message::<_, Request>(&mut server).await.unwrap(), Request::PairConfirm { name, authentication_code } if name == "Mac" && authentication_code == "123456")
+            );
+            assert_ne!(stage.lock().unwrap().state, "paired");
+            write_message(&mut server, &PairingEvent::Paired)
+                .await
+                .unwrap();
+        });
+        result.unwrap();
+        assert_eq!(stage.lock().unwrap().state, "paired");
+
+        let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let (confirm, confirmation) = oneshot::channel();
+        drop(confirm);
+        let (result, ()) = tokio::join!(run_stream(client, None, confirmation, &stage), async {
+            let _: Request = read_message(&mut server).await.unwrap();
+            write_message(
+                &mut server,
+                &PairingEvent::Confirm {
+                    peer_label: None,
+                    authentication_code: "123456".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(read_message::<_, Request>(&mut server).await.is_err());
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancellation_isolates_late_pairing_results() {
+        let mut pairing = Pairing::default();
+        let old = pairing.stage.clone();
+        let (sender, mut receiver) = oneshot::channel();
+        pairing.cancel = Some(sender);
+        pairing.cancel();
+        assert_eq!(receiver.try_recv(), Ok(()));
+        old.lock().unwrap().state = "paired";
         assert_eq!(pairing.snapshot().state, "idle");
     }
 }

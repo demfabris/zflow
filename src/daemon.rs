@@ -354,7 +354,7 @@ impl Shared {
             .get(peer)
             .cloned()
             .with_context(|| format!("unknown peer {peer}"))?;
-        require_outbound_permission(peer, &record)?;
+        require_outbound_permission(&*self.config.read().await, peer, &record)?;
         let session = self.ensure_session(peer, &record).await?;
         let _policy = self.policy.lock().await;
         let current = self
@@ -365,7 +365,7 @@ impl Shared {
             .get(peer)
             .cloned()
             .with_context(|| format!("peer {peer} was revoked during connection setup"))?;
-        require_outbound_permission(peer, &current)?;
+        require_outbound_permission(&*self.config.read().await, peer, &current)?;
         if current.spki_der_hex != record.spki_der_hex
             || !self
                 .sessions
@@ -417,12 +417,13 @@ impl Shared {
         )
         .await?;
         let _policy = self.policy.lock().await;
-        let current = self.config.read().await.peers.get(peer).cloned();
+        let config = self.config.read().await;
+        let current = config.peers.get(peer).cloned();
         if self.policy_generation.load(Ordering::Acquire) != policy_generation
             || current.as_ref() != Some(record)
             || current
                 .as_ref()
-                .is_none_or(|current| require_outbound_permission(peer, current).is_err())
+                .is_none_or(|current| require_outbound_permission(&config, peer, current).is_err())
         {
             session.close(SessionCloseReason::PermissionRevoked);
             bail!("peer {peer} authorization changed during connection negotiation");
@@ -506,7 +507,7 @@ impl Shared {
             .get(peer)
             .cloned()
             .with_context(|| format!("peer {peer} was revoked before capture armed"))?;
-        require_outbound_permission(peer, &record)?;
+        require_outbound_permission(&*self.config.read().await, peer, &record)?;
         let session = self
             .sessions
             .lock()
@@ -594,7 +595,7 @@ impl Shared {
             .get(&active.peer)
             .cloned()
             .with_context(|| format!("peer {} was revoked during capture", active.peer))?;
-        require_outbound_permission(&active.peer, &record)?;
+        require_outbound_permission(&*self.config.read().await, &active.peer, &record)?;
         self.sessions
             .lock()
             .await
@@ -882,6 +883,9 @@ async fn query_seat_gate() -> InjectionGate {
 }
 
 fn receiver_authorized(config: &Config, peer: &str, gate: InjectionGate) -> bool {
+    if !config.daemon.sharing {
+        return false;
+    }
     let Some(peer) = config.peers.get(peer) else {
         return false;
     };
@@ -939,7 +943,8 @@ fn is_safety_release(effect: &ReceiverEffect) -> bool {
     )
 }
 
-fn require_outbound_permission(peer: &str, record: &PeerConfig) -> Result<()> {
+fn require_outbound_permission(config: &Config, peer: &str, record: &PeerConfig) -> Result<()> {
+    anyhow::ensure!(config.daemon.sharing, "Input sharing is paused");
     if !record.permissions.connect {
         bail!("peer {peer} is not allowed to connect");
     }
@@ -950,6 +955,9 @@ fn require_outbound_permission(peer: &str, record: &PeerConfig) -> Result<()> {
 }
 
 fn eligible_outbound_peers(config: &Config) -> Vec<String> {
+    if !config.daemon.sharing {
+        return Vec::new();
+    }
     config
         .peers
         .iter()
@@ -959,6 +967,7 @@ fn eligible_outbound_peers(config: &Config) -> Vec<String> {
 }
 
 fn peer_name_for_spki(config: &Config, spki: &[u8]) -> Result<String> {
+    anyhow::ensure!(config.daemon.sharing, "Input sharing is paused");
     let mut matches = config
         .peers
         .iter()
@@ -986,6 +995,9 @@ fn validate_peer_identities(config: &Config) -> Result<()> {
 }
 
 fn build_server_config(identity: &Identity, config: &Config) -> Result<Option<InputServerConfig>> {
+    if !config.daemon.sharing {
+        return Ok(None);
+    }
     let peers = config
         .peers
         .values()
@@ -1429,7 +1441,7 @@ impl Shared {
         if runtime_changed {
             self.reload_runtime(runtime_config).await?;
         }
-        if persist && let Err(error) = config.save(&self.config_path) {
+        if persist && let Err(error) = self.save_config(&old, &config) {
             // Runtime reload is acknowledged before persistence so a full or
             // stopped command queue can never make disk claim a rejected
             // configuration. Roll back the acknowledged runtime mutation if
@@ -1443,7 +1455,7 @@ impl Shared {
                     "runtime rollback also failed after config persistence error: {rollback}"
                 )));
             }
-            return Err(error.into());
+            return Err(error);
         }
         let _policy = self.policy.lock().await;
         self.endpoint
@@ -1453,7 +1465,8 @@ impl Shared {
         self.policy_generation.fetch_add(1, Ordering::AcqRel);
 
         let sessions = self.sessions.lock().await.clone();
-        let session_policy_changed = old.transport.checkpoint_ms != config.transport.checkpoint_ms
+        let session_policy_changed = old.daemon.sharing != config.daemon.sharing
+            || old.transport.checkpoint_ms != config.transport.checkpoint_ms
             || old.transport.lease_ms != config.transport.lease_ms
             || old.playout != config.playout
             || old.input.experimental_touchpad != config.input.experimental_touchpad
@@ -1478,6 +1491,16 @@ impl Shared {
             }
         }
         Ok(())
+    }
+
+    fn save_config(&self, old: &Config, config: &Config) -> Result<()> {
+        let mut document = crate::app::model::ConfigDocument::open(self.config_path.clone())?;
+        anyhow::ensure!(
+            document.saved() == old,
+            "Configuration changed on disk; restart the service before saving"
+        );
+        document.draft = config.clone();
+        document.save()
     }
 
     async fn reload_runtime(&self, config: LinuxRuntimeConfig) -> Result<()> {
@@ -1533,6 +1556,52 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pausing_blocks_both_directions_and_preserves_peer_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(dir.path()).unwrap();
+        let mut config = Config::default();
+        let record = PeerConfig::from_spki(
+            identity.spki(),
+            vec![],
+            PeerPermissions {
+                connect: true,
+                send_normal: true,
+                receive_normal: true,
+                inject_prelogin: true,
+            },
+        )
+        .unwrap();
+        config.peers.insert("mac".into(), record.clone());
+        config.input.allow_prelogin_input = true;
+        assert!(receiver_authorized(
+            &config,
+            "mac",
+            InjectionGate::Normal { uid: 1000 }
+        ));
+        assert!(require_outbound_permission(&config, "mac", &record).is_ok());
+        assert!(build_server_config(&identity, &config).unwrap().is_some());
+        config.daemon.sharing = false;
+        assert!(!receiver_authorized(
+            &config,
+            "mac",
+            InjectionGate::Normal { uid: 1000 }
+        ));
+        assert!(!receiver_authorized(
+            &config,
+            "mac",
+            InjectionGate::PreLogin
+        ));
+        assert!(require_outbound_permission(&config, "mac", &record).is_err());
+        assert!(eligible_outbound_peers(&config).is_empty());
+        assert!(peer_name_for_spki(&config, identity.spki()).is_err());
+        assert!(build_server_config(&identity, &config).unwrap().is_none());
+        assert_eq!(config.peers["mac"], record);
+        config.daemon.sharing = true;
+        assert_eq!(eligible_outbound_peers(&config), vec!["mac"]);
+        assert_eq!(peer_name_for_spki(&config, identity.spki()).unwrap(), "mac");
+    }
 
     #[test]
     fn discovery_advertises_touch_only_when_experiment_is_enabled() {

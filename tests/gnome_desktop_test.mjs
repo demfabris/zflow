@@ -16,6 +16,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     const sessionMode = {isLocked: false, isGreeter: false};
     const context = {
         Extension: class {},
+        Indicator: class { destroy() {} },
         global: {backend: {capabilities: 1}, get_pointer: () => [pointer.x, pointer.y]},
         Main: {sessionMode, layoutManager: {monitors, connect(name, fn) {handlers.set(name, fn); return 1;}, disconnect() {}}},
         GLib: {

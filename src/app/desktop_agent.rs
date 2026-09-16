@@ -1,10 +1,10 @@
 //! Login-session GNOME integration without a desktop window.
-use super::{
-    desktop::DesktopReceiver,
-    displays::{DesktopDetector, DisplayDiscovery},
+use super::displays::{DesktopDetector, DisplayDiscovery};
+use anyhow::{Result, ensure};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
 };
-use anyhow::{Context, Result, ensure};
-use std::{path::PathBuf, time::Duration};
 
 pub fn run(install: bool) -> Result<()> {
     if install {
@@ -17,7 +17,8 @@ pub fn run(install: bool) -> Result<()> {
         )
         .try_init();
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
-        let mut receiver=DesktopReceiver::default();
+        let state = Arc::new(Mutex::new(super::gnome::State::default()));
+        let _connection = super::gnome::connect(state.clone()).await?;
         let mut detector=DesktopDetector::default();
         let mut discovery=DisplayDiscovery::default();
         let mut timer=tokio::time::interval(Duration::from_secs(2));
@@ -29,19 +30,30 @@ pub fn run(install: bool) -> Result<()> {
                 _=terminate.recv() => break,
                 _=interrupt.recv() => break,
                 _=timer.tick() => {
-                    if !receiver.is_active() { receiver.start(); }
-                    let status=receiver.status();
+                    let status = {
+                        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                        if !state.receiver.is_active() { state.receiver.start(); }
+                        state.receiver.status()
+                    };
                     if status!=previous { tracing::info!(%status,"desktop agent"); previous=status; }
                     detector.refresh();
                     match crate::peer_view::fetch().await {
-                        Ok(snapshot) => discovery.update(detector.snapshot().0,snapshot.discovery),
-                        Err(error) => { discovery.stop(); tracing::debug!(%error,"desktop service unavailable"); },
+                        Ok(snapshot) => {
+                            discovery.update(detector.snapshot().0,snapshot.discovery);
+                            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                            if snapshot.discovery { state.nearby.start(); } else { state.nearby.stop(); }
+                        },
+                        Err(error) => {
+                            discovery.stop();
+                            state.lock().unwrap_or_else(|e| e.into_inner()).nearby.stop();
+                            tracing::debug!(%error,"desktop service unavailable");
+                        },
                     }
                     if let Some(error)=discovery.error() { tracing::warn!(%error,"desktop discovery unavailable"); }
                 }
             }
         }
-        receiver.stop();
+        state.lock().unwrap_or_else(|e| e.into_inner()).receiver.stop();
         Ok(())
     })
 }
@@ -51,36 +63,8 @@ fn install_agent() -> Result<()> {
         !nix::unistd::Uid::effective().is_root(),
         "Run desktop-agent --install as your desktop user, without sudo"
     );
-    let directory = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .context("HOME is not set")?
-        .join("autostart");
-    let executable = std::env::current_exe()?;
-    let executable = executable
-        .to_str()
-        .context("Executable path must be UTF-8")?;
-    ensure!(
-        !executable.chars().any(char::is_control),
-        "Invalid executable path"
-    );
-    let executable = executable
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('`', "\\`")
-        .replace('$', "\\$")
-        .replace('%', "%%");
-    std::fs::create_dir_all(&directory)?;
-    std::fs::write(
-        directory.join("io.zflow.desktop-agent.desktop"),
-        format!(
-            "[Desktop Entry]\nType=Application\nName=zflow desktop agent\nExec=\"{executable}\" desktop-agent\nOnlyShowIn=GNOME;\nTerminal=false\n"
-        ),
-    )?;
+    super::gnome::install()?;
     super::desktop::install_extension()?;
-    println!(
-        "Desktop agent installed for your next login. Run zflow desktop-agent to start it now."
-    );
+    println!("GNOME integration installed. Open zflow from Applications or run zflow settings.");
     Ok(())
 }

@@ -1,6 +1,7 @@
 version = 1
 
 [daemon]
+sharing = true
 state_dir = "/var/lib/zflow"
 control_socket = "/run/zflow/zflowd.sock"
 

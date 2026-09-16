@@ -13,6 +13,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open native GNOME settings. Closing the window leaves sharing running.
+    Settings,
     /// Run the GNOME session integration without a window.
     DesktopAgent {
         /// Install the GNOME extension and start this agent at login.
@@ -161,6 +163,7 @@ fn main() -> anyhow::Result<()> {
 impl From<Command> for zflow::cli::Command {
     fn from(value: Command) -> Self {
         match value {
+            Command::Settings => Self::Settings,
             Command::DesktopAgent { install } => Self::DesktopAgent { install },
             Command::Setup {
                 state_dir,

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 struct State {
     active: bool,
+    ready: bool,
     message: String,
 }
 
@@ -18,6 +19,9 @@ pub struct DesktopReceiver {
 impl DesktopReceiver {
     pub fn is_active(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).active
+    }
+    pub fn is_ready(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).ready
     }
     pub fn status(&self) -> String {
         self.state
@@ -43,6 +47,7 @@ impl DesktopReceiver {
         self.cancel = Some(cancel);
         *state.lock().unwrap_or_else(|e| e.into_inner()) = State {
             active: true,
+            ready: false,
             message: "Connecting to the local GNOME desktop…".into(),
         };
         std::thread::spawn(move || {
@@ -63,6 +68,7 @@ impl DesktopReceiver {
                 }
                 *state.lock().unwrap_or_else(|e| e.into_inner()) = State {
                     active: false,
+                    ready: false,
                     message: match result {
                         Ok(()) => "Receiving stopped".into(),
                         Err(error) => format!("{error:#}"),
@@ -80,6 +86,7 @@ impl DesktopReceiver {
         }
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State {
             active: false,
+            ready: false,
             message: "Receiving stopped".into(),
         };
     }
@@ -143,6 +150,7 @@ async fn run(
     }
     state.lock().unwrap_or_else(|e| e.into_inner()).message =
         "Ready to receive through the GNOME desktop".into();
+    state.lock().unwrap_or_else(|e| e.into_inner()).ready = true;
     tracing::info!(generation = expected, "desktop agent ready");
 
     loop {
@@ -249,6 +257,15 @@ pub fn install_extension() -> anyhow::Result<()> {
         std::fs::write(
             path.join("extension.js"),
             include_str!("../../packaging/gnome-extension/extension.js"),
+        )?;
+        super::gnome::write_assets(&path)?;
+        std::fs::write(
+            path.join("indicator.js"),
+            include_str!("../../packaging/gnome-extension/indicator.js"),
+        )?;
+        std::fs::write(
+            path.join("prefs.js"),
+            include_str!("../../packaging/gnome-extension/prefs.js"),
         )?;
         let mut child = std::process::Command::new("gnome-extensions")
             .args(["enable", crate::desktop::EXTENSION_ID])
