@@ -455,9 +455,11 @@ The effective daemon account owns its identity keys in a mode 0700 state directo
 
 The baseline creates a remote-injection keyboard and pointer pair. The touchpad remains behind an experiment flag. No local-relay devices exist; local input never passes through zflow.
 
+When available, Linux touch reports carry receiver-mapped capture timestamps in CLOCK_MONOTONIC, including touch state from reliable anchors. The backend bounds timestamps by its previous report and the current time; unstamped begins and emergency cleanup use the current time. Delivery never waits for this metadata. This preserves capture intervals through network bursts without inventing intermediate contacts. Kernel timestamp limits still apply; see [uinput timestamp validation](https://github.com/torvalds/linux/blob/v7.0/drivers/input/misc/uinput.c#L615).
+
 Each uinput device has stable zflow vendor, product, role, name, and physical identifiers. evdev monitoring and capture filters exclude those identifiers to prevent loops, and portal/EIS source capture MUST never capture a zflow remote-injection device.
 
-Before UI_DEV_CREATE, each virtual device advertises every event code supported by its negotiated HID mapping. Injection rejects an unsupported usage instead of dropping it. A capability change requires device recreation while input is neutral. The pointer advertises REL_X, REL_Y, required buttons, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES, and matching legacy wheel events required by the [Linux event-code contract](https://docs.kernel.org/input/event-codes.html).
+Before UI_DEV_CREATE, each virtual device advertises every event code supported by its negotiated HID mapping. Session validation rejects an unsupported usage before backend injection, closes only the offending peer, and releases its held state. A backend I/O failure still stops the descriptor-owning runtime so device destruction can clear uncertain kernel state. A capability change requires device recreation while input is neutral. The pointer advertises REL_X, REL_Y, required buttons, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES, and matching legacy wheel events required by the [Linux event-code contract](https://docs.kernel.org/input/event-codes.html).
 
 The installer and test matrix verify:
 

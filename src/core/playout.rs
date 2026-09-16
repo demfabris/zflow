@@ -170,6 +170,8 @@ pub enum EnqueueOutcome {
 /// One backend-neutral playout operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayoutStep {
+    /// Receiver-domain capture time for the selected snapshot.
+    pub mapped_capture_time: MonotonicTimeMicros,
     pub through_sequence: MotionSequence,
     pub delta: MotionDelta,
     /// A complete newest-wins touch snapshot, emitted once when it matures.
@@ -496,6 +498,7 @@ impl ReceiverPlayout {
         }
 
         Ok(Some(PlayoutStep {
+            mapped_capture_time: self.target.mapped_capture_time,
             through_sequence: self.target.sequence,
             delta,
             touch_snapshot,

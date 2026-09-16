@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
     io,
+    time::{Duration, Instant},
 };
 
 use evdev::{
@@ -340,6 +341,7 @@ impl Default for TouchpadState {
 pub struct VirtualTouchpad {
     device: VirtualDevice,
     state: TouchpadState,
+    last_report_time: Duration,
 }
 
 impl VirtualTouchpad {
@@ -393,18 +395,37 @@ impl VirtualTouchpad {
         Ok(Self {
             device,
             state: TouchpadState::default(),
+            last_report_time: Duration::ZERO,
         })
     }
 
     pub fn replace(&mut self, touch: &TouchState) -> Result<(), InjectionError> {
-        for (events, next) in plan_touchpad_events(&self.state, touch)? {
+        self.replace_at(touch, None)
+    }
+
+    pub fn replace_at(
+        &mut self,
+        touch: &TouchState,
+        captured_at: Option<Instant>,
+    ) -> Result<(), InjectionError> {
+        for (mut events, next) in plan_touchpad_events(&self.state, touch)? {
             if !events.is_empty() {
+                let age = captured_at
+                    .filter(|_| !touch.is_empty())
+                    .map(|time| time.elapsed());
+                let now = monotonic_time().map_err(|source| InjectionError::Emit {
+                    role: VirtualDeviceRole::Touchpad,
+                    source,
+                })?;
+                let timestamp = touch_report_time(now, age, self.last_report_time);
+                stamp_touch_report(&mut events, timestamp);
                 self.device
                     .emit(&events)
                     .map_err(|source| InjectionError::Emit {
                         role: VirtualDeviceRole::Touchpad,
                         source,
                     })?;
+                self.last_report_time = timestamp;
             }
             self.state = next;
         }
@@ -413,6 +434,40 @@ impl VirtualTouchpad {
 
     pub fn release_all(&mut self) -> Result<(), InjectionError> {
         self.replace(&TouchState::default())
+    }
+}
+
+fn monotonic_time() -> io::Result<Duration> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // CLOCK_MONOTONIC matches both Rust Instant and libinput's evdev clock.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Duration::new(time.tv_sec as u64, time.tv_nsec as u32))
+}
+
+fn touch_report_time(now: Duration, age: Option<Duration>, previous: Duration) -> Duration {
+    // uinput rejects future timestamps and timestamps older than ten seconds.
+    let capture = age
+        .filter(|age| *age < Duration::from_secs(10))
+        .map_or(now, |age| now.saturating_sub(age));
+    capture.max(previous).min(now)
+}
+
+fn stamp_touch_report(events: &mut [InputEvent], timestamp: Duration) {
+    for event in events {
+        *event = InputEvent::from(libc::input_event {
+            time: libc::timeval {
+                tv_sec: timestamp.as_secs() as libc::time_t,
+                tv_usec: timestamp.subsec_micros().into(),
+            },
+            type_: event.event_type().0,
+            code: event.code(),
+            value: event.value(),
+        });
     }
 }
 
@@ -620,8 +675,16 @@ impl VirtualInput {
     }
 
     pub fn replace_touch(&mut self, touch: &TouchState) -> Result<(), InjectionError> {
+        self.replace_touch_at(touch, None)
+    }
+
+    pub fn replace_touch_at(
+        &mut self,
+        touch: &TouchState,
+        captured_at: Option<Instant>,
+    ) -> Result<(), InjectionError> {
         match &mut self.touchpad {
-            Some(touchpad) => touchpad.replace(touch),
+            Some(touchpad) => touchpad.replace_at(touch, captured_at),
             None if touch.is_empty() => Ok(()),
             None => Err(InjectionError::TouchpadDisabled),
         }
@@ -757,6 +820,139 @@ mod tests {
                 value: i64::MAX
             }
         ));
+    }
+
+    #[test]
+    fn touch_timestamps_are_monotonic_bounded_and_cleanup_uses_now() {
+        let now = Duration::from_secs(30);
+        let previous = now - Duration::from_millis(20);
+        assert_eq!(
+            touch_report_time(now, Some(Duration::from_millis(10)), previous),
+            now - Duration::from_millis(10)
+        );
+        assert_eq!(
+            touch_report_time(now, Some(Duration::from_millis(50)), previous),
+            previous
+        );
+        assert_eq!(
+            touch_report_time(now, Some(Duration::from_secs(11)), previous),
+            now
+        );
+        assert_eq!(touch_report_time(now, None, previous), now);
+        assert_eq!(
+            touch_report_time(now, Some(Duration::ZERO), now + Duration::from_secs(1)),
+            now
+        );
+        let mut events = vec![InputEvent::new(
+            EventType::ABSOLUTE.0,
+            AbsoluteAxisCode::ABS_MT_POSITION_X.0,
+            42,
+        )];
+        stamp_touch_report(&mut events, previous);
+        assert_eq!(
+            events[0]
+                .timestamp()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+            previous
+        );
+        assert_eq!(events[0].value(), 42);
+    }
+
+    #[test]
+    fn jitter_burst_keeps_capture_intervals_in_touch_reports() {
+        use crate::core::{
+            ActivationId, ClockMapper, ClockSample, ControlSequence, CumulativeMotion,
+            MonotonicTimeMicros, MotionFrame, MotionSequence, PlayoutConfig, ProtocolVersion,
+            ReceiverPlayout, SessionContext, SessionEpoch, TransportGeneration,
+        };
+        let session = SessionContext {
+            protocol_version: ProtocolVersion(1),
+            session_epoch: SessionEpoch([1; 16]),
+            transport_generation: TransportGeneration(1),
+            activation_id: ActivationId(1),
+        };
+        let mut clock = ClockMapper::default();
+        clock
+            .ingest_sample(ClockSample::exact(
+                MonotonicTimeMicros(0),
+                MonotonicTimeMicros(0),
+            ))
+            .unwrap();
+        let mut playout = ReceiverPlayout::new(PlayoutConfig::default(), session).unwrap();
+        let mut arrivals: Vec<_> = (1..=15u64)
+            .map(|sequence| {
+                let capture = sequence * 16_000;
+                let arrival = match sequence {
+                    8 | 9 => 195_000,
+                    10 => 196_000,
+                    11 => 197_000,
+                    12 => 214_000,
+                    _ => capture + 1_000,
+                };
+                let mut contact = touch(1, (600 + sequence * 60) as i32, 1_000);
+                contact.source_dimensions = None;
+                (
+                    arrival,
+                    MotionFrame {
+                        session,
+                        motion_sequence: MotionSequence(sequence),
+                        control_watermark: ControlSequence(0),
+                        sender_capture_time: MonotonicTimeMicros(capture),
+                        totals: CumulativeMotion::ZERO,
+                        touch_snapshot: Some(TouchState::new([contact]).unwrap()),
+                    },
+                )
+            })
+            .collect();
+        arrivals.sort_by_key(|(arrival, frame)| (*arrival, frame.motion_sequence));
+        let mut arrivals = arrivals.into_iter().peekable();
+        let origin = Duration::from_secs(30);
+        let mut previous = origin;
+        let mut state = TouchpadState::default();
+        let mut emitted = Vec::new();
+        for now in (0..400_000u64).step_by(1_000) {
+            while arrivals.peek().is_some_and(|(arrival, _)| *arrival <= now) {
+                let (arrival, frame) = arrivals.next().unwrap();
+                playout
+                    .ingest_frame(frame, MonotonicTimeMicros(arrival), &clock)
+                    .unwrap();
+            }
+            if let Some(step) = playout.poll(MonotonicTimeMicros(now)).unwrap()
+                && let Some(touch) = step.touch_snapshot
+            {
+                let timestamp = touch_report_time(
+                    origin + Duration::from_micros(now),
+                    Some(Duration::from_micros(now - step.mapped_capture_time.0)),
+                    previous,
+                );
+                let (mut events, next) = one_touchpad_report(&state, &touch);
+                stamp_touch_report(&mut events, timestamp);
+                assert!(events.iter().all(|event| {
+                    event
+                        .timestamp()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        == timestamp
+                }));
+                state = next;
+                previous = timestamp;
+                emitted.push((step.through_sequence.0, now, timestamp));
+            }
+        }
+        let ninth = emitted.iter().find(|event| event.0 == 9).unwrap();
+        let tenth = emitted.iter().find(|event| event.0 == 10).unwrap();
+        assert_eq!(
+            tenth.1 - ninth.1,
+            1_000,
+            "fixture must reproduce a compressed delivery burst"
+        );
+        assert_eq!(tenth.2 - ninth.2, Duration::from_millis(16));
+        // libinput normalizes this 2mm movement to 12ms. Arrival timing gives
+        // 24mm (>20mm jump threshold); preserved capture timing gives 1.5mm.
+        assert_eq!(2.0 * 12_000.0 / (tenth.1 - ninth.1) as f64, 24.0);
+        assert_eq!(2.0 * 12_000.0 / (tenth.2 - ninth.2).as_micros() as f64, 1.5);
+        assert_eq!(state.contacts[&ContactId(1)].x, 1_500);
     }
 
     #[test]

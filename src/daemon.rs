@@ -1174,11 +1174,18 @@ impl Shared {
             }
             SessionEventKind::ReceiverEffects {
                 effects,
+                touch_captured_at,
                 received_at,
                 applied,
             } => {
                 match self
-                    .route_receiver_effects(&event.peer, event.session_id, effects, received_at)
+                    .route_receiver_effects(
+                        &event.peer,
+                        event.session_id,
+                        effects,
+                        received_at,
+                        touch_captured_at,
+                    )
                     .await
                 {
                     Ok(true) => {
@@ -1279,6 +1286,7 @@ impl Shared {
         session_id: u64,
         effects: Vec<ReceiverEffect>,
         received_at: std::time::Instant,
+        touch_captured_at: Option<Instant>,
     ) -> Result<bool> {
         let opens = effects
             .iter()
@@ -1334,6 +1342,7 @@ impl Shared {
             let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
             let command = RuntimeCommand::ReceiverEffects {
                 effects: deliver,
+                touch_captured_at,
                 applied: Some(applied_tx),
             };
             let result = if safety_release {

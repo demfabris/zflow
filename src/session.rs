@@ -120,6 +120,7 @@ pub enum SessionEventKind {
     },
     ReceiverEffects {
         effects: Vec<ReceiverEffect>,
+        touch_captured_at: Option<Instant>,
         received_at: Instant,
         applied: oneshot::Sender<Result<(), String>>,
     },
@@ -463,24 +464,10 @@ async fn run_session(
     let mut control_rate = EventRate::new(MAX_CONTROL_MESSAGES_PER_SECOND);
     let mut datagram_rate = EventRate::new(MAX_DATAGRAMS_PER_SECOND);
     let mut next_probe_at = add_duration(clock.now(), PROBE_INTERVAL);
-    let mut tick = tokio::time::interval(SESSION_TICK);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_tick_at = clock.now();
 
     let run_result: Result<()> = async {
     loop {
-        if let Some((id, receiver, started)) = desktop_reply.as_mut() {
-            match receiver.try_recv() {
-                Ok(response) => {
-                    tracing::trace!(%peer, session_id, request_id = *id, outcome = desktop_response_kind(&response), elapsed_ms = started.elapsed().as_millis() as u64, "desktop reply sending to peer");
-                    channels.control_send.send_desktop(crate::desktop::DesktopMessage::Response { id: *id, response }).await?;
-                    desktop_reply = None;
-                }
-                Err(oneshot::error::TryRecvError::Closed) => bail!("Desktop receiver stopped"),
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    anyhow::ensure!(started.elapsed() < Duration::from_millis(crate::desktop::REQUEST_TIMEOUT_MS), "Desktop receiver timed out");
-                }
-            }
-        }
         if let Some((_, request, started)) = &desktop_incoming {
             anyhow::ensure!(started.elapsed() < Duration::from_millis(crate::desktop::REQUEST_TIMEOUT_MS), "Desktop operation ordering timed out");
             // Finish follows Leave on this stream. Wait through playout and the
@@ -495,7 +482,35 @@ async fn run_session(
                 desktop_reply = Some((id, receipt, started));
             }
         }
+        let active_context = receiver.active_context();
+        if probe_context != active_context {
+            pending_probes.clear();
+            probe_context = active_context;
+            next_probe_at = add_duration(clock.now(), PROBE_INTERVAL);
+        }
+        let deadline = session_deadline(
+            sender.as_ref(), &receiver, playout.as_ref(), !pending_controls.is_empty(),
+            last_tick_at, next_probe_at,
+        ).map(|deadline| clock.0 + Duration::from_micros(deadline.0));
         tokio::select! {
+            response = async {
+                let Some((id, receipt, started)) = desktop_reply.as_mut() else {
+                    return std::future::pending().await;
+                };
+                let deadline = tokio::time::Instant::from_std(
+                    *started + Duration::from_millis(crate::desktop::REQUEST_TIMEOUT_MS),
+                );
+                let response = tokio::time::timeout_at(deadline, receipt).await
+                    .context("Desktop receiver timed out")?
+                    .context("Desktop receiver stopped")?;
+                Ok::<_, anyhow::Error>((*id, response))
+            } => {
+                let (id, response) = response?;
+                let (_, _, started) = desktop_reply.take().expect("completed desktop reply");
+                tracing::trace!(%peer, session_id, request_id = id, outcome = desktop_response_kind(&response), elapsed_ms = started.elapsed().as_millis() as u64, "desktop reply sending to peer");
+                channels.control_send.send_desktop(crate::desktop::DesktopMessage::Response { id, response }).await?;
+            }
+
             command = commands.recv() => {
                 let Some(command) = command else {
                     break;
@@ -685,11 +700,12 @@ async fn run_session(
                     }
                 }
             }
-            scheduled_at = tick.tick() => {
+            scheduled_at = wait_for_deadline(deadline) => {
                 lock_metrics(&metrics)
                     .scheduler_lateness_us
                     .record(scheduled_at.elapsed().as_secs_f64() * 1_000_000.0);
                 let now = clock.now();
+                last_tick_at = now;
                 if let Some(active) = sender.as_mut() {
                     match active.tick(now)? {
                         SenderTick::Checkpoint(checkpoint) => {
@@ -723,6 +739,7 @@ async fn run_session(
                     &peer,
                     &metrics,
                     Instant::now(),
+                    None,
                 ).await?;
                 if let Some(closed) = active_before_tick
                     && receiver.active_context() != Some(closed)
@@ -759,11 +776,6 @@ async fn run_session(
                 ).await?;
 
                 let active_context = receiver.active_context();
-                if probe_context != active_context {
-                    pending_probes.clear();
-                    probe_context = active_context;
-                    next_probe_at = add_duration(now, PROBE_INTERVAL);
-                }
                 let oldest_probe = now.0.saturating_sub(
                     u64::try_from(PROBE_MAX_AGE.as_micros()).unwrap_or(u64::MAX),
                 );
@@ -787,6 +799,8 @@ async fn run_session(
                             .checked_add(1)
                             .context("probe sequence exhausted")?,
                     );
+                }
+                if now >= next_probe_at {
                     next_probe_at = add_duration(now, PROBE_INTERVAL);
                 }
             }
@@ -821,6 +835,40 @@ async fn run_session(
     outbound_cleanup_result?;
     cleanup_result?;
     run_result
+}
+
+// Tick only when an engine needs progress. Catch-up and deferred controls keep
+// their 1ms cadence; quiet connections sleep until a checkpoint, lease, or probe.
+fn session_deadline(
+    sender: Option<&Sender>,
+    receiver: &Receiver,
+    playout: Option<&ReceiverPlayout>,
+    pending_controls: bool,
+    last_tick_at: MonotonicTimeMicros,
+    next_probe_at: MonotonicTimeMicros,
+) -> Option<MonotonicTimeMicros> {
+    let catch_up = playout.is_some_and(|playout| {
+        let stats = playout.stats();
+        stats.selected_target_sequence > stats.completed_sequence
+    });
+    [
+        sender.and_then(Sender::next_deadline),
+        receiver.lease_deadline(),
+        playout.and_then(ReceiverPlayout::next_deadline),
+        (catch_up || pending_controls).then(|| add_duration(last_tick_at, SESSION_TICK)),
+        receiver.active_context().map(|_| next_probe_at),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+async fn wait_for_deadline(deadline: Option<Instant>) -> Instant {
+    let Some(deadline) = deadline else {
+        return std::future::pending().await;
+    };
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    deadline
 }
 
 async fn negotiate(
@@ -910,8 +958,9 @@ fn validate_negotiated_control(
         ReliableControl::KeyDown { key } | ReliableControl::KeyUp { key } => {
             validate_negotiated_usage(*key, negotiated)?;
         }
-        ReliableControl::ButtonDown { anchor, .. } | ReliableControl::ButtonUp { anchor, .. } => {
-            require_capability(negotiated, InputCapability::Pointer, "pointer button")?;
+        ReliableControl::ButtonDown { button, anchor }
+        | ReliableControl::ButtonUp { button, anchor } => {
+            validate_negotiated_button(*button, negotiated)?;
             validate_negotiated_anchor(anchor, negotiated)?;
         }
         ReliableControl::ScrollBegin { scroll } => {
@@ -977,7 +1026,23 @@ fn validate_negotiated_usage(usage: HidUsage, negotiated: &NegotiatedSession) ->
         HidUsagePage::CONSUMER => InputCapability::ConsumerControls,
         _ => bail!("peer sent a key from an unsupported HID usage page"),
     };
-    require_capability(negotiated, capability, "key usage")
+    require_capability(negotiated, capability, "key usage")?;
+    // Reject unsupported input before it can become a backend injection failure.
+    #[cfg(target_os = "linux")]
+    crate::linux::hid_to_evdev_key(usage)?;
+    Ok(())
+}
+
+fn validate_negotiated_button(
+    button: crate::core::PointerButton,
+    negotiated: &NegotiatedSession,
+) -> Result<()> {
+    require_capability(negotiated, InputCapability::Pointer, "pointer button")?;
+    #[cfg(target_os = "linux")]
+    crate::linux::pointer_button_to_evdev(button)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = button;
+    Ok(())
 }
 
 fn validate_negotiated_held(state: &HeldState, negotiated: &NegotiatedSession) -> Result<()> {
@@ -987,8 +1052,8 @@ fn validate_negotiated_held(state: &HeldState, negotiated: &NegotiatedSession) -
     if !state.modifiers.is_empty() {
         require_capability(negotiated, InputCapability::Keyboard, "modifier state")?;
     }
-    if !state.pressed_buttons.is_empty() {
-        require_capability(negotiated, InputCapability::Pointer, "pointer button state")?;
+    for button in &state.pressed_buttons {
+        validate_negotiated_button(*button, negotiated)?;
     }
     if let Some(scroll) = state.active_scroll {
         validate_negotiated_scroll(scroll, negotiated)?;
@@ -1383,11 +1448,18 @@ async fn apply_control(
             peer,
             metrics,
             received_at,
+            None,
         )
         .await?;
     }
 
     let anchor = message.payload.motion_anchor().cloned();
+    let touch_captured_at = anchor
+        .as_ref()
+        .filter(|anchor| !anchor.final_touch_state.is_empty() && clock_mapper.is_ready())
+        .map(|anchor| clock_mapper.map(anchor.sender_capture_time))
+        .transpose()?
+        .map(|capture| capture_instant(capture, now));
     let sequence = message.sequence;
     let effects = receiver.receive_control(message, now)?;
     let takeover_accepted = takeover
@@ -1448,6 +1520,7 @@ async fn apply_control(
         peer,
         metrics,
         received_at,
+        touch_captured_at,
     )
     .await
 }
@@ -1571,6 +1644,10 @@ async fn poll_playout(
     if step.target_reached {
         motion_received_at.retain(|sequence, _| *sequence > step.through_sequence);
     }
+    let touch_captured_at = step
+        .touch_snapshot
+        .as_ref()
+        .map(|_| capture_instant(step.mapped_capture_time, now));
     let session = playout.session();
     let effects = receiver.receive_playout_step(session, step, now)?;
     emit_receiver_effects(
@@ -1582,8 +1659,16 @@ async fn poll_playout(
         peer,
         metrics,
         received_at,
+        touch_captured_at,
     )
     .await
+}
+
+fn capture_instant(capture: MonotonicTimeMicros, now: MonotonicTimeMicros) -> Instant {
+    let instant = Instant::now();
+    instant
+        .checked_sub(Duration::from_micros(now.0.saturating_sub(capture.0)))
+        .unwrap_or(instant)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1656,6 +1741,7 @@ async fn emit_receiver_effects(
     peer: &str,
     metrics: &Arc<Mutex<SessionMetrics>>,
     received_at: Instant,
+    touch_captured_at: Option<Instant>,
 ) -> Result<()> {
     let mut backend = Vec::new();
     let mut responses = Vec::new();
@@ -1704,6 +1790,7 @@ async fn emit_receiver_effects(
                 peer: peer.to_owned(),
                 kind: SessionEventKind::ReceiverEffects {
                     effects: backend,
+                    touch_captured_at,
                     received_at,
                     applied,
                 },
@@ -1759,6 +1846,7 @@ async fn close_receiver(
                 peer: peer.to_owned(),
                 kind: SessionEventKind::ReceiverEffects {
                     effects,
+                    touch_captured_at: None,
                     received_at: Instant::now(),
                     applied,
                 },
@@ -2064,6 +2152,96 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_linux_input_is_rejected_in_controls_and_authoritative_state() {
+        let selected = select_negotiation(&options().offer, &options().offer).unwrap();
+        for key in [
+            Some(HidUsage::keyboard(0xffff)),
+            Some(HidUsage::consumer(0xffff)),
+            None,
+        ] {
+            let mut sender = Sender::new(
+                SenderConfig::new(Duration::from_millis(250), Duration::from_millis(900)).unwrap(),
+                context(),
+                MonotonicTimeMicros(0),
+            )
+            .unwrap();
+            sender.enter(MonotonicTimeMicros(0)).unwrap();
+            let down = match key {
+                Some(key) => sender.key_down(key, MonotonicTimeMicros(1)).unwrap(),
+                None => sender
+                    .button_down(PointerButton(9), MonotonicTimeMicros(1))
+                    .unwrap(),
+            };
+            assert!(validate_negotiated_control(&down.payload, &selected).is_err());
+            let snapshot = sender.snapshot(MonotonicTimeMicros(2)).unwrap();
+            assert!(validate_negotiated_control(&snapshot.payload, &selected).is_err());
+            let takeover = sender
+                .propose_takeover(
+                    TransportGeneration(2),
+                    crate::core::TakeoverNonce([3; 16]),
+                    MonotonicTimeMicros(3),
+                )
+                .unwrap();
+            assert!(validate_negotiated_control(&takeover.payload, &selected).is_err());
+        }
+        validate_negotiated_usage(HidUsage::keyboard(4), &selected).unwrap();
+        validate_negotiated_usage(HidUsage::consumer(0xe9), &selected).unwrap();
+        validate_negotiated_button(PointerButton(8), &selected).unwrap();
+    }
+
+    #[test]
+    fn quiet_session_deadlines_preserve_checkpoints_leases_and_pending_controls() {
+        let now = MonotonicTimeMicros(0);
+        let probe = MonotonicTimeMicros(100_000);
+        let mut receiver = Receiver::new(
+            ReceiverConfig::new(Duration::from_millis(900)).unwrap(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            session_deadline(None, &receiver, None, false, now, probe),
+            None
+        );
+        let mut sender = Sender::new(
+            SenderConfig::new(Duration::from_millis(250), Duration::from_millis(900)).unwrap(),
+            context(),
+            now,
+        )
+        .unwrap();
+        sender.enter(now).unwrap();
+        assert_eq!(
+            session_deadline(Some(&sender), &receiver, None, false, now, probe),
+            sender.next_deadline()
+        );
+        receiver = active_receiver(Duration::from_millis(5));
+        assert_eq!(
+            session_deadline(None, &receiver, None, false, now, probe),
+            Some(probe)
+        );
+        receiver
+            .receive_control(
+                ReliableControlMessage {
+                    session: context(),
+                    sequence: ControlSequence(2),
+                    payload: ReliableControl::KeyDown {
+                        key: HidUsage::keyboard(4),
+                    },
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            session_deadline(None, &receiver, None, false, now, probe),
+            Some(MonotonicTimeMicros(5_000))
+        );
+        assert_eq!(
+            session_deadline(None, &receiver, None, true, now, probe),
+            Some(MonotonicTimeMicros(1_000))
+        );
+    }
+
     #[test]
     fn capture_merge_keeps_overlapping_devices_held_until_the_last_release() {
         let key = HidUsage::keyboard(0xe0);
@@ -2279,6 +2457,7 @@ mod tests {
                 "peer",
                 &metrics,
                 Instant::now(),
+                None,
             )
             .await
         });
@@ -2657,6 +2836,122 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_sessions_answer_desktop_requests_without_periodic_ticks() {
+        use crate::desktop::{DesktopRequest, DesktopResponse};
+        let (left, right, mut events, _client, _server) = desktop_test_pair().await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(left.metrics_snapshot().scheduler_lateness_us.is_none());
+        assert!(right.metrics_snapshot().scheduler_lateness_us.is_none());
+        let source = left.clone();
+        let request =
+            tokio::spawn(async move { source.desktop_request(DesktopRequest::Snapshot).await });
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SessionEventKind::Desktop { reply, .. } = event.kind else {
+            panic!("expected desktop request")
+        };
+        reply
+            .send(DesktopResponse::unavailable("test desktop"))
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            DesktopResponse::Unavailable { .. }
+        ));
+        assert!(left.metrics_snapshot().scheduler_lateness_us.is_none());
+        assert!(right.metrics_snapshot().scheduler_lateness_us.is_none());
+        left.close(SessionCloseReason::LocalRelease);
+        right.close(SessionCloseReason::LocalRelease);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unsupported_button_closes_peer_and_releases_keys_without_reaching_backend() {
+        let (left, right, mut events, _client, _server) = desktop_test_pair().await;
+        left.begin_outbound(context()).unwrap();
+        let capture = |transition| CapturedDeviceFrame {
+            device_path: "fake".into(),
+            captured_at: Instant::now(),
+            frame: CaptureFrame {
+                transitions: vec![transition],
+                ..CaptureFrame::default()
+            },
+        };
+        left.capture(capture(CaptureTransition::Key {
+            usage: HidUsage::keyboard(4),
+            state: KeyState::Pressed,
+        }))
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let SessionEventKind::ReceiverEffects {
+                    effects, applied, ..
+                } = events.recv().await.unwrap().kind
+                {
+                    let pressed = effects
+                        .iter()
+                        .any(|effect| matches!(effect, ReceiverEffect::Key { pressed: true, .. }));
+                    applied.send(Ok(())).unwrap();
+                    if pressed {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        left.capture(capture(CaptureTransition::Button {
+            button: PointerButton(9),
+            state: KeyState::Pressed,
+        }))
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut released = false;
+            loop {
+                if let SessionEventKind::ReceiverEffects {
+                    effects, applied, ..
+                } = events.recv().await.unwrap().kind
+                {
+                    assert!(!effects.iter().any(|effect| matches!(
+                        effect,
+                        ReceiverEffect::Button {
+                            button: PointerButton(9),
+                            ..
+                        }
+                    )));
+                    released |= effects.iter().any(|effect| {
+                        matches!(
+                            effect,
+                            ReceiverEffect::Key {
+                                pressed: false,
+                                synthetic: true,
+                                ..
+                            }
+                        )
+                    });
+                    let closed = effects
+                        .iter()
+                        .any(|effect| matches!(effect, ReceiverEffect::ActivationClosed { .. }));
+                    applied.send(Ok(())).unwrap();
+                    if closed {
+                        assert!(released);
+                        break;
+                    }
+                }
+            }
+            right.connection.closed().await;
+        })
+        .await
+        .unwrap();
+        left.close(SessionCloseReason::LocalRelease);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn desktop_finish_waits_for_applied_leave() {
         use crate::desktop::*;
         let (left, right, mut events, _client, _server) = desktop_test_pair().await;
@@ -2912,5 +3207,140 @@ mod tests {
             error.contains("request queue unavailable: channel closed"),
             "{error}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn touch_capture_times_survive_datagrams_and_checkpoint_recovery() {
+        use crate::core::{ContactId, SourceDimensions, TouchContact, TouchTool};
+
+        fn touch(x: i32) -> TouchState {
+            TouchState::new([TouchContact {
+                id: ContactId(1),
+                x,
+                y: 500,
+                pressure: None,
+                major: None,
+                minor: None,
+                orientation_millidegrees: None,
+                tool: TouchTool::Finger,
+                source_dimensions: Some(SourceDimensions {
+                    width: 2000,
+                    height: 1000,
+                }),
+            }])
+            .unwrap()
+        }
+
+        async fn next_touch(
+            events: &mut mpsc::Receiver<SessionEvent>,
+            expected: &TouchState,
+        ) -> (Option<Instant>, oneshot::Sender<Result<(), String>>) {
+            loop {
+                match events
+                    .recv()
+                    .await
+                    .expect("receiver event stream ended")
+                    .kind
+                {
+                    SessionEventKind::ReceiverEffects {
+                        effects,
+                        touch_captured_at,
+                        applied,
+                        ..
+                    } => {
+                        if effects.iter().any(|effect| {
+                            matches!(effect,
+                                ReceiverEffect::TouchReplaced { state, .. } if state == expected
+                            )
+                        }) {
+                            return (touch_captured_at, applied);
+                        }
+                        applied.send(Ok(())).unwrap();
+                    }
+                    _ => panic!("unexpected session event"),
+                }
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (channels, mut peer, _client, _server) = input_channel_pair().await;
+            let mut config = Config::default();
+            config.input.experimental_touchpad = true;
+            config.transport.lease_ms = 900;
+            config.transport.checkpoint_ms = 250;
+            config.playout.mode = PlayoutMode::Fixed;
+            config.playout.fixed_delay_ms = 3;
+            let options = SessionOptions::from_config(&config).unwrap();
+            let offer = options.offer.clone();
+            let (commands, command_rx) = mpsc::channel(4);
+            let (events, mut event_rx) = mpsc::channel(16);
+            let (ready, receipt) = oneshot::channel();
+            let mut actor = tokio::spawn(run_session(
+                1,
+                "manual-touch-peer".into(),
+                channels,
+                command_rx,
+                options,
+                events,
+                Arc::new(Mutex::new(SessionMetrics::default())),
+                ready,
+            ));
+            let negotiated = negotiate(&mut peer, &offer).await.unwrap();
+            assert!(negotiated.capabilities.contains(InputCapability::Touch));
+            peer.datagrams.configure_maximum(negotiated.maximum_datagram_size).unwrap();
+            receipt.await.unwrap().unwrap();
+            let mut sender = Sender::new(
+                SenderConfig::new(Duration::from_millis(250), Duration::from_millis(900)).unwrap(),
+                context(),
+                MonotonicTimeMicros(0),
+            ).unwrap();
+            peer.control_send.send_control(&sender.enter(MonotonicTimeMicros(0)).unwrap()).await.unwrap();
+            peer.control_send.send_control(&sender.touch_begin(touch(100), MonotonicTimeMicros(0)).unwrap()).await.unwrap();
+            let (initial_time, initial_applied) = next_touch(&mut event_rx, &touch(100)).await;
+            assert_eq!(initial_time, None, "TouchBegin carries no source timestamp");
+            initial_applied.send(Ok(())).unwrap();
+
+            let motion = sender.capture_motion(
+                MotionDelta::default(), Some(touch(200)), MonotonicTimeMicros(100_000),
+            ).unwrap();
+            peer.datagrams.send_motion(&motion).unwrap();
+            let (motion_time, motion_applied) = next_touch(&mut event_rx, &touch(200)).await;
+            let motion_time = motion_time.expect("datagram touch lost its capture timestamp");
+            // Delay backend application so arrival/injection timestamps cannot
+            // accidentally satisfy the eight-millisecond source spacing below.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            motion_applied.send(Ok(())).unwrap();
+
+            let _lost = sender.capture_motion(
+                MotionDelta::default(), Some(touch(300)), MonotonicTimeMicros(108_000),
+            ).unwrap();
+            let checkpoint = sender.snapshot(MonotonicTimeMicros(108_000)).unwrap();
+            peer.control_send.send_control(&checkpoint).await.unwrap();
+            let (checkpoint_time, checkpoint_applied) = next_touch(&mut event_rx, &touch(300)).await;
+            let checkpoint_time = checkpoint_time.expect("checkpoint recovery lost its capture timestamp");
+            let spacing = checkpoint_time.duration_since(motion_time);
+            assert!(spacing.abs_diff(Duration::from_millis(8)) < Duration::from_millis(2),
+                "source samples were 8 ms apart, but backend timestamps were {spacing:?} apart");
+            assert!(tokio::time::timeout(Duration::from_millis(20), peer.control_receive.receive()).await.is_err(),
+                "checkpoint ACK escaped before touch was applied");
+            checkpoint_applied.send(Ok(())).unwrap();
+            let InputControlMessage::Reliable(reply) = peer.control_receive.receive().await.unwrap() else {
+                panic!("expected checkpoint acknowledgement");
+            };
+            assert!(matches!(reply.payload, ReliableControl::SnapshotAck(ack)
+                if ack.snapshot_sequence == checkpoint.sequence));
+
+            commands.send(SessionCommand::Close(SessionCloseReason::LocalRelease)).await.unwrap();
+            loop {
+                tokio::select! {
+                    result = &mut actor => { result.unwrap().unwrap(); break; }
+                    event = event_rx.recv() => {
+                        if let Some(SessionEvent { kind: SessionEventKind::ReceiverEffects { applied, .. }, .. }) = event {
+                            applied.send(Ok(())).unwrap();
+                        }
+                    }
+                }
+            }
+        }).await.expect("touch session regression timed out");
     }
 }

@@ -42,8 +42,8 @@ impl KeyMapping {
 }
 
 // Linux input-event-codes.h to USB HID Usage Tables. This intentionally lists
-// only keys whose semantics are unambiguous. Unknown/vendor usages are ignored
-// rather than guessed or allowed to tear down an otherwise valid activation.
+// only keys whose semantics are unambiguous. Capture ignores unknown/vendor
+// codes; receiver validation rejects unsupported usages before injection.
 const KEY_MAP: &[KeyMapping] = &[
     KeyMapping::keyboard(1, 0x29), // Esc
     KeyMapping::keyboard(2, 0x1e),

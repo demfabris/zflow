@@ -4,6 +4,51 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Reliability fixes, September 15
+
+Automated regressions cover these boundaries:
+
+- Unsupported Linux HID usages and pointer buttons are rejected before backend
+  injection, including checkpoint and takeover state. A loopback test holds a
+  key, sends button 9, and verifies peer cleanup releases the key without sending
+  the unsupported button to the backend.
+- The Mac edge observer runs independently of rendering. Worker tests exercise
+  polling with no UI calls, stop notification, cleanup and joined shutdown.
+- Quiet sessions wait for checkpoint, lease, playout and probe deadlines instead
+  of polling every millisecond. Desktop replies wake the actor directly. Pending
+  controls and cumulative catch-up retain the 1 ms progress cadence.
+- Touch reports preserve mapped capture timestamps through uinput. A synthetic
+  16 ms contact stream reproduces a network burst with two reports delivered
+  1 ms apart; their event timestamps remain 16 ms apart. This removes the
+  resulting 24 mm normalized jump in libinput's detector without delaying
+  delivery. Timestamp tests cover clock regression, stale input and cleanup.
+- Seat queries use a persistent system D-Bus connection with fresh property
+  reads and bounded timeouts. Classification, consistency, invalid properties,
+  failed handshakes and reconnection have regression coverage.
+
+Run `just check`. On an unlocked Linux desktop, run the read-only seat check:
+
+```sh
+cargo test --locked --lib linux::seat::tests::live_logind_matches_loginctl_and_reuses_connection -- --ignored --nocapture
+```
+
+That check matched this host's unlocked Wayland session and verified denial on
+connection loss followed by reconnection. Twenty inspections took about 50 ms
+through D-Bus versus 178 ms through `loginctl`; this is a local measurement.
+
+Live qualification still requires matching Mac and Ubuntu builds. Enable edge
+sharing, minimize or hide the Mac window, cross to Ubuntu, return, and repeat.
+Check Stop/Escape, window close and display changes during preparation and
+active sharing. Linux worker tests do not compile or exercise the macOS APIs.
+
+Repeat touch gestures with a clean link and controlled jitter while recording
+uinput/libinput events. Confirm nondecreasing timestamps, gesture behavior and
+prompt release after link loss. Capture timestamps can still reflect source
+queue processing time; unstamped begins and clock corrections can clamp an
+interval. Backdated events can produce separate libinput processing-lag warnings.
+The synthetic regression does not prove that all historical touch-jump warnings
+are gone, or qualify GNOME gesture timers under burst delivery.
+
 ## GUI pairing and Mac-to-GNOME handoff, September 14
 
 The GUI now supports pairing, explicit Mac source start/stop, saved-layout edge

@@ -1,5 +1,7 @@
 //! Desktop setup and explicit input-sharing controls.
 
+#[cfg(any(target_os = "macos", test))]
+mod background;
 #[cfg(target_os = "linux")]
 mod desktop;
 mod displays;

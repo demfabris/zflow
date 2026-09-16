@@ -7,8 +7,6 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    fs::File,
-    io::Read,
     net::{IpAddr, SocketAddr, SocketAddrV6},
 };
 
@@ -65,19 +63,9 @@ pub struct EphemeralInstanceId([u8; INSTANCE_ENTROPY_BYTES]);
 
 impl EphemeralInstanceId {
     fn generate() -> Result<Self, DiscoveryError> {
-        #[cfg(unix)]
-        {
-            let mut bytes = [0; INSTANCE_ENTROPY_BYTES];
-            File::open("/dev/urandom")
-                .and_then(|mut random| random.read_exact(&mut bytes))
-                .map_err(DiscoveryError::Entropy)?;
-            Ok(Self(bytes))
-        }
-
-        #[cfg(not(unix))]
-        {
-            Err(DiscoveryError::UnsupportedPlatform)
-        }
+        let mut bytes = [0; INSTANCE_ENTROPY_BYTES];
+        getrandom::fill(&mut bytes).map_err(DiscoveryError::Entropy)?;
+        Ok(Self(bytes))
     }
 
     fn parse(value: &str) -> Result<Self, CandidateParseError> {
@@ -746,12 +734,9 @@ pub enum DiscoveryError {
     #[error("mDNS operation failed: {0}")]
     Mdns(#[from] mdns_sd::Error),
     #[error("failed to obtain entropy for an ephemeral discovery identifier: {0}")]
-    Entropy(std::io::Error),
+    Entropy(getrandom::Error),
     #[error("failed to enumerate local network interfaces: {0}")]
     Interfaces(std::io::Error),
-    #[cfg(not(unix))]
-    #[error("secure ephemeral discovery identifiers are unsupported on this platform")]
-    UnsupportedPlatform,
     #[error("invalid discovery advertisement: {0}")]
     InvalidAdvertisement(&'static str),
     #[error("invalid discovery lifecycle state: {0}")]

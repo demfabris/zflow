@@ -1,17 +1,25 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt, io,
-    path::PathBuf,
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fmt,
+    sync::OnceLock,
+    time::Duration,
 };
 
 use thiserror::Error;
+use tokio::{runtime::Runtime, sync::Mutex, time::timeout_at};
+use zbus::{
+    Connection,
+    zvariant::{OwnedObjectPath, OwnedValue},
+};
 
 const PRIMARY_SEAT: &str = "seat0";
-const MAX_LOGINCTL_OUTPUT: usize = 64 * 1024;
+const SYSTEM_BUS_ADDRESS: &str = "unix:path=/run/dbus/system_bus_socket";
+const LOGIND: &str = "org.freedesktop.login1";
+const MANAGER_PATH: &str = "/org/freedesktop/login1";
+
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
+
+type Properties = BTreeMap<String, String>;
 
 /// The permission class required before remote input may reach the active
 /// Linux seat.
@@ -95,171 +103,182 @@ impl SeatState {
 pub trait LogindQuery {
     type Error: fmt::Display;
 
-    fn show_seat(&self, seat: &str) -> Result<String, Self::Error>;
-    fn show_session(&self, session: &str) -> Result<String, Self::Error>;
+    fn show_seat(&self, seat: &str) -> Result<Properties, Self::Error>;
+    fn show_session(&self, session: &str) -> Result<Properties, Self::Error>;
 }
 
-#[derive(Debug, Clone)]
-pub struct LoginctlQuery {
-    program: PathBuf,
+struct LogindBusQuery {
+    runtime: Runtime,
+    connection: Mutex<Option<Connection>>,
+    address: String,
     timeout: Duration,
 }
 
-impl Default for LoginctlQuery {
-    fn default() -> Self {
-        Self {
-            program: PathBuf::from("/usr/bin/loginctl"),
-            timeout: DEFAULT_QUERY_TIMEOUT,
-        }
-    }
-}
-
-impl LoginctlQuery {
-    pub fn new(program: impl Into<PathBuf>, timeout: Duration) -> Self {
-        Self {
-            program: program.into(),
+impl LogindBusQuery {
+    fn new(address: &str, timeout: Duration) -> std::io::Result<Self> {
+        Ok(Self {
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("zflow-logind")
+                .enable_all()
+                .build()?,
+            connection: Mutex::new(None),
+            address: address.to_owned(),
             timeout,
-        }
+        })
     }
 
-    fn run(&self, subject: &'static str, args: &[&str]) -> Result<String, LoginctlError> {
-        // Capture and uinput handles are opened through Rust/evdev
-        // OpenOptions, which sets O_CLOEXEC on Unix. Keep the helper's three
-        // standard streams explicit and never clear close-on-exec flags.
-        let mut child = Command::new(&self.program)
-            .args(["--no-pager", "--no-legend", "--all"])
-            .args(args)
-            .env_clear()
-            .env("LANG", "C")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| LoginctlError::Spawn { subject, source })?;
-
-        let started = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if started.elapsed() < self.timeout => {
-                    thread::sleep(Duration::from_millis(2));
+    fn query(&self, kind: &str, id: &str) -> Result<HashMap<String, OwnedValue>, LogindError> {
+        self.runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + self.timeout;
+            let mut connection = timeout_at(deadline, self.connection.lock())
+                .await
+                .map_err(|_| LogindError::Timeout(self.timeout))?;
+            let result = timeout_at(deadline, async {
+                if connection.is_none() {
+                    *connection = Some(
+                        zbus::connection::Builder::address(self.address.as_str())?
+                            .build()
+                            .await?,
+                    );
                 }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(LoginctlError::Timeout {
-                        subject,
-                        timeout: self.timeout,
-                    });
-                }
-                Err(source) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(LoginctlError::Wait { subject, source });
-                }
+                let connection = connection.as_ref().unwrap();
+                let path: OwnedObjectPath = connection
+                    .call_method(
+                        Some(LOGIND),
+                        MANAGER_PATH,
+                        Some("org.freedesktop.login1.Manager"),
+                        format!("Get{kind}").as_str(),
+                        &(id,),
+                    )
+                    .await?
+                    .body()
+                    .deserialize()?;
+                // GetAll bypasses proxy property caches: both confirmation reads
+                // must observe logind, including lock changes without a signal.
+                let properties = connection
+                    .call_method(
+                        Some(LOGIND),
+                        path.as_str(),
+                        Some("org.freedesktop.DBus.Properties"),
+                        "GetAll",
+                        &(format!("org.freedesktop.login1.{kind}"),),
+                    )
+                    .await?
+                    .body()
+                    .deserialize()?;
+                Ok::<_, zbus::Error>(properties)
+            })
+            .await;
+            let result = result
+                .map_err(|_| LogindError::Timeout(self.timeout))
+                .and_then(|result| result.map_err(LogindError::Bus));
+            if result.is_err() {
+                // A lost bus or cancelled request must not poison later polls.
+                *connection = None;
             }
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|source| LoginctlError::Wait { subject, source })?;
-        if output.stdout.len() > MAX_LOGINCTL_OUTPUT || output.stderr.len() > MAX_LOGINCTL_OUTPUT {
-            return Err(LoginctlError::OutputTooLarge { subject });
-        }
-        if !output.status.success() {
-            return Err(LoginctlError::Failed {
-                subject,
-                status: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            });
-        }
-        String::from_utf8(output.stdout).map_err(|_| LoginctlError::InvalidUtf8 { subject })
+            result
+        })
     }
 }
 
-impl LogindQuery for LoginctlQuery {
-    type Error = LoginctlError;
+impl LogindQuery for LogindBusQuery {
+    type Error = LogindError;
 
-    fn show_seat(&self, seat: &str) -> Result<String, Self::Error> {
+    fn show_seat(&self, seat: &str) -> Result<Properties, Self::Error> {
         validate_identifier("seat", seat)?;
-        self.run(
-            "seat",
-            &[
-                "--property=Id",
-                "--property=ActiveSession",
-                "--property=Sessions",
-                "show-seat",
-                seat,
-            ],
-        )
+        seat_properties(self.query("Seat", seat)?)
     }
 
-    fn show_session(&self, session: &str) -> Result<String, Self::Error> {
+    fn show_session(&self, session: &str) -> Result<Properties, Self::Error> {
         validate_identifier("session", session)?;
-        self.run(
-            "session",
-            &[
-                "--property=Id",
-                "--property=User",
-                "--property=VTNr",
-                "--property=Seat",
-                "--property=TTY",
-                "--property=Remote",
-                "--property=Type",
-                "--property=Class",
-                "--property=Active",
-                "--property=State",
-                "--property=CanLock",
-                "--property=LockedHint",
-                "show-session",
-                session,
-            ],
-        )
+        session_properties(self.query("Session", session)?)
     }
+}
+
+fn property<T>(values: &mut HashMap<String, OwnedValue>, name: &str) -> Result<T, LogindError>
+where
+    T: TryFrom<OwnedValue>,
+    T::Error: fmt::Display,
+{
+    let value = values.remove(name).ok_or_else(|| LogindError::Property {
+        name: name.to_owned(),
+        reason: "missing".into(),
+    })?;
+    T::try_from(value).map_err(|error| LogindError::Property {
+        name: name.to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+fn seat_properties(mut values: HashMap<String, OwnedValue>) -> Result<Properties, LogindError> {
+    let id: String = property(&mut values, "Id")?;
+    let (active, _): (String, OwnedObjectPath) = property(&mut values, "ActiveSession")?;
+    let sessions: Vec<(String, OwnedObjectPath)> = property(&mut values, "Sessions")?;
+    for (session, _) in &sessions {
+        validate_identifier("session", session)?;
+    }
+    Ok(BTreeMap::from([
+        ("Id".into(), id),
+        ("ActiveSession".into(), active),
+        (
+            "Sessions".into(),
+            sessions
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    ]))
+}
+
+fn session_properties(mut values: HashMap<String, OwnedValue>) -> Result<Properties, LogindError> {
+    let mut properties = Properties::new();
+    for name in ["Id", "TTY", "Type", "Class", "State"] {
+        properties.insert(name.into(), property::<String>(&mut values, name)?);
+    }
+    for name in ["Remote", "Active", "CanLock", "LockedHint"] {
+        properties.insert(
+            name.into(),
+            if property::<bool>(&mut values, name)? {
+                "yes"
+            } else {
+                "no"
+            }
+            .into(),
+        );
+    }
+    let (uid, _): (u32, OwnedObjectPath) = property(&mut values, "User")?;
+    let (seat, _): (String, OwnedObjectPath) = property(&mut values, "Seat")?;
+    properties.insert("User".into(), uid.to_string());
+    properties.insert("Seat".into(), seat);
+    properties.insert(
+        "VTNr".into(),
+        property::<u32>(&mut values, "VTNr")?.to_string(),
+    );
+    Ok(properties)
 }
 
 #[derive(Debug, Error)]
-pub enum LoginctlError {
+pub enum LogindError {
     #[error("invalid {kind} identifier {value:?}")]
     InvalidIdentifier { kind: &'static str, value: String },
-    #[error("could not start loginctl {subject} query: {source}")]
-    Spawn {
-        subject: &'static str,
-        #[source]
-        source: io::Error,
-    },
-    #[error("loginctl {subject} query exceeded {timeout:?}")]
-    Timeout {
-        subject: &'static str,
-        timeout: Duration,
-    },
-    #[error("could not wait for loginctl {subject} query: {source}")]
-    Wait {
-        subject: &'static str,
-        #[source]
-        source: io::Error,
-    },
-    #[error("loginctl {subject} query returned too much output")]
-    OutputTooLarge { subject: &'static str },
-    #[error("loginctl {subject} query returned non-UTF-8 output")]
-    InvalidUtf8 { subject: &'static str },
-    #[error("loginctl {subject} query failed with status {status:?}: {stderr}")]
-    Failed {
-        subject: &'static str,
-        status: Option<i32>,
-        stderr: String,
-    },
+    #[error("system bus query exceeded {0:?}")]
+    Timeout(Duration),
+    #[error("system bus query failed: {0}")]
+    Bus(#[source] zbus::Error),
+    #[error("logind property {name:?} is invalid: {reason}")]
+    Property { name: String, reason: String },
 }
 
-fn validate_identifier(kind: &'static str, value: &str) -> Result<(), LoginctlError> {
+fn validate_identifier(kind: &'static str, value: &str) -> Result<(), LogindError> {
     if value.is_empty()
         || value.len() > 128
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        return Err(LoginctlError::InvalidIdentifier {
+        return Err(LogindError::InvalidIdentifier {
             kind,
             value: value.to_owned(),
         });
@@ -270,7 +289,13 @@ fn validate_identifier(kind: &'static str, value: &str) -> Result<(), LoginctlEr
 /// Classifies the primary Linux seat. Query failure is represented as
 /// `SeatState::Unknown`, which always denies input.
 pub fn query_primary_seat() -> SeatState {
-    inspect_seat(&LoginctlQuery::default(), PRIMARY_SEAT)
+    static QUERY: OnceLock<Result<LogindBusQuery, std::io::Error>> = OnceLock::new();
+    // Use the system socket directly, as the old env-cleared loginctl did.
+    // User-provided bus-address environment variables cannot authorize input.
+    match QUERY.get_or_init(|| LogindBusQuery::new(SYSTEM_BUS_ADDRESS, DEFAULT_QUERY_TIMEOUT)) {
+        Ok(query) => inspect_seat(query, PRIMARY_SEAT),
+        Err(error) => unknown_query("runtime", error),
+    }
 }
 
 pub fn inspect_seat<Q: LogindQuery>(query: &Q, seat: &str) -> SeatState {
@@ -329,20 +354,12 @@ pub fn inspect_seat<Q: LogindQuery>(query: &Q, seat: &str) -> SeatState {
         Err(error) => return unknown_query("session confirmation", error),
     };
 
-    let first_properties = match parse_properties(&first_session) {
-        Ok(properties) => properties,
-        Err(reason) => return SeatState::Unknown { reason },
-    };
-    let second_properties = match parse_properties(&second_session) {
-        Ok(properties) => properties,
-        Err(reason) => return SeatState::Unknown { reason },
-    };
-    if first_properties != second_properties {
+    if first_session != second_session {
         return SeatState::Unknown {
             reason: "the active session properties changed while logind was queried".to_owned(),
         };
     }
-    classify_session(&first_properties, seat, active_session)
+    classify_session(&first_session, seat, active_session)
         .unwrap_or_else(|reason| SeatState::Unknown { reason })
 }
 
@@ -358,10 +375,9 @@ struct SeatSnapshot {
     sessions: BTreeSet<String>,
 }
 
-fn parse_seat(output: &str, expected_seat: &str) -> Result<SeatSnapshot, String> {
-    let properties = parse_properties(output)?;
-    require_exact(&properties, "Id", expected_seat)?;
-    let active_session = match require(&properties, "ActiveSession")? {
+fn parse_seat(properties: &Properties, expected_seat: &str) -> Result<SeatSnapshot, String> {
+    require_exact(properties, "Id", expected_seat)?;
+    let active_session = match require(properties, "ActiveSession")? {
         "" => None,
         value => {
             validate_identifier("session", value).map_err(|error| error.to_string())?;
@@ -369,7 +385,7 @@ fn parse_seat(output: &str, expected_seat: &str) -> Result<SeatSnapshot, String>
         }
     };
     let mut sessions = BTreeSet::new();
-    for session in require(&properties, "Sessions")?.split_whitespace() {
+    for session in require(properties, "Sessions")?.split_whitespace() {
         validate_identifier("session", session).map_err(|error| error.to_string())?;
         if !sessions.insert(session.to_owned()) {
             return Err(format!(
@@ -488,36 +504,33 @@ fn require_exact(
     }
 }
 
-fn parse_properties(output: &str) -> Result<BTreeMap<String, String>, String> {
-    if output.len() > MAX_LOGINCTL_OUTPUT {
-        return Err("logind output exceeds the size limit".to_owned());
-    }
-    let mut properties = BTreeMap::new();
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let (name, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("malformed logind property line {line:?}"))?;
-        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-            return Err(format!("invalid logind property name {name:?}"));
-        }
-        if properties
-            .insert(name.to_owned(), value.to_owned())
-            .is_some()
-        {
-            return Err(format!("logind property {name:?} appears more than once"));
-        }
-    }
-    Ok(properties)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::VecDeque, fs, os::unix::fs::PermissionsExt, path::Path};
+    use std::{cell::RefCell, collections::VecDeque};
 
     use super::*;
+
+    fn parse_properties(output: &str) -> Result<BTreeMap<String, String>, String> {
+        let mut properties = BTreeMap::new();
+        for line in output.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let (name, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("malformed logind property line {line:?}"))?;
+            if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                return Err(format!("invalid logind property name {name:?}"));
+            }
+            if properties
+                .insert(name.to_owned(), value.to_owned())
+                .is_some()
+            {
+                return Err(format!("logind property {name:?} appears more than once"));
+            }
+        }
+        Ok(properties)
+    }
 
     const SEAT_ACTIVE: &str = "Id=seat0\nActiveSession=2\nSessions=2 c1\n";
     const WAYLAND: &str = "Id=2\nUser=1000\nVTNr=2\nSeat=seat0\nTTY=tty2\nRemote=no\nType=wayland\nClass=user\nActive=yes\nState=active\nCanLock=yes\nLockedHint=no\n";
@@ -543,20 +556,24 @@ mod tests {
     }
 
     impl LogindQuery for FakeQuery {
-        type Error = &'static str;
+        type Error = String;
 
-        fn show_seat(&self, _seat: &str) -> Result<String, Self::Error> {
+        fn show_seat(&self, _seat: &str) -> Result<Properties, Self::Error> {
             self.seats
                 .borrow_mut()
                 .pop_front()
                 .expect("unexpected seat query")
+                .map_err(str::to_owned)
+                .and_then(|output| parse_properties(&output))
         }
 
-        fn show_session(&self, _session: &str) -> Result<String, Self::Error> {
+        fn show_session(&self, _session: &str) -> Result<Properties, Self::Error> {
             self.sessions
                 .borrow_mut()
                 .pop_front()
                 .expect("unexpected session query")
+                .map_err(str::to_owned)
+                .and_then(|output| parse_properties(&output))
         }
     }
 
@@ -681,40 +698,199 @@ mod tests {
         assert_eq!(state.injection_gate(), InjectionGate::Denied);
     }
 
-    #[test]
-    fn loginctl_runner_times_out() {
-        let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("slow-loginctl");
-        fs::write(&script, "#!/bin/sh\nsleep 1\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let query = LoginctlQuery::new(&script, Duration::from_millis(20));
-        let error = query.show_seat("seat0").unwrap_err();
-        assert!(matches!(error, LoginctlError::Timeout { .. }));
+    fn bus_properties(text: &str) -> HashMap<String, OwnedValue> {
+        use zbus::zvariant::{ObjectPath, Value};
+        let path = ObjectPath::try_from("/org/freedesktop/login1/test").unwrap();
+        parse_properties(text)
+            .unwrap()
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match name.as_str() {
+                    "ActiveSession" | "Seat" => Value::from((value, path.clone())),
+                    "Sessions" => Value::from(
+                        value
+                            .split_whitespace()
+                            .map(|id| (id.to_owned(), path.clone()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    "User" => Value::from((value.parse::<u32>().unwrap(), path.clone())),
+                    "VTNr" => Value::from(value.parse::<u32>().unwrap()),
+                    "Remote" | "Active" | "CanLock" | "LockedHint" => Value::from(value == "yes"),
+                    _ => Value::from(value),
+                };
+                (name, value.try_into().unwrap())
+            })
+            .collect()
     }
 
     #[test]
-    fn loginctl_runner_returns_bounded_machine_readable_output() {
-        let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("fake-loginctl");
-        fs::write(
-            &script,
-            "#!/bin/sh\nprintf 'Id=seat0\\nActiveSession=\\nSessions=\\n'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let query = LoginctlQuery::new(&script, Duration::from_secs(1));
+    fn typed_bus_properties_preserve_seat_and_session_classification() {
+        let seat = seat_properties(bus_properties(SEAT_ACTIVE)).unwrap();
+        let session = session_properties(bus_properties(WAYLAND)).unwrap();
+        assert_eq!(seat, parse_properties(SEAT_ACTIVE).unwrap());
+        assert_eq!(session, parse_properties(WAYLAND).unwrap());
         assert_eq!(
-            query.show_seat("seat0").unwrap(),
-            "Id=seat0\nActiveSession=\nSessions=\n"
+            classify_session(&session, "seat0", "2")
+                .unwrap()
+                .injection_gate(),
+            InjectionGate::Normal { uid: 1000 }
+        );
+        let no_active = "Id=seat0\nActiveSession=\nSessions=\n";
+        assert_eq!(
+            seat_properties(bus_properties(no_active)).unwrap(),
+            parse_properties(no_active).unwrap()
         );
     }
 
     #[test]
-    fn loginctl_runner_rejects_identifiers_before_spawn() {
-        let query = LoginctlQuery::new(Path::new("/does/not/exist"), Duration::from_secs(1));
+    fn wrong_bus_types_and_missing_security_properties_are_rejected() {
+        for name in ["LockedHint", "Remote", "User", "Seat", "VTNr"] {
+            let mut missing = bus_properties(WAYLAND);
+            missing.remove(name);
+            assert!(session_properties(missing).is_err(), "missing {name}");
+            let mut wrong = bus_properties(WAYLAND);
+            wrong.insert(name.into(), OwnedValue::from(17u8));
+            assert!(session_properties(wrong).is_err(), "wrong type for {name}");
+        }
+        for name in ["ActiveSession", "Sessions"] {
+            let mut wrong = bus_properties(SEAT_ACTIVE);
+            wrong.insert(name.into(), OwnedValue::from(17u8));
+            assert!(seat_properties(wrong).is_err(), "wrong type for {name}");
+        }
+    }
+
+    #[test]
+    fn bus_authentication_timeout_denies_input_and_reconnects() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bus");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let query = LogindBusQuery::new(
+            &format!("unix:path={}", path.display()),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        // A listening socket that never answers authentication must be bounded,
+        // too. Each failed poll must attempt a fresh connection.
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let error = query.show_seat("seat0").unwrap_err();
+            assert!(matches!(error, LogindError::Timeout(_)), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(
+                unknown_query("seat", error).injection_gate(),
+                InjectionGate::Denied
+            );
+            assert!(query.connection.blocking_lock().is_none());
+            let _ = listener.accept().unwrap();
+        }
+    }
+
+    #[test]
+    fn waiting_for_an_inflight_bus_query_is_also_bounded() {
+        let query =
+            LogindBusQuery::new("unix:path=/does/not/exist", Duration::from_millis(20)).unwrap();
+        let _guard = query.connection.blocking_lock();
+        let error = query.show_seat("seat0").unwrap_err();
+        assert!(matches!(error, LogindError::Timeout(_)));
+    }
+
+    #[test]
+    fn invalid_identifier_and_unavailable_bus_deny_input() {
+        let query =
+            LogindBusQuery::new("unix:path=/does/not/exist", Duration::from_millis(20)).unwrap();
         assert!(matches!(
             query.show_session("../../evil"),
-            Err(LoginctlError::InvalidIdentifier { .. })
+            Err(LogindError::InvalidIdentifier { .. })
         ));
+        assert_eq!(
+            inspect_seat(&query, "seat0").injection_gate(),
+            InjectionGate::Denied
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local system bus, logind seat0 and loginctl"]
+    fn live_logind_matches_loginctl_and_reuses_connection() {
+        struct Cli;
+        impl LogindQuery for Cli {
+            type Error = String;
+            fn show_seat(&self, seat: &str) -> Result<Properties, String> {
+                cli_query("show-seat", seat, "Id,ActiveSession,Sessions")
+            }
+            fn show_session(&self, session: &str) -> Result<Properties, String> {
+                cli_query(
+                    "show-session",
+                    session,
+                    "Id,User,VTNr,Seat,TTY,Remote,Type,Class,Active,State,CanLock,LockedHint",
+                )
+            }
+        }
+        fn cli_query(kind: &str, id: &str, fields: &str) -> Result<Properties, String> {
+            let output = std::process::Command::new("/usr/bin/loginctl")
+                .args(["--no-pager", "--all", kind, id])
+                .args(fields.split(',').map(|field| format!("--property={field}")))
+                .env_clear()
+                .env("LANG", "C")
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+            }
+            parse_properties(&String::from_utf8(output.stdout).map_err(|e| e.to_string())?)
+        }
+        let query = LogindBusQuery::new(SYSTEM_BUS_ADDRESS, DEFAULT_QUERY_TIMEOUT).unwrap();
+        let expected = inspect_seat(&Cli, PRIMARY_SEAT);
+        assert!(
+            !matches!(expected, SeatState::Unknown { .. }),
+            "{expected:?}"
+        );
+        assert_eq!(inspect_seat(&query, PRIMARY_SEAT), expected);
+        let unique_name = query
+            .connection
+            .blocking_lock()
+            .as_ref()
+            .unwrap()
+            .unique_name()
+            .unwrap()
+            .to_owned();
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            assert_eq!(inspect_seat(&query, PRIMARY_SEAT), expected);
+            assert_eq!(
+                query
+                    .connection
+                    .blocking_lock()
+                    .as_ref()
+                    .unwrap()
+                    .unique_name(),
+                Some(&unique_name)
+            );
+        }
+        let bus_elapsed = started.elapsed();
+        let closed = query.connection.blocking_lock().as_ref().unwrap().clone();
+        query.runtime.block_on(closed.close()).unwrap();
+        assert_eq!(
+            inspect_seat(&query, PRIMARY_SEAT).injection_gate(),
+            InjectionGate::Denied
+        );
+        assert!(query.connection.blocking_lock().is_none());
+        assert_eq!(inspect_seat(&query, PRIMARY_SEAT), expected);
+        assert_ne!(
+            query
+                .connection
+                .blocking_lock()
+                .as_ref()
+                .unwrap()
+                .unique_name(),
+            Some(&unique_name)
+        );
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            assert_eq!(inspect_seat(&Cli, PRIMARY_SEAT), expected);
+        }
+        eprintln!(
+            "20 seat inspections: D-Bus {bus_elapsed:?}, loginctl {:?}; state {expected:?}",
+            started.elapsed()
+        );
     }
 }

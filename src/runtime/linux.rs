@@ -123,6 +123,7 @@ pub enum RuntimeCommand {
     },
     ReceiverEffects {
         effects: Vec<ReceiverEffect>,
+        touch_captured_at: Option<Instant>,
         /// Sent only after every effect reaches the uinput backend.
         applied: Option<tokio::sync::oneshot::Sender<Instant>>,
     },
@@ -824,10 +825,15 @@ impl RuntimeLoop {
                 self.terminal_sent(transport_live);
             }
             CommandRoute::Inject => {
-                let RuntimeCommand::ReceiverEffects { effects, applied } = command else {
+                let RuntimeCommand::ReceiverEffects {
+                    effects,
+                    touch_captured_at,
+                    applied,
+                } = command
+                else {
                     unreachable!()
                 };
-                if self.inject(effects)
+                if self.inject(effects, touch_captured_at)
                     && let Some(applied) = applied
                 {
                     let _ = applied.send(Instant::now());
@@ -892,9 +898,11 @@ impl RuntimeLoop {
         self.advance_ownership_boundary();
     }
 
-    fn inject(&mut self, effects: Vec<ReceiverEffect>) -> bool {
+    fn inject(&mut self, effects: Vec<ReceiverEffect>, touch_captured_at: Option<Instant>) -> bool {
         for effect in effects {
-            if let Err(diagnostic) = apply_receiver_effect(&mut self.virtual_input, effect) {
+            if let Err(diagnostic) =
+                apply_receiver_effect(&mut self.virtual_input, effect, touch_captured_at)
+            {
                 self.diagnostic(diagnostic);
                 // A failed emit followed by a failed release can leave kernel
                 // key state behind. Stop the descriptor-owning thread so Drop
@@ -1458,6 +1466,7 @@ fn ensure_close_on_exec(fd: RawFd) -> io::Result<()> {
 fn apply_receiver_effect(
     virtual_input: &mut VirtualInput,
     effect: ReceiverEffect,
+    touch_captured_at: Option<Instant>,
 ) -> Result<(), RuntimeDiagnostic> {
     let result: Result<(), InjectionError> = match effect {
         ReceiverEffect::Motion { delta, .. } => virtual_input.pointer.motion(delta),
@@ -1470,7 +1479,9 @@ fn apply_receiver_effect(
         } => virtual_input
             .keyboard
             .set_key(modifier_usage(modifier), pressed),
-        ReceiverEffect::TouchReplaced { state, .. } => virtual_input.replace_touch(&state),
+        ReceiverEffect::TouchReplaced { state, synthetic } => {
+            virtual_input.replace_touch_at(&state, if synthetic { None } else { touch_captured_at })
+        }
         ReceiverEffect::ActivationClosed { .. } => {
             return virtual_input
                 .release_all()
@@ -1857,6 +1868,7 @@ mod tests {
                 true,
                 &RuntimeCommand::ReceiverEffects {
                     effects: Vec::new(),
+                    touch_captured_at: None,
                     applied: None,
                 }
             ),

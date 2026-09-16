@@ -1602,6 +1602,7 @@ mod tests {
             .receive_playout_step(
                 session,
                 PlayoutStep {
+                    mapped_capture_time: MonotonicTimeMicros(0),
                     through_sequence: MotionSequence(1),
                     delta: MotionDelta {
                         dx: 8,
@@ -1622,6 +1623,7 @@ mod tests {
             .receive_playout_step(
                 session,
                 PlayoutStep {
+                    mapped_capture_time: MonotonicTimeMicros(0),
                     through_sequence: MotionSequence(1),
                     delta: MotionDelta {
                         dx: 5,
