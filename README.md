@@ -27,10 +27,10 @@ apt, dnf, or pacman. GNOME settings need GJS, GTK 4.12+, and libadwaita 1.5+.
 System changes request administrator access through GNOME's password dialog
 when available, or `sudo` in the terminal.
 
-On macOS, the installer places `zflow.app` in `/Applications`. Current release
-apps use ad hoc signatures and are not notarized. Input sharing works; the
-optional AWDL helper requires an Apple-issued signing identity and is
-unavailable in these builds.
+On macOS, the installer places `zflow.app` in `/Applications`. The release
+workflow signs Mac apps with Developer ID and includes Apple's notarization
+ticket. You can install the optional AWDL helper from the app with administrator
+approval.
 
 Repeat the command to update. It keeps your configuration and paired identities;
 updating the Linux service interrupts an active connection. Log out and back in

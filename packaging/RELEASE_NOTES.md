@@ -14,9 +14,8 @@ Linux binaries require glibc 2.39+ and systemd 254+. GNOME settings require
 GJS, GTK 4.12+, and libadwaita 1.5+. macOS requires version 26 or newer.
 No Rust, Swift, Xcode, or C compiler is needed on the installing computer.
 
-Mac apps use ad hoc signatures and are not notarized. Ordinary input sharing
-works; installing the optional AWDL helper requires an Apple-issued signing
-identity and is unavailable in these artifacts.
+Mac apps include Developer ID signatures and Apple's notarization ticket.
+You can install the optional AWDL helper from the app with administrator approval.
 
 Updates preserve configuration and pairing identities. Restarting the Linux
 service interrupts active sharing. Log out and back in after updating the
