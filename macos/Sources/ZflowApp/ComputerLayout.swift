@@ -22,32 +22,14 @@ struct ComputerLayout: View {
         if computers.isEmpty { Text("Detecting this Mac’s displays…").foregroundStyle(.secondary) }
         ForEach(computers) { computer in
           let active = dragging == computer.id
-          VStack(spacing: 6) {
-            Image(systemName: computer.peer == nil ? "laptopcomputer" : "display").font(.title2)
-            Text(computer.label).font(.callout.weight(.medium)).lineLimit(1)
-          }
-          .frame(
-            width: max(70, Double(computer.width) * scale),
-            height: max(60, Double(computer.height) * scale)
-          )
-          .background(
-            computer.peer == nil
-              ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor),
-            in: RoundedRectangle(cornerRadius: 8)
-          )
-          .overlay {
-            RoundedRectangle(cornerRadius: 8).strokeBorder(
-              active ? Color.accentColor : Color.secondary.opacity(0.35), lineWidth: active ? 2 : 1)
-          }
-          .shadow(
-            color: .black.opacity(active ? 0.13 : 0.04), radius: active ? 8 : 2, y: active ? 4 : 1
-          )
-          .position(
-            x: origin.x + (Double(computer.x) + Double(computer.width) / 2) * scale
+          let center = CGPoint(
+            x: origin.x + (CGFloat(computer.x) + CGFloat(computer.width) / 2) * scale
               + (active ? translation.width : 0),
-            y: origin.y + (Double(computer.y) + Double(computer.height) / 2) * scale
+            y: origin.y + (CGFloat(computer.y) + CGFloat(computer.height) / 2) * scale
               + (active ? translation.height : 0)
           )
+          computerTile(computer, scale: scale, active: active)
+          .position(center)
           .zIndex(active ? 1 : 0)
           .gesture(
             DragGesture(minimumDistance: 2)
@@ -101,6 +83,30 @@ struct ComputerLayout: View {
       Text("You will need to pair again to share input with this computer.")
     }
   }
+
+  private func computerTile(_ computer: Computer, scale: CGFloat, active: Bool) -> some View {
+    VStack(spacing: 6) {
+      Image(systemName: computer.peer == nil ? "laptopcomputer" : "display").font(.title2)
+      Text(computer.label).font(.callout.weight(.medium)).lineLimit(1)
+    }
+    .frame(
+      width: max(70, CGFloat(computer.width) * scale),
+      height: max(60, CGFloat(computer.height) * scale)
+    )
+    .background(
+      computer.peer == nil
+        ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor),
+      in: RoundedRectangle(cornerRadius: 8)
+    )
+    .overlay {
+      RoundedRectangle(cornerRadius: 8).strokeBorder(
+        active ? Color.accentColor : Color.secondary.opacity(0.35), lineWidth: active ? 2 : 1)
+    }
+    .shadow(
+      color: .black.opacity(active ? 0.13 : 0.04), radius: active ? 8 : 2, y: active ? 4 : 1
+    )
+  }
+
   private var layoutBounds: CGRect {
     computers.reduce(CGRect.null) {
       $0.union(CGRect(x: $1.x, y: $1.y, width: $1.width, height: $1.height))
