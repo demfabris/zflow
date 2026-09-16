@@ -31,10 +31,42 @@ commit and push, then either push its matching `vVERSION` tag or dispatch with
 Prerelease version suffixes produce GitHub prereleases, which users select
 with `--version`; the default `latest` selects a normal published release.
 
-Release Mac apps currently use ad hoc signatures. They are not notarized, and
-the optional AWDL helper remains unavailable. To build a signed app locally,
-use `scripts/build-macos-app.sh --sign IDENTITY` before packaging. Signing and
-notarization credentials are not stored in the repository.
+The release workflow signs both Mac architectures with Developer ID, submits
+each app to Apple, and staples the accepted notarization ticket. It checks
+signatures, the ticket, and Gatekeeper again after extracting the final archive.
+A signing or notarization failure blocks publication, including manual builds
+with `publish` off.
+
+Configure these GitHub Actions repository secrets before running the workflow:
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_CERTIFICATE_BASE64` | Base64-encoded `.p12` containing the Developer ID Application certificate and private key |
+| `MACOS_CERTIFICATE_PASSWORD` | Password protecting that `.p12` |
+| `MACOS_SIGNING_IDENTITY` | SHA-1 fingerprint shown by `security find-identity -v -p codesigning` |
+| `APPLE_ID` | Apple Account email address |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password generated for that account |
+| `APPLE_TEAM_ID` | Developer team ID matching the certificate |
+
+Each Mac job imports the certificate into a temporary keychain and deletes it
+after packaging or failure. Credentials stay in GitHub secrets and the runner's
+temporary keychain. Notarization JSON results remain in separate workflow
+artifacts for seven days; they do not enter the published release.
+
+For a local signed and notarized build:
+
+```sh
+./scripts/build-macos-app.sh --sign 'Developer ID Application: NAME (TEAM_ID)'
+xcrun notarytool store-credentials zflow-notary --team-id TEAM_ID
+./scripts/notarize-macos-app.sh zflow-notary
+./scripts/package-release.sh aarch64-apple-darwin  # x86_64-apple-darwin on Intel
+```
+
+The notarization script accepts an optional keychain path as its second argument.
+It waits up to 20 minutes. If Apple takes longer, the job fails and retains the
+submission ID in `target/notarization/submission.json`; inspect that submission
+with `xcrun notarytool info ID --keychain-profile PROFILE` before submitting again.
+Rebuilding or signing the app again requires another notarization.
 
 Local artifact assembly after building the native release binaries:
 

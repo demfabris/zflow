@@ -22,6 +22,9 @@ No host service, input device, or system package is changed by these tests.
 The release workflow runs the bootstrap tests on Linux and macOS runners,
 Linux Rust/GNOME checks and package lifecycle tests on both Linux architectures,
 and native Mac app builds and Swift bridge tests on both Mac architectures.
+Mac jobs also run `python3 tests/macos_notarization_test.py`, sign with Developer
+ID, require Apple's acceptance, and staple the ticket. They extract each release
+archive and check its signature, ticket, and Gatekeeper assessment before upload.
 Only a complete build matrix can publish a release.
 
 Live installation checks remain:
