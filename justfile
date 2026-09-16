@@ -84,6 +84,10 @@ test-gtk: (_platform "linux")
 test-install:
     python3 tests/install_test.py
 
+# Exercise a built Debian package in a disposable Ubuntu container.
+test-package:
+    ./tests/deb_lifecycle.sh
+
 # Format Rust code.
 fmt:
     cargo fmt --all

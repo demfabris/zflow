@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the Cargo.toml version after all builds pass
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUSTUP_TOOLCHAIN: 1.97.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-26
+            target: aarch64-apple-darwin
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check release version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo 'The tag must match Cargo.toml' >&2
+            exit 1
+          fi
+      - name: Install Rust build toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - name: Check installer
+        run: python3 tests/install_test.py
+      - name: Linux checks and binaries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debhelper
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+          node tests/gnome_desktop_test.mjs
+          node tests/gnome_panel_test.mjs
+          cargo build --locked --release --bin zflow --bin zflowd
+          ./scripts/build-deb.sh
+          ./tests/deb_lifecycle.sh
+      - name: Native macOS app and bridge tests
+        if: runner.os == 'macOS'
+        run: |
+          ./scripts/build-macos-app.sh
+          ZFLOW_RUST_LIB_DIR="$PWD/target/release" swift test --package-path macos
+      - name: Assemble release archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: ./scripts/package-release.sh "$TARGET"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: target/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish verified artifacts
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: target/dist
+          merge-multiple: true
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          tag="v$version"
+          # Never overwrite an existing release, including an incomplete draft.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; inspect it before retrying." >&2
+            exit 1
+          fi
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]]; then
+            git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+            if [[ "$(git rev-parse "$tag^{commit}")" != "$GITHUB_SHA" ]]; then
+              echo 'Existing release tag does not point to the built commit.' >&2
+              exit 1
+            fi
+          fi
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            test -s "target/dist/zflow-$tag-$target.tar.gz"
+          done
+          test -s "target/dist/zflow_${version}_amd64.deb"
+          test -s "target/dist/zflow_${version}_arm64.deb"
+          cp install.sh target/dist/install.sh
+          (cd target/dist && sha256sum ./*.tar.gz ./*.deb install.sh | sed 's|  ./|  |' > SHA256SUMS)
+          prerelease=()
+          if [[ "$version" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$tag" target/dist/* --target "$GITHUB_SHA" --draft \
+            --title "zflow $tag" --notes-file packaging/RELEASE_NOTES.md "${prerelease[@]}"
+          gh release edit "$tag" --draft=false

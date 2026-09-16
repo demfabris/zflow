@@ -1,0 +1,48 @@
+#!/bin/bash
+set -euo pipefail
+if [[ "$1" == configure ]]; then
+    SERVICE_USER=zflow
+    SERVICE_GROUP=zflow
+    STATE_DIR=/var/lib/zflow
+    die() { printf 'zflow: %s\n' "$*" >&2; exit 1; }
+    # shellcheck source-path=SCRIPTDIR
+    # shellcheck source=../packaging/linux/account.sh
+    source /usr/lib/zflow/account.sh
+    ensure_service_account
+    for path in /etc/zflow /var/lib/zflow /etc/zflow/zflow.toml /etc/udev/rules.d/71-zflow-capture.rules /etc/udev/71-zflow-capture.rules.disabled; do
+        [[ ! -L "$path" ]] || die "Refusing symlink: $path"
+    done
+    install -d -o zflow -g zflow -m 0700 /etc/zflow /var/lib/zflow
+    if [[ ! -e /etc/zflow/zflow.toml ]]; then
+        install -o zflow -g zflow -m 0600 /usr/share/zflow/zflow.toml /etc/zflow/zflow.toml
+    fi
+    [[ -f /etc/zflow/zflow.toml ]] || die 'Configuration is not a regular file'
+    chown zflow:zflow /etc/zflow/zflow.toml
+    chmod 0600 /etc/zflow/zflow.toml
+    install -d -m 0755 /etc/udev/rules.d
+    if [[ ! -e /etc/udev/rules.d/71-zflow-capture.rules ]]; then
+        if [[ -f /etc/udev/71-zflow-capture.rules.disabled ]]; then
+            mv /etc/udev/71-zflow-capture.rules.disabled /etc/udev/rules.d/71-zflow-capture.rules
+        else
+            install -m 0644 /usr/share/zflow/71-zflow-capture.rules /etc/udev/rules.d/71-zflow-capture.rules
+        fi
+    fi
+    [[ -f /etc/udev/rules.d/71-zflow-capture.rules ]] || die 'Capture rules are not a regular file'
+    chown root:root /etc/udev/rules.d/71-zflow-capture.rules
+    chmod 0644 /etc/udev/rules.d/71-zflow-capture.rules
+    if [[ -d /run/systemd/system && -S /run/udev/control ]]; then
+        udevadm verify /usr/lib/udev/rules.d/70-zflow.rules /etc/udev/rules.d/71-zflow-capture.rules
+        modprobe uinput
+        udevadm control --reload-rules
+        udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
+        udevadm trigger --action=change --subsystem-match=input
+        udevadm settle
+        [[ -c /dev/uinput ]] || die 'uinput is unavailable'
+        setfacl --remove-all /dev/uinput
+        chown root:zflow /dev/uinput
+        chmod 0660 /dev/uinput
+        runuser -u zflow -- /usr/bin/test -w /dev/uinput
+    fi
+fi
+# debhelper honors policy-rc.d and handles service enable/restart after setup.
+#DEBHELPER#

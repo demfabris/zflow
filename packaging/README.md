@@ -1,18 +1,85 @@
 # Installation
 
-The root `install.sh` is the cross-platform source installer used by the curl
-command in the main README. It downloads a source archive, installs prerequisites
-when needed, and calls the platform scripts below. Use `./install.sh --source .`
-to install a checkout, or add `--skip-dependencies` to manage prerequisites
-yourself. `--headless` skips GNOME setup on Linux. On macOS, `--sign IDENTITY`
-selects an installed Apple signing identity; the default is an ad hoc signature.
-The installer does not publish or notarize builds.
+The root `install.sh` downloads release binaries for the detected OS and CPU,
+verifies the selected file against that release's `SHA256SUMS`, and installs it.
+It resolves `latest` to a specific tag before downloading either file. Use
+`--version v0.1.0` to select a release. A failed download, missing checksum, or
+unsupported platform stops installation before requesting administrator access.
+
+## Release artifacts
+
+`.github/workflows/release.yml` builds these artifacts on native runners:
+
+| Platform | Runner | Artifact |
+| --- | --- | --- |
+| Linux x86-64 | Ubuntu 24.04 | `zflow-vVERSION-x86_64-unknown-linux-gnu.tar.gz`, `zflow_VERSION_amd64.deb` |
+| Linux ARM64 | Ubuntu 24.04 ARM | `zflow-vVERSION-aarch64-unknown-linux-gnu.tar.gz`, `zflow_VERSION_arm64.deb` |
+| macOS Apple Silicon | macOS 26 | `zflow-vVERSION-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | macOS 26 Intel | `zflow-vVERSION-x86_64-apple-darwin.tar.gz` |
+
+Linux uses Ubuntu 24.04 to keep the glibc floor at 2.39. Rust is pinned in the
+workflow; the app's minimum macOS version remains 26. After all builds and tests
+pass, the publish job combines the artifacts, computes `SHA256SUMS`, uploads a
+draft release, and publishes it. It refuses to replace an existing release.
+The release also contains `install.sh`. Checksums detect corrupt or mismatched
+downloads; they rely on the same GitHub/HTTPS trust as the artifacts.
+
+To build without publishing, dispatch the **Release** workflow with `publish`
+left off. To publish, update Cargo.toml/Cargo.lock to the intended version,
+commit and push, then either push its matching `vVERSION` tag or dispatch with
+`publish=true`. Manual publication creates the tag at the workflow's commit.
+Prerelease version suffixes produce GitHub prereleases, which users select
+with `--version`; the default `latest` selects a normal published release.
+
+Release Mac apps currently use ad hoc signatures. They are not notarized, and
+the optional AWDL helper remains unavailable. To build a signed app locally,
+use `scripts/build-macos-app.sh --sign IDENTITY` before packaging. Signing and
+notarization credentials are not stored in the repository.
+
+Local artifact assembly after building the native release binaries:
+
+```sh
+./scripts/package-release.sh x86_64-unknown-linux-gnu
+./scripts/build-deb.sh   # Linux; requires debhelper and dpkg-dev
+```
+
+Both commands package existing binaries under `target/release`; neither builds
+them. Substitute the native target from the table for the archive command.
+Outputs go under `target/dist`.
+
+## Debian packages
+
+The package owns `/usr/bin/zflow`, `/usr/bin/zflowd`, vendor systemd/udev files
+under `/usr/lib`, and the GNOME extension, application launcher, and D-Bus entry
+under `/usr/share`. debhelper handles service lifecycle and respects
+`policy-rc.d`. Configuration and capture rules are generated only when absent;
+updates keep daemon-written settings and pairing state.
+
+`apt remove zflow` stops the service and moves selected-device rules out of
+udev's active directory, retaining them for reinstallation. `apt purge zflow`
+also removes generated configuration and device selections. Both retain
+`/var/lib/zflow` identities and the locked system account. Per-user autostart
+and desktop files, if created previously, stay in that user's account.
+
+An archive/source installation owns `/usr/local` binaries and `/etc` service
+files that would shadow a Debian installation. The curl installer keeps using
+archives for such a machine. To migrate deliberately, stop sharing, save
+`/etc/udev/rules.d/71-zflow-capture.rules`, run the archive/source uninstaller
+without `--purge`, install the `.deb`, then restore the capture rules and reload
+udev. Configuration and identity remain in place. Remove the old per-user
+launcher, D-Bus service and extension listed below so the package's global
+files take effect; update any autostart entry to use `/usr/bin/zflow`.
+The `.deb` rejects a remaining `/usr/local` installation before unpacking.
 
 ## Linux service
 
-`scripts/install.sh` builds both headless binaries and installs them under
+For development, `scripts/install.sh` builds both headless binaries and installs them under
 `/usr/local/bin`. It creates a locked `zflow` account, loads `uinput`, installs
 the service, udev rules, and a system-sleep hook, then starts `zflowd`.
+
+Binary archives contain the same installer and Linux service assets alongside
+`bin/zflow` and `bin/zflowd`. Their installer runs with `--install-built` and
+needs no source checkout or compiler.
 
 The installer keeps two administrator-managed files on upgrades:
 

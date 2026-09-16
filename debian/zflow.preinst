@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+case "$1" in
+    install|upgrade)
+        if [ -e /usr/local/bin/zflow ] || [ -e /usr/local/bin/zflowd ] ||
+           { [ -f /etc/systemd/system/zflowd.service ] && grep -q /usr/local/bin/zflowd /etc/systemd/system/zflowd.service; }; then
+            echo 'An archive/source installation is present. Continue updating with the curl installer, or follow the migration instructions in packaging/README.md before installing a .deb.' >&2
+            exit 1
+        fi
+        ;;
+esac
+#DEBHELPER#

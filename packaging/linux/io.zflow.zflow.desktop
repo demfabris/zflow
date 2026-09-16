@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=zflow
+Comment=Share your keyboard, pointer, and trackpad
+Exec=/usr/bin/zflow settings
+Icon=input-mouse
+Terminal=false
+Categories=Settings;GTK;GNOME;
+StartupNotify=true

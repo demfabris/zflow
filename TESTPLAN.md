@@ -4,28 +4,33 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
-## Cross-platform source installer, September 16
+## Binary releases and Debian packaging, September 16
 
-Run `just test-install` (also included in `just check`). The tests replace
-package managers, privilege brokers, and builds with fixtures. They cover Linux
-package selection, unprivileged builds, graphical/terminal authentication,
-failed downloads and builds, GNOME activation after login, macOS prerequisites,
-and app replacement with recovery of the previous bundle.
+Run `just test-install` (also included in `just check`). The tests use local
+release fixtures with real SHA-256 verification and archive extraction. They
+cover platform/architecture selection, a pinned latest release, rejected
+checksums, failed downloads, runtime dependency selection, GUI/terminal
+authentication, GNOME setup, and macOS update recovery. Build tools fail the
+test if the installer tries to invoke them.
 
-All 18 tests passed on the Linux host and under Bash 3.2.57 in an isolated
-container. ShellCheck passed for both install scripts. The Linux release
-binaries built with the locked dependency graph, and `just check` passed.
-The tests did not replace the running service or install packages on the host.
+Build a native `.deb` with `scripts/build-deb.sh`, then run `just test-package`.
+This installs the actual package in a disposable Ubuntu 24.04 container,
+checks paths and permissions, edits configuration/device selections, and checks
+update, removal, reinstallation, purge, and rejection of a source installation.
+No host service, input device, or system package is changed by these tests.
+
+The release workflow runs the bootstrap tests on Linux and macOS runners,
+Linux Rust/GNOME checks and package lifecycle tests on both Linux architectures,
+and native Mac app builds and Swift bridge tests on both Mac architectures.
+Only a complete build matrix can publish a release.
 
 Live installation checks remain:
 
-- Install and update on current Ubuntu, Fedora, and Arch GNOME sessions.
-  Check password approval/cancellation, first-login extension activation,
-  preserved configuration/identity, and settings launch from Applications.
-- Install headless from a terminal, including a machine without Rust.
-- On macOS 26+, test missing Command Line Tools, ad hoc and Apple-signed
-  builds, updating a running app, first-launch permissions, and Open at login
-  from the installed `/Applications/zflow.app` path.
+- Install/update on Ubuntu, Fedora, and Arch GNOME sessions, including password
+  approval/cancellation, extension activation, runtime dependencies, and app launch.
+- Install headless from a terminal with no compiler toolchain present.
+- On macOS 26+, install each architecture's released bundle, update a running
+  app, grant first-launch permissions, and test Open at login at its final path.
 
 ## Native GNOME app and panel, September 16
 

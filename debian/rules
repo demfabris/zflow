@@ -1,0 +1,27 @@
+#!/usr/bin/make -f
+export DH_VERBOSE = 1
+# The release workflow builds Rust once, then packages the resulting executables.
+export DEB_BUILD_OPTIONS = nostrip
+
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_install:
+	install -D -m 0755 "$(ZFLOW_BIN_DIR)/zflow" debian/zflow/usr/bin/zflow
+	install -D -m 0755 "$(ZFLOW_BIN_DIR)/zflowd" debian/zflow/usr/bin/zflowd
+	install -D -m 0644 packaging/systemd/zflowd.service debian/zflow/usr/lib/systemd/system/zflowd.service
+	sed -i 's|/usr/local/bin/zflowd|/usr/bin/zflowd|' debian/zflow/usr/lib/systemd/system/zflowd.service
+	install -D -m 0644 packaging/systemd/zflowd-prelogin.conf debian/zflow/usr/lib/systemd/system/zflowd.service.d/prelogin.conf
+	install -D -m 0755 packaging/system-sleep/zflow debian/zflow/usr/lib/systemd/system-sleep/zflow
+	install -D -m 0644 packaging/modules-load.d/zflow.conf debian/zflow/usr/lib/modules-load.d/zflow.conf
+	install -D -m 0644 packaging/udev/70-zflow.rules debian/zflow/usr/lib/udev/rules.d/70-zflow.rules
+	install -D -m 0644 packaging/udev/71-zflow-capture.rules debian/zflow/usr/share/zflow/71-zflow-capture.rules
+	install -D -m 0644 packaging/config/zflow.toml debian/zflow/usr/share/zflow/zflow.toml
+	install -D -m 0644 packaging/linux/account.sh debian/zflow/usr/lib/zflow/account.sh
+	install -D -m 0644 packaging/linux/io.zflow.zflow.desktop debian/zflow/usr/share/applications/io.zflow.zflow.desktop
+	install -D -m 0644 packaging/linux/io.zflow.Desktop.service debian/zflow/usr/share/dbus-1/services/io.zflow.Desktop.service
+	install -d debian/zflow/usr/share/gnome-shell/extensions/zflow@demfabris
+	install -m 0644 packaging/gnome-extension/*.js packaging/gnome-extension/metadata.json debian/zflow/usr/share/gnome-shell/extensions/zflow@demfabris/
+
+override_dh_installsystemd:
+	dh_installsystemd --name=zflowd --restart-after-upgrade

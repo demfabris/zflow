@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-# Download, build, and install zflow on Linux or macOS.
+# Install published zflow binaries on Linux or macOS.
 set -Eeuo pipefail
 
 usage() {
     cat <<'USAGE'
 Usage: bash install.sh [options]
 
-  --yes                 Accept installation of dependencies and Rust
-  --ref REF             Git branch, tag, or commit to build (default: main)
-  --source PATH         Build an existing checkout instead of downloading it
+  --yes                 Accept installation and runtime dependencies
+  --version VERSION     Install a release tag (default: latest)
   --headless            Linux: install the service without GNOME integration
   --no-launch           Do not open the app after installation
-  --skip-dependencies   Use the existing build tools and runtime dependencies
-  --sign IDENTITY       macOS: sign with an installed Apple signing identity
   -h, --help            Show this help
 
 Run as your normal user. Only system changes request administrator access.
@@ -68,21 +65,21 @@ cleanup() {
 linux_dependencies() {
     local packages=()
     if command -v apt-get >/dev/null 2>&1; then
-        packages=(build-essential pkg-config curl ca-certificates acl kmod udev passwd util-linux)
+        packages=(acl kmod udev passwd util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gir1.2-gtk-4.0 gir1.2-adw-1); fi
         as_root apt-get update
         as_root apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
-        packages=(gcc gcc-c++ make pkgconf-pkg-config curl ca-certificates acl kmod systemd-udev shadow-utils util-linux)
+        packages=(acl kmod systemd-udev shadow-utils util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita); fi
         as_root dnf install -y "${packages[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        packages=(base-devel pkgconf curl ca-certificates acl kmod systemd shadow util-linux)
+        packages=(acl kmod systemd shadow util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita); fi
         # Do not refresh the package database without upgrading the whole system.
         as_root pacman -S --needed --noconfirm "${packages[@]}"
     else
-        die 'Automatic dependency installation supports apt, dnf, and pacman. Install the prerequisites and rerun with --skip-dependencies.'
+        die 'Automatic dependency installation supports apt, dnf, and pacman. Install the runtime dependencies and use the installation script inside the release archive.'
     fi
 }
 
@@ -90,7 +87,7 @@ check_linux() {
     require systemctl
     [[ -n "$(systemctl show --property=Version --value 2>/dev/null)" ]] || die 'Linux installation requires a running systemd system manager.'
     local command
-    for command in cc make pkg-config getent groupadd useradd runuser setfacl modprobe systemd-analyze udevadm; do require "$command"; done
+    for command in getent groupadd useradd runuser setfacl modprobe systemd-analyze udevadm; do require "$command"; done
     udevadm --help | grep 'verify' >/dev/null || die 'udevadm verify is required (systemd 254 or newer).'
     if [[ "$desktop" == true ]]; then
         require gjs
@@ -108,61 +105,92 @@ check_linux() {
 }
 
 check_macos() {
-    local version swift_version sdk_version
-    version=$(sw_vers -productVersion)
-    version_at_least "$version" 26.0 || die 'The native app requires macOS 26 or newer.'
-    if ! xcode-select -p >/dev/null 2>&1; then
-        if [[ "$skip_dependencies" == false ]]; then xcode-select --install || true; fi
-        die 'Install Apple Command Line Tools with Swift 6.2+ and the macOS 26 SDK, then rerun this installer.'
-    fi
-    swift_version=$(swift --version | sed -n 's/.*Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1)
-    if [[ -z "$swift_version" ]] || ! version_at_least "$swift_version" 6.2; then
-        die 'Swift 6.2 or newer is required. Update Xcode or Apple Command Line Tools.'
-    fi
-    sdk_version=$(xcrun --sdk macosx --show-sdk-version)
-    version_at_least "$sdk_version" 26.0 || die 'Select an Apple toolchain containing the macOS 26 SDK or newer.'
-    require python3
+    version_at_least "$(sw_vers -productVersion)" 26.0 || die 'The native app requires macOS 26 or newer.'
     require codesign
     require ditto
 }
 
-ensure_rust() {
-    local minimum current rust_bin
-    minimum=$(sed -n 's/^rust-version = "\([0-9.]*\)"/\1/p' "$source_dir/Cargo.toml")
-    [[ -n "$minimum" ]] || die 'Could not read the required Rust version from Cargo.toml.'
-    rust_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
-    if ! command -v cargo >/dev/null 2>&1 && [[ -x "$rust_bin/cargo" ]]; then export PATH="$rust_bin:$PATH"; fi
-    if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
-        current=$(rustc --version | awk '{print $2}')
-        if version_at_least "$current" "$minimum"; then return; fi
-    fi
-    [[ "$skip_dependencies" == false ]] || die "Rust $minimum or newer is required."
-    say "Installing a current Rust toolchain for your user account."
-    if command -v rustup >/dev/null 2>&1; then
-        rustup toolchain install stable --profile minimal </dev/null
+latest_version() {
+    local url
+    url=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error \
+        --head --location --retry 3 --connect-timeout 20 --max-time 60 \
+        --output /dev/null --write-out '%{url_effective}' \
+        https://github.com/demfabris/zflow/releases/latest </dev/null) \
+        || die 'No release could be found. Check https://github.com/demfabris/zflow/releases.'
+    [[ "$url" == https://github.com/demfabris/zflow/releases/tag/* ]] || die 'Unexpected release redirect.'
+    printf '%s\n' "${url##*/}"
+}
+
+verify_download() {
+    local expected actual
+    expected=$(awk -v name="$asset" '$2 == name && NF == 2 {hash=$1; count++} END {if (count == 1) print hash; else exit 1}' "$work_dir/SHA256SUMS") \
+        || die "The release has no unique checksum for $asset."
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die 'Invalid release checksum.'
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$work_dir/$asset" | awk '{print $1}')
     else
-        fetch https://sh.rustup.rs "$work_dir/rustup.sh"
-        sh "$work_dir/rustup.sh" -y --profile minimal --default-toolchain stable --no-modify-path </dev/null
-        export PATH="$rust_bin:$PATH"
+        actual=$(shasum -a 256 "$work_dir/$asset" | awk '{print $1}')
     fi
-    # Select stable for this build without changing an existing default toolchain.
-    export RUSTUP_TOOLCHAIN=stable
-    require cargo
-    require rustc
-    current=$(rustc --version | awk '{print $2}')
-    version_at_least "$current" "$minimum" || die "Rust $minimum or newer is required."
+    [[ "$actual" == "$expected" ]] || die "Checksum mismatch for $asset; nothing was installed."
+}
+
+archive_install_present() {
+    [[ -e /usr/local/bin/zflow || -e /usr/local/bin/zflowd || -e /etc/systemd/system/zflowd.service ]]
+}
+
+select_artifact() {
+    local machine libc_version
+    machine=$(uname -m)
+    if [[ "$platform" == Darwin && "$machine" == x86_64 ]] && [[ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" == 1 ]]; then
+        machine=arm64
+    fi
+    case "$machine" in
+        x86_64|amd64) architecture=x86_64; deb_arch=amd64 ;;
+        arm64|aarch64) architecture=aarch64; deb_arch=arm64 ;;
+        *) die "No release binary is available for $machine." ;;
+    esac
+    use_deb=false
+    if [[ "$platform" == Linux ]]; then
+        libc_version=$(getconf GNU_LIBC_VERSION 2>/dev/null) || die 'Linux release binaries require glibc 2.39 or newer; musl is not supported.'
+        version_at_least "${libc_version#glibc }" 2.39 || die 'Linux release binaries require glibc 2.39 or newer.'
+        # Keep existing source/archive installs in place instead of shadowing them with /usr/bin.
+        if command -v apt-get >/dev/null 2>&1 && ! archive_install_present; then
+            use_deb=true
+        elif command -v dpkg-query >/dev/null 2>&1 && [[ "$(dpkg-query -W -f='${Status}' zflow 2>/dev/null || true)" == 'install ok installed' ]]; then
+            use_deb=true
+        fi
+        if [[ "$use_deb" == true ]]; then asset="zflow_${version#v}_${deb_arch}.deb";
+        else asset="zflow-${version}-${architecture}-unknown-linux-gnu.tar.gz"; fi
+    else
+        asset="zflow-${version}-${architecture}-apple-darwin.tar.gz"
+    fi
 }
 
 install_linux() {
-    say 'Building the Linux service and desktop app…'
-    cargo build --locked --release --manifest-path "$source_dir/Cargo.toml" \
-        --target-dir "$source_dir/target" --bin zflow --bin zflowd </dev/null
     say 'Installing the service. An existing zflow connection will disconnect during its restart.'
-    as_root bash "$source_dir/scripts/install.sh" --install-built
+    if [[ "$use_deb" == true ]]; then
+        # apt drops privileges to _apt while reading the verified local package.
+        chmod 0755 "$work_dir"
+        chmod 0644 "$work_dir/$asset"
+        as_root apt-get update
+        if [[ "$desktop" == true ]]; then as_root apt-get install -y "$work_dir/$asset";
+        else as_root apt-get install -y --no-install-recommends "$work_dir/$asset"; fi
+        installed_cli=/usr/bin/zflow
+    else
+        linux_dependencies
+        check_linux
+        as_root bash "$payload_dir/scripts/install.sh" --install-built
+        installed_cli=/usr/local/bin/zflow
+    fi
     if [[ "$desktop" == true ]]; then
         say 'Installing GNOME integration for your desktop account…'
+        check_linux
         local output
-        if output=$(/usr/local/bin/zflow desktop-agent --install </dev/null 2>&1); then
+        if [[ "$use_deb" == true ]]; then
+            # The package owns the desktop files and extension under /usr/share.
+            gnome-extensions enable zflow@demfabris 2>/dev/null || true
+            say 'Enable Start at Login in Settings to start sharing on future logins.'
+        elif output=$("$installed_cli" desktop-agent --install </dev/null 2>&1); then
             printf '%s\n' "$output"
         else
             printf '%s\n' "$output" >&2
@@ -172,7 +200,7 @@ install_linux() {
         fi
         say 'Log out and back in to load the GNOME extension. Enable zflow in GNOME Extensions if needed, then open it from Applications.'
         if [[ "$launch" == true ]]; then
-            /usr/local/bin/zflow settings </dev/null >/dev/null 2>&1 &
+            "$installed_cli" settings </dev/null >/dev/null 2>&1 &
         fi
     else
         say 'The Linux service is installed. Run zflow desktop-agent --install from a GNOME session to add the desktop app.'
@@ -180,13 +208,8 @@ install_linux() {
 }
 
 install_macos() {
-    local args=() bundle
-    if [[ -n "$sign_identity" ]]; then args+=(--sign "$sign_identity"); fi
-    # Bash 3.2 treats an empty array as unset under nounset.
-    if [[ ${#args[@]} -gt 0 ]]; then bash "$source_dir/scripts/build-macos-app.sh" "${args[@]}" </dev/null;
-    else bash "$source_dir/scripts/build-macos-app.sh" </dev/null; fi
-    bundle="$source_dir/target/release/zflow.app"
-    [[ -d "$bundle" && ! -L "$bundle" ]] || die "The build did not produce $bundle"
+    local bundle="$payload_dir/zflow.app"
+    [[ -d "$bundle" && ! -L "$bundle" ]] || die 'The release archive does not contain zflow.app.'
     codesign --verify --strict --deep "$bundle"
     [[ ! -L "$mac_destination" ]] || die "Refusing to replace a symlink at $mac_destination."
     if [[ -e "$mac_destination" ]]; then
@@ -212,18 +235,17 @@ install_macos() {
     as_root rm -rf -- "$mac_stage"
     mac_stage=''
     say 'Installed zflow. Allow Accessibility and Local Network access when the app requests them.'
-    if [[ -z "$sign_identity" || "$sign_identity" == - ]]; then
+    if codesign --display --verbose=2 "$mac_destination" 2>&1 | grep 'Signature=adhoc' >/dev/null; then
         printf 'This build uses an ad-hoc signature. Input sharing works; AWDL helper installation requires an Apple signing identity.\n'
     fi
     if [[ "$launch" == true ]]; then open "$mac_destination"; fi
 }
 
 main() {
-    local ref=main source_option='' assume_yes=false headless=false command
+    local assume_yes=false headless=false command base_url
     platform=$(uname -s)
+    version=latest
     launch=true
-    skip_dependencies=false
-    sign_identity=''
     desktop=false
     work_dir=''
     mac_stage=''
@@ -233,42 +255,39 @@ main() {
             --yes) assume_yes=true ;;
             --headless) headless=true ;;
             --no-launch) launch=false ;;
-            --skip-dependencies) skip_dependencies=true ;;
-            --ref|--source|--sign)
-                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value"
-                case "$1" in --ref) ref="$2";; --source) source_option="$2";; --sign) sign_identity="$2";; esac
-                shift ;;
+            --version)
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die '--version requires a release version'
+                version="$2"; shift ;;
             -h|--help) usage; return ;;
             *) die "Unknown option: $1" ;;
         esac
         shift
     done
-    case "$platform" in Linux|Darwin) ;; *) die "Unsupported operating system: $platform (Linux and macOS are supported).";; esac
+    case "$platform" in Linux|Darwin) ;; *) die "Unsupported operating system: $platform.";; esac
     [[ "$(id -u)" != 0 ]] || die 'Run this installer as your normal user, without sudo. It requests administrator access when needed.'
     [[ -n "${HOME:-}" && "$HOME" == /* ]] || die 'HOME must be an absolute path.'
-    [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$ref" != *..* ]] || die 'Invalid Git ref.'
-    [[ "$platform" == Darwin || -z "$sign_identity" ]] || die '--sign is only available on macOS.'
     [[ "$platform" == Linux || "$headless" == false ]] || die '--headless is only available on Linux.'
-    if [[ "$platform" == Linux && "$headless" == false ]]; then
-        case ":${XDG_CURRENT_DESKTOP:-}:" in *:GNOME:*|*:gnome:*) desktop=true;; esac
-        if [[ "$desktop" == true && -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then desktop=false; fi
-    fi
-    for command in curl tar awk sed mktemp; do require "$command"; done
-    if [[ -n "$source_option" ]]; then
-        source_dir=$(cd -- "$source_option" && pwd -P) || die 'The source checkout does not exist.'
-    fi
-    say "zflow source installer ($platform)"
-    printf 'Source: %s\n' "${source_option:-https://github.com/demfabris/zflow/tree/$ref}"
+    for command in curl tar awk mktemp; do require "$command"; done
+    if ! command -v sha256sum >/dev/null 2>&1; then require shasum; fi
+    if [[ "$version" == latest ]]; then version=$(latest_version); fi
+    case "$version" in v*) ;; *) version="v$version";; esac
+    [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die 'Invalid release version.'
     if [[ "$platform" == Linux ]]; then
-        printf 'Install/update the system service; GNOME integration: %s.\n' "$desktop"
+        require systemctl
+        [[ -n "$(systemctl show --property=Version --value 2>/dev/null)" ]] || die 'Linux installation requires a running systemd system manager.'
+        if [[ "$headless" == false && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            case ":${XDG_CURRENT_DESKTOP:-}:" in *:GNOME:*|*:gnome:*) desktop=true;; esac
+        fi
     else
-        printf 'Build the native app and install/update /Applications/zflow.app.\n'
+        check_macos
     fi
-    if [[ "$skip_dependencies" == false ]]; then printf 'Install missing build/runtime prerequisites and Rust as needed.\n'; fi
+    select_artifact
+    say "zflow binary installer ($version, $platform $architecture)"
+    printf 'Download: %s\n' "$asset"
     printf 'Existing service/app configuration and paired identities are preserved.\n'
     if [[ "$assume_yes" == false ]]; then
         local answer
-        printf 'Continue? [y/N] ' >/dev/tty 2>/dev/null || die 'No terminal is available; pass --yes to accept installation.'
+        printf 'Install zflow and its runtime dependencies? [y/N] ' >/dev/tty 2>/dev/null || die 'No terminal is available; pass --yes to accept installation.'
         IFS= read -r answer </dev/tty || die 'Could not read confirmation.'
         case "$answer" in y|Y|yes|YES) ;; *) say 'Installation cancelled.'; return;; esac
     fi
@@ -276,24 +295,20 @@ main() {
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    if [[ "$platform" == Darwin ]]; then check_macos; fi
-    if [[ -z "$source_option" ]]; then
-        say "Downloading zflow ($ref)…"
-        fetch "https://codeload.github.com/demfabris/zflow/tar.gz/$ref" "$work_dir/source.tar.gz" \
-            || die 'Could not download the source. Check the ref and repository access; for a private checkout, use --source PATH.'
-        mkdir "$work_dir/source"
-        tar -xzf "$work_dir/source.tar.gz" --strip-components=1 -C "$work_dir/source"
-        source_dir="$work_dir/source"
+    base_url="https://github.com/demfabris/zflow/releases/download/$version"
+    fetch "$base_url/SHA256SUMS" "$work_dir/SHA256SUMS" || die "Checksums are unavailable for $version."
+    fetch "$base_url/$asset" "$work_dir/$asset" || die "No downloadable artifact for $platform $architecture in $version."
+    verify_download
+    if [[ "$use_deb" == false ]]; then
+        payload_dir="$work_dir/payload"
+        mkdir "$payload_dir"
+        tar -xzf "$work_dir/$asset" --strip-components=1 -C "$payload_dir"
+        if [[ "$platform" == Linux ]]; then
+            [[ -x "$payload_dir/bin/zflow" && -x "$payload_dir/bin/zflowd" && -f "$payload_dir/scripts/install.sh" ]] \
+                || die 'The release archive is missing the Linux binaries or installer.'
+            "$payload_dir/bin/zflow" --version
+        fi
     fi
-    [[ -f "$source_dir/Cargo.toml" && -f "$source_dir/scripts/install.sh" && -f "$source_dir/scripts/build-macos-app.sh" ]] \
-        || die 'The selected source does not contain the zflow installers.'
-    if [[ "$platform" == Linux ]]; then
-        require systemctl
-        [[ -n "$(systemctl show --property=Version --value 2>/dev/null)" ]] || die 'Linux installation requires a running systemd system manager.'
-        if [[ "$skip_dependencies" == false ]]; then linux_dependencies; fi
-        check_linux
-    fi
-    ensure_rust
     if [[ "$platform" == Linux ]]; then install_linux; else install_macos; fi
     say 'zflow installation finished.'
 }

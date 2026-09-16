@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+#DEBHELPER#
+case "$1" in
+    remove)
+        # Preserve the device selection outside udev's active rules directory.
+        if [ -f /etc/udev/rules.d/71-zflow-capture.rules ] && [ ! -L /etc/udev/rules.d/71-zflow-capture.rules ]; then
+            test -d /etc/udev && test ! -L /etc/udev
+            test ! -L /etc/udev/71-zflow-capture.rules.disabled
+            mv /etc/udev/rules.d/71-zflow-capture.rules /etc/udev/71-zflow-capture.rules.disabled
+        fi
+        ;;
+    purge)
+        rm -f /etc/udev/rules.d/71-zflow-capture.rules /etc/udev/71-zflow-capture.rules.disabled
+        # Preserve identities and the system account even on purge.
+        if [ -d /etc/zflow ] && [ ! -L /etc/zflow ]; then
+            rm -f /etc/zflow/zflow.toml
+            rmdir /etc/zflow 2>/dev/null || true
+        fi
+        ;;
+esac
+case "$1" in
+    remove|purge)
+        if [ -S /run/udev/control ] && command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules
+            udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput || true
+            udevadm trigger --action=change --subsystem-match=input || true
+        fi
+        ;;
+esac

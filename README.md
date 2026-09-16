@@ -15,61 +15,50 @@ Run as your normal user on Linux or macOS:
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash
 ```
 
-The installer builds from source for now. On Linux it installs build tools with
-apt, dnf, or pacman, sets up the system service, and adds the panel indicator and
-native settings when run from a GNOME session. On macOS it builds the native
-app and installs it in `/Applications`. Builds run under your user account;
-system changes request administrator access through GNOME's password dialog
+The installer downloads prebuilt GitHub release artifacts and verifies their
+SHA-256 checksums. It needs no Rust, Swift, Xcode, or C compiler. Linux binaries
+support x86-64 and ARM64 with glibc 2.39+ and systemd 254+. Native Mac apps support
+Intel and Apple Silicon on macOS 26+.
+
+On Ubuntu/Debian, a fresh installation uses the `.deb` package. On other
+supported Linux distributions, or when updating an existing `/usr/local`
+installation, it uses the binary archive. Linux runtime dependencies come from
+apt, dnf, or pacman. GNOME settings need GJS, GTK 4.12+, and libadwaita 1.5+.
+System changes request administrator access through GNOME's password dialog
 when available, or `sudo` in the terminal.
 
-Linux needs systemd 254+; the desktop also needs GNOME 46+, GTK 4.12+, and
-libadwaita 1.5+. macOS needs version 26+, Swift 6.2+, and the macOS 26 SDK.
-If Apple Command Line Tools are missing, finish their graphical installer and
-rerun this command. The script installs Rust when needed.
+On macOS, the installer places `zflow.app` in `/Applications`. Current release
+apps use ad hoc signatures and are not notarized. Input sharing works; the
+optional AWDL helper requires an Apple-issued signing identity and is
+unavailable in these builds.
 
 Repeat the command to update. It keeps your configuration and paired identities;
 updating the Linux service interrupts an active connection. Log out and back in
 after installing or updating the GNOME extension, then enable zflow in GNOME
-Extensions if needed.
+Extensions if needed. Debian packages install the Applications launcher and
+extension for all users; use **Start at Login** in Settings to enable autostart.
 
-Pass options after `bash -s --`, for example `--yes --headless` for a Linux
-service without desktop integration. `--yes` accepts setup, but administrator
-authentication may still be required. Use `--ref TAG_OR_COMMIT` to choose a
-source revision, `--no-launch` to leave the app closed, or `--skip-dependencies`
-to use installed tools. From a checkout, run `./install.sh --source .`.
-See `./install.sh --help` for all options.
+Pass options after `bash -s --`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.1.0 --no-launch
+```
+
+Omit `--version` for the latest release. `--headless` skips GNOME integration;
+`--yes` accepts installation but still requires administrator authentication.
+The script does not fall back to compiling if a release is unavailable.
+
+You can also download a `.deb` from [Releases](https://github.com/demfabris/zflow/releases)
+and install it with `sudo apt install ./zflow_0.1.0_amd64.deb` (use `arm64` on ARM).
+See [packaging/README.md](packaging/README.md) for migration from a source/archive
+installation, package removal, and building releases.
 
 ## Mac → Ubuntu setup
 
-Build on macOS with Rust and Swift 6.2 or newer (Xcode 27 is supported).
-The app requires macOS 26 or newer:
-
-```sh
-./scripts/build-macos-app.sh --sign "Apple Development: YOUR NAME (TEAM)"
-open target/release/zflow.app
-```
-
-Move the bundle to `/Applications` before enrolling permissions or enabling
-Open at login, so its installed path stays stable.
-
-Omit `--sign` for an ad hoc development build. Input sharing can run in that
-build, but the AWDL service requires an Apple-issued signing identity shared
-by the app, client, and daemon. Use `--debug` for a debug bundle.
-
-On Ubuntu, install the service, then install the GNOME integration as your
-normal desktop user:
-
-```sh
-./scripts/install.sh
-zflow desktop-agent --install
-zflow settings
-```
-
-The installer preserves the service configuration and identity. Repeat it
-after updating the code. Log out and back in to load new extension code, then
-enable zflow in GNOME Extensions if needed. The desktop agent
-starts automatically on subsequent GNOME logins. Keep it running during use;
-it supplies cursor placement, desktop dimensions, and return barriers.
+Install zflow on both computers using the command above. Open zflow from
+Applications on GNOME and `/Applications/zflow.app` on macOS. Keep the GNOME
+desktop agent running during use; it supplies cursor placement, desktop
+dimensions, and return barriers.
 
 1. On Ubuntu, open **zflow → Pair Computer… → Wait for Connection**.
 2. Open **Settings…** from the Mac's zflow menu-bar icon. Choose **Pair Computer…**
@@ -151,10 +140,9 @@ permission rules from app bundles. See [Apple's local-network guidance](https://
 
 ## Install and select devices
 
-Run the installer on both Linux machines:
+After installing zflow on both Linux machines:
 
 ```sh
-./scripts/install.sh
 sudo zflow devices
 ```
 
@@ -342,7 +330,8 @@ just test                    # Rust tests
 just test-native             # Swift bridge tests (macOS)
 just test-desktop            # GNOME extension tests (Node.js)
 just test-gtk                # Native GTK controls and D-Bus tests (Linux display)
-just test-install            # Installer and recovery tests (Python 3)
+just test-install            # Binary installer and recovery tests (Python 3)
+just test-package            # Debian lifecycle tests in Docker (build a .deb first)
 just check                   # Formatting, Clippy, Rust, GNOME, installer tests
 ```
 

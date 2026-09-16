@@ -39,42 +39,6 @@ refuse_symlink() {
     [[ ! -L "$1" ]] || die "refusing to replace symlink: $1"
 }
 
-ensure_service_account() {
-    local group_record members passwd_record uid gid shell uid_min nologin
-
-    if group_record="$(getent group "$SERVICE_GROUP")"; then
-        IFS=: read -r _ _ _ members <<<"$group_record"
-        [[ -z "$members" ]] || die "group $SERVICE_GROUP has members; remove them before installing"
-    else
-        groupadd --system "$SERVICE_GROUP"
-    fi
-
-    if passwd_record="$(getent passwd "$SERVICE_USER")"; then
-        IFS=: read -r _ _ uid gid _ _ shell <<<"$passwd_record"
-        uid_min="$(awk '$1 == "UID_MIN" { print $2; exit }' /etc/login.defs)"
-        uid_min="${uid_min:-1000}"
-        [[ "$uid" =~ ^[0-9]+$ && "$uid" -lt "$uid_min" ]] || die "$SERVICE_USER exists but is not a system account"
-        [[ "$gid" == "$(getent group "$SERVICE_GROUP" | cut -d: -f3)" ]] || die "$SERVICE_USER does not use group $SERVICE_GROUP"
-        case "$shell" in
-            */nologin|*/false) ;;
-            *) die "$SERVICE_USER has a login shell: $shell" ;;
-        esac
-        return
-    fi
-
-    nologin="$(command -v nologin || true)"
-    [[ -n "$nologin" ]] || nologin="/usr/sbin/nologin"
-    [[ -x "$nologin" ]] || die "could not find a nologin executable"
-    useradd \
-        --system \
-        --gid "$SERVICE_GROUP" \
-        --home-dir "$STATE_DIR" \
-        --no-create-home \
-        --shell "$nologin" \
-        --comment "zflow input daemon" \
-        "$SERVICE_USER"
-}
-
 build_binaries() {
     local cargo_args=(build --locked --release --manifest-path "$REPO_ROOT/Cargo.toml"
         --target-dir "$REPO_ROOT/target" --bin zflow --bin zflowd)
@@ -86,7 +50,7 @@ for argument in "$@"; do
     case "$argument" in
         --install-built) install_built=true ;;
         -h|--help)
-            printf 'usage: ./scripts/install.sh\n'
+            printf 'usage: ./scripts/install.sh [--install-built]\n'
             exit 0
             ;;
         *) die "usage: ./scripts/install.sh" ;;
@@ -95,8 +59,7 @@ done
 [[ "$(uname -s)" == "Linux" ]] || die "Linux is required"
 
 for source in \
-    "$REPO_ROOT/Cargo.toml" \
-    "$REPO_ROOT/Cargo.lock" \
+    "$REPO_ROOT/packaging/linux/account.sh" \
     "$REPO_ROOT/packaging/config/zflow.toml" \
     "$REPO_ROOT/packaging/modules-load.d/zflow.conf" \
     "$REPO_ROOT/packaging/system-sleep/zflow" \
@@ -106,6 +69,10 @@ for source in \
     "$REPO_ROOT/packaging/udev/71-zflow-capture.rules"; do
     require_regular_source "$source"
 done
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../packaging/linux/account.sh
+source "$REPO_ROOT/packaging/linux/account.sh"
 
 if [[ "$EUID" -ne 0 ]]; then
     [[ "$install_built" == false ]] || die "--install-built requires root"
@@ -124,8 +91,15 @@ for command in awk cut getent grep groupadd install modprobe runuser setfacl sys
     require_command "$command"
 done
 
-[[ -x "$REPO_ROOT/target/release/zflow" ]] || die "cargo did not produce target/release/zflow"
-[[ -x "$REPO_ROOT/target/release/zflowd" ]] || die "cargo did not produce target/release/zflowd"
+binary_dir="$REPO_ROOT/target/release"
+if [[ -d "$REPO_ROOT/bin" ]]; then binary_dir="$REPO_ROOT/bin"; fi
+for binary in zflow zflowd; do
+    require_regular_source "$binary_dir/$binary"
+    [[ -x "$binary_dir/$binary" ]] || die "binary is not executable: $binary"
+done
+if command -v dpkg-query >/dev/null 2>&1 && [[ "$(dpkg-query -W -f='${Status}' zflow 2>/dev/null || true)" == 'install ok installed' ]]; then
+    die 'zflow is managed by dpkg. Install the release .deb instead of an archive/source build.'
+fi
 
 ensure_service_account
 
@@ -144,8 +118,8 @@ install -d -o root -g root -m 0755 \
     "$BIN_DIR" "$UDEV_RULE_DIR" /etc/modules-load.d /usr/lib/systemd/system-sleep \
     "$PRELOGIN_DROPIN_DIR"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$CONFIG_DIR" "$STATE_DIR"
-install -o root -g root -m 0755 "$REPO_ROOT/target/release/zflow" "$BIN_DIR/zflow"
-install -o root -g root -m 0755 "$REPO_ROOT/target/release/zflowd" "$BIN_DIR/zflowd"
+install -o root -g root -m 0755 "$binary_dir/zflow" "$BIN_DIR/zflow"
+install -o root -g root -m 0755 "$binary_dir/zflowd" "$BIN_DIR/zflowd"
 # Retire the old desktop launcher when upgrading an existing installation.
 rm -f -- "$BIN_DIR/zflow-gui" /usr/local/share/applications/io.zflow.zflow.desktop
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/systemd/zflowd.service" "$UNIT_FILE"
