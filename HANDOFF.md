@@ -2,18 +2,15 @@
 
 Date: 2026-09-01
 
-This is a historical handoff, not the current task list. As of 2026-09-14,
-the Mac source includes cursor isolation and leased AWDL suppression, with
-normal-exit, crash, and freeze results in TESTPLAN.md. A disabled event tap now
-ends forwarding and restores local input instead of reenabling the tap. The
-optional eguicn GUI now includes pairing and explicit Mac-to-GNOME edge sharing
-using the saved layout and a GNOME desktop extension. Opening the window and
-saving settings do not start capture. Linux device enrollment and revocation
-remain CLI operations. The new handoff workflow has automated coverage but
-still needs live two-computer qualification. Consult
-README.md and TESTPLAN.md for current commands and remaining qualification.
-The push instructions and excluded features below describe the September 1
-work only; they do not authorize actions in a later session.
+This is a historical handoff, not the current task list. As of September 16,
+macOS uses a native SwiftUI menu-bar app backed by the Rust core. Linux uses
+`zflow desktop-agent` for GNOME handoff and desktop announcements. The settings
+window exposes pairing, layout, AWDL, and readiness actions; advanced settings
+stay in TOML. The older GUI was removed. Earlier live measurements describe
+their recorded builds and do not qualify the new interface or XPC helper.
+See README.md and TESTPLAN.md for current commands and qualification work.
+The push instructions and excluded features below apply to September 1 only;
+they do not authorize actions in a later session.
 
 You are the Codex session on fabrico's MacBook Pro. Build and test the first
 Mac-to-Linux zflow path. Push each finished checkpoint to `origin/main` so the

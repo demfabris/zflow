@@ -141,6 +141,7 @@ static ZFlowMacRect g_entry_region;
 static bool g_forwarded_keys[128];
 static bool g_forwarded_buttons[33];
 static _Atomic bool g_stop;
+static _Atomic bool g_pause_requested;
 static _Atomic bool g_raw_contact_active;
 static int g_capture_status;
 static char g_error[256] = "no diagnostic";
@@ -437,6 +438,7 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
           (flags & kCGEventFlagMaskControl) &&
           (flags & kCGEventFlagMaskCommand)) {
         captured.kind = ZFLOW_EVENT_ESCAPE;
+        atomic_store(&g_pause_requested, true);
         enqueue(&captured);
         atomic_store(&g_stop, true);
         stop_capture_run_loop();
@@ -651,6 +653,7 @@ int zflow_mac_capture_start(int raw_touch, const ZFlowMacRect *entry) {
   }
   clear_capture_queue();
   atomic_store(&g_stop, false);
+  atomic_store(&g_pause_requested, false);
   atomic_store(&g_raw_contact_active, false);
   g_capture_status = 0;
   set_error("no diagnostic");
@@ -695,6 +698,10 @@ int zflow_mac_capture_poll(ZFlowMacEvent *event) {
 
 int zflow_mac_capture_stop_requested(void) {
   return atomic_load(&g_stop) ? 1 : 0;
+}
+
+int zflow_mac_capture_pause_requested(void) {
+  return atomic_load(&g_pause_requested) ? 1 : 0;
 }
 
 int zflow_mac_capture_stop_at(const ZFlowMacPosition *position) {

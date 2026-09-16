@@ -15,30 +15,19 @@ code on `main` at `57fba3c`.
 | Return polls while on Ubuntu | 1288 in 51 s, about 25/s, 21 ms each |
 | Barrier hit to edge sharing rearmed | about 130 ms |
 
-## Working state right now
+## Current status, September 16
 
-- Finding 3 remains staged; Finding 1 is now complete, reviewed and staged.
-- Finding 1 gates: Mac 202 tests passed, one ignored; Ubuntu review checkout
-  249 tests passed, two ignored. Formatting, Clippy, Node and diff checks passed.
-- Finding 2 Step A is complete, reviewed and staged. Mac: 204 passed, one
-  ignored; Ubuntu: 251 passed, two ignored; all other gates passed.
-- Finding 4 is complete, reviewed and staged. Mac: 205 passed, one ignored;
-  Ubuntu: 251 passed, two ignored. Native C tests and all other gates passed.
-  Stop during Prepare now drains its bounded reply before Finish.
-- Finding 5 AWDL overlap is complete, reviewed and staged. Final Mac: 205
-  passed, one ignored; Ubuntu: 251 passed, two ignored. All gates and builds
-  passed, including native cursor and AWDL guardian/pipe tests.
-- Next: install/run matching builds and complete the live checklist now in
-  TESTPLAN.md, including Finding 6 minimized-window/other-Space crossings.
-  No live input tests ran in this continuation; running apps/service are still
-  the earlier builds. Finding 2 Step B remains conditional on live measurements.
-- Finding 5: the daemon rejects duplicate same-peer connections before and after
-  negotiation (`src/daemon.rs`, `accept_connection`). Keep drain before rearming.
-  The 17:32 Mac log confirms AWDL was on for crossings 7–9 and accounts for
-  the 15 ms acquire / 25 ms release gaps. Overlap those helper calls only.
-- Nothing is committed. Keep this file until live qualification is complete.
+The recorded latency fixes preceded the native interface migration. macOS now
+uses SwiftUI with a dedicated Rust application worker; Linux uses the headless
+desktop agent. Live two-computer qualification and Finding 2 Step B remain
+outstanding. The measured table above and findings below refer to the reviewed
+September 14 revision. Source paths under `src/gui/` in those notes have moved
+to `src/app/`. Current build and test commands are in README.md and TESTPLAN.md.
 
-## How each step runs
+## Historical September 14 execution procedure
+
+The following staging, commit, and remote-checkout instructions record that
+session's procedure and do not authorize those actions in a later task.
 
 1. One finding at a time. Write a self-contained task (Codex cannot see the
    chat): files, contract, what must not change, gates as exact commands.
@@ -186,15 +175,14 @@ quick back-and-forth across the edge within 150 ms starts a new crossing.
 
 ## Finding 6: verify the edge watcher survives a hidden window (live check pending)
 
-Crossing detection runs inside `Sharing::show` during egui repaints every
-12 ms. Manual check: enable sharing, minimize the window (and separately
-move it to another Space), cross. If crossings stop, move the 12 ms cursor
-poll to a dedicated thread that sends crossing events to the GUI over a
-channel; the GUI keeps owning the `Running` state.
+Crossing detection now runs every 12 ms on the Rust application worker,
+independently of SwiftUI rendering. Verify with Settings closed, minimized, and
+on another Space. Input capture, return, and cleanup must work in every case.
 
 ## Live qualification after 1 to 5
 
-Run `just debug mac`, `just debug linux` and `just debug-daemon`. Cross five
+Run the native app with `just debug mac`, the Linux desktop agent with
+`just debug linux`, and daemon diagnostics with `just debug-daemon`. Cross five
 times each way, escape twice, click once during a connect, and overshoot
 once. Check:
 

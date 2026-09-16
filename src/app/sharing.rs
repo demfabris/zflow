@@ -1,11 +1,10 @@
 use std::{
     path::{Path, PathBuf},
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
-use eguicn::{Button, ButtonVariant, Card, egui};
 use tokio::sync::{mpsc, watch};
 use tracing::Instrument;
 
@@ -16,9 +15,8 @@ use crate::{
 };
 
 use super::{
-    background::Background,
     handoff::{self, Handoff},
-    layout_model::{Layout, LayoutDocument},
+    layout_model::Layout,
 };
 
 struct Running {
@@ -35,118 +33,16 @@ struct Running {
     started: Instant,
 }
 
-#[derive(Default)]
-pub(super) struct Sharing {
-    worker: Option<Background>,
-    notices: Option<watch::Receiver<String>>,
-    notice: String,
-    reduce_wifi_latency: bool,
-}
-
-impl Sharing {
-    pub fn is_active(&self) -> bool {
-        self.worker
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-    }
-
-    pub fn stop(&mut self) {
-        if let Some(worker) = &self.worker {
-            worker.stop();
-            self.notice = "Returning input to the Mac…".into();
-        }
-    }
-
-    fn refresh(&mut self) {
-        let finished = self.worker.as_ref().is_some_and(Background::is_finished);
-        let panicked = finished && self.worker.take().unwrap().join().is_err();
-        if let Some(notices) = &self.notices {
-            self.notice = notices.borrow().clone();
-        } else if self.notice.is_empty() {
-            self.notice = "Sharing is off.".into();
-        }
-        if finished {
-            self.notices = None;
-        }
-        if panicked {
-            self.notice = "The sharing observer stopped unexpectedly. Sharing is off.".into();
-        }
-    }
-
-    pub fn show(&mut self, ui: &mut egui::Ui, path: &Path, config: &Config, editable: bool) {
-        self.refresh();
-        Card::new().padding(16).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            Card::header(ui, "Share from this Mac", &self.notice);
-            if config.peers.is_empty() {
-                ui.label("Pair a computer below, then arrange your displays in Layout.");
-                return;
-            }
-            if self.is_active() {
-                if ui.add(Button::new("Stop sharing").variant(ButtonVariant::Destructive)).clicked() { self.stop(); }
-                ui.label("Ctrl+Cmd+Backspace returns input and turns sharing off.");
-            } else {
-                let permitted = macos::accessibility_authorized(false);
-                if !permitted {
-                    ui.label("Allow zflow in System Settings → Privacy & Security → Accessibility, then return here.");
-                    if ui.add(Button::new("Request Accessibility access").variant(ButtonVariant::Outline)).clicked() {
-                        macos::accessibility_authorized(true);
-                    }
-                }
-                ui.add(eguicn::Switch::new(&mut self.reduce_wifi_latency, "Reduce Wi-Fi latency"));
-                if self.reduce_wifi_latency {
-                    ui.label("Requires the installed AWDL helper. AirDrop and Continuity may pause during sharing.");
-                }
-                if ui.add_enabled(permitted && editable && !config.peers.is_empty(), Button::new("Enable edge sharing")).clicked()
-                    && let Err(error) = self.enable(path, config, ui.ctx()) { self.notice = format!("{error:#}"); }
-                ui.label("On Ubuntu, enable desktop handoff. Save the computer layout here, then enable sharing. Keep both apps open.");
-                if !editable { ui.label("Save your changes and finish pairing before enabling sharing."); }
-            }
-        });
-    }
-
-    fn enable(&mut self, path: &Path, config: &Config, ctx: &egui::Context) -> Result<()> {
-        let mut observer = Observer {
-            reduce_wifi_latency: self.reduce_wifi_latency,
-            ..Default::default()
-        };
-        observer.enable(path, config)?;
-        let (notices, updates) = watch::channel(observer.notice.clone());
-        let ctx = ctx.clone();
-        let worker =
-            Background::spawn("zflow-edges", Duration::from_millis(12), move |stopping| {
-                if stopping && observer.enabled {
-                    observer.stop();
-                }
-                observer.tick();
-                let active = observer.is_active();
-                if notices.send_if_modified(|notice| {
-                    if *notice == observer.notice {
-                        return false;
-                    }
-                    notice.clone_from(&observer.notice);
-                    true
-                }) || !active
-                {
-                    ctx.request_repaint();
-                }
-                active
-            })?;
-        self.worker = Some(worker);
-        self.notices = Some(updates);
-        self.refresh();
-        Ok(())
-    }
-}
-
-struct Observer {
+pub(super) struct Observer {
     enabled: bool,
     layout: Option<Layout>,
     path: PathBuf,
+    config: Option<Config>,
     running: Option<Running>,
     previous: Option<Point>,
-    notice: String,
-    reduce_wifi_latency: bool,
+    pub notice: String,
+    pub reduce_wifi_latency: bool,
+    pub pause_requested: bool,
 }
 
 impl Default for Observer {
@@ -155,24 +51,34 @@ impl Default for Observer {
             enabled: false,
             layout: None,
             path: PathBuf::new(),
+            config: None,
             running: None,
             previous: None,
             notice: "Sharing is off.".into(),
             reduce_wifi_latency: false,
+            pause_requested: false,
         }
     }
 }
 
 impl Observer {
-    fn is_active(&self) -> bool {
+    pub fn has_session(&self) -> bool {
+        self.running.is_some()
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn is_active(&self) -> bool {
         self.enabled || self.running.is_some()
     }
 
-    fn stop(&mut self) {
+    pub fn stop(&mut self) {
         self.enabled = false;
         self.previous = None;
         if let Some(running) = &self.running {
-            tracing::info!(parent: &running.span, "stop requested by window or user");
+            tracing::info!(parent: &running.span, "sharing stop requested");
             let _ = running.stop.send(true);
             self.notice = "Returning input to the Mac…".into();
         } else {
@@ -180,17 +86,12 @@ impl Observer {
         }
     }
 
-    fn enable(&mut self, path: &Path, config: &Config) -> Result<()> {
-        let document = LayoutDocument::open(path)?;
-        anyhow::ensure!(
-            !document.is_new(),
-            "Save the computer layout before enabling sharing"
-        );
+    pub fn enable(&mut self, path: &Path, config: &Config, layout: &Layout) -> Result<()> {
         let geometry = local_geometry()?;
-        handoff::validate(&document.draft, &geometry)?;
-        for transition in document.draft.transitions() {
-            if document.draft.monitors[transition.source].peer.is_none() {
-                let name = document.draft.monitors[transition.target]
+        handoff::validate(layout, &geometry)?;
+        for transition in layout.transitions() {
+            if layout.monitors[transition.source].peer.is_none() {
+                let name = layout.monitors[transition.target]
                     .peer
                     .as_ref()
                     .context("Missing target computer")?;
@@ -204,16 +105,18 @@ impl Observer {
                 );
             }
         }
-        self.layout = Some(document.draft);
+        self.layout = Some(layout.clone());
         self.path = path.into();
+        self.config = Some(config.clone());
         self.previous = None;
         self.enabled = true;
+        self.pause_requested = false;
         tracing::info!("edge sharing enabled");
         self.notice = "Ready on the Mac. Move through a configured edge to connect.".into();
         Ok(())
     }
 
-    fn tick(&mut self) {
+    pub fn tick(&mut self) {
         if let Some(running) = &mut self.running {
             while let Ok(status) = running.events.try_recv() {
                 match status {
@@ -239,6 +142,10 @@ impl Observer {
                             self.notice = format!("Crossing cancelled: {reason}");
                         }
                     }
+                    SourceStatus::PauseRequested => {
+                        self.pause_requested = true;
+                        self.enabled = false;
+                    }
                     SourceStatus::Failed(error) => {
                         tracing::warn!(parent: &running.span, %error, "edge observer received crossing failure");
                         running.failed = true;
@@ -254,7 +161,7 @@ impl Observer {
                 self.enabled = false;
                 running.failed = true;
                 self.notice =
-                    "The Mac displays changed. Sharing stopped; refresh and save the layout."
+                    "The Mac displays changed. Checking the new layout before sharing resumes."
                         .into();
             }
             if !running.capturing
@@ -287,6 +194,10 @@ impl Observer {
                                 self.notice = format!("Crossing cancelled: {reason}");
                             }
                         }
+                        SourceStatus::PauseRequested => {
+                            self.pause_requested = true;
+                            self.enabled = false;
+                        }
                         SourceStatus::Failed(error) => {
                             running.failed = true;
                             self.notice = error;
@@ -310,6 +221,7 @@ impl Observer {
                     );
                     self.notice = "Back on the Mac. Edge sharing is ready.".into();
                 } else {
+                    self.pause_requested |= self.enabled;
                     self.enabled = false;
                     self.notice = "Sharing is off. Input is on the Mac.".into();
                 }
@@ -364,6 +276,7 @@ impl Observer {
         tracing::debug!(parent: &span, ?entry_region, "capture admission region");
         let options = SourceOptions {
             config_path: self.path.clone(),
+            config: self.config.clone(),
             peer: handoff.peer.clone(),
             address: None,
             raw_touch: true,
@@ -432,7 +345,7 @@ impl Drop for Observer {
     }
 }
 
-fn local_geometry() -> Result<Geometry> {
+pub(super) fn local_geometry() -> Result<Geometry> {
     let geometry = Geometry {
         monitors: macos::active_desktop_rectangles()?
             .into_iter()

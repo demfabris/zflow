@@ -24,6 +24,7 @@ pub struct Config {
     pub transport: TransportConfig,
     pub playout: PlayoutConfig,
     pub peers: BTreeMap<String, PeerConfig>,
+    pub macos: MacosConfig,
 }
 
 impl Default for Config {
@@ -35,6 +36,23 @@ impl Default for Config {
             transport: TransportConfig::default(),
             playout: PlayoutConfig::default(),
             peers: BTreeMap::new(),
+            macos: MacosConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MacosConfig {
+    pub sharing: bool,
+    pub block_awdl: bool,
+}
+
+impl Default for MacosConfig {
+    fn default() -> Self {
+        Self {
+            sharing: true,
+            block_awdl: false,
         }
     }
 }

@@ -42,14 +42,17 @@ if [[ "$explicit_sign" == true ]]; then
 fi
 
 cargo_args=(build --locked --manifest-path "$REPO_ROOT/Cargo.toml"
-    --target-dir "$REPO_ROOT/target" --features gui --bin zflow-gui)
+    --target-dir "$REPO_ROOT/target" --lib)
 if [[ "$profile" == release ]]; then
     cargo_args+=(--release)
 fi
-cargo "${cargo_args[@]}"
+MACOSX_DEPLOYMENT_TARGET=26.0 cargo "${cargo_args[@]}"
 
 readonly output_dir="$REPO_ROOT/target/$profile"
-readonly binary="$output_dir/zflow-gui"
+swift_profile="$profile"
+ZFLOW_RUST_LIB_DIR="$output_dir" swift build --package-path "$REPO_ROOT/macos" --configuration "$swift_profile"
+swift_output="$(ZFLOW_RUST_LIB_DIR="$output_dir" swift build --package-path "$REPO_ROOT/macos" --configuration "$swift_profile" --show-bin-path)"
+readonly binary="$swift_output/zflow-app"
 readonly bundle="$output_dir/zflow.app"
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || die "missing native executable: $binary"
 [[ ! -L "$bundle" ]] || die "refusing to replace a symlink: $bundle"
@@ -58,17 +61,21 @@ readonly bundle="$output_dir/zflow.app"
 temporary_dir="$(mktemp -d "$output_dir/.zflow-app.XXXXXXXX")"
 trap 'rm -rf -- "$temporary_dir"' EXIT
 app="$temporary_dir/zflow.app"
-install -d -m 0755 "$app/Contents/MacOS"
-install -m 0755 "$binary" "$app/Contents/MacOS/zflow-gui"
+install -d -m 0755 "$app/Contents/MacOS" "$app/Contents/Library/LaunchDaemons"
+install -m 0755 "$binary" "$app/Contents/MacOS/zflow-app"
+install -m 0755 "$swift_output/zflow-awdl-client" "$app/Contents/MacOS/zflow-awdl-client"
+install -m 0755 "$swift_output/zflow-awdl-daemon" "$app/Contents/MacOS/zflow-awdl-daemon"
+install -m 0644 "$REPO_ROOT/packaging/macOS/io.zflow.awdl.plist" "$app/Contents/Library/LaunchDaemons/io.zflow.awdl.plist"
 install -m 0644 "$REPO_ROOT/packaging/macOS/Info.plist" "$app/Contents/Info.plist"
-version="$("$binary" --version)"
-version="${version##* }"
+version="$(cargo metadata --no-deps --format-version 1 --manifest-path "$REPO_ROOT/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 if command -v codesign >/dev/null 2>&1; then
-    codesign --force --sign "$sign_identity" "$app"
-    codesign --verify --strict "$app"
+    codesign --force --options runtime --identifier io.zflow.awdl-client --sign "$sign_identity" "$app/Contents/MacOS/zflow-awdl-client"
+    codesign --force --options runtime --identifier io.zflow.awdl-daemon --sign "$sign_identity" "$app/Contents/MacOS/zflow-awdl-daemon"
+    codesign --force --options runtime --sign "$sign_identity" "$app"
+    codesign --verify --strict --deep "$app"
 fi
 
 rm -rf -- "$bundle"

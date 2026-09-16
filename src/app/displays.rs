@@ -4,12 +4,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use eguicn::egui;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::{config::Config, discovery::local_unicast_addresses};
+#[cfg(any(target_os = "macos", test))]
+use crate::config::Config;
+use crate::discovery::local_unicast_addresses;
 
 mod desktop;
 pub(super) use desktop::DesktopDetector;
@@ -31,7 +32,9 @@ impl Desktop {
 
 #[derive(Clone)]
 struct Report {
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     addresses: Vec<IpAddr>,
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     desktop: Desktop,
 }
 
@@ -49,7 +52,7 @@ pub(super) struct DisplayDiscovery {
 }
 
 impl DisplayDiscovery {
-    pub fn update(&mut self, ctx: &egui::Context, local: Option<Desktop>, enabled: bool) {
+    pub fn update(&mut self, local: Option<Desktop>, enabled: bool) {
         let local = local.filter(Desktop::valid);
         let should_run = enabled && local.is_some();
         if self.local == local && self.stop.is_some() == should_run {
@@ -64,8 +67,7 @@ impl DisplayDiscovery {
         let (sender, receiver) = oneshot::channel();
         self.stop = Some(sender);
         let state = self.state.clone();
-        let ctx = ctx.clone();
-        let worker_ctx = ctx.clone();
+
         if let Err(error) = std::thread::Builder::new()
             .name("zflow-displays".into())
             .spawn(move || {
@@ -73,19 +75,17 @@ impl DisplayDiscovery {
                     tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?
-                        .block_on(browse(state.clone(), worker_ctx.clone(), local, receiver))
+                        .block_on(browse(state.clone(), local, receiver))
                 })();
                 if let Err(error) = result {
                     let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
                     state.reports.clear();
                     state.error = Some(format!("{error:#}"));
-                    worker_ctx.request_repaint();
                 }
             })
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.error = Some(format!("Could not start desktop discovery: {error}"));
-            ctx.request_repaint();
         }
     }
 
@@ -96,6 +96,7 @@ impl DisplayDiscovery {
         self.state = Arc::new(Mutex::new(State::default()));
     }
 
+    #[cfg(target_os = "macos")]
     pub fn remote(&self, config: &Config) -> BTreeMap<String, Desktop> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match_reports(&state.reports, config)
@@ -116,6 +117,7 @@ impl Drop for DisplayDiscovery {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn match_reports(reports: &BTreeMap<String, Report>, config: &Config) -> BTreeMap<String, Desktop> {
     let mut matches = BTreeMap::new();
     for (name, peer) in &config.peers {
@@ -138,6 +140,7 @@ fn match_reports(reports: &BTreeMap<String, Report>, config: &Config) -> BTreeMa
     matches
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn has_peer_address(report: &Report, peer: &crate::config::PeerConfig) -> bool {
     peer.addresses.iter().any(|address| {
         report
@@ -177,7 +180,6 @@ fn parse_report(service: &mdns_sd::ResolvedService) -> Option<Report> {
 
 async fn browse(
     state: Arc<Mutex<State>>,
-    ctx: egui::Context,
     local: Desktop,
     mut stop: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
@@ -219,7 +221,7 @@ async fn browse(
                         ServiceEvent::ServiceRemoved(_, name) => { state.reports.remove(&name); }
                         _ => {}
                     }
-                    ctx.request_repaint();
+
                 }
             }
         }

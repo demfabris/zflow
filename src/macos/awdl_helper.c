@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <errno.h>
@@ -29,7 +30,7 @@ typedef struct {
 } Guardian;
 
 enum Reply { NO_REPLY, ACTIVE_REPLY, HELD_REPLY, RELEASED_REPLY, FAILED_REPLY };
-static volatile sig_atomic_t stopped;
+static atomic_bool stopped;
 
 static uint64_t milliseconds(void) {
   struct timespec value;
@@ -37,7 +38,8 @@ static uint64_t milliseconds(void) {
   return (uint64_t)value.tv_sec * 1000 + (uint64_t)value.tv_nsec / 1000000;
 }
 
-static int run_guardian(Backend backend, int route_fd);
+static int run_guardian_fds(Backend backend, int route_fd, int input_fd, int output_fd);
+
 
 static int restore(Guardian *guardian) {
   if (!guardian->restore_needed) return 0;
@@ -105,7 +107,7 @@ failed:
 #include <sys/stat.h>
 
 typedef struct { int control_fd; int lock_fd; } Native;
-static void stop_signal(int number) { (void)number; stopped = 1; }
+
 
 static int native_lock(void *context) {
   Native *native = context;
@@ -149,47 +151,28 @@ static void diagnostic(const char *message) {
     (void)write(STDERR_FILENO, message, strlen(message));
 }
 
-static int reply(const char *message) {
+static int reply(int output_fd, const char *message) {
   size_t length = strlen(message);
-  return write(STDOUT_FILENO, message, length) == (ssize_t)length ? 0 : -1;
+  return write(output_fd, message, length) == (ssize_t)length ? 0 : -1;
 }
 
 #ifndef ZFLOW_AWDL_HELPER_TEST
-static int close_inherited(void) {
-  DIR *directory = opendir("/dev/fd");
-  if (!directory) return -1;
-  struct dirent *entry;
-  while ((entry = readdir(directory)) != NULL) {
-    char *end;
-    long fd = strtol(entry->d_name, &end, 10);
-    if (*end == '\0' && fd > 2 && fd <= INT32_MAX && fd != dirfd(directory))
-      close((int)fd);
-  }
-  return closedir(directory);
+void zflow_awdl_stop(void) { atomic_store(&stopped, true); }
+
+int zflow_awdl_check(void) {
+  if (geteuid() != 0 || atomic_load(&stopped)) return -1;
+  Native native = {.control_fd = socket(AF_INET, SOCK_DGRAM, 0), .lock_fd = -1};
+  if (native.control_fd < 0) return -1;
+  bool up;
+  int result = native_get(&native, &up);
+  close(native.control_fd);
+  return result;
 }
 
-int main(int argc, char **argv) {
-  (void)argv;
-  if (argc != 1 || geteuid() != 0) {
-    diagnostic("zflow AWDL helper: requires an administrator-installed helper; no arguments accepted\n");
-    return 1;
-  }
-  struct stat input, output;
-  if (fstat(STDIN_FILENO, &input) != 0 || !S_ISFIFO(input.st_mode) ||
-      fstat(STDOUT_FILENO, &output) != 0 || !S_ISFIFO(output.st_mode)) return 1;
-  if (close_inherited() != 0) return 1;
-  umask(077);
-  if (setgroups(0, NULL) != 0 || setgid(getgid()) != 0) return 1;
-  if (fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) != 0 ||
-      fcntl(STDOUT_FILENO, F_SETFL, O_NONBLOCK) != 0) return 1;
-  struct sigaction action = {0};
-  action.sa_handler = stop_signal;
-  sigemptyset(&action.sa_mask);
-  if (sigaction(SIGTERM, &action, NULL) != 0 ||
-      sigaction(SIGINT, &action, NULL) != 0 ||
-      sigaction(SIGHUP, &action, NULL) != 0) return 1;
-  action.sa_handler = SIG_IGN;
-  if (sigaction(SIGPIPE, &action, NULL) != 0) return 1;
+int zflow_awdl_run(int input_fd, int output_fd) {
+  if (geteuid() != 0 || atomic_load(&stopped)) return 1;
+  if (fcntl(input_fd, F_SETFL, O_NONBLOCK) != 0 ||
+      fcntl(output_fd, F_SETFL, O_NONBLOCK) != 0) return 1;
   Native native = {.control_fd = socket(AF_INET, SOCK_DGRAM, 0), .lock_fd = -1};
   if (native.control_fd < 0) return 1;
   int route_fd = socket(AF_ROUTE, SOCK_RAW, 0);
@@ -197,8 +180,8 @@ int main(int argc, char **argv) {
     close(route_fd);
     route_fd = -1;
   }
-  int status = run_guardian((Backend){&native, native_lock, native_get, native_set},
-                            route_fd);
+  int status = run_guardian_fds((Backend){&native, native_lock, native_get, native_set},
+                            route_fd, input_fd, output_fd);
   if (route_fd >= 0) close(route_fd);
   close(native.control_fd);
   if (native.lock_fd >= 0) close(native.lock_fd);
@@ -206,24 +189,24 @@ int main(int argc, char **argv) {
 }
 #endif
 
-static int run_guardian(Backend backend, int route_fd) {
+static int run_guardian_fds(Backend backend, int route_fd, int input_fd, int output_fd) {
   uint64_t now = milliseconds();
   if (now == UINT64_MAX) return 1;
   Guardian guardian = guardian_new(backend, now);
   uint64_t route_resume = 0;
-  int status = reply("READY\n") == 0 ? 0 : 1;
+  int status = reply(output_fd, "READY\n") == 0 ? 0 : 1;
   while (status == 0 && !guardian.done) {
-    struct pollfd fds[2] = {{.fd = STDIN_FILENO, .events = POLLIN},
+    struct pollfd fds[2] = {{.fd = input_fd, .events = POLLIN},
                            {.fd = now >= route_resume ? route_fd : -1,
                             .events = POLLIN}};
     uint64_t remaining = guardian.deadline > now ? guardian.deadline - now : 0;
     int wait_ms = remaining < CHECK_MS ? (int)remaining : CHECK_MS;
     int count = poll(fds, 2, wait_ms);
     int command = 0;
-    if (stopped || (count < 0 && errno != EINTR)) command = -1;
+    if (atomic_load(&stopped) || (count < 0 && errno != EINTR)) command = -1;
     if (command == 0 && (fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
       unsigned char byte;
-      ssize_t received = read(STDIN_FILENO, &byte, 1);
+      ssize_t received = read(input_fd, &byte, 1);
       if (received == 1) command = byte == 0 ? -1 : byte;
       else if (received == 0 || (errno != EINTR && errno != EAGAIN)) command = -1;
     }
@@ -236,9 +219,9 @@ static int run_guardian(Backend backend, int route_fd) {
     now = milliseconds();
     if (now == UINT64_MAX) command = -1;
     enum Reply response = guardian_step(&guardian, command, now);
-    if (response == ACTIVE_REPLY && reply("ACTIVE\n") != 0) status = 1;
-    if (response == HELD_REPLY && reply("HELD\n") != 0) status = 1;
-    if (response == RELEASED_REPLY && reply("RELEASED\n") != 0) status = 1;
+    if (response == ACTIVE_REPLY && reply(output_fd, "ACTIVE\n") != 0) status = 1;
+    if (response == HELD_REPLY && reply(output_fd, "HELD\n") != 0) status = 1;
+    if (response == RELEASED_REPLY && reply(output_fd, "RELEASED\n") != 0) status = 1;
     if (response == FAILED_REPLY) status = 1;
   }
   for (int attempt = 0; guardian.restore_needed && attempt < 3; attempt++) {

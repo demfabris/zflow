@@ -9,7 +9,6 @@ pub struct ConfigDocument {
     pub draft: Config,
     saved: Config,
     disk_contents: Option<Vec<u8>>,
-    read_only: bool,
 }
 
 impl ConfigDocument {
@@ -31,18 +30,7 @@ impl ConfigDocument {
             saved: draft.clone(),
             draft,
             disk_contents,
-            read_only: false,
         })
-    }
-
-    pub fn service_snapshot(path: PathBuf, config: Config) -> Self {
-        Self {
-            path,
-            draft: config.clone(),
-            saved: config,
-            disk_contents: None,
-            read_only: true,
-        }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -54,7 +42,7 @@ impl ConfigDocument {
     }
 
     pub fn is_new(&self) -> bool {
-        !self.read_only && self.disk_contents.is_none()
+        self.disk_contents.is_none()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -66,30 +54,88 @@ impl ConfigDocument {
     }
 
     pub fn save(&mut self) -> Result<()> {
-        if self.read_only {
-            bail!("Service settings are read-only in this window");
-        }
         self.validate()?;
-        let next_contents = toml::to_string_pretty(&self.draft)?.into_bytes();
+        let next = toml::to_string_pretty(&self.draft)?;
+        let next_contents = if let Some(bytes) = &self.disk_contents {
+            let mut document = std::str::from_utf8(bytes)?.parse::<toml_edit::DocumentMut>()?;
+            let before = toml::to_string_pretty(&self.saved)?.parse::<toml_edit::DocumentMut>()?;
+            let after = next.parse::<toml_edit::DocumentMut>()?;
+            merge_changes(document.as_table_mut(), before.as_table(), after.as_table());
+            document.to_string()
+        } else {
+            next
+        };
         if read_contents(&self.path)? != self.disk_contents {
             bail!(
                 "{} changed on disk. Reload it before saving; keep a copy of your edits first.",
                 self.path.display()
             );
         }
-        self.draft.save(&self.path)?;
-        self.disk_contents = Some(next_contents);
+        crate::config::save_text(&self.path, &next_contents)?;
+        self.disk_contents = Some(next_contents.into_bytes());
         self.saved = self.draft.clone();
         Ok(())
     }
 
     pub fn reload(&mut self) -> Result<()> {
-        if self.read_only {
-            bail!("Refresh service settings through the desktop API");
-        }
         let replacement = Self::open(self.path.clone())?;
         *self = replacement;
         Ok(())
+    }
+}
+
+// Compare complete configurations, but patch only changed fields into the user's document.
+fn merge_changes(
+    target: &mut dyn toml_edit::TableLike,
+    before: &toml_edit::Table,
+    after: &toml_edit::Table,
+) {
+    for (key, _) in before {
+        if !after.contains_key(key) {
+            target.remove(key);
+        }
+    }
+    for (key, value) in after {
+        if before
+            .get(key)
+            .is_some_and(|previous| items_equal(previous, value))
+        {
+            continue;
+        }
+        if let (Some(previous), Some(next)) =
+            (before.get(key).and_then(|v| v.as_table()), value.as_table())
+        {
+            if !target.contains_key(key) {
+                target.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+            }
+            if let Some(table) = target.get_mut(key).and_then(|v| v.as_table_like_mut()) {
+                merge_changes(table, previous, next);
+                continue;
+            }
+        }
+        let mut replacement = value.clone();
+        if let (Some(old), Some(new)) = (
+            target.get(key).and_then(|v| v.as_value()),
+            replacement.as_value_mut(),
+        ) {
+            *new.decor_mut() = old.decor().clone();
+        }
+        target.insert(key, replacement);
+    }
+}
+
+fn items_equal(left: &toml_edit::Item, right: &toml_edit::Item) -> bool {
+    match (left.as_table(), right.as_table()) {
+        (Some(left), Some(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| items_equal(value, other))
+                })
+        }
+        (None, None) => left.to_string() == right.to_string(),
+        _ => false,
     }
 }
 
@@ -117,15 +163,34 @@ mod tests {
     use crate::config::{DeviceSelector, PeerConfig, PeerPermissions};
 
     #[test]
-    fn service_snapshot_cannot_write_or_read_a_config_file() {
+    fn gui_changes_preserve_inline_table_comments() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("private.toml");
-        let mut document = ConfigDocument::service_snapshot(path.clone(), Config::default());
-        document.draft.transport.discovery = false;
-        assert!(document.save().is_err());
-        assert!(document.reload().is_err());
-        assert!(!path.exists());
-        assert!(!document.is_new());
+        let path = directory.path().join("zflow.toml");
+        let original = "macos = { sharing = true, block_awdl = false } # radio\n";
+        fs::write(&path, original).unwrap();
+        let mut document = ConfigDocument::open(path.clone()).unwrap();
+        document.draft.macos.block_awdl = true;
+        document.save().unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original.replace("block_awdl = false", "block_awdl = true")
+        );
+    }
+
+    #[test]
+    fn gui_changes_preserve_comments_and_unrelated_toml() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let original = "# My desk\nversion = 1\n\n[transport] # network\ncheckpoint_ms = 25 # keep this\n\n[macos]\nblock_awdl = false # radio\n";
+        fs::write(&path, original).unwrap();
+        let mut document = ConfigDocument::open(path.clone()).unwrap();
+        document.draft.macos.block_awdl = true;
+        document.save().unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original.replace("block_awdl = false", "block_awdl = true")
+        );
+        assert!(Config::load(&path).unwrap().macos.block_awdl);
     }
 
     #[test]

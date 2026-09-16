@@ -31,21 +31,18 @@ pub(super) fn validate(layout: &Layout, geometry: &Geometry) -> Result<()> {
         .iter()
         .filter(|m| m.peer.is_none())
         .collect();
-    ensure!(
-        locals.len() == 1,
-        "Save a layout with one local computer before enabling sharing"
-    );
+    ensure!(locals.len() == 1, "The layout needs one local computer");
     let bounds = geometry.bounds()?;
     ensure!(
         locals[0].width == bounds.width && locals[0].height == bounds.height,
-        "The Mac desktop changed. Refresh and save its layout before enabling sharing"
+        "The Mac desktop changed. Waiting for its updated layout"
     );
     ensure!(
         layout
             .transitions()
             .iter()
             .any(|t| layout.monitors[t.source].peer.is_none()),
-        "Place a paired computer against the Mac's edge and save the layout"
+        "Drag a paired computer until its edge touches this Mac"
     );
     Ok(())
 }

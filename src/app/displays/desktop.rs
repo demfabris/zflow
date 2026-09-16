@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
-use eguicn::egui;
 
 use super::Desktop;
 
@@ -23,7 +22,7 @@ impl DesktopDetector {
         (state.desktop, state.error.clone())
     }
 
-    pub fn refresh(&mut self, ctx: &egui::Context) {
+    pub fn refresh(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.running {
             return;
@@ -31,7 +30,7 @@ impl DesktopDetector {
         state.running = true;
         drop(state);
         let shared = self.state.clone();
-        let ctx = ctx.clone();
+
         if let Err(error) = std::thread::Builder::new()
             .name("zflow-desktop".into())
             .spawn(move || {
@@ -48,7 +47,6 @@ impl DesktopDetector {
                         state.error = Some(format!("{error:#}"));
                     }
                 }
-                ctx.request_repaint();
             })
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -104,18 +102,16 @@ fn desktop_bounds(rects: impl IntoIterator<Item = Rect>) -> Result<Desktop> {
 
 #[cfg(target_os = "macos")]
 fn detect() -> Result<Desktop> {
-    use core_graphics::display::CGDisplay;
-    let active = CGDisplay::active_displays()
-        .map_err(|error| anyhow::anyhow!("Could not read active macOS displays: {error}"))?;
-    desktop_bounds(active.into_iter().map(|id| {
-        let bounds = CGDisplay::new(id).bounds();
-        Rect {
-            x: bounds.origin.x,
-            y: bounds.origin.y,
-            width: bounds.size.width,
-            height: bounds.size.height,
-        }
-    }))
+    desktop_bounds(
+        crate::macos::active_desktop_rectangles()?
+            .into_iter()
+            .map(|bounds| Rect {
+                x: bounds.x,
+                y: bounds.y,
+                width: bounds.width,
+                height: bounds.height,
+            }),
+    )
 }
 
 #[cfg(target_os = "linux")]

@@ -3,7 +3,7 @@
 > Specification v0.3, draft, 2026-08-31
 >
 > Implementation status: the headless Linux prototype is implemented. It is not yet a qualified alpha: the privileged, packaged two-host qualification run in [TESTPLAN.md](TESTPLAN.md) has not run.
-> September 14 desktop implementation: GUI pairing and experimental Mac-to-GNOME edge handoff are implemented. A user-enabled GNOME extension places the receiver cursor and reports return barriers through the active desktop GUI and authenticated session. This path still requires live qualification; the broader portal-based desktop matrices below remain future work.
+> September 16 implementation: macOS uses a native SwiftUI menu-bar app linked to the Rust core through a C ABI. Linux uses a headless desktop agent and GNOME extension for cursor placement and return barriers. AWDL suppression uses a signed, same-team XPC service registered through SMAppService. Live two-host and signed-helper qualification remain outstanding; broader portal and macOS receiver matrices below are future work.
 >
 > v0.3 records three maintainer decisions after adversarial review: on-demand device grabs, raw-contact capture in the signed macOS baseline behind a flag, and the split of release matrices into [TESTPLAN.md](TESTPLAN.md).
 
@@ -491,6 +491,9 @@ A process crash closes physical and virtual descriptors. The kernel releases gra
 
 ### Session helper and portals
 
+The current GNOME integration is `zflow desktop-agent`, connected to the existing
+desktop API with Unix credential checks. The portal design below is future work.
+
 zflow-session owns desktop geometry, consent UI, portal integration, and the future configuration UI. It authenticates to zflowd through filesystem mode and SO_PEERCRED.
 
 For portal interface version 2 or newer, the freedesktop InputCapture lifecycle is:
@@ -527,6 +530,15 @@ ei_gestures carries recognized gestures rather than raw MT contacts. It cannot r
 ## macOS
 
 ### Process model
+
+The current source-only app runs capture and networking in its user process.
+SwiftUI owns the menu and Settings window; a Rust worker owns engine lifetimes.
+A separate SMAppService daemon handles only leased AWDL suppression. Its XPC
+peers require the same signing team and exact client/daemon identifiers. The
+build script bundles and signs these executables with hardened runtime enabled;
+notarization and distribution qualification are separate release steps.
+
+The broader receiver and LoginWindow process model below is future work.
 
 A root LaunchDaemon owns networking, peer state, console-session arbitration, and the optional root-only Karabiner client. It never creates CGEvent taps or calls CGEventPost. A signed native Mach-O LaunchAgent owns CGEvent capture, filtering, and posting in each Aqua or LoginWindow session.
 

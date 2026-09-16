@@ -1,4 +1,4 @@
-use std::{fs, os::unix::fs::MetadataExt, path::Path, process::Stdio, time::Duration};
+use std::{process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use tokio::{
@@ -7,7 +7,6 @@ use tokio::{
     time::timeout,
 };
 
-const HELPER_PATH: &str = "/Library/PrivilegedHelperTools/io.zflow.awdl-helper";
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(super) const RENEW_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -19,10 +18,12 @@ pub(super) struct AwDlLease {
 
 impl AwDlLease {
     pub(super) async fn acquire() -> Result<Self> {
-        validate_helper(Path::new(HELPER_PATH)).context(
-            "AWDL helper is not installed safely; see README.md for the admin setup step",
-        )?;
-        let mut command = Command::new(HELPER_PATH);
+        let executable = std::env::current_exe()?;
+        let client = executable
+            .parent()
+            .context("Missing app directory")?
+            .join("zflow-awdl-client");
+        let mut command = Command::new(client);
         command.env_clear().current_dir("/");
         Self::start(command, RESPONSE_TIMEOUT).await
     }
@@ -106,20 +107,6 @@ impl Drop for AwDlLease {
         // EOF restores AWDL on early returns and task cancellation, without a shell.
         self.input.take();
     }
-}
-
-fn validate_helper(path: &Path) -> Result<()> {
-    let file = fs::symlink_metadata(path)?;
-    if !file.is_file() || file.uid() != 0 || file.mode() & 0o6022 != 0o4000 {
-        bail!("AWDL helper must be a root-owned setuid file without group or other write access");
-    }
-    for directory in path.ancestors().skip(1) {
-        let metadata = fs::symlink_metadata(directory)?;
-        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            bail!("unsafe AWDL helper directory: {}", directory.display());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -216,11 +203,5 @@ printf 'RELEASED\n'
             .await
             .unwrap();
         assert!(lease.release().await.is_err());
-    }
-
-    #[test]
-    fn refuses_an_unprivileged_helper() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        assert!(validate_helper(file.path()).is_err());
     }
 }

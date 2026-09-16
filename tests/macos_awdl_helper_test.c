@@ -126,13 +126,9 @@ static void process_test(int ending) {
   if (child == 0) {
     close(input[1]);
     close(output[0]);
-    assert(dup2(input[0], STDIN_FILENO) >= 0);
-    assert(dup2(output[1], STDOUT_FILENO) >= 0);
-    close(input[0]);
-    close(output[1]);
-    assert(fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) == 0);
-    assert(fcntl(STDOUT_FILENO, F_SETFL, O_NONBLOCK) == 0);
-    _exit(run_guardian(backend(fake), -1));
+    assert(fcntl(input[0], F_SETFL, O_NONBLOCK) == 0);
+    assert(fcntl(output[1], F_SETFL, O_NONBLOCK) == 0);
+    _exit(run_guardian_fds(backend(fake), -1, input[0], output[1]));
   }
   close(input[0]);
   close(output[1]);

@@ -25,6 +25,9 @@ use crate::{
 
 #[derive(Debug)]
 pub enum Command {
+    DesktopAgent {
+        install: bool,
+    },
     Setup {
         state_dir: Option<PathBuf>,
         control_socket: Option<PathBuf>,
@@ -91,6 +94,17 @@ struct SetupOptions {
 
 pub fn run(path: PathBuf, command: Command) -> Result<()> {
     match command {
+        Command::DesktopAgent { install } => {
+            #[cfg(target_os = "linux")]
+            {
+                crate::app::desktop_agent::run(install)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = install;
+                bail!("The desktop agent requires Linux with GNOME")
+            }
+        }
         Command::Setup {
             state_dir,
             control_socket,

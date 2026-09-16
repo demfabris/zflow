@@ -4,6 +4,79 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Native macOS app and Linux desktop agent, September 16
+
+Current architecture: SwiftUI MenuBarExtra and Settings, a Rust application
+worker behind a C ABI, a headless Linux desktop agent, and an SMAppService AWDL
+daemon authenticated through same-team XPC. The earlier desktop GUI is removed.
+Historical sections below retain their dated measurements, not current commands.
+
+Automated checks:
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+just test-native
+node tests/gnome_desktop_test.mjs
+./scripts/build-macos-app.sh --debug --sign "SIGNING IDENTITY"
+```
+
+The Swift tests call the actual Rust bridge with isolated temporary files.
+They check snapshot decoding, persistent AWDL settings, comment preservation,
+last-valid settings after malformed edits, and Pause when saving is blocked.
+Rust tests retain layout snapping, geometry validation, discovery filtering,
+pairing over loopback QUIC, and external-write conflict coverage. The guardian
+C tests use passed pipe descriptors and a fake radio backend.
+
+Native UI and live matrix:
+
+- Launch an isolated bundle configuration with sharing paused. Check menu
+  actions, native Settings, keyboard focus, health popover, pairing sheet,
+  AWDL switch, automatic window sizing, and light/dark system appearance.
+- Pair through both six-digit confirmations; cancellation must never save trust.
+- Drag computers in all directions, including offsets. Check snapping,
+  overlap rejection, reopening, and external layout conflicts.
+- Check first launch, malformed/deleted TOML, correction, GUI writes preserving
+  comments, and the last-valid running configuration.
+- Allow Accessibility and Local Network through macOS. Denied or revoked
+  permission must produce useful health actions and stop capture.
+- Install the signed helper from the GUI; test required approval, denial,
+  repair, helper restart, an invalid client signature, and mismatched teams.
+  Registration alone must not report readiness; authenticated ping must pass.
+- Test Open at login and reboot with the final installed app path.
+- Keep Settings closed and cross repeatedly. Repeat on another Space, through
+  Pause, emergency return, display changes, receiver loss, and clean Quit.
+- Run `zflow desktop-agent --install` as the Linux desktop user, then test
+  GNOME login autostart, daemon restart/reconnect, and display advertisements.
+
+Actual input capture, radio changes, OS authorization, and two-computer latency
+remain live qualification steps. A successful build does not establish them.
+
+September 16 implementation verification (macOS 27, Xcode 27, Swift 6.4,
+Rust 1.97):
+
+- Mac: 185 library tests, one CLI test, and eight QUIC integration tests passed;
+  one native-desktop test remained ignored. Formatting and strict Clippy passed.
+- Three Swift tests passed against the Rust bridge, including automatic reload
+  without UI requests. Strict Swift formatting checks passed.
+- Native C cursor and guardian tests passed with fake system APIs. Emergency
+  return remains latched when the event queue is full; ordinary capture failure
+  does not become a user pause. Guardian tests cover release, EOF, and expiry.
+- GNOME compositor simulation passed. Linux binaries and tests cross-compiled
+  and linked. In a network-disabled, read-only Debian amd64 container, 226
+  library tests and eight QUIC integration tests passed; three hardware tests
+  remained ignored. The emulated parallel run exposed a timestamp-test failure;
+  that test passed alone and the complete library suite passed serially.
+- Signed debug and release app bundles passed plist and strict signature checks.
+  The native dark-mode Settings window, health actions, AWDL toggle, pairing
+  sheet cancellation, accessible tile movement, saved layout, close/reopen, and
+  clean Quit were checked with a disposable paused configuration.
+
+No helper registration, login-item enrollment, radio suppression, actual input
+capture, or two-computer pairing was performed during this implementation.
+Light-mode appearance and mouse-drag interactions still need live inspection.
+
 ## Reliability fixes, September 15
 
 Automated regressions cover these boundaries:
@@ -49,7 +122,7 @@ interval. Backdated events can produce separate libinput processing-lag warnings
 The synthetic regression does not prove that all historical touch-jump warnings
 are gone, or qualify GNOME gesture timers under burst delivery.
 
-## GUI pairing and Mac-to-GNOME handoff, September 14
+## Historical GUI pairing and Mac-to-GNOME handoff, September 14
 
 The GUI now supports pairing, explicit Mac source start/stop, saved-layout edge
 entry, and automatic return through the GNOME extension. These implementation
@@ -80,29 +153,19 @@ one network round trip of the barrier hit. The daemon refreshes cached seat stat
 on its 250 ms tick and keeps fresh seat checks around other desktop operations.
 These are targets; the two-machine measurements remain pending.
 
-For live qualification, install matching daemon/GUI builds on Ubuntu and open
-the bundled Mac app. Complete the README's setup without terminal pairing or
-capture commands. On Ubuntu, use Install GNOME integration and Enable desktop
-handoff; a first extension installation may require logout/login. On Mac, use
-normal Accessibility and Local Network permission prompts.
+For current live qualification, install matching Linux daemon/desktop-agent
+builds and open the native Mac bundle. Follow README.md for CLI pairing on
+Linux, native Mac pairing, GNOME extension setup, and OS permissions. Drag the
+computer tiles and verify pointer, typing, scrolling, raw touch, and automatic
+return across all four orientations and partial overlaps. Settings can close
+while sharing continues. Pause, emergency return, and Quit must restore input.
 
-Verify discovery, both pairing confirmations, two computer tiles, Save layout,
-Enable edge sharing, pointer/typing/scrolling on Ubuntu, then automatic return.
-Repeat all four orientations and partial overlap ranges. Verify clicks, held
-keys at entry, raw touch on/off, independent Mac input while sharing is disabled,
-and input recovery after Stop, Escape, window close, network loss, receiver app
-exit, lock/logout and monitor changes. Check that the cursor is on the correct
-active monitor and inside the intended edge after each return. Old receivers
-must reject desktop requests before Mac capture begins.
-
-Sharing must remain disabled when opening either window, saving settings,
-discovering receivers, or confirming a pairing. A capture, geometry or cleanup failure must display an
-error and require the user to enable sharing again. Leaving the entry region or
-holding input during admission must cancel only that crossing: keep sharing
-armed, show the cancellation reason, and require a move back inside the Mac
-before another crossing. Stop and Escape still turn sharing off. Record the GNOME/macOS
-versions and signature used for the actual test; simulated extension tests and
-cross-compilation do not replace this run.
+Check held keys at entry, movement during admission, lock/logout, monitor
+changes, receiver exit, and connection loss. Cancelled admission must keep
+sharing armed. Emergency return must stay paused even if cleanup fails.
+Connection failures may retry while sharing is enabled. Record the GNOME/macOS
+versions and the exact bundle signature used; simulated checks do not qualify
+the live workflow.
 
 September 14 implementation verification: Mac passed 200 Rust tests with one
 native-desktop test ignored, plus formatting, Clippy, native fake-capture tests
@@ -186,7 +249,7 @@ while a connection is pending. The previous 17:32 Mac log shows about 15 ms for
 acquisition and 25 ms for release with the switch on; measure the updated build
 before claiming a reduction. The under-60-ms rearm target remains unverified.
 
-Complete this live checklist with matching Mac, Linux GUI, daemon and extension
+Complete this live checklist with matching Mac, Linux desktop-agent, daemon and extension
 builds. Use `just debug mac`, `just debug linux` and `just debug-daemon`:
 
 - Cross five times each way, including one 60-second stay on Ubuntu. Record
@@ -202,7 +265,7 @@ builds. Use `just debug mac`, `just debug linux` and `just debug-daemon`:
 - Measure return-edge report to `edge sharing rearmed`, with Reduce Wi-Fi latency
   both off and on. Try another crossing within 150 ms and record its result.
 - Minimize the Mac window and cross, then repeat with its window on another Space.
-  Only move the watcher off the paint loop if either test stops detecting edges.
+  The application worker must continue observing without window rendering.
 
 Automated verification for this follow-up: Mac passed 205 Rust tests with one
 native-desktop test ignored; Ubuntu passed 251 with two hardware-dependent tests
@@ -216,40 +279,10 @@ Live results for these changes remain pending. Existing logs describe the
 previous build; automated checks do not establish crossing latency or hidden
 window behavior. Keep `PLAN.md` until this checklist has measured results.
 
-## Configuration GUI
+## Historical configuration GUI observations
 
-Run without elevated permissions. Opening the window leaves sharing disabled:
-
-```sh
-cargo test --features gui gui:: --lib
-cargo clippy --all-targets --all-features -- -D warnings
-cargo run --features gui --bin zflow-gui -- --config /path/to/test-config.toml
-```
-
-The GUI tests use temporary files and in-memory egui input. They cover real
-navigation, touchpad toggle, Save, discard/reload confirmation, and theme
-widgets; malformed and missing files; invalid addresses and session timing;
-preservation of peer identities and device attributes; external edit/create/
-delete conflicts; and quoted launch commands with opt-in source flags.
-Opening, drawing, and changing a draft must not write settings before Save.
-
-Layout tests cover positive-length shared edges, reciprocal normalized ranges,
-stacked displays, same-computer boundaries, gaps and corner contact, rejected
-overlap, and nearest-edge snapping. In-memory pointer tests drag through multiple
-frames, check total displacement without repeated accumulation, and verify
-rejected drops. Sidecar tests cover round trips, empty layouts, malformed files,
-external changes, and leaving the daemon configuration untouched.
-
-Nearby tests cover offline construction, compatible and incompatible protocol
-records, local-only filtering, a 64-record bound, add/update/removal, failure
-cleanup, cancellation, and preventing old workers from restoring paused records.
-The native GUI opts into networking; the test harness does not.
-
-For native QA, use a disposable configuration to check text editing, tab focus,
-light/dark themes, scrolling, minimum window size, and closing with unsaved
-changes. Invalid input must remain editable and must disable Save. A malformed
-file must show an error, not a replacement configuration. Opening the user's
-real configuration is read-only until Save; do not use it for save tests.
+The native September 16 matrix above replaces the old widget/editor harness.
+The following September 10 observations describe the removed interface.
 
 On September 10, the first native Mac window loaded the existing paired-Ubuntu
 configuration and rendered the Computers and Mac source launch sections. No
@@ -275,16 +308,15 @@ qualify this test; allow access through the normal system UI and retry.
 
 ### Desktop service access and detected displays
 
-The Linux default GUI uses `/run/zflow-gui/peers.sock`, a separate desktop
+The Linux desktop agent uses `/run/zflow-gui/peers.sock`, a separate desktop
 endpoint. The original control socket and private config/state paths retain
 their permissions. The endpoint accepts Snapshot, user-confirmed pairing and
 an explicitly enabled desktop broker. It checks Unix credentials
 against the service/root/active desktop UID, and returns public peer records
 plus the discovery flag. It has a separate eight-client limit and three-second
 initial-request timeout; pairing has its own bounded confirmation window and
-the desktop broker rechecks authorization during its connection. The GUI also
-checks the server UID. Explicit `--config` stays
-in file-editing mode; service snapshots cannot save or reload a config file.
+the desktop broker rechecks authorization during its connection. The agent also
+checks the server UID; it cannot edit service configuration.
 
 Tests cover rejected mutation commands and unknown fields, socket credentials,
 snapshot write refusal, invalid desktop records, ambiguous address matches,
@@ -293,11 +325,9 @@ from service settings. Native tests still need to cover hotplug, rotated
 displays, mixed scale factors, remote report removal, stale saved addresses,
 and Local Network permission denial.
 
-Before deploying the updated service on a live input-sharing host, ask the user
-before restarting it. Then launch `just run linux` without a disposable config,
-verify the saved Mac pairing appears, and run the updated GUI on Mac. Check that
-one tile appears per computer and that dragging and
-Save layout do not change `/etc/zflow/zflow.toml` or capture input.
+With the updated service installed, run `zflow desktop-agent` in the unlocked
+GNOME session and open the native Mac app. Verify that one tile appears per
+computer and that arranging tiles does not modify the protected Linux config.
 
 September 10 implementation checks: Mac passed 174 tests; Ubuntu passed 221
 with one ignored hardware test. Both passed formatting, Clippy, and GUI builds;
@@ -339,7 +369,7 @@ records; v2 accepts one bounded desktop and retains ambiguous-address rejection.
 Run the read-only native detector check in the desktop session:
 
 ```sh
-cargo test --locked --features gui --lib native_desktop_geometry -- --ignored --nocapture
+cargo test --locked --lib native_desktop_geometry -- --ignored --nocapture
 ```
 
 September 10 computer-tile checks: Mac passed 179 tests with one opt-in test
@@ -349,11 +379,10 @@ separately: Mac reported 5696 × 1692 and GNOME reported 2880 × 1620. Linux che
 used an isolated source snapshot; the Ubuntu checkout, running GUI, and service
 were not changed. The rebuilt GUI binary is ready for the next approved launch.
 
-After permission to reopen both GUIs, confirm one Mac tile and one Ubuntu tile,
-drag Ubuntu to the correct side, save, reopen, and check that the arrangement
-persists. Quit one GUI and verify that its known tile remains with a waiting
-label, then reopen and verify that it updates without duplicating. No input
-capture or monitor-input changes belong to this test.
+Restart the native Mac app and Linux desktop agent. Confirm one tile per
+computer, drag and reopen Settings, and verify persistence. Stop and restart
+the desktop agent; its known tile should keep its position without duplication.
+Use a paused configuration for layout-only checks.
 
 ## Headless Linux alpha qualification
 
@@ -508,11 +537,11 @@ xcrun --sdk macosx clang \
 ./target/debug/macos-awdl-helper-test
 ```
 
-After a separate admin-approved helper installation, qualify
-`zflow-macos-source --reduce-wifi-latency` with:
+After installing the signed helper through the native GUI and macOS
+authorization, qualify **Block AWDL while sharing** with:
 
-- flag absent: no helper process and no AWDL changes;
-- helper missing or unsafe: refuse activation before local input capture;
+- switch off: no lease and no AWDL changes;
+- helper missing, denied, or incorrectly signed: refuse activation before capture;
 - AWDL initially up and initially down: restore the original state on return;
 - repeated activation/return, Escape, Ctrl+C, SIGTERM, and a failed capture;
 - sender SIGKILL and pipe closure: restore without sender cleanup;

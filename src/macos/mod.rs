@@ -39,6 +39,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub struct SourceOptions {
     pub config_path: PathBuf,
+    pub config: Option<Config>,
     pub peer: String,
     pub address: Option<SocketAddr>,
     pub raw_touch: bool,
@@ -80,6 +81,7 @@ pub async fn run(options: SourceOptions) -> Result<()> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceStatus {
+    PauseRequested,
     Connecting,
     Sharing,
     LocalInputRestored,
@@ -292,6 +294,62 @@ impl Drop for SourceEndpoint {
     }
 }
 
+/// Check an authenticated receiver before arming edge sharing. The endpoint is fully
+/// closed before returning so the next crossing can use the peer's session slot.
+pub(crate) async fn receiver_snapshot(
+    config: &Config,
+    name: &str,
+) -> Result<crate::desktop::Geometry> {
+    let _guard = SourceGuard::acquire()?;
+    let peer = config.peers.get(name).context("Unknown paired computer")?;
+    anyhow::ensure!(
+        peer.permissions.connect && peer.permissions.receive_normal,
+        "{name} does not allow input sharing"
+    );
+    let identity = Identity::load_or_create(&config.daemon.state_dir)?;
+    let client = input_client_config(&identity, &peer.spki_der()?)?;
+    let address = *peer
+        .addresses
+        .first()
+        .context("Computer has no input address")?;
+    let bind = match address.ip() {
+        IpAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+        IpAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
+    };
+    let endpoint = SourceEndpoint(Endpoint::client(bind)?);
+    let (events, _received) = mpsc::channel(128);
+    let result = async {
+        let connection = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_input(&endpoint.0, address, &client),
+        )
+        .await??;
+        let session = start_session(
+            connection,
+            name.to_owned(),
+            TransportGeneration(1),
+            SessionOptions::from_config(config)?,
+            events,
+        )
+        .await?;
+        let response = session
+            .desktop_request(crate::desktop::DesktopRequest::Snapshot)
+            .await;
+        session.close(SessionCloseReason::LocalRelease);
+        let response = response?;
+        response.validate()?;
+        match response {
+            DesktopResponse::Snapshot { geometry, .. } => Ok(geometry),
+            DesktopResponse::Unavailable { reason } => bail!("{reason}"),
+            _ => bail!("Unexpected receiver response"),
+        }
+    }
+    .await;
+    let cleanup = endpoint.shutdown().await;
+    cleanup?;
+    result
+}
+
 async fn run_source(
     options: SourceOptions,
     stop: &mut watch::Receiver<bool>,
@@ -301,7 +359,10 @@ async fn run_source(
         return Ok(None);
     }
     let _guard = SourceGuard::acquire()?;
-    let mut config = Config::load(&options.config_path)?;
+    let mut config = match &options.config {
+        Some(config) => config.clone(),
+        None => Config::load(&options.config_path)?,
+    };
     let peer = config
         .peers
         .get(&options.peer)
@@ -566,6 +627,7 @@ async fn run_endpoint(
                     while let Some(event) = capture.poll() {
                         captured_events += 1;
                         if event.kind == NativeEventKind::Escape as u32 {
+                            let _ = status.send(SourceStatus::PauseRequested);
                             stop_reason = "native escape event";
                             break;
                         }
@@ -652,6 +714,10 @@ async fn run_endpoint(
         } else if return_point.is_some() {
             tracing::info!(point = ?return_point, "Mac cursor positioned before local input resumed");
             let _ = status.send(SourceStatus::LocalInputRestored);
+        }
+        // Escape must stay paused even when the event queue was full or cleanup failed.
+        if capture.pause_requested() {
+            let _ = status.send(SourceStatus::PauseRequested);
         }
         if touch_active {
             let _ = session.capture(touch_frame(TouchState::default()));
@@ -1068,6 +1134,7 @@ unsafe extern "C" {
     fn zflow_mac_capture_stop_at(position: *const CursorPosition) -> i32;
     fn zflow_mac_capture_poll(event: *mut NativeEvent) -> i32;
     fn zflow_mac_capture_stop_requested() -> i32;
+    fn zflow_mac_capture_pause_requested() -> i32;
     fn zflow_mac_capture_last_error() -> *const c_char;
     #[cfg(test)]
     fn zflow_mac_modifier_pressed(keycode: u16, flags: u64) -> u8;
@@ -1117,6 +1184,11 @@ impl MacCapture {
     fn stop_requested(&self) -> bool {
         // SAFETY: the bridge exposes this flag atomically.
         unsafe { zflow_mac_capture_stop_requested() == 1 }
+    }
+
+    fn pause_requested(&self) -> bool {
+        // SAFETY: the bridge exposes this flag atomically and preserves it after stop.
+        unsafe { zflow_mac_capture_pause_requested() == 1 }
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -1426,6 +1498,7 @@ mod tests {
             let (status, mut events) = mpsc::unbounded_channel();
             run_controlled(
                 SourceOptions {
+                    config: None,
                     config_path: PathBuf::from("/nonexistent-zflow-test-config"),
                     peer: "unused".into(),
                     address: None,

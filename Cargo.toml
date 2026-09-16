@@ -10,27 +10,17 @@ rust-version = "1.88"
 [lib]
 name = "zflow"
 path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
 
 [[bin]]
 name = "zflow"
 path = "src/main.rs"
-
-[[bin]]
-name = "zflow-gui"
-path = "src/bin/zflow-gui.rs"
-required-features = ["gui"]
-
-[features]
-default = []
-gui = ["dep:eframe", "dep:eguicn", "dep:core-graphics"]
 
 [dependencies]
 anyhow = "1.0"
 bincode = { version = "2.0", features = ["serde"] }
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
-eframe = { version = "0.36.1", default-features = false, features = ["glow", "wayland", "x11", "accesskit"], optional = true }
-eguicn = { git = "https://github.com/demfabris/eguicn", rev = "301264dc82df0b256b4f8a6e0e040545bddcb48e", optional = true }
 getrandom = "0.3"
 if-addrs = "0.15.0"
 mdns-sd = { version = "0.21.1", default-features = false, features = ["async"] }
@@ -44,6 +34,7 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.1.4"
+toml_edit = { version = "0.25", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
@@ -58,9 +49,6 @@ mio = { version = "1.2.2", default-features = false, features = ["os-ext", "os-p
 nix = { version = "0.30", features = ["socket", "user"] }
 sd-notify = "0.5.0"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = { version = "0.23.2", optional = true }
-
 [patch.crates-io]
 evdev = { git = "https://github.com/cmr/evdev", rev = "7fee138a341f73b81b9c4f8c59e3527c6a169ea3" }
 
@@ -71,3 +59,8 @@ tempfile = "3.23"
 [profile.release]
 lto = "thin"
 strip = "symbols"
+
+# macOS 27 rejects malformed proc-macro dylibs produced by Rust's stripping pass.
+# https://github.com/rust-lang/rust/issues/157750
+[profile.release.build-override]
+strip = "none"

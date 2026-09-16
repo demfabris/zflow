@@ -1,6 +1,5 @@
 //! User-session connection between the daemon and GNOME's desktop integration.
 
-use eguicn::egui;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -27,7 +26,7 @@ impl DesktopReceiver {
             .message
             .clone()
     }
-    pub fn start(&mut self, ctx: &egui::Context) {
+    pub fn start(&mut self) {
         if self.is_active() {
             return;
         }
@@ -37,9 +36,9 @@ impl DesktopReceiver {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
         let generation_ref = self.generation.clone();
-        tracing::debug!(generation, "starting desktop GUI receiver");
+        tracing::debug!(generation, "starting desktop agent");
         let state = self.state.clone();
-        let ctx = ctx.clone();
+
         let (cancel, receipt) = tokio::sync::oneshot::channel();
         self.cancel = Some(cancel);
         *state.lock().unwrap_or_else(|e| e.into_inner()) = State {
@@ -53,14 +52,14 @@ impl DesktopReceiver {
                     .build()?
                     .block_on(async {
                         tokio::select! {
-                            result=run(&state,&ctx,&generation_ref,generation) => result,
+                            result=run(&state,&generation_ref,generation) => result,
                             _=receipt => Ok(()),
                         }
                     })
             })();
             if generation_ref.load(std::sync::atomic::Ordering::SeqCst) == generation {
                 if let Err(error) = &result {
-                    tracing::warn!(generation, error = %format_args!("{error:#}"), "desktop GUI receiver stopped");
+                    tracing::warn!(generation, error = %format_args!("{error:#}"), "desktop agent stopped");
                 }
                 *state.lock().unwrap_or_else(|e| e.into_inner()) = State {
                     active: false,
@@ -69,12 +68,11 @@ impl DesktopReceiver {
                         Err(error) => format!("{error:#}"),
                     },
                 };
-                ctx.request_repaint();
             }
         });
     }
     pub fn stop(&mut self) {
-        tracing::debug!("stopping desktop GUI receiver");
+        tracing::debug!("stopping desktop agent");
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(cancel) = self.cancel.take() {
@@ -96,7 +94,6 @@ impl Drop for DesktopReceiver {
 #[cfg(target_os = "linux")]
 async fn run(
     state: &Arc<Mutex<State>>,
-    ctx: &egui::Context,
     generation: &std::sync::atomic::AtomicU64,
     expected: u64,
 ) -> anyhow::Result<()> {
@@ -146,8 +143,8 @@ async fn run(
     }
     state.lock().unwrap_or_else(|e| e.into_inner()).message =
         "Ready to receive through the GNOME desktop".into();
-    tracing::info!(generation = expected, "desktop GUI receiver ready");
-    ctx.request_repaint();
+    tracing::info!(generation = expected, "desktop agent ready");
+
     loop {
         let request: DesktopRequest = crate::control::read_message(&mut stream).await?;
         request.validate()?;
@@ -221,7 +218,6 @@ async fn call(
 #[cfg(not(target_os = "linux"))]
 async fn run(
     _state: &Arc<Mutex<State>>,
-    _ctx: &egui::Context,
     _generation: &std::sync::atomic::AtomicU64,
     _expected: u64,
 ) -> anyhow::Result<()> {

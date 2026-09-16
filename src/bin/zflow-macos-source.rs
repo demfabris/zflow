@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     zflow::macos::run(zflow::macos::SourceOptions {
         config_path: args.config,
+        config: None,
         peer: args.peer,
         address: args.address,
         raw_touch: !args.no_touch,

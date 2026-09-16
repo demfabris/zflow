@@ -5,11 +5,9 @@ use std::{
     time::Duration,
 };
 
-use eguicn::{Badge, Button, ButtonVariant, Card, egui};
 use tokio::sync::oneshot;
 
 use crate::{
-    config::Config,
     discovery::{Discovery, DiscoveryEvent, UntrustedCandidate, local_unicast_addresses},
     wire::CURRENT_PROTOCOL_VERSION,
 };
@@ -25,7 +23,7 @@ pub(super) enum BrowserStatus {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) struct NearbyRecord {
     pub instance: String,
     pub addresses: Vec<SocketAddr>,
@@ -97,7 +95,7 @@ impl NearbyBrowser {
         )
     }
 
-    pub fn start(&mut self, ctx: egui::Context) {
+    pub fn start(&mut self) {
         if self.is_running() {
             return;
         }
@@ -109,7 +107,7 @@ impl NearbyBrowser {
         let (stop, cancelled) = oneshot::channel();
         self.stop = Some(stop);
         let shared = Arc::clone(&self.shared);
-        let worker_ctx = ctx.clone();
+
         if let Err(error) = std::thread::Builder::new()
             .name("zflow-nearby".into())
             .spawn(move || {
@@ -117,15 +115,15 @@ impl NearbyBrowser {
                     .enable_all()
                     .build();
                 match runtime {
-                    Ok(runtime) => runtime.block_on(browse(shared, worker_ctx, cancelled)),
-                    Err(error) => update(&shared, &worker_ctx, |state| {
+                    Ok(runtime) => runtime.block_on(browse(shared, cancelled)),
+                    Err(error) => update(&shared, |state| {
                         state.fail(format!("Could not start discovery: {error}"));
                     }),
                 }
             })
         {
             self.stop.take();
-            update(&self.shared, &ctx, |state| {
+            update(&self.shared, |state| {
                 state.fail(format!("Could not start discovery: {error}"));
             });
         }
@@ -137,78 +135,6 @@ impl NearbyBrowser {
         }
         self.shared = Arc::new(Mutex::new(NearbySnapshot::default()));
     }
-
-    pub fn show(&mut self, ui: &mut egui::Ui, config: &Config) -> Option<SocketAddr> {
-        let snapshot = self.snapshot();
-        let mut selected = None;
-        Card::new().padding(20).show(ui, |ui| {
-            Card::header(ui, "Nearby computers", "Find zflow receivers on your local network.");
-            ui.horizontal(|ui| {
-                let label = match &snapshot.status {
-                    BrowserStatus::Paused => "Paused",
-                    BrowserStatus::Starting => "Starting",
-                    BrowserStatus::Browsing => "Searching local network",
-                    BrowserStatus::Failed(_) => "Unavailable",
-                };
-                ui.add(Badge::new(label).variant(ButtonVariant::Secondary));
-                if self.is_running() {
-                    if ui.add(Button::new("Pause").variant(ButtonVariant::Outline)).clicked() {
-                        self.stop();
-                    }
-                } else if ui
-                    .add_enabled(
-                        config.transport.discovery,
-                        Button::new("Resume").variant(ButtonVariant::Outline),
-                    )
-                    .clicked()
-                {
-                    self.start(ui.ctx().clone());
-                }
-            });
-            if !config.transport.discovery {
-                ui.label("Save Local discovery as enabled in Connection settings to resume.");
-            }
-            if let BrowserStatus::Failed(error) = &snapshot.status {
-                ui.label(error);
-                ui.label("You can still enter an address yourself.");
-            }
-            ui.label("Network announcements do not verify identity. Pair before sending input.");
-            if snapshot.records.is_empty() && self.is_running() {
-                ui.label("No receivers found yet. Start zflowd on the other computer and enable discovery there.");
-                if cfg!(target_os = "macos") {
-                    ui.label("Also check this app under System Settings > Privacy & Security > Local Network. After allowing access, Pause and Resume to retry. An empty list does not distinguish blocked multicast from absent receivers.");
-                }
-            }
-            for record in snapshot.records.values() {
-                ui.add_space(12.0);
-                ui.separator();
-                ui.label(egui::RichText::new(&record.instance).small());
-                if !record.compatible {
-                    ui.add(Badge::new("Different protocol version").variant(ButtonVariant::Secondary));
-                }
-                for address in &record.addresses {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.monospace(address.to_string());
-                        if cfg!(target_os = "macos") {
-                            if ui.add_enabled(record.compatible, Button::new("Pair this computer")
-                                .variant(ButtonVariant::Outline)).clicked()
-                            {
-                                selected = Some(*address);
-                            }
-                        } else if ui.add(Button::new("Copy address")
-                            .variant(ButtonVariant::Outline)).clicked()
-                        {
-                            ui.ctx().copy_text(address.to_string());
-                        }
-                    });
-                    for (name, _) in config.peers.iter().filter(|(_, peer)| peer.addresses.contains(address)) {
-                        ui.label(format!("Address matches saved peer {name}; identity unverified."));
-                    }
-                }
-            }
-        });
-        selected
-    }
 }
 
 impl Drop for NearbyBrowser {
@@ -219,20 +145,11 @@ impl Drop for NearbyBrowser {
     }
 }
 
-fn update(
-    shared: &Mutex<NearbySnapshot>,
-    ctx: &egui::Context,
-    change: impl FnOnce(&mut NearbySnapshot),
-) {
+fn update(shared: &Mutex<NearbySnapshot>, change: impl FnOnce(&mut NearbySnapshot)) {
     change(&mut shared.lock().unwrap_or_else(|error| error.into_inner()));
-    ctx.request_repaint();
 }
 
-async fn browse(
-    shared: Arc<Mutex<NearbySnapshot>>,
-    ctx: egui::Context,
-    mut stop: oneshot::Receiver<()>,
-) {
+async fn browse(shared: Arc<Mutex<NearbySnapshot>>, mut stop: oneshot::Receiver<()>) {
     if !matches!(stop.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
         return;
     }
@@ -247,15 +164,13 @@ async fn browse(
     let (discovery, local) = match setup {
         Ok(value) => value,
         Err(error) => {
-            update(&shared, &ctx, |state| {
+            update(&shared, |state| {
                 state.fail(format!("Discovery unavailable: {error}"))
             });
             return;
         }
     };
-    update(&shared, &ctx, |state| {
-        state.status = BrowserStatus::Browsing
-    });
+    update(&shared, |state| state.status = BrowserStatus::Browsing);
     loop {
         tokio::select! {
             biased;
@@ -263,23 +178,23 @@ async fn browse(
             event = discovery.next_event() => match event {
                 Ok(DiscoveryEvent::Candidate(candidate)) => {
                     if let Some(record) = NearbyRecord::from_candidate(candidate) {
-                        update(&shared, &ctx, |state| state.insert(record, &local));
+                        update(&shared, |state| state.insert(record, &local));
                     }
                 }
                 Ok(DiscoveryEvent::Removed(instance)) => {
-                    update(&shared, &ctx, |state| { state.records.remove(&instance.to_string()); });
+                    update(&shared, |state| { state.records.remove(&instance.to_string()); });
                 }
                 Ok(DiscoveryEvent::Stopped) => {
-                    update(&shared, &ctx, |state| state.fail("Network discovery stopped. Choose Resume to retry."));
+                    update(&shared, |state| state.fail("Network discovery stopped. Choose Resume to retry."));
                     break;
                 }
                 Err(error) => {
-                    update(&shared, &ctx, |state| state.fail(format!("Discovery unavailable: {error}")));
+                    update(&shared, |state| state.fail(format!("Discovery unavailable: {error}")));
                     break;
                 }
             },
             error = discovery.next_daemon_error() => {
-                update(&shared, &ctx, |state| state.fail(match error {
+                update(&shared, |state| state.fail(match error {
                     Ok(error) => format!("Discovery unavailable: {error}"),
                     Err(error) => format!("Discovery unavailable: {error}"),
                 }));
@@ -356,7 +271,7 @@ mod tests {
         let shared = Arc::new(Mutex::new(NearbySnapshot::default()));
         let (stop, cancelled) = oneshot::channel();
         drop(stop);
-        browse(Arc::clone(&shared), egui::Context::default(), cancelled).await;
+        browse(Arc::clone(&shared), cancelled).await;
         assert_eq!(shared.lock().unwrap().status, BrowserStatus::Paused);
     }
 

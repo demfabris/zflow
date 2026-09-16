@@ -1,7 +1,7 @@
 {
   "uuid": "zflow@demfabris",
   "name": "zflow desktop input sharing",
-  "description": "Provides desktop geometry, cursor entry placement and return edges to the local zflow window.",
+  "description": "Provides desktop geometry, cursor entry placement and return edges to the local zflow desktop agent.",
   "shell-version": ["46", "47", "48", "49", "50", "51"],
   "version": 1,
   "url": "https://github.com/demfabris/zflow"

@@ -5,16 +5,24 @@ set positional-arguments
 default:
     @just --list
 
-# Run the GUI on this host (mac or linux); forward extra arguments to the app.
+# Build and open the Mac app, or run the Linux desktop agent.
 run platform *args: (_platform platform)
-    @if [[ "$1" == linux ]]; then printf '%s\n' 'Ubuntu: run just install-linux after updating code, then enable desktop handoff in the app.'; fi
-    shift; cargo run --locked --features gui --bin zflow-gui -- "$@"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    platform="$1"
+    shift
+    if [[ "$platform" == mac ]]; then
+        ./scripts/build-macos-app.sh --debug
+        open target/debug/zflow.app --args "$@"
+    else
+        cargo run --locked --bin zflow -- desktop-agent "$@"
+    fi
 
-# Install or update the Linux service and GUI, then restart the service (requires sudo).
+# Install/update the Linux service (requires sudo).
 install-linux:
-    ./scripts/install.sh --gui
+    ./scripts/install.sh
 
-# Run with crossing diagnostics and save terminal output under target/logs.
+# Run with diagnostics and save terminal output under target/logs.
 debug platform *args: (_platform platform)
     #!/usr/bin/env bash
     set -euo pipefail
@@ -24,10 +32,12 @@ debug platform *args: (_platform platform)
     mkdir -p target/logs
     logfile="target/logs/zflow-$platform-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
     printf 'Saving diagnostics to %s/%s\n' "$PWD" "$logfile"
-    {
-        printf 'zflow diagnostics: platform=%s revision=%s\n' "$platform" "$(git describe --always --dirty)"
-        cargo run --locked --features gui --bin zflow-gui -- --debug "$@"
-    } 2>&1 | tee "$logfile"
+    if [[ "$platform" == mac ]]; then
+        ./scripts/build-macos-app.sh --debug
+        RUST_LOG=warn,zflow=debug target/debug/zflow.app/Contents/MacOS/zflow-app "$@" 2>&1 | tee "$logfile"
+    else
+        RUST_LOG=warn,zflow=debug cargo run --locked --bin zflow -- desktop-agent "$@" 2>&1 | tee "$logfile"
+    fi
 
 # Enable Linux daemon diagnostics until reboot; requires sudo and restarts the service.
 debug-daemon: (_platform "linux")
@@ -39,13 +49,26 @@ debug-daemon: (_platform "linux")
     sudo systemctl restart zflowd.service
     printf 'Daemon debug logging enabled until reboot. Read with: journalctl -u zflowd -f -o short-iso-precise\n'
 
-# Build the GUI on this host (mac or linux); append --release for a release build.
+# Package the Mac app or build the Linux service and agent.
 build platform *args: (_platform platform)
-    shift; cargo build --locked --features gui --bin zflow-gui "$@"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    platform="$1"
+    shift
+    if [[ "$platform" == mac ]]; then
+        ./scripts/build-macos-app.sh "$@"
+    else
+        cargo build --locked --bin zflow --bin zflowd "$@"
+    fi
 
-# Run tests, including the GUI; forward extra arguments to Cargo.
+# Run Rust tests.
 test *args:
-    cargo test --locked --all-targets --all-features "$@"
+    cargo test --locked --all-targets "$@"
+
+# Run Swift/Rust bridge tests with an isolated temporary configuration.
+test-native: (_platform "mac")
+    MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --locked --lib
+    swift test --package-path macos
 
 # Exercise the shipped GNOME extension with a simulated compositor (requires Node.js).
 test-desktop:
@@ -59,9 +82,9 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-# Lint Rust code, including the GUI.
+# Lint Rust code.
 lint:
-    cargo clippy --locked --all-targets --all-features -- -D warnings
+    cargo clippy --locked --all-targets -- -D warnings
 
 # Check formatting, lint, and run tests.
 check: fmt-check lint test test-desktop

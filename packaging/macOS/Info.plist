@@ -9,7 +9,11 @@
     <key>CFBundleIdentifier</key>
     <string>io.zflow.zflow</string>
     <key>CFBundleExecutable</key>
-    <string>zflow-gui</string>
+    <string>zflow-app</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>

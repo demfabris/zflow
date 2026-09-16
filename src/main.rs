@@ -13,6 +13,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the GNOME session integration without a window.
+    DesktopAgent {
+        /// Install the GNOME extension and start this agent at login.
+        #[arg(long)]
+        install: bool,
+    },
     /// Create or update the local configuration.
     Setup {
         /// Override the daemon state directory; changes require a daemon restart.
@@ -155,6 +161,7 @@ fn main() -> anyhow::Result<()> {
 impl From<Command> for zflow::cli::Command {
     fn from(value: Command) -> Self {
         match value {
+            Command::DesktopAgent { install } => Self::DesktopAgent { install },
             Command::Setup {
                 state_dir,
                 control_socket,

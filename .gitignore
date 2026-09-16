@@ -1,3 +1,6 @@
 /target
 spikes/**/target/
 spikes/a-radio/results.csv
+
+/macos/.build/
+/macos/.swiftpm/

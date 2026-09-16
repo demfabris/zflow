@@ -82,9 +82,9 @@ impl Hub {
             .as_ref()
             .map(|(_, sender)| sender.clone());
         let Some(broker) = broker else {
-            tracing::debug!(operation, "desktop request has no connected GUI broker");
+            tracing::debug!(operation, "desktop request has no connected desktop agent");
             return DesktopResponse::unavailable(
-                "Start receiving in the Linux zflow window and enable its GNOME integration",
+                "Run zflow desktop-agent in the Linux desktop session and enable the zflow GNOME extension",
             );
         };
         let (reply, receipt) = tokio::sync::oneshot::channel();
@@ -245,7 +245,7 @@ pub(super) async fn request(
     response
 }
 
-/// A GUI explicitly opts in by keeping this credential-checked stream open.
+/// A desktop agent opts in by keeping this credential-checked stream open.
 /// Polls use the active seat refreshed on the idle interval; other RPCs recheck it.
 /// The compositor barrier and daemon reservation both expire after two seconds
 /// without a source Poll.
@@ -261,7 +261,7 @@ pub(super) async fn serve(
         ensure!(broker.is_none(), "A desktop receiver is already connected");
         *broker = Some((id, sender));
     }
-    tracing::info!(broker_id = id, "desktop GUI broker connected");
+    tracing::info!(broker_id = id, "desktop desktop agent connected");
     let result=async {
         write_message(&mut stream,&DesktopResponse::Finished).await?;
         let mut seat=tokio::task::spawn_blocking(query_primary_seat).await?;
@@ -309,7 +309,7 @@ pub(super) async fn serve(
                         }
                     }
                     let compositor_started = Instant::now();
-                    tracing::trace!(broker_id = id, %peer, ?session_id, operation, "desktop broker calling GUI compositor bridge");
+                    tracing::trace!(broker_id = id, %peer, ?session_id, operation, "desktop broker calling desktop compositor bridge");
                     write_message(&mut stream,&job.request).await?;
                     let response:DesktopResponse=tokio::time::timeout(Duration::from_millis(600),read_message(&mut stream)).await
                         .context("Desktop bridge response timed out")??;
@@ -350,7 +350,7 @@ pub(super) async fn serve(
                             session.close(SessionCloseReason::BackendUnavailable);
                         }
                     }
-                    // Unix stream readiness detects a closed GUI without creating
+                    // Unix stream readiness detects a closed desktop agent without creating
                     // another reader that could consume a response frame.
                     let mut byte=[0u8;1];
                     match stream.try_read(&mut byte) {
@@ -365,9 +365,9 @@ pub(super) async fn serve(
         Ok(())
     }.await;
     if let Err(error) = &result {
-        tracing::warn!(broker_id = id, error = %format_args!("{error:#}"), "desktop GUI broker stopped");
+        tracing::warn!(broker_id = id, error = %format_args!("{error:#}"), "desktop desktop agent stopped");
     } else {
-        tracing::info!(broker_id = id, "desktop GUI broker stopped");
+        tracing::info!(broker_id = id, "desktop desktop agent stopped");
     }
     shared.desktop.disconnected(id, &shared.sessions).await;
     result

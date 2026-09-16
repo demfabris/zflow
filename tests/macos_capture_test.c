@@ -272,6 +272,7 @@ static void reset(void) {
   background = false;
   hide_count = 0;
   atomic_store(&g_stop, false);
+  atomic_store(&g_pause_requested, false);
   atomic_store(&g_raw_contact_active, false);
   g_capture_status = 0;
   g_request_raw_touch = false;
@@ -432,6 +433,7 @@ static void event_tests(void) {
     assert(capture_cursor());
     assert(event_callback(NULL, disabled[i], event, NULL) == event);
     assert(zflow_mac_capture_stop_requested() == 1);
+    assert(zflow_mac_capture_pause_requested() == 0);
     assert(g_capture_status == -1);
     assert(event_callback(NULL, kCGEventMouseMoved, event, NULL) == event);
     assert(zflow_mac_capture_poll(&captured) == 0);
@@ -446,8 +448,22 @@ static void event_tests(void) {
   CGEventSetFlags(event, kCGEventFlagMaskControl | kCGEventFlagMaskCommand);
   event_callback(NULL, kCGEventKeyDown, event, NULL);
   assert(zflow_mac_capture_stop_requested() == 1);
+  assert(zflow_mac_capture_pause_requested() == 1);
   assert(zflow_mac_capture_poll(&captured) == 1);
   assert(captured.kind == ZFLOW_EVENT_ESCAPE);
+
+  reset();
+  ZFlowMacEvent motion_event = {.kind = ZFLOW_EVENT_MOTION};
+  for (size_t i = 0; i < ZFLOW_QUEUE_CAPACITY - 1; i++) {
+    assert(enqueue(&motion_event));
+  }
+  assert(!enqueue(&motion_event));
+  event_callback(NULL, kCGEventKeyDown, event, NULL);
+  assert(zflow_mac_capture_stop_requested() == 1);
+  assert(zflow_mac_capture_pause_requested() == 1);
+  while (zflow_mac_capture_poll(&captured)) {
+    assert(captured.kind == ZFLOW_EVENT_MOTION);
+  }
   CFRelease(event);
 }
 
@@ -458,7 +474,9 @@ int main(void) {
   return_cursor_tests();
   event_tests();
   reset();
+  atomic_store(&g_pause_requested, true);
   assert(zflow_mac_capture_start(0, NULL) == -1);
+  assert(zflow_mac_capture_pause_requested() == 0);
   assert(tap_calls == 1 && call_count == 0);
   assert(!g_thread_valid);
   puts("macOS cursor lifecycle and event-filter tests passed (fake cursor APIs)");

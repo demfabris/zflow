@@ -43,3 +43,37 @@ sudo ./scripts/uninstall.sh
 ```
 
 Use `--purge` only when you also want to delete those files and the account.
+
+## Native macOS app
+
+`scripts/build-macos-app.sh [--debug] [--sign IDENTITY]` builds the Rust static
+library and Swift package, then assembles `target/{debug,release}/zflow.app`.
+The app requires macOS 26 and Swift 6.2 or newer. It uses SwiftUI Settings and
+MenuBarExtra with no Dock icon. The bundle contains the AWDL client, daemon,
+and SMAppService launchd plist. All executables use hardened runtime signatures.
+
+Use an Apple-issued signing identity to install the privileged helper through
+the app. XPC requires matching teams and exact client/daemon identifiers. Ad hoc
+builds leave AWDL installation unavailable and can still run input sharing.
+The build script does not install services, launch the app, or notarize it.
+
+## Linux desktop session
+
+After installing the system service, run as the logged-in desktop user:
+
+```sh
+zflow desktop-agent --install
+zflow desktop-agent
+```
+
+The install command writes the GNOME extension and
+`$XDG_CONFIG_HOME/autostart/io.zflow.desktop-agent.desktop` (falling back to
+`~/.config/autostart`). GNOME may require logout/login before enabling a new
+extension. The agent reconnects to the system service, serves desktop requests,
+and advertises display dimensions without opening a window. It obtains public
+peer/discovery settings through the credential-checked desktop API. It does not
+read the protected system configuration directly. Quit the foreground agent
+with Ctrl+C; future GNOME logins start it automatically.
+
+The system uninstaller does not delete per-user extension or autostart files.
+Remove those from the desktop account when removing desktop integration.
