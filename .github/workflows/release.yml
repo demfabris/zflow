@@ -58,7 +58,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y debhelper
+          sudo apt-get install -y build-essential debhelper
           cargo fmt --all --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked --all-targets

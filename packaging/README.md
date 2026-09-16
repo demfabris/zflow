@@ -40,7 +40,7 @@ Local artifact assembly after building the native release binaries:
 
 ```sh
 ./scripts/package-release.sh x86_64-unknown-linux-gnu
-./scripts/build-deb.sh   # Linux; requires debhelper and dpkg-dev
+./scripts/build-deb.sh   # Linux; requires build-essential and debhelper
 ```
 
 Both commands package existing binaries under `target/release`; neither builds

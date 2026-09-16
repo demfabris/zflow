@@ -21,51 +21,7 @@ struct ComputerLayout: View {
         RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.35))
         if computers.isEmpty { Text("Detecting this Mac’s displays…").foregroundStyle(.secondary) }
         ForEach(computers) { computer in
-          let active = dragging == computer.id
-          let center = CGPoint(
-            x: origin.x + (CGFloat(computer.x) + CGFloat(computer.width) / 2) * scale
-              + (active ? translation.width : 0),
-            y: origin.y + (CGFloat(computer.y) + CGFloat(computer.height) / 2) * scale
-              + (active ? translation.height : 0)
-          )
-          computerTile(computer, scale: scale, active: active)
-          .position(center)
-          .zIndex(active ? 1 : 0)
-          .gesture(
-            DragGesture(minimumDistance: 2)
-              .onChanged { value in
-                dragging = computer.id
-                translation = value.translation
-              }
-              .onEnded { value in
-                move(
-                  computer, computer.x + Int((value.translation.width / scale).rounded()),
-                  computer.y + Int((value.translation.height / scale).rounded()),
-                  Int((14 / scale).rounded()))
-                dragging = nil
-                translation = .zero
-              }
-          )
-          .contextMenu {
-            if computer.peer != nil {
-              Button("Forget Computer…", role: .destructive) { forgetting = computer }
-            }
-          }
-          .accessibilityElement(children: .ignore)
-          .accessibilityLabel(computer.label)
-          .accessibilityValue("Position \(computer.x), \(computer.y)")
-          .accessibilityAction(named: "Move left") {
-            move(computer, computer.x - 100, computer.y, 150)
-          }
-          .accessibilityAction(named: "Move right") {
-            move(computer, computer.x + 100, computer.y, 150)
-          }
-          .accessibilityAction(named: "Move up") {
-            move(computer, computer.x, computer.y - 100, 150)
-          }
-          .accessibilityAction(named: "Move down") {
-            move(computer, computer.x, computer.y + 100, 150)
-          }
+          accessibleComputer(computer, scale: scale, origin: origin)
         }
       }.clipped()
     }
@@ -82,6 +38,70 @@ struct ComputerLayout: View {
     } message: {
       Text("You will need to pair again to share input with this computer.")
     }
+  }
+
+  private func positionedComputer(
+    _ computer: Computer, scale: CGFloat, origin: CGPoint
+  ) -> some View {
+    let active: Bool = dragging == computer.id
+    let offset: CGSize = active ? translation : .zero
+    let midpointX: CGFloat = CGFloat(computer.x) + CGFloat(computer.width) / 2
+    let midpointY: CGFloat = CGFloat(computer.y) + CGFloat(computer.height) / 2
+    let center = CGPoint(
+      x: origin.x + midpointX * scale + offset.width,
+      y: origin.y + midpointY * scale + offset.height)
+    return computerTile(computer, scale: scale, active: active)
+      .position(center)
+      .zIndex(active ? 1 : 0)
+  }
+
+  private func accessibleComputer(
+    _ computer: Computer, scale: CGFloat, origin: CGPoint
+  ) -> some View {
+    interactiveComputer(computer, scale: scale, origin: origin)
+      .accessibilityElement(children: .ignore)
+      .accessibilityLabel(Text(computer.label))
+      .accessibilityValue(Text("Position \(computer.x), \(computer.y)"))
+      .accessibilityAction(named: Text("Move left")) {
+        move(computer, computer.x - 100, computer.y, 150)
+      }
+      .accessibilityAction(named: Text("Move right")) {
+        move(computer, computer.x + 100, computer.y, 150)
+      }
+      .accessibilityAction(named: Text("Move up")) {
+        move(computer, computer.x, computer.y - 100, 150)
+      }
+      .accessibilityAction(named: Text("Move down")) {
+        move(computer, computer.x, computer.y + 100, 150)
+      }
+  }
+
+  private func interactiveComputer(
+    _ computer: Computer, scale: CGFloat, origin: CGPoint
+  ) -> some View {
+    positionedComputer(computer, scale: scale, origin: origin)
+      .gesture(dragGesture(for: computer, scale: scale))
+      .contextMenu {
+        if computer.peer != nil {
+          Button("Forget Computer…", role: .destructive) { forgetting = computer }
+        }
+      }
+  }
+
+  private func dragGesture(for computer: Computer, scale: CGFloat) -> some Gesture {
+    DragGesture(minimumDistance: 2)
+      .onChanged { (value: DragGesture.Value) in
+        dragging = computer.id
+        translation = value.translation
+      }
+      .onEnded { (value: DragGesture.Value) in
+        let deltaX: Int = Int((value.translation.width / scale).rounded())
+        let deltaY: Int = Int((value.translation.height / scale).rounded())
+        let tolerance: Int = Int((CGFloat(14) / scale).rounded())
+        move(computer, computer.x + deltaX, computer.y + deltaY, tolerance)
+        dragging = nil
+        translation = .zero
+      }
   }
 
   private func computerTile(_ computer: Computer, scale: CGFloat, active: Bool) -> some View {
