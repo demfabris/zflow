@@ -124,7 +124,6 @@ export default class ZflowExtension extends Extension {
         const vertical = r.edge === 'left' || r.edge === 'right';
         const origin = vertical ? top : left;
         const span = vertical ? bottom - top : right - left;
-        const coordinate = Math.min(origin + span - 1, origin + Math.floor(r.position * span / MAX));
         const boundary = {left, right, top, bottom}[r.edge];
         const segments = ms.filter(m => ({left: m.x, right: m.x + m.width, top: m.y, bottom: m.y + m.height}[r.edge]) === boundary)
             .map(m => ({
@@ -132,8 +131,15 @@ export default class ZflowExtension extends Extension {
                 end: Math.min(vertical ? m.y + m.height : m.x + m.width, origin + Math.floor(r.end * span / MAX)),
                 monitor: m,
             })).filter(s => s.end > s.start);
-        const segment = segments.find(s => coordinate >= s.start && coordinate < s.end);
-        if (!segment) throw new Error('The selected crossing enters a gap between GNOME monitors');
+        // The Mac tile is this desktop's bounding box, so the entry can fall where no
+        // monitor touches the edge, or a rounding pixel outside the range. Enter at
+        // the nearest pixel that has a monitor behind it.
+        const wanted = origin + Math.floor(r.position * span / MAX);
+        const along = s => Math.max(s.start, Math.min(s.end - 1, wanted));
+        const segment = segments.reduce((best, s) =>
+            best && Math.abs(along(best) - wanted) <= Math.abs(along(s) - wanted) ? best : s, null);
+        if (!segment) throw new Error('No GNOME monitor touches the selected crossing range');
+        const coordinate = along(segment);
         const m = segment.monitor;
         if (m.width < 8 || m.height < 8) throw new Error('The entry monitor is too small');
         const point = vertical ? {x: r.edge === 'left' ? left + 3 : right - 4, y: coordinate}

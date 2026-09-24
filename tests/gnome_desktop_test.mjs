@@ -144,12 +144,28 @@ for (const [edge, expectedY, direction] of [['top', 3, 4], ['bottom', 1076, 8]])
 }
 {
     const d = desktop([{x: -200, y: -100, width: 200, height: 100}, {x: -200, y: 100, width: 200, height: 100}]);
-    await assert.rejects(d.extension._request(prepare('left')), /gap/);
-    assert.equal(d.barriers.length, 0);
+    await assert.rejects(d.extension._request(prepare('left', {start: 366667, end: 600000})), /No GNOME monitor/);
+    assert.equal(d.barriers.length, 0, 'a range inside the gap creates no barriers');
     const result = await d.extension._request(prepare('left', {position: 100000}));
-    assert.equal(result.position.x, -197);
-    assert.equal(result.position.y, -70);
+    assert.deepEqual({...result.position}, {x: -197, y: -70});
     assert.equal(d.barriers.length, 2);
+    await d.extension._request({command: 'finish', token: 7});
+    const gap = await d.extension._request(prepare('left'));
+    assert.deepEqual({...gap.position}, {x: -197, y: 100}, 'an entry into the gap moves to the nearest monitor');
+    d.extension.disable();
+}
+{
+    // 1920x1080 left of 2560x1440 with the Mac on the left: the bottom quarter of that edge has no monitor.
+    const d = desktop([{x: 0, y: 0, width: 1920, height: 1080}, {x: 1920, y: 0, width: 2560, height: 1440}]);
+    const result = await d.extension._request(prepare('left', {position: 900000}));
+    assert.deepEqual({...result.position}, {x: 3, y: 1079});
+    assert.deepEqual(d.barriers.map(b => [b.properties.y1, b.properties.y2]), [[0, 1080]]);
+    d.extension.disable();
+}
+for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 500000, position: 500000}, 539]]) {
+    // The first and last pixel of a partial range round inside it, not one pixel out.
+    const d = desktop();
+    assert.equal((await d.extension._request(prepare('left', range))).position.y, y);
     d.extension.disable();
 }
 {
