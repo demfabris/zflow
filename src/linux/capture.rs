@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeSet,
+    fs::OpenOptions,
     io,
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     time::Instant,
 };
 
-use evdev::{Device, InputEvent, KeyCode};
+use evdev::{InputEvent, KeyCode, raw_stream::RawDevice};
 use thiserror::Error;
 
 use crate::capture::CapturedDeviceFrame;
@@ -16,15 +17,21 @@ use super::{AggregateInputState, DeviceInfo, FrameAccumulator, MappingError, Tou
 #[derive(Debug)]
 struct CaptureNode {
     path: PathBuf,
-    device: Device,
+    /// Raw reads pass SYN_DROPPED through. The synced reader hides it and
+    /// rebuilds state on its own, which leaves stale multitouch slots.
+    device: RawDevice,
     frames: FrameAccumulator,
     touch: Option<TouchAccumulator>,
 }
 
 impl CaptureNode {
     fn open(info: &DeviceInfo) -> io::Result<(Self, Vec<KeyCode>)> {
-        let device = Device::open(&info.path)?;
-        device.set_nonblocking(true)?;
+        // Capture only reads and grabs, and setup grants read access alone.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&info.path)?;
+        let device = RawDevice::try_from(file)?;
         let held = device.get_key_state()?.iter().collect();
         let touch = TouchAccumulator::from_device(&device)?;
         Ok((
@@ -320,41 +327,14 @@ impl CaptureSet {
             }
         };
 
-        let mut frames = Vec::new();
-        for event in events {
-            self.aggregate.observe(path, event);
-            let touch = self.nodes[index]
-                .touch
-                .as_mut()
-                .map(|touch| touch.push(event))
-                .transpose()
-                .map_err(|_| CaptureReadError::Mapping {
-                    path: path.to_owned(),
-                    source: MappingError::InvalidTouchState,
-                })?
-                .flatten();
-            match self.nodes[index].frames.push(event) {
-                Ok(Some(mut frame)) => {
-                    if let Some((state, event_count)) = touch {
-                        frame.touch_snapshot = Some(state);
-                        frame.event_count = frame.event_count.saturating_add(event_count);
-                    }
-                    frames.push(CapturedDeviceFrame {
-                        device_path: path.to_owned(),
-                        frame,
-                        captured_at: Instant::now(),
-                    });
-                }
-                Ok(None) => {}
-                Err(source) => {
-                    return Err(CaptureReadError::Mapping {
-                        path: path.to_owned(),
-                        source,
-                    });
-                }
-            }
-        }
-        Ok(frames)
+        let node = &mut self.nodes[index];
+        map_events(
+            path,
+            &mut self.aggregate,
+            &mut node.frames,
+            node.touch.as_mut(),
+            events,
+        )
     }
 
     /// Applies a periodic-rescan selection. A removed active node closes the
@@ -428,6 +408,52 @@ impl Drop for CaptureSet {
     }
 }
 
+/// Maps one batch of raw events into complete frames. SYN_DROPPED fails the
+/// batch, so the runtime closes the capture set and rebuilds it from fresh
+/// kernel state instead of guessing what was lost.
+fn map_events(
+    path: &Path,
+    aggregate: &mut AggregateInputState,
+    frames: &mut FrameAccumulator,
+    mut touch: Option<&mut TouchAccumulator>,
+    events: Vec<InputEvent>,
+) -> Result<Vec<CapturedDeviceFrame>, CaptureReadError> {
+    let mut captured = Vec::new();
+    for event in events {
+        aggregate.observe(path, event);
+        let touch_state = touch
+            .as_deref_mut()
+            .map(|touch| touch.push(event))
+            .transpose()
+            .map_err(|_| CaptureReadError::Mapping {
+                path: path.to_owned(),
+                source: MappingError::InvalidTouchState,
+            })?
+            .flatten();
+        match frames.push(event) {
+            Ok(Some(mut frame)) => {
+                if let Some((state, event_count)) = touch_state {
+                    frame.touch_snapshot = Some(state);
+                    frame.event_count = frame.event_count.saturating_add(event_count);
+                }
+                captured.push(CapturedDeviceFrame {
+                    device_path: path.to_owned(),
+                    frame,
+                    captured_at: Instant::now(),
+                });
+            }
+            Ok(None) => {}
+            Err(source) => {
+                return Err(CaptureReadError::Mapping {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(captured)
+}
+
 fn is_device_removed(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound
         || error.raw_os_error() == Some(libc::ENODEV)
@@ -436,7 +462,117 @@ fn is_device_removed(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use evdev::{AbsoluteAxisCode, EventType, SynchronizationCode};
+
     use super::*;
+    use crate::linux::TouchAxisRange;
+
+    fn event(kind: EventType, code: u16, value: i32) -> InputEvent {
+        InputEvent::new(kind.0, code, value)
+    }
+
+    fn sync(code: SynchronizationCode) -> InputEvent {
+        event(EventType::SYNCHRONIZATION, code.0, 0)
+    }
+
+    fn finger_down() -> Vec<InputEvent> {
+        vec![
+            event(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_MT_SLOT.0, 0),
+            event(
+                EventType::ABSOLUTE,
+                AbsoluteAxisCode::ABS_MT_TRACKING_ID.0,
+                7,
+            ),
+            event(
+                EventType::ABSOLUTE,
+                AbsoluteAxisCode::ABS_MT_POSITION_X.0,
+                40,
+            ),
+            event(
+                EventType::ABSOLUTE,
+                AbsoluteAxisCode::ABS_MT_POSITION_Y.0,
+                30,
+            ),
+            sync(SynchronizationCode::SYN_REPORT),
+        ]
+    }
+
+    fn touchpad() -> TouchAccumulator {
+        TouchAccumulator::new(
+            TouchAxisRange::new(0, 100).unwrap(),
+            TouchAxisRange::new(0, 100).unwrap(),
+        )
+    }
+
+    #[test]
+    fn raw_batches_map_complete_frames_with_touch_state() {
+        let path = Path::new("/dev/input/event4");
+        let mut aggregate = AggregateInputState::default();
+        aggregate.add_device(path, []);
+        let mut frames = FrameAccumulator::default();
+        let mut touch = touchpad();
+        let captured = map_events(
+            path,
+            &mut aggregate,
+            &mut frames,
+            Some(&mut touch),
+            finger_down(),
+        )
+        .unwrap();
+        assert_eq!(captured.len(), 1);
+        let state = captured[0].frame.touch_snapshot.as_ref().unwrap();
+        assert_eq!(state.len(), 1);
+        assert!(aggregate.all_at_boundary());
+    }
+
+    #[test]
+    fn syn_dropped_fails_closed_for_keys_and_touch() {
+        let path = Path::new("/dev/input/event4");
+        let mut aggregate = AggregateInputState::default();
+        aggregate.add_device(path, []);
+        let keys = vec![
+            event(EventType::KEY, KeyCode::KEY_A.code(), 1),
+            sync(SynchronizationCode::SYN_REPORT),
+            sync(SynchronizationCode::SYN_DROPPED),
+            event(EventType::KEY, KeyCode::KEY_A.code(), 0),
+            sync(SynchronizationCode::SYN_REPORT),
+        ];
+        let error = map_events(
+            path,
+            &mut aggregate,
+            &mut FrameAccumulator::default(),
+            None,
+            keys,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureReadError::Mapping {
+                source: MappingError::SynchronizationLost,
+                ..
+            }
+        ));
+
+        // A lifted finger lost in the overflow must not stay down.
+        let mut touch = touchpad();
+        let mut lost_lift = finger_down();
+        lost_lift.push(sync(SynchronizationCode::SYN_DROPPED));
+        let error = map_events(
+            path,
+            &mut aggregate,
+            &mut FrameAccumulator::default(),
+            Some(&mut touch),
+            lost_lift,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CaptureReadError::Mapping {
+                source: MappingError::InvalidTouchState,
+                ..
+            }
+        ));
+    }
 
     #[derive(Debug)]
     struct FakeTarget {

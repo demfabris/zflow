@@ -1,6 +1,6 @@
 use std::io;
 
-use evdev::{AbsoluteAxisCode, Device, EventType, InputEvent, SynchronizationCode};
+use evdev::{AbsoluteAxisCode, EventType, InputEvent, SynchronizationCode, raw_stream::RawDevice};
 
 use crate::{
     capture::MAX_TOUCHPAD_CONTACTS,
@@ -47,7 +47,7 @@ pub struct TouchAccumulator {
 }
 
 impl TouchAccumulator {
-    pub fn from_device(device: &Device) -> io::Result<Option<Self>> {
+    pub fn from_device(device: &RawDevice) -> io::Result<Option<Self>> {
         let Some(axes) = device.supported_absolute_axes() else {
             return Ok(None);
         };
@@ -103,6 +103,8 @@ impl TouchAccumulator {
                     Ok(Some((state, count)))
                 }
                 SynchronizationCode::SYN_REPORT => Ok(None),
+                // Slots changed while events were lost. Fail rather than keep
+                // contacts the kernel may already have lifted.
                 SynchronizationCode::SYN_DROPPED => {
                     Err(io::Error::other("multitouch synchronization was lost"))
                 }
@@ -240,6 +242,22 @@ mod tests {
             .unwrap();
         let (lifted, _) = touch.push(report()).unwrap().unwrap();
         assert!(lifted.is_empty());
+    }
+
+    #[test]
+    fn dropped_events_fail_instead_of_keeping_stale_contacts() {
+        let mut touch = accumulator();
+        touch.push(abs(AbsoluteAxisCode::ABS_MT_SLOT, 0)).unwrap();
+        touch
+            .push(abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, 41))
+            .unwrap();
+        touch.push(report()).unwrap().unwrap();
+        let dropped = InputEvent::new(
+            EventType::SYNCHRONIZATION.0,
+            SynchronizationCode::SYN_DROPPED.0,
+            0,
+        );
+        assert!(touch.push(dropped).is_err());
     }
 
     #[test]

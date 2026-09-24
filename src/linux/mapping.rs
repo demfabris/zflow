@@ -559,6 +559,22 @@ mod tests {
     }
 
     #[test]
+    fn syn_dropped_is_a_lost_frame_not_a_boundary() {
+        let mut accumulator = FrameAccumulator::default();
+        accumulator
+            .push(event(EventType::KEY, KeyCode::KEY_A.code(), 1))
+            .unwrap();
+        assert_eq!(
+            accumulator.push(event(
+                EventType::SYNCHRONIZATION,
+                SynchronizationCode::SYN_DROPPED.0,
+                0,
+            )),
+            Err(MappingError::SynchronizationLost)
+        );
+    }
+
+    #[test]
     fn legacy_wheel_is_normalized_to_high_resolution_units() {
         let mut accumulator = FrameAccumulator::default();
         accumulator
