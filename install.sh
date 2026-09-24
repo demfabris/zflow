@@ -145,8 +145,8 @@ select_artifact() {
         machine=arm64
     fi
     case "$machine" in
-        x86_64|amd64) architecture=x86_64; deb_arch=amd64 ;;
-        arm64|aarch64) architecture=aarch64; deb_arch=arm64 ;;
+        x86_64|amd64) architecture=x86_64 ;;
+        arm64|aarch64) architecture=aarch64 ;;
         *) die "No release binary is available for $machine." ;;
     esac
     use_deb=false
@@ -159,8 +159,16 @@ select_artifact() {
         elif command -v dpkg-query >/dev/null 2>&1 && [[ "$(dpkg-query -W -f='${Status}' zflow 2>/dev/null || true)" == 'install ok installed' ]]; then
             use_deb=true
         fi
-        if [[ "$use_deb" == true ]]; then asset="zflow_${version#v}_${deb_arch}.deb";
-        else asset="zflow-${version}-${architecture}-unknown-linux-gnu.tar.gz"; fi
+        if [[ "$use_deb" == true ]]; then
+            # A 32-bit userland can run on a 64-bit kernel; the package must match dpkg.
+            deb_arch=$(dpkg --print-architecture)
+            case "$deb_arch" in
+                amd64|arm64) asset="zflow_${version#v}_${deb_arch}.deb" ;;
+                *) die "No release package is available for $deb_arch." ;;
+            esac
+        else
+            asset="zflow-${version}-${architecture}-unknown-linux-gnu.tar.gz"
+        fi
     else
         asset="zflow-${version}-${architecture}-apple-darwin.tar.gz"
     fi

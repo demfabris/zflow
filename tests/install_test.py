@@ -30,6 +30,7 @@ fetch() { record "fetch $1"; cp "$RELEASE/${1##*/}" "$2"; }
 curl() { record latest; echo "${LATEST_URL:-https://github.com/demfabris/zflow/releases/tag/v0.1.0}"; }
 archive_install_present() { [[ "$LEGACY" == true ]]; }
 dpkg-query() { echo "${DPKG_STATUS:-unknown}"; }
+dpkg() { echo "${DPKG_ARCH:-amd64}"; }
 getconf() { echo "${LIBC:-glibc 2.39}"; }
 systemctl() { echo "${SYSTEMD_VERSION-259}"; }
 udevadm() { echo verify; }
@@ -145,6 +146,14 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("extension enable zflow@demfabris", self.calls())
         self.assertNotIn("desktop-agent --install", self.calls())
         self.assertNotIn("/scripts/install.sh", self.calls())
+
+    def test_debian_package_follows_dpkg_architecture(self):
+        self.run_shell("main --yes --headless", env={"LEGACY": "false", "ARCH": "x86_64", "DPKG_ARCH": "arm64"})
+        self.assertIn("zflow_0.1.0_arm64.deb", self.calls())
+        self.log.write_text("")
+        output = self.run_shell("main --yes --headless", env={"LEGACY": "false", "ARCH": "aarch64", "DPKG_ARCH": "armhf"}, ok=False)
+        self.assertIn("armhf", output)
+        self.assertNotIn("fetch ", self.calls())
 
     def test_headless_debian_skips_desktop_recommendations(self):
         self.run_shell("main --yes --headless", env={"LEGACY": "false"})
