@@ -21,9 +21,9 @@ use crate::{
     },
     config::Config,
     core::{
-        ActivationId, ContactId, HidUsage, MotionDelta, PointerButton, SessionCloseReason,
-        SessionContext, SessionEpoch, SourceDimensions, TouchContact, TouchState, TouchTool,
-        TransportGeneration,
+        ActivationId, ContactId, HidUsage, InputCapability, MotionDelta, PointerButton,
+        SessionCloseReason, SessionContext, SessionEpoch, SourceDimensions, TouchContact,
+        TouchState, TouchTool, TransportGeneration,
     },
     desktop::{DesktopRequest, DesktopResponse, Edge},
     identity::Identity,
@@ -467,6 +467,12 @@ async fn run_endpoint(
             if acquired && let Some(session) = connected.take() { break session; }
         }
     };
+    // A receiver without Touch drops contact snapshots, so keep pointer and
+    // scroll instead of suppressing them while a finger is down.
+    let raw_touch = raw_available && session.capabilities().contains(InputCapability::Touch);
+    if raw_available && !raw_touch {
+        eprintln!("{} does not accept raw touch; falling back to pointer and scroll", options.peer);
+    }
 
     let mut prepared = None;
     let mut activation_started = false;
@@ -549,7 +555,7 @@ async fn run_endpoint(
 
         let capture_start = Instant::now();
         tracing::debug!("native capture starting");
-        let mut capture = MacCapture::start(raw_available, options.handoff.as_ref().map(|h| h.entry_region))
+        let mut capture = MacCapture::start(raw_touch, options.handoff.as_ref().map(|h| h.entry_region))
             .inspect_err(|error| {
                 tracing::warn!(elapsed_ms = capture_start.elapsed().as_millis() as u64,
                     cursor = ?cursor_position().ok().map(|p| (p.x, p.y)),
@@ -1310,6 +1316,66 @@ mod tests {
                 quinn::ConnectionError::ApplicationClosed(_)
             ));
         }
+        server.close(0_u32.into(), b"test finished");
+    }
+
+    #[tokio::test]
+    async fn raw_touch_needs_a_receiver_that_negotiates_touch() {
+        use crate::transport::{accept_input, input_server_config};
+
+        let left_dir = tempfile::tempdir().unwrap();
+        let right_dir = tempfile::tempdir().unwrap();
+        let left = Identity::load_or_create(left_dir.path()).unwrap();
+        let right = Identity::load_or_create(right_dir.path()).unwrap();
+        let client_config = input_client_config(&left, right.spki()).unwrap();
+        let server_config = input_server_config(&right, left.spki()).unwrap();
+        let server =
+            Endpoint::server(server_config.quinn_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = server.local_addr().unwrap();
+        let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut sender = Config::default();
+        sender.input.experimental_touchpad = true;
+        for touch in [false, true] {
+            let mut receiver = Config::default();
+            receiver.input.experimental_touchpad = touch;
+            let (server, server_config) = (server.clone(), server_config.clone());
+            let accepted = tokio::spawn(async move {
+                let incoming = server.accept().await.unwrap();
+                let connection = accept_input(incoming, &server_config).await.unwrap();
+                let options = SessionOptions::from_config(&receiver).unwrap();
+                let (events, received) = mpsc::channel(8);
+                let session = start_session(
+                    connection,
+                    "mac".into(),
+                    TransportGeneration(1),
+                    options,
+                    events,
+                );
+                (session.await.unwrap(), received)
+            });
+            let connection = connect_input(&client, address, &client_config)
+                .await
+                .unwrap();
+            let options = SessionOptions::from_config(&sender).unwrap();
+            let (events, _received) = mpsc::channel(8);
+            let session = start_session(
+                connection,
+                "linux".into(),
+                TransportGeneration(1),
+                options,
+                events,
+            )
+            .await
+            .unwrap();
+            let (remote, _remote_events) = accepted.await.unwrap();
+            assert_eq!(
+                session.capabilities().contains(InputCapability::Touch),
+                touch
+            );
+            session.close(SessionCloseReason::LocalRelease);
+            remote.close(SessionCloseReason::LocalRelease);
+        }
+        client.close(0_u32.into(), b"test finished");
         server.close(0_u32.into(), b"test finished");
     }
 

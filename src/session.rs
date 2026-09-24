@@ -168,6 +168,7 @@ pub struct SessionHandle {
     connection: crate::transport::DatagramChannel,
     metrics: Arc<Mutex<SessionMetrics>>,
     desktop_id: Arc<std::sync::atomic::AtomicU64>,
+    capabilities: InputCapabilities,
 }
 
 pub(crate) fn desktop_operation(request: &crate::desktop::DesktopRequest) -> &'static str {
@@ -298,6 +299,11 @@ impl SessionHandle {
         self.generation
     }
 
+    /// Capabilities both peers agreed on during negotiation.
+    pub fn capabilities(&self) -> &InputCapabilities {
+        &self.capabilities
+    }
+
     pub fn metrics_snapshot(&self) -> SessionMetricsSnapshot {
         let snapshot_data = { lock_metrics(&self.metrics).snapshot_data() };
         let mut snapshot = snapshot_data.summarize();
@@ -383,6 +389,7 @@ pub async fn start_session(
         connection: connection.clone(),
         metrics: metrics.clone(),
         desktop_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        capabilities: InputCapabilities::default(),
     };
 
     tokio::spawn(async move {
@@ -412,7 +419,10 @@ pub async fn start_session(
     });
 
     match tokio::time::timeout(NEGOTIATION_TIMEOUT, ready_rx).await {
-        Ok(Ok(Ok(()))) => Ok(handle),
+        Ok(Ok(Ok(capabilities))) => Ok(SessionHandle {
+            capabilities,
+            ..handle
+        }),
         Ok(Ok(Err(error))) => {
             handle.close(SessionCloseReason::ProtocolViolation);
             Err(anyhow!(error))
@@ -437,7 +447,7 @@ async fn run_session(
     options: SessionOptions,
     events: mpsc::Sender<SessionEvent>,
     metrics: Arc<Mutex<SessionMetrics>>,
-    ready: oneshot::Sender<Result<(), String>>,
+    ready: oneshot::Sender<Result<InputCapabilities, String>>,
 ) -> Result<()> {
     let setup = async {
         let negotiated = negotiate(&mut channels, &options.offer).await?;
@@ -458,7 +468,7 @@ async fn run_session(
             return Err(error);
         }
     };
-    let _ = ready.send(Ok(()));
+    let _ = ready.send(Ok(negotiated.capabilities.clone()));
 
     let clock = MonotonicClock::new();
     let mut desktop_waiter: Option<(u64, oneshot::Sender<crate::desktop::DesktopResponse>)> = None;
@@ -2822,7 +2832,10 @@ mod tests {
             channels: InputChannels,
             id: u64,
             events: mpsc::Sender<SessionEvent>,
-        ) -> (SessionHandle, oneshot::Receiver<Result<(), String>>) {
+        ) -> (
+            SessionHandle,
+            oneshot::Receiver<Result<InputCapabilities, String>>,
+        ) {
             let (commands, command_rx) = mpsc::channel(512);
             let (ready, receipt) = oneshot::channel();
             let connection = channels.datagrams.clone();
@@ -2835,6 +2848,7 @@ mod tests {
                 connection: connection.clone(),
                 metrics: metrics.clone(),
                 desktop_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                capabilities: InputCapabilities::default(),
             };
             tokio::spawn(async move {
                 let _ = run_session(
