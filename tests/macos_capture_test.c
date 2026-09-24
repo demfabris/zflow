@@ -2,9 +2,11 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <float.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static void *fake_dlsym(void *, const char *);
 static CGError fake_associate(boolean_t);
@@ -22,10 +24,15 @@ static Boolean fake_trusted_options(CFDictionaryRef);
 static CFMachPortRef fake_tap(CGEventTapLocation, CGEventTapPlacement,
                              CGEventTapOptions, CGEventMask,
                              CGEventTapCallBack, void *);
+static void fake_tap_enable(CFMachPortRef, bool);
+static CFRunLoopRunResult fake_run_loop(CFRunLoopMode, CFTimeInterval, Boolean);
 
 // Replace cursor mutations and tap creation before including the bridge.
 // These tests do not capture, hide, disconnect, or post input on the host.
+// The capture thread runs its real run loop on a plain Mach port.
 #define dlsym fake_dlsym
+#define CGEventTapEnable fake_tap_enable
+#define CFRunLoopRunInMode fake_run_loop
 #define CGAssociateMouseAndMouseCursorPosition fake_associate
 #define CGDisplayHideCursor fake_hide
 #define CGDisplayShowCursor fake_show
@@ -40,6 +47,7 @@ static CFMachPortRef fake_tap(CGEventTapLocation, CGEventTapPlacement,
 #define AXIsProcessTrusted fake_trusted
 #define AXIsProcessTrustedWithOptions fake_trusted_options
 #include "../src/macos/capture_bridge.c"
+#undef CFRunLoopRunInMode
 
 static char calls[64];
 static size_t call_count;
@@ -49,6 +57,10 @@ static bool connected;
 static bool background;
 static int hide_count;
 static int tap_calls;
+static bool tap_available;
+static int tap_enables;
+static bool lose_stop;
+static _Atomic int loop_runs;
 static CGPoint warped_position;
 static CGPoint cursor_position = {-1200, -50};
 static int held_key = -1;
@@ -249,6 +261,10 @@ static CGError fake_show(CGDirectDisplayID display) {
   return error;
 }
 
+static void idle_port(CFMachPortRef port, void *message, CFIndex size, void *info) {
+  (void)port; (void)message; (void)size; (void)info;
+}
+
 static CFMachPortRef fake_tap(CGEventTapLocation location,
                              CGEventTapPlacement placement,
                              CGEventTapOptions options, CGEventMask mask,
@@ -259,7 +275,24 @@ static CFMachPortRef fake_tap(CGEventTapLocation location,
   assert(mask & CGEventMaskBit(kCGEventMouseMoved));
   assert(callback == event_callback && context == NULL);
   tap_calls++;
-  return NULL;
+  return tap_available ? CFMachPortCreate(NULL, idle_port, NULL, NULL) : NULL;
+}
+
+static void fake_tap_enable(CFMachPortRef tap, bool enable) {
+  assert(tap);
+  if (enable) tap_enables++;
+}
+
+static CFRunLoopRunResult fake_run_loop(CFRunLoopMode mode, CFTimeInterval seconds,
+                                        Boolean once) {
+  atomic_fetch_add(&loop_runs, 1);
+  if (lose_stop) {
+    // A stop that lands just before the loop runs is dropped by CFRunLoopStop.
+    lose_stop = false;
+    atomic_store(&g_stop, true);
+    stop_capture_run_loop();
+  }
+  return CFRunLoopRunInMode(mode, seconds, once);
 }
 
 static void reset(void) {
@@ -279,47 +312,31 @@ static void reset(void) {
   expect_return_warp = false;
   g_return_pending = false;
   g_queue_head = g_queue_tail = 0;
+  tap_available = true;
 }
 
-static void idle_test_source(void *context) { (void)context; }
-
-static void *fake_capture_cleanup(void *context) {
-  (void)context;
-  CFRunLoopSourceContext source_context = {0};
-  source_context.perform = idle_test_source;
-  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &source_context);
-  assert(source);
-  CFRunLoopRef loop = CFRunLoopGetCurrent();
-  CFRunLoopAddSource(loop, source, kCFRunLoopDefaultMode);
-  pthread_mutex_lock(&g_run_loop_lock);
-  g_run_loop = loop;
-  pthread_mutex_unlock(&g_run_loop_lock);
-  signal_started(0);
-  if (!atomic_load(&g_stop)) CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1, false);
-  ZFlowMacPosition position;
-  bool returning = take_return_position(&position);
-  if (!release_cursor_at(returning ? &position : NULL)) g_capture_status = -1;
-  CFRunLoopRemoveSource(loop, source, kCFRunLoopDefaultMode);
-  CFRelease(source);
-  atomic_store(&g_stop, true);
-  return NULL;
+static void start_capture(void) {
+  assert(zflow_mac_capture_start(0, NULL) == 0);
+  assert(g_thread_valid && strcmp(calls, "BHD") == 0);
 }
 
-static void start_fake_capture_cleanup(void) {
-  assert(capture_cursor());
-  g_start_ready = false;
-  assert(pthread_create(&g_thread, NULL, fake_capture_cleanup, NULL) == 0);
-  g_thread_valid = true;
-  pthread_mutex_lock(&g_start_lock);
-  while (!g_start_ready) pthread_cond_wait(&g_start_condition, &g_start_lock);
-  pthread_mutex_unlock(&g_start_lock);
+static void lost_stop_tests(void) {
+  reset();
+  lose_stop = true;
+  atomic_store(&loop_runs, 0);
+  start_capture();
+  while (atomic_load(&loop_runs) == 0) sched_yield();
+  // The join returns only if the loop rechecks the flag it missed.
+  assert(zflow_mac_capture_stop() == 0);
+  assert(!g_thread_valid && !lose_stop);
+  assert(strcmp(calls, "BHDCSb") == 0);
 }
 
 static void return_cursor_tests(void) {
   const ZFlowMacPosition target = {-1200, -50};
   reset();
   expect_return_warp = true;
-  start_fake_capture_cleanup();
+  start_capture();
   assert(zflow_mac_capture_stop_at(&target) == 0);
   assert(strcmp(calls, "BHDWCSb") == 0);
   assert(warped_position.x == target.x && warped_position.y == target.y);
@@ -329,7 +346,7 @@ static void return_cursor_tests(void) {
   assert(strcmp(calls, "BHDWCSb") == 0);
 
   reset();
-  start_fake_capture_cleanup();
+  start_capture();
   atomic_store(&g_stop, true);
   stop_capture_run_loop();
   assert(zflow_mac_capture_stop_at(&target) == -1);
@@ -340,7 +357,7 @@ static void return_cursor_tests(void) {
                                     {1920, 0}, {-1200, -201}};
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     reset();
-    start_fake_capture_cleanup();
+    start_capture();
     assert(zflow_mac_capture_stop_at(&invalid[i]) == -1);
     assert(strcmp(calls, "BHDCSb") == 0);
     assert(connected && hide_count == 0 && !background);
@@ -348,14 +365,14 @@ static void return_cursor_tests(void) {
 
   reset();
   expect_return_warp = true;
-  start_fake_capture_cleanup();
+  start_capture();
   fail_call = 'W';
   assert(zflow_mac_capture_stop_at(&target) == -1);
   assert(strcmp(calls, "BHDWCSb") == 0);
   assert(connected && hide_count == 0 && !background);
 
   reset();
-  start_fake_capture_cleanup();
+  start_capture();
   assert(zflow_mac_capture_stop() == 0);
   assert(strcmp(calls, "BHDCSb") == 0);
 }
@@ -468,16 +485,21 @@ static void event_tests(void) {
 }
 
 int main(void) {
+  // A capture thread that misses its stop hangs the join. Fail instead.
+  alarm(30);
   desktop_and_permission_tests();
   startup_release_tests();
   cursor_lifecycle_tests();
+  lost_stop_tests();
   return_cursor_tests();
   event_tests();
   reset();
+  tap_available = false;
+  int taps = tap_calls;
   atomic_store(&g_pause_requested, true);
   assert(zflow_mac_capture_start(0, NULL) == -1);
   assert(zflow_mac_capture_pause_requested() == 0);
-  assert(tap_calls == 1 && call_count == 0);
+  assert(tap_calls == taps + 1 && call_count == 0);
   assert(!g_thread_valid);
   puts("macOS cursor lifecycle and event-filter tests passed (fake cursor APIs)");
   return 0;

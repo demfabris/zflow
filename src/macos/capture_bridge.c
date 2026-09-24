@@ -621,7 +621,11 @@ static void *capture_thread(void *context) {
     // Mac. Do not replay that local part of the stroke after remote entry.
     clear_capture_queue();
     signal_started(raw_active ? 1 : 0);
-    if (!atomic_load(&g_stop)) CFRunLoopRun();
+    // CFRunLoopStop is lost when it lands before the loop runs, so wake up
+    // to recheck the flag. Finished means macOS invalidated the tap.
+    while (!atomic_load(&g_stop) &&
+           CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false) !=
+               kCFRunLoopRunFinished) {}
   }
 
   ZFlowMacPosition return_position;
