@@ -20,6 +20,11 @@ export class Indicator {
         this._busy = false;
         this._destroyed = false;
         this._client = new Client(snapshot => this._update(snapshot));
+        // Shell destroys the panel at session end without calling disable().
+        this._button.connect('destroy', () => {
+            this._destroyed = true;
+            this._client.destroy();
+        });
         Main.panel.addToStatusArea('zflow', this._button);
         this._client.start();
     }
@@ -47,8 +52,6 @@ export class Indicator {
     }
 
     destroy() {
-        this._destroyed = true;
-        this._client.destroy();
-        this._button.destroy();
+        if (!this._destroyed) this._button.destroy();
     }
 }

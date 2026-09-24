@@ -30,8 +30,10 @@ const context = {
     St: {Icon: class { constructor(props) {Object.assign(this, props);} }},
     PanelMenu: {Button: class {
         menu = {addMenuItem() {}, addAction() {}};
+        handlers = {};
         add_child() {}
-        destroy() {this.destroyed = true;}
+        connect(signal, callback) {this.handlers[signal] = callback;}
+        destroy() {this.destroyed = (this.destroyed ?? 0) + 1; this.handlers.destroy?.();}
     }},
     PopupMenu: {
         PopupMenuItem: class {label = {};}, PopupSeparatorMenuItem: class {},
@@ -60,6 +62,14 @@ assert.equal(panel._icon.icon_name, 'media-playback-pause-symbolic');
 panel.destroy();
 assert.equal(timers.size, 0, 'disable removes panel polling');
 assert.ok(panel._button.destroyed);
+// Shell destroys the panel at session end without calling disable().
+const ended = new context.TestIndicator();
+Object.freeze(ended._status.label);
+ended._button.destroy();
+await new Promise(setImmediate);
+assert.equal(timers.size, 0, 'session teardown stops panel polling before it reaches disposed widgets');
+ended.destroy();
+assert.equal(ended._button.destroyed, 1, 'a later disable leaves the disposed button alone');
 const settings = new context.TestClient(() => {}, true);
 await settings.refresh();
 assert.equal(calls.at(-1).flags, 0, 'opening preferences explicitly starts the session agent');
