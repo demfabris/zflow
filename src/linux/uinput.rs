@@ -27,8 +27,6 @@ const TOUCHPAD_RESOLUTION: i32 = 30;
 pub enum InjectionError {
     #[error(transparent)]
     Unsupported(#[from] MappingError),
-    #[error("{axis} value {value} does not fit the Linux input_event i32 field")]
-    ValueOutOfRange { axis: &'static str, value: i64 },
     #[error("cannot repeat USB HID usage {usage:?} because it is not held")]
     RepeatOfReleasedKey { usage: HidUsage },
     #[error("failed to create {role:?} virtual device: {source}")]
@@ -241,36 +239,26 @@ impl VirtualPointer {
     /// Emits one complete pointer report. High-resolution wheel events are
     /// always paired with the accumulated legacy detent event Linux requires.
     pub fn motion(&mut self, motion: MotionDelta) -> Result<(), InjectionError> {
+        let scroll_x = relative_value(motion.scroll_x);
+        let scroll_y = relative_value(motion.scroll_y);
         let mut events = Vec::with_capacity(6);
-        push_relative(&mut events, RelativeAxisCode::REL_X, "pointer x", motion.dx)?;
-        push_relative(&mut events, RelativeAxisCode::REL_Y, "pointer y", motion.dy)?;
         push_relative(
             &mut events,
-            RelativeAxisCode::REL_HWHEEL_HI_RES,
-            "horizontal high-resolution wheel",
-            motion.scroll_x,
-        )?;
+            RelativeAxisCode::REL_X,
+            relative_value(motion.dx),
+        );
         push_relative(
             &mut events,
-            RelativeAxisCode::REL_WHEEL_HI_RES,
-            "vertical high-resolution wheel",
-            motion.scroll_y,
-        )?;
+            RelativeAxisCode::REL_Y,
+            relative_value(motion.dy),
+        );
+        push_relative(&mut events, RelativeAxisCode::REL_HWHEEL_HI_RES, scroll_x);
+        push_relative(&mut events, RelativeAxisCode::REL_WHEEL_HI_RES, scroll_y);
 
-        let legacy_x = legacy_wheel_delta(&mut self.legacy_hwheel_remainder, motion.scroll_x);
-        let legacy_y = legacy_wheel_delta(&mut self.legacy_wheel_remainder, motion.scroll_y);
-        push_relative(
-            &mut events,
-            RelativeAxisCode::REL_HWHEEL,
-            "horizontal legacy wheel",
-            legacy_x,
-        )?;
-        push_relative(
-            &mut events,
-            RelativeAxisCode::REL_WHEEL,
-            "vertical legacy wheel",
-            legacy_y,
-        )?;
+        let legacy_x = legacy_wheel_delta(&mut self.legacy_hwheel_remainder, scroll_x);
+        let legacy_y = legacy_wheel_delta(&mut self.legacy_wheel_remainder, scroll_y);
+        push_relative(&mut events, RelativeAxisCode::REL_HWHEEL, legacy_x);
+        push_relative(&mut events, RelativeAxisCode::REL_WHEEL, legacy_y);
         if events.is_empty() {
             return Ok(());
         }
@@ -725,28 +713,23 @@ impl Drop for VirtualInput {
     }
 }
 
-fn push_relative(
-    events: &mut Vec<InputEvent>,
-    axis: RelativeAxisCode,
-    axis_name: &'static str,
-    value: i64,
-) -> Result<(), InjectionError> {
-    if value == 0 {
-        return Ok(());
+fn push_relative(events: &mut Vec<InputEvent>, axis: RelativeAxisCode, value: i32) {
+    if value != 0 {
+        events.push(InputEvent::new(EventType::RELATIVE.0, axis.0, value));
     }
-    let value = i32::try_from(value).map_err(|_| InjectionError::ValueOutOfRange {
-        axis: axis_name,
-        value,
-    })?;
-    events.push(InputEvent::new(EventType::RELATIVE.0, axis.0, value));
-    Ok(())
 }
 
-fn legacy_wheel_delta(remainder: &mut i64, high_resolution: i64) -> i64 {
-    let total = *remainder + high_resolution;
-    let clicks = total / WHEEL_CLICK_UNITS;
+/// Peers choose motion deltas and input_event carries an i32. Clamping an
+/// absurd delta keeps it from stopping the receiver for every peer.
+fn relative_value(value: i64) -> i32 {
+    value.clamp(i32::MIN.into(), i32::MAX.into()) as i32
+}
+
+fn legacy_wheel_delta(remainder: &mut i64, high_resolution: i32) -> i32 {
+    let total = *remainder + i64::from(high_resolution);
     *remainder = total % WHEEL_CLICK_UNITS;
-    clicks
+    // The remainder is under one click, so the quotient fits an i32.
+    (total / WHEEL_CLICK_UNITS) as i32
 }
 
 #[cfg(test)]
@@ -809,17 +792,17 @@ mod tests {
     }
 
     #[test]
-    fn pointer_value_range_error_names_the_axis() {
-        let mut events = Vec::new();
-        let error =
-            push_relative(&mut events, RelativeAxisCode::REL_X, "pointer x", i64::MAX).unwrap_err();
-        assert!(matches!(
-            error,
-            InjectionError::ValueOutOfRange {
-                axis: "pointer x",
-                value: i64::MAX
-            }
-        ));
+    fn oversized_peer_motion_is_clamped_instead_of_failing() {
+        assert_eq!(relative_value(i64::MAX), i32::MAX);
+        assert_eq!(relative_value(i64::MIN), i32::MIN);
+        assert_eq!(relative_value(-7), -7);
+        let mut remainder = WHEEL_CLICK_UNITS - 1;
+        assert_eq!(
+            i64::from(legacy_wheel_delta(&mut remainder, i32::MAX)),
+            (i64::from(i32::MAX) + WHEEL_CLICK_UNITS - 1) / WHEEL_CLICK_UNITS
+        );
+        let mut remainder = 1 - WHEEL_CLICK_UNITS;
+        assert!(legacy_wheel_delta(&mut remainder, i32::MIN) < 0);
     }
 
     #[test]

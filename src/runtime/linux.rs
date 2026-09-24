@@ -158,6 +158,7 @@ pub enum RuntimeDiagnostic {
     UngrabRequiredDescriptorClose,
     CapturedFrameQueueFull,
     InjectionFailed,
+    InjectionRejected,
     ReadinessProbeFailed,
     ServiceNotificationFailed,
     EventQueueFull,
@@ -904,6 +905,11 @@ impl RuntimeLoop {
                 apply_receiver_effect(&mut self.virtual_input, effect, touch_captured_at)
             {
                 self.diagnostic(diagnostic);
+                if diagnostic == RuntimeDiagnostic::InjectionRejected {
+                    // Without an acknowledgement the daemon closes only the
+                    // sending peer, whose cleanup releases what it holds.
+                    return false;
+                }
                 // A failed emit followed by a failed release can leave kernel
                 // key state behind. Stop the descriptor-owning thread so Drop
                 // closes the uinput pair. The systemd watchdog then restarts
@@ -1494,7 +1500,19 @@ fn apply_receiver_effect(
         | ReceiverEffect::TakeoverAccepted { .. }
         | ReceiverEffect::Rejected { .. } => Ok(()),
     };
-    result.map_err(|_| RuntimeDiagnostic::InjectionFailed)
+    result.map_err(|error| injection_diagnostic(&error))
+}
+
+/// Only a failed device write leaves kernel state uncertain. Any other error
+/// is input the backend cannot represent, such as touch after the touchpad
+/// was disabled, and rejects just the peer that sent it.
+fn injection_diagnostic(error: &InjectionError) -> RuntimeDiagnostic {
+    match error {
+        InjectionError::Emit { .. } | InjectionError::Create { .. } => {
+            RuntimeDiagnostic::InjectionFailed
+        }
+        _ => RuntimeDiagnostic::InjectionRejected,
+    }
 }
 
 fn modifier_usage(modifier: Modifier) -> HidUsage {
@@ -1904,6 +1922,31 @@ mod tests {
             Some(Duration::from_secs(1))
         );
         assert_eq!(watchdog_tick_interval(None), None);
+    }
+
+    #[test]
+    fn only_backend_io_failures_stop_the_runtime() {
+        use crate::linux::{MappingError, VirtualDeviceRole};
+        for rejected in [
+            InjectionError::TouchpadDisabled,
+            InjectionError::TooManyTouchContacts {
+                actual: 6,
+                maximum: 5,
+            },
+            InjectionError::Unsupported(MappingError::UnsupportedHidUsage { page: 7, usage: 0 }),
+        ] {
+            assert_eq!(
+                injection_diagnostic(&rejected),
+                RuntimeDiagnostic::InjectionRejected
+            );
+        }
+        assert_eq!(
+            injection_diagnostic(&InjectionError::Emit {
+                role: VirtualDeviceRole::Pointer,
+                source: io::Error::from(io::ErrorKind::BrokenPipe),
+            }),
+            RuntimeDiagnostic::InjectionFailed
+        );
     }
 
     #[test]
