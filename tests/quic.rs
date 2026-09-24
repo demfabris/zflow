@@ -12,10 +12,9 @@ use zflow::{
     },
     identity::Identity,
     transport::{
-        INPUT_CHANNELS, InputChannelKind, InputControlMessage, InputDatagram, TransportError,
-        accept_input, accept_pairing, connect_input, connect_pairing, input_client_config,
-        input_server_config, input_server_config_for_peers, pairing_client_config,
-        pairing_server_config,
+        InputControlMessage, InputDatagram, TransportError, accept_input, accept_pairing,
+        connect_input, connect_pairing, input_client_config, input_server_config,
+        input_server_config_for_peers, pairing_client_config, pairing_server_config,
     },
     wire::{CURRENT_PROTOCOL_VERSION, PairingMethod, PairingOffer, WireMessage, encode},
 };
@@ -125,7 +124,7 @@ fn session() -> SessionContext {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mutual_rpk_pinning_delivers_control_and_datagram_without_bulk_channel() {
+async fn mutual_rpk_pinning_delivers_control_and_datagram() {
     let (_client_directory, client_identity) = identity();
     let (_server_directory, server_identity) = identity();
     let client_config = input_client_config(&client_identity, server_identity.spki()).unwrap();
@@ -141,26 +140,23 @@ async fn mutual_rpk_pinning_delivers_control_and_datagram_without_bulk_channel()
         accept_input(incoming, &accept_config).await.unwrap()
     });
 
-    let mut client = connect_input(&client_endpoint, server_address, &client_config)
+    let client = connect_input(&client_endpoint, server_address, &client_config)
         .await
         .unwrap();
-    let mut server = accept.await.unwrap();
+    let server = accept.await.unwrap();
     assert_eq!(client.peer_spki(), server_identity.spki());
     assert_eq!(server.peer_spki(), client_identity.spki());
+    let mut client = client.into_channels();
+    let mut server = server.into_channels();
 
     let control = ReliableControlMessage {
         session: session(),
         sequence: ControlSequence(1),
         payload: ReliableControl::Enter,
     };
-    client
-        .channels_mut()
-        .0
-        .send_control(&control)
-        .await
-        .unwrap();
+    client.control_send.send_control(&control).await.unwrap();
     assert_eq!(
-        server.channels_mut().1.receive().await.unwrap(),
+        server.control_receive.receive().await.unwrap(),
         InputControlMessage::Reliable(control)
     );
 
@@ -175,35 +171,26 @@ async fn mutual_rpk_pinning_delivers_control_and_datagram_without_bulk_channel()
         touch_snapshot: None,
     };
     assert!(matches!(
-        client.channels_mut().2.send_motion(&motion),
+        client.datagrams.send_motion(&motion),
         Err(TransportError::DatagramSizeNotNegotiated)
     ));
-    client.channels_mut().2.configure_maximum(512).unwrap();
-    server.channels_mut().2.configure_maximum(512).unwrap();
+    client.datagrams.configure_maximum(512).unwrap();
+    server.datagrams.configure_maximum(512).unwrap();
     assert!(matches!(
-        client.channels_mut().2.configure_maximum(511),
+        client.datagrams.configure_maximum(511),
         Err(TransportError::DatagramSizeAlreadyNegotiated {
             current: 512,
             requested: 511,
         })
     ));
-    client.channels_mut().2.send_motion(&motion).unwrap();
+    client.datagrams.send_motion(&motion).unwrap();
     assert_eq!(
-        server.channels_mut().2.receive().await.unwrap(),
+        server.datagrams.receive().await.unwrap(),
         InputDatagram::Motion(motion)
     );
 
-    assert_eq!(
-        INPUT_CHANNELS,
-        [
-            InputChannelKind::ReliableControl,
-            InputChannelKind::CumulativeMotion,
-            InputChannelKind::Probe,
-        ]
-    );
-
-    client.close();
-    server.close();
+    client.datagrams.close();
+    server.datagrams.close();
     client_endpoint.wait_idle().await;
     server_endpoint.wait_idle().await;
 }
@@ -218,28 +205,20 @@ async fn cancelling_fragmented_control_reads_preserves_framing_progress() {
     let server_endpoint = quinn::Endpoint::server(server_config.quinn_config(), LOOPBACK).unwrap();
     let server_address = server_endpoint.local_addr().unwrap();
     let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
+    // Accept the stream directly so the server controls fragment boundaries
+    // that the typed sender deliberately hides.
     let accept_endpoint = server_endpoint.clone();
-    let accept_config = server_config.clone();
     let accept = tokio::spawn(async move {
-        let incoming = accept_endpoint.accept().await.unwrap();
-        accept_input(incoming, &accept_config).await.unwrap()
+        let raw_connection = accept_endpoint.accept().await.unwrap().await.unwrap();
+        let (raw_send, raw_receive) = raw_connection.accept_bi().await.unwrap();
+        (raw_connection, raw_send, raw_receive)
     });
-
-    // Open the authenticated stream directly so the test controls fragment
-    // boundaries that the typed sender deliberately hides.
-    let raw_connection = client_endpoint
-        .connect_with(
-            client_config.quinn_config(),
-            server_address,
-            "zflow.invalid",
-        )
-        .unwrap()
+    let client = connect_input(&client_endpoint, server_address, &client_config)
         .await
         .unwrap();
-    let (mut raw_send, _raw_receive) = raw_connection.open_bi().await.unwrap();
-    raw_send.write_all(b"zflow-control-v1\0").await.unwrap();
-    let server = accept.await.unwrap();
-    let mut server_channels = server.into_channels();
+    // Dropping the receive half would stop the client's critical stream.
+    let (raw_connection, mut raw_send, _raw_receive) = accept.await.unwrap();
+    let mut client_channels = client.into_channels();
 
     let control = ReliableControlMessage {
         session: session(),
@@ -253,7 +232,7 @@ async fn cancelling_fragmented_control_reads_preserves_framing_progress() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(50),
-            server_channels.control_receive.receive(),
+            client_channels.control_receive.receive(),
         )
         .await
         .is_err()
@@ -264,7 +243,7 @@ async fn cancelling_fragmented_control_reads_preserves_framing_progress() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(50),
-            server_channels.control_receive.receive(),
+            client_channels.control_receive.receive(),
         )
         .await
         .is_err()
@@ -274,7 +253,7 @@ async fn cancelling_fragmented_control_reads_preserves_framing_progress() {
     assert_eq!(
         tokio::time::timeout(
             Duration::from_secs(1),
-            server_channels.control_receive.receive(),
+            client_channels.control_receive.receive(),
         )
         .await
         .unwrap()
@@ -318,7 +297,8 @@ async fn unread_control_stream_hits_the_bounded_fail_closed_write_timeout() {
 
     let mut client = connect_input(&client_endpoint, server_address, &client_config)
         .await
-        .unwrap();
+        .unwrap()
+        .into_channels();
     let _server = accept.await.unwrap();
 
     let mut timed_out = None;
@@ -329,7 +309,7 @@ async fn unread_control_stream_hits_the_bounded_fail_closed_write_timeout() {
             payload: ReliableControl::Enter,
         };
         let started = Instant::now();
-        match client.channels_mut().0.send_control(&control).await {
+        match client.control_send.send_control(&control).await {
             Ok(()) => {}
             Err(TransportError::ControlWriteTimedOut) => {
                 timed_out = Some(started.elapsed());
@@ -342,7 +322,7 @@ async fn unread_control_stream_hits_the_bounded_fail_closed_write_timeout() {
     let elapsed = timed_out.expect("flow-control pressure never blocked the control sender");
     assert!(elapsed >= Duration::from_millis(75), "elapsed: {elapsed:?}");
     assert!(elapsed < Duration::from_millis(500), "elapsed: {elapsed:?}");
-    tokio::time::timeout(Duration::from_secs(1), client.closed())
+    tokio::time::timeout(Duration::from_secs(1), client.datagrams.closed())
         .await
         .expect("timed-out critical write did not close the connection");
 }
@@ -423,10 +403,9 @@ async fn pairing_proves_rpk_possession_and_exports_the_same_transcript_binding()
     let server_address = server_endpoint.local_addr().unwrap();
     let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
     let accept_endpoint = server_endpoint.clone();
-    let accept_config = server_config.clone();
     let accept = tokio::spawn(async move {
         let incoming = accept_endpoint.accept().await.unwrap();
-        accept_pairing(incoming, &accept_config).await.unwrap()
+        accept_pairing(incoming).await.unwrap()
     });
 
     let mut client = connect_pairing(&client_endpoint, server_address, &client_config)

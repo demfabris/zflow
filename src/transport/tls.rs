@@ -47,13 +47,6 @@ impl fmt::Debug for InputClientConfig {
     }
 }
 
-impl InputClientConfig {
-    /// Clone the endpoint configuration for direct use with Quinn APIs.
-    pub fn quinn_config(&self) -> quinn::ClientConfig {
-        self.quinn.clone()
-    }
-}
-
 /// A Quinn server configuration that requires a client SPKI from a fixed allowlist.
 #[derive(Clone)]
 pub struct InputServerConfig {

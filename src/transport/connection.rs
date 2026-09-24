@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     INPUT_ALPN_PROTOCOL, InputClientConfig, InputServerConfig, PAIRING_ALPN_PROTOCOL,
-    PairingClientConfig, PairingServerConfig, TransportError,
+    PairingClientConfig, TransportError,
 };
 
 const SERVER_NAME_PLACEHOLDER: &str = "zflow.invalid";
@@ -39,21 +39,6 @@ const CRITICAL_STREAM_ERROR: VarInt = VarInt::from_u32(0x100);
 const PROTOCOL_ERROR: VarInt = VarInt::from_u32(0x101);
 const PAIRING_EXPORTER_LABEL: &[u8] = b"EXPORTER-zflow-pairing-v1";
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputChannelKind {
-    ReliableControl,
-    CumulativeMotion,
-    Probe,
-}
-
-/// The complete channel surface of the input connection. Bulk data must use a
-/// future, separate connection and socket.
-pub const INPUT_CHANNELS: [InputChannelKind; 3] = [
-    InputChannelKind::ReliableControl,
-    InputChannelKind::CumulativeMotion,
-    InputChannelKind::Probe,
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputControlMessage {
@@ -100,14 +85,6 @@ impl InputConnection {
 
     pub fn remote_address(&self) -> SocketAddr {
         self.datagrams.connection.remote_address()
-    }
-
-    pub fn channels_mut(&mut self) -> (&mut ControlSender, &mut ControlReceiver, &DatagramChannel) {
-        (
-            &mut self.control_send,
-            &mut self.control_receive,
-            &self.datagrams,
-        )
     }
 
     pub fn into_channels(self) -> InputChannels {
@@ -818,10 +795,7 @@ pub async fn connect_pairing(
     })
 }
 
-pub async fn accept_pairing(
-    incoming: Incoming,
-    _config: &PairingServerConfig,
-) -> Result<PairingConnection, TransportError> {
+pub async fn accept_pairing(incoming: Incoming) -> Result<PairingConnection, TransportError> {
     let connection = incoming.await?;
     let peer_spki = verify_connection(&connection, None, PAIRING_ALPN_PROTOCOL)?;
     let (send, mut receive) = connection.accept_bi().await?;
@@ -993,7 +967,7 @@ mod pairing_tests {
         let client_endpoint = Endpoint::client(loopback).unwrap();
         let (client, server) = tokio::join!(
             connect_pairing(&client_endpoint, server_address, &client_config),
-            async { accept_pairing(server_endpoint.accept().await.unwrap(), &server_config).await }
+            async { accept_pairing(server_endpoint.accept().await.unwrap()).await }
         );
         let (mut client, mut server) = (client.unwrap(), server.unwrap());
 

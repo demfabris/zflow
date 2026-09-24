@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail};
 use crate::{
     identity::Identity,
     transport::{
-        PairingConnection, PairingServerConfig, TransportError, accept_pairing, connect_pairing,
-        pairing_client_config, pairing_server_config,
+        PairingConnection, TransportError, accept_pairing, connect_pairing, pairing_client_config,
+        pairing_server_config,
     },
     wire::{PairingMethod, PairingOffer, WireMessage, encode as encode_wire},
 };
@@ -78,7 +78,6 @@ pub fn make_offer(
 
 pub struct PairingListener<'identity> {
     endpoint: quinn::Endpoint,
-    server_config: PairingServerConfig,
     identity: &'identity Identity,
     local_offer: PairingOffer,
 }
@@ -89,12 +88,11 @@ impl<'identity> PairingListener<'identity> {
         address: SocketAddr,
         local_offer: PairingOffer,
     ) -> Result<Self> {
-        let server_config = pairing_server_config(identity)?;
-        let endpoint = quinn::Endpoint::server(server_config.quinn_config(), address)
+        let config = pairing_server_config(identity)?.quinn_config();
+        let endpoint = quinn::Endpoint::server(config, address)
             .with_context(|| format!("could not bind the pairing listener at {address}"))?;
         Ok(Self {
             endpoint,
-            server_config,
             identity,
             local_offer,
         })
@@ -116,22 +114,17 @@ impl<'identity> PairingListener<'identity> {
                 .accept()
                 .await
                 .context("pairing listener closed")?;
-            let error = match exchange(
-                self.identity,
-                &self.local_offer,
-                accept_pairing(incoming, &self.server_config),
-            )
-            .await
-            {
-                Ok((connection, observation)) => {
-                    return Ok(PairingSession {
-                        observation,
-                        _connection: connection,
-                        _endpoint: Some(self.endpoint.clone()),
-                    });
-                }
-                Err(error) => error,
-            };
+            let error =
+                match exchange(self.identity, &self.local_offer, accept_pairing(incoming)).await {
+                    Ok((connection, observation)) => {
+                        return Ok(PairingSession {
+                            observation,
+                            _connection: connection,
+                            _endpoint: Some(self.endpoint.clone()),
+                        });
+                    }
+                    Err(error) => error,
+                };
             failures += 1;
             if failures == MAX_PAIRING_ATTEMPTS {
                 return Err(error.context("too many failed pairing attempts"));
