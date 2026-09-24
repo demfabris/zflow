@@ -1,10 +1,11 @@
 //! Deterministic receiver playout for cumulative motion frames.
 //!
 //! Playout never predicts input. It waits for both the mapped sender deadline
-//! and the reliable-control watermark, selects the newest mature cumulative
-//! target, then approaches that target with bounded catch-up steps. Since each
-//! step is reconciled against the last successfully emitted totals, the final
-//! displacement remains exact through loss, reordering, and jitter bursts.
+//! and the reliable-control watermark, then selects the newest mature
+//! cumulative target. That frame's own sample plays at once; any older backlog
+//! drains in bounded catch-up steps. Since each step is reconciled against the
+//! last successfully emitted totals, the final displacement remains exact
+//! through loss, reordering, and jitter bursts.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -464,7 +465,7 @@ impl ReceiverPlayout {
     pub fn poll(&mut self, now: MonotonicTimeMicros) -> Result<Option<PlayoutStep>, PlayoutError> {
         self.observe_time(now)?;
         let elapsed = self.poll_elapsed(now)?;
-        self.select_newest_mature_target(now)?;
+        let own_sample_start = self.select_newest_mature_target(now)?;
 
         let remaining = self
             .target
@@ -476,16 +477,22 @@ impl ReceiverPlayout {
             return Ok(None);
         }
 
+        // Capping the newest sample too would throttle the start of every
+        // fast flick while the smoothed velocity lags behind it.
+        let backlog_end = own_sample_start.unwrap_or(self.target.totals);
+        let backlog = backlog_end.checked_delta_from(self.injected_totals)?;
+        let fresh = self.target.totals.checked_delta_from(backlog_end)?;
         let pointer_cap = self.catch_up_cap(self.pointer_velocity_per_micro, elapsed)?;
         let scroll_cap = self.catch_up_cap(self.scroll_velocity_per_micro, elapsed)?;
-        let (dx, dy, pointer_limited) = limit_pair(remaining.dx, remaining.dy, pointer_cap);
+        let (dx, dy, pointer_limited) = limit_pair(backlog.dx, backlog.dy, pointer_cap);
         let (scroll_x, scroll_y, scroll_limited) =
-            limit_pair(remaining.scroll_x, remaining.scroll_y, scroll_cap);
+            limit_pair(backlog.scroll_x, backlog.scroll_y, scroll_cap);
+        // Each sum lies between `fresh` and `remaining`, so it cannot overflow.
         let delta = MotionDelta {
-            dx,
-            dy,
-            scroll_x,
-            scroll_y,
+            dx: dx + fresh.dx,
+            dy: dy + fresh.dy,
+            scroll_x: scroll_x + fresh.scroll_x,
+            scroll_y: scroll_y + fresh.scroll_y,
         };
 
         self.injected_totals = self.injected_totals.checked_add(delta)?;
@@ -708,10 +715,12 @@ impl ReceiverPlayout {
         Ok(())
     }
 
+    /// Returns the totals just before the new target's own sample when the
+    /// preceding frame is known. Without them the whole remainder is backlog.
     fn select_newest_mature_target(
         &mut self,
         now: MonotonicTimeMicros,
-    ) -> Result<(), PlayoutError> {
+    ) -> Result<Option<CumulativeMotion>, PlayoutError> {
         let delay = self.current_delay_micros();
         let candidate = self
             .queue
@@ -723,7 +732,15 @@ impl ReceiverPlayout {
             })
             .map(|(sequence, _)| *sequence);
         let Some(sequence) = candidate else {
-            return Ok(());
+            return Ok(None);
+        };
+        let previous = sequence.0.checked_sub(1).map(MotionSequence);
+        let own_sample_start = if previous == Some(self.target.sequence) {
+            Some(self.target.totals)
+        } else {
+            previous
+                .and_then(|previous| self.queue.get(&previous))
+                .map(|queued| queued.frame.totals)
         };
         let queued = self
             .queue
@@ -747,7 +764,7 @@ impl ReceiverPlayout {
             mapped_capture_time: queued.mapped_capture_time,
             pending_touch_snapshot: queued.frame.touch_snapshot,
         };
-        Ok(())
+        Ok(own_sample_start)
     }
 
     fn update_velocity(&mut self, newest: VelocitySample) -> Result<(), PlayoutError> {
@@ -1127,6 +1144,48 @@ mod tests {
         assert!(playout.stats().late_frame_count >= 3);
         assert!(playout.stats().catch_up_step_count > 0);
         assert!(catch_up_dx > 0);
+    }
+
+    #[test]
+    fn fast_flick_onset_is_not_throttled_by_catch_up() {
+        let clock = identity_clock();
+        let config = PlayoutConfig {
+            delay_mode: PlayoutDelayMode::Fixed,
+            fixed_delay: Duration::from_millis(8),
+            ..PlayoutConfig::default()
+        };
+        let mut playout = ReceiverPlayout::new(config, session(1)).unwrap();
+        // From rest, each 1 ms sample moves 50 units: ten times the minimum
+        // catch-up step and far ahead of the smoothed velocity.
+        let mut steps = Vec::new();
+        for now in (0..=20_000).step_by(500) {
+            let sequence = now / 1_000;
+            if now % 1_000 == 500 && (1..=10).contains(&sequence) {
+                playout
+                    .ingest_frame(
+                        frame(sequence, sequence * 1_000, sequence as i64 * 50, 0),
+                        time(now),
+                        &clock,
+                    )
+                    .unwrap();
+            }
+            if let Some(step) = playout.poll(time(now)).unwrap() {
+                steps.push((now, step));
+            }
+        }
+
+        assert_eq!(steps.len(), 10);
+        for (index, (now, step)) in steps.iter().enumerate() {
+            assert_eq!(
+                *now,
+                (index as u64 + 1) * 1_000 + 8_000,
+                "sample played late"
+            );
+            assert_eq!(step.delta.dx, 50);
+            assert!(step.target_reached);
+            assert!(!step.pointer_catch_up_limited);
+        }
+        assert_eq!(playout.stats().catch_up_step_count, 0);
     }
 
     #[test]
