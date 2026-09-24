@@ -24,7 +24,7 @@ use crate::{
 pub const SERVICE_TYPE: &str = "_zflow._udp.local.";
 pub const MAX_DISCOVERY_CANDIDATES: usize = 16;
 pub const MAX_PROTOCOL_VERSIONS: usize = 16;
-pub const MAX_TXT_PROPERTIES: usize = 3;
+pub const MAX_TXT_PROPERTIES: usize = 2;
 pub const MAX_TXT_BYTES: usize = 384;
 
 const INSTANCE_PREFIX: &str = "zf-";
@@ -32,7 +32,6 @@ const INSTANCE_ENTROPY_BYTES: usize = 16;
 const INSTANCE_HEX_BYTES: usize = INSTANCE_ENTROPY_BYTES * 2;
 const TXT_PROTOCOL_VERSIONS: &str = "v";
 const TXT_CAPABILITIES: &str = "cap";
-const TXT_ROTATING_TOKEN: &str = "token";
 
 /// Lists this host's current addresses. Loopback and non-unicast addresses
 /// never help another machine connect.
@@ -83,10 +82,6 @@ impl EphemeralInstanceId {
         Ok(Self(bytes))
     }
 
-    pub fn as_bytes(&self) -> &[u8; INSTANCE_ENTROPY_BYTES] {
-        &self.0
-    }
-
     fn hostname(self) -> String {
         format!("{self}.local.")
     }
@@ -111,7 +106,6 @@ impl fmt::Display for EphemeralInstanceId {
 pub struct Advertisement {
     quic_port: u16,
     capability_summary: InputCapabilities,
-    rotating_token: Option<[u8; 16]>,
 }
 
 impl Advertisement {
@@ -136,43 +130,17 @@ impl Advertisement {
         Ok(Self {
             quic_port,
             capability_summary,
-            rotating_token: None,
         })
     }
-
-    pub fn with_rotating_token(mut self, token: [u8; 16]) -> Self {
-        self.rotating_token = Some(token);
-        self
-    }
-
-    pub fn quic_port(&self) -> u16 {
-        self.quic_port
-    }
-
-    pub fn capability_summary(&self) -> &InputCapabilities {
-        &self.capability_summary
-    }
-
-    pub fn rotating_token(&self) -> Option<[u8; 16]> {
-        self.rotating_token
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CandidateSource {
-    Mdns,
-    Explicit,
 }
 
 /// A bounded endpoint hint which has not been authenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UntrustedCandidate {
-    source: CandidateSource,
     ephemeral_instance_id: Option<EphemeralInstanceId>,
     protocol_versions: Vec<ProtocolVersion>,
     capability_summary: InputCapabilities,
     socket_addresses: Vec<SocketAddr>,
-    rotating_token: Option<[u8; 16]>,
 }
 
 impl UntrustedCandidate {
@@ -180,17 +148,11 @@ impl UntrustedCandidate {
     pub fn explicit(address: SocketAddr) -> Result<Self, CandidateParseError> {
         validate_socket_address(address).map_err(CandidateParseError::InvalidAddress)?;
         Ok(Self {
-            source: CandidateSource::Explicit,
             ephemeral_instance_id: None,
             protocol_versions: Vec::new(),
             capability_summary: InputCapabilities::default(),
             socket_addresses: vec![address],
-            rotating_token: None,
         })
-    }
-
-    pub fn source(&self) -> CandidateSource {
-        self.source
     }
 
     pub fn ephemeral_instance_id(&self) -> Option<EphemeralInstanceId> {
@@ -207,10 +169,6 @@ impl UntrustedCandidate {
 
     pub fn socket_addresses(&self) -> &[SocketAddr] {
         &self.socket_addresses
-    }
-
-    pub fn rotating_token(&self) -> Option<[u8; 16]> {
-        self.rotating_token
     }
 }
 
@@ -245,10 +203,6 @@ impl Discovery {
         })
     }
 
-    pub fn instance_id(&self) -> EphemeralInstanceId {
-        self.instance_id
-    }
-
     pub fn register(&mut self, advertisement: Advertisement) -> Result<(), DiscoveryError> {
         if self.registration.is_some() {
             return Err(DiscoveryError::InvalidState(
@@ -258,24 +212,6 @@ impl Discovery {
         let service = build_service_info(self.instance_id, &advertisement)?;
         self.daemon.register(service)?;
         self.registration = Some(advertisement);
-        Ok(())
-    }
-
-    /// Re-announces the same ephemeral service with a new or removed token.
-    pub fn rotate_discovery_token(
-        &mut self,
-        token: Option<[u8; 16]>,
-    ) -> Result<(), DiscoveryError> {
-        let mut updated = self
-            .registration
-            .clone()
-            .ok_or(DiscoveryError::InvalidState(
-                "no zflow service is registered",
-            ))?;
-        updated.rotating_token = token;
-        let service = build_service_info(self.instance_id, &updated)?;
-        self.daemon.register(service)?;
-        self.registration = Some(updated);
         Ok(())
     }
 
@@ -476,12 +412,10 @@ fn parse_candidate_fields(
     let txt = parse_txt(properties)?;
 
     Ok(UntrustedCandidate {
-        source: CandidateSource::Mdns,
         ephemeral_instance_id: Some(instance_id),
         protocol_versions: txt.protocol_versions,
         capability_summary: txt.capability_summary,
         socket_addresses,
-        rotating_token: txt.rotating_token,
     })
 }
 
@@ -491,13 +425,10 @@ fn build_service_info(
 ) -> Result<ServiceInfo, DiscoveryError> {
     let versions = CURRENT_PROTOCOL_VERSION.0.to_string();
     let capabilities = format_capabilities(&advertisement.capability_summary);
-    let mut properties = vec![
+    let properties = [
         (TXT_PROTOCOL_VERSIONS.to_owned(), versions),
         (TXT_CAPABILITIES.to_owned(), capabilities),
     ];
-    if let Some(token) = advertisement.rotating_token {
-        properties.push((TXT_ROTATING_TOKEN.to_owned(), encode_hex(&token)));
-    }
     debug_assert!(txt_size(&properties) <= MAX_TXT_BYTES);
 
     // No address list: with addr_auto, mdns-sd adds and drops addresses as
@@ -517,7 +448,6 @@ fn build_service_info(
 struct ParsedTxt {
     protocol_versions: Vec<ProtocolVersion>,
     capability_summary: InputCapabilities,
-    rotating_token: Option<[u8; 16]>,
 }
 
 fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseError> {
@@ -528,7 +458,6 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
     let mut total_size = 0usize;
     let mut versions = None;
     let mut capabilities = None;
-    let mut token = None;
 
     for property in properties.iter() {
         let value = property.val().ok_or(CandidateParseError::InvalidTxtValue)?;
@@ -547,10 +476,7 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
             TXT_CAPABILITIES if capabilities.is_none() => {
                 capabilities = Some(parse_capabilities(value)?);
             }
-            TXT_ROTATING_TOKEN if token.is_none() => {
-                token = Some(parse_token(value)?);
-            }
-            TXT_PROTOCOL_VERSIONS | TXT_CAPABILITIES | TXT_ROTATING_TOKEN => {
+            TXT_PROTOCOL_VERSIONS | TXT_CAPABILITIES => {
                 return Err(CandidateParseError::DuplicateTxtProperty);
             }
             _ => return Err(CandidateParseError::UnexpectedTxtProperty),
@@ -563,7 +489,6 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
         ))?,
         capability_summary: capabilities
             .ok_or(CandidateParseError::MissingTxtProperty(TXT_CAPABILITIES))?,
-        rotating_token: token,
     })
 }
 
@@ -633,17 +558,6 @@ fn capability_from_name(name: &str) -> Option<InputCapability> {
     }
 }
 
-fn parse_token(value: &str) -> Result<[u8; 16], CandidateParseError> {
-    if value.len() != 32 {
-        return Err(CandidateParseError::InvalidToken);
-    }
-    let mut token = [0; 16];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        token[index] = decode_hex_pair(pair).ok_or(CandidateParseError::InvalidToken)?;
-    }
-    Ok(token)
-}
-
 fn instance_from_fullname(fullname: &str) -> Result<EphemeralInstanceId, CandidateParseError> {
     if fullname.len() > 255 {
         return Err(CandidateParseError::InvalidInstanceId);
@@ -683,16 +597,6 @@ fn txt_size(properties: &[(String, String)]) -> usize {
         .iter()
         .map(|(key, value)| 1 + key.len() + 1 + value.len())
         .sum()
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
 }
 
 fn decode_hex_pair(pair: &[u8]) -> Option<u8> {
@@ -754,8 +658,6 @@ pub enum CandidateParseError {
     InvalidProtocolVersions,
     #[error("capability summary is malformed")]
     InvalidCapabilities,
-    #[error("rotating discovery token is malformed")]
-    InvalidToken,
 }
 
 #[cfg(test)]
@@ -777,7 +679,6 @@ mod tests {
             ],
         )
         .unwrap()
-        .with_rotating_token([0xcd; 16])
     }
 
     #[test]
@@ -800,10 +701,6 @@ mod tests {
         assert_eq!(
             properties.get_property_val_str("cap"),
             Some("keyboard,pointer,scroll")
-        );
-        assert_eq!(
-            properties.get_property_val_str("token"),
-            Some("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
         );
 
         let rendered = format!("{service:?}").to_ascii_lowercase();
@@ -843,7 +740,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(parsed.source(), CandidateSource::Mdns);
         assert_eq!(parsed.ephemeral_instance_id(), Some(test_instance()));
         assert_eq!(parsed.protocol_versions(), &[CURRENT_PROTOCOL_VERSION]);
         assert_eq!(parsed.socket_addresses(), addresses);
@@ -852,7 +748,6 @@ mod tests {
                 .capability_summary()
                 .contains(InputCapability::Keyboard)
         );
-        assert_eq!(parsed.rotating_token(), Some([0xcd; 16]));
     }
 
     #[test]
@@ -864,7 +759,7 @@ mod tests {
             &id.hostname(),
             [IpAddr::V4(Ipv4Addr::LOCALHOST)].as_slice(),
             43_119,
-            &[("v", "1"), ("cap", "keyboard"), ("spki", "stable-key")][..],
+            &[("cap", "keyboard"), ("spki", "stable-key")][..],
         )
         .unwrap();
         assert_eq!(
@@ -894,7 +789,6 @@ mod tests {
     fn explicit_address_path_needs_no_mdns_daemon() {
         let address = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 43_119));
         let candidate = UntrustedCandidate::explicit(address).unwrap();
-        assert_eq!(candidate.source(), CandidateSource::Explicit);
         assert_eq!(candidate.socket_addresses(), &[address]);
         assert_eq!(candidate.ephemeral_instance_id(), None);
         assert!(candidate.protocol_versions().is_empty());

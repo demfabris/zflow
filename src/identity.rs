@@ -54,20 +54,12 @@ impl Identity {
         }
     }
 
-    pub fn key_pair(&self) -> &KeyPair {
-        &self.key_pair
-    }
-
     pub fn private_key_der(&self) -> Vec<u8> {
         self.key_pair.serialize_der()
     }
 
     pub fn spki(&self) -> &[u8] {
         &self.spki
-    }
-
-    pub fn fingerprint(&self) -> [u8; 32] {
-        self.fingerprint
     }
 
     pub fn fingerprint_hex(&self) -> String {
@@ -185,12 +177,12 @@ mod tests {
     fn identity_persists_and_has_stable_fingerprint() {
         let directory = tempfile::tempdir().unwrap();
         let first = Identity::load_or_create(directory.path()).unwrap();
-        let fingerprint = first.fingerprint();
+        let fingerprint = first.fingerprint_hex();
         let spki = first.spki().to_vec();
         drop(first);
 
         let second = Identity::load_or_create(directory.path()).unwrap();
-        assert_eq!(second.fingerprint(), fingerprint);
+        assert_eq!(second.fingerprint_hex(), fingerprint);
         assert_eq!(second.spki(), spki);
     }
 
