@@ -31,9 +31,9 @@ dpkg -i /tmp/zflow.deb
 cmp /etc/zflow/zflow.toml /tmp/expected.toml
 cmp /etc/udev/rules.d/71-zflow-capture.rules /tmp/expected.rules
 mkdir -p /etc/systemd/system/zflowd.service.d
-printf '[Unit]\nBefore=display-manager.service\n' > /etc/systemd/system/zflowd.service.d/zflowd-prelogin.conf
+printf '[Unit]\nBefore=display-manager.service\n' > /etc/systemd/system/zflowd.service.d/prelogin.conf
 dpkg --remove zflow
-test -f /etc/systemd/system/zflowd.service.d/zflowd-prelogin.conf
+test -f /etc/systemd/system/zflowd.service.d/prelogin.conf
 test ! -e /usr/bin/zflow
 test ! -e /etc/udev/rules.d/71-zflow-capture.rules
 cmp /etc/udev/71-zflow-capture.rules.disabled /tmp/expected.rules

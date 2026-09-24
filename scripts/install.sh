@@ -10,9 +10,10 @@ readonly BIN_DIR="/usr/local/bin"
 readonly LIB_DIR="/usr/local/lib/zflow"
 readonly UNINSTALLER="$LIB_DIR/uninstall.sh"
 readonly UNIT_FILE="/etc/systemd/system/zflowd.service"
+readonly CONFIG_FILE="/etc/zflow/zflow.toml"
 readonly DROPIN_DIR="/etc/systemd/system/zflowd.service.d"
-# Older installs ordered zflowd before the display manager on every boot.
-readonly LEGACY_PRELOGIN_DROPIN="$DROPIN_DIR/prelogin.conf"
+# zflow setup --prelogin on|off manages this; older installs always added it.
+readonly PRELOGIN_DROPIN="$DROPIN_DIR/prelogin.conf"
 readonly UDEV_RULE_DIR="/etc/udev/rules.d"
 readonly VIRTUAL_RULE_FILE="$UDEV_RULE_DIR/70-zflow.rules"
 readonly CAPTURE_RULE_FILE="$UDEV_RULE_DIR/71-zflow-capture.rules"
@@ -81,7 +82,7 @@ if [[ "$install_built" == false ]]; then
     build_binaries
 fi
 
-for command in install systemctl systemd-analyze; do
+for command in grep install systemctl systemd-analyze; do
     require_command "$command"
 done
 
@@ -110,9 +111,11 @@ install -o root -g root -m 0755 "$binary_dir/zflowd" "$BIN_DIR/zflowd"
 install -o root -g root -m 0755 "$SCRIPT_DIR/uninstall.sh" "$UNINSTALLER"
 # Retire the old desktop launcher when upgrading an existing installation.
 rm -f -- "$BIN_DIR/zflow-gui" /usr/local/share/applications/io.zflow.zflow.desktop
-# zflow setup --prelogin on installs its own drop-in when pre-login input is wanted.
-rm -f -- "$LEGACY_PRELOGIN_DROPIN"
-rmdir -- "$DROPIN_DIR" 2>/dev/null || true
+# Keep the pre-login ordering only when the configuration enables pre-login input.
+if ! grep -Eqs '^[[:space:]]*allow_prelogin_input[[:space:]]*=[[:space:]]*true([[:space:]#]|$)' "$CONFIG_FILE"; then
+    rm -f -- "$PRELOGIN_DROPIN"
+    rmdir -- "$DROPIN_DIR" 2>/dev/null || true
+fi
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/systemd/zflowd.service" "$UNIT_FILE"
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/udev/70-zflow.rules" "$VIRTUAL_RULE_FILE"
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/modules-load.d/zflow.conf" "$MODULE_FILE"

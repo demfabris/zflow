@@ -9,10 +9,8 @@ readonly CONFIG_DIR="/etc/zflow"
 readonly STATE_DIR="/var/lib/zflow"
 readonly UNIT_FILE="/etc/systemd/system/zflowd.service"
 readonly DROPIN_DIR="/etc/systemd/system/zflowd.service.d"
-# Written by zflow setup --prelogin on; kept with the configuration unless purging.
-readonly PRELOGIN_DROPIN="$DROPIN_DIR/zflowd-prelogin.conf"
-# Older installs added this ordering drop-in unconditionally.
-readonly LEGACY_PRELOGIN_DROPIN="$DROPIN_DIR/prelogin.conf"
+# Written by zflow setup --prelogin on; older installs always added it.
+readonly PRELOGIN_DROPIN="$DROPIN_DIR/prelogin.conf"
 readonly VIRTUAL_RULE_FILE="/etc/udev/rules.d/70-zflow.rules"
 readonly CAPTURE_RULE_FILE="/etc/udev/rules.d/71-zflow-capture.rules"
 readonly MODULE_FILE="/etc/modules-load.d/zflow.conf"
@@ -68,7 +66,7 @@ fi
 
 rm -f -- \
     "$UNIT_FILE" \
-    "$LEGACY_PRELOGIN_DROPIN" \
+    "$PRELOGIN_DROPIN" \
     "$VIRTUAL_RULE_FILE" \
     "$CAPTURE_RULE_FILE" \
     "$MODULE_FILE" \
@@ -79,13 +77,12 @@ rm -f -- \
     "$LIB_DIR/uninstall.sh" \
     "$ZFLOW_GUI_BIN" \
     "$DESKTOP_FILE"
-rmdir -- "$LIB_DIR" 2>/dev/null || true
+rmdir -- "$LIB_DIR" "$DROPIN_DIR" 2>/dev/null || true
 
 if [[ "$purge" == true ]]; then
     for command in find getent groupdel userdel; do
         command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
     done
-    rm -f -- "$PRELOGIN_DROPIN"
     remove_tree "$CONFIG_DIR"
     remove_tree "$STATE_DIR"
     if getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
@@ -95,7 +92,6 @@ if [[ "$purge" == true ]]; then
         groupdel "$SERVICE_GROUP"
     fi
 fi
-rmdir -- "$DROPIN_DIR" 2>/dev/null || true
 
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
