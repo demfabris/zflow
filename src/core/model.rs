@@ -1,15 +1,14 @@
 //! Pure domain types shared by protocol and platform adapters.
 //!
-//! This module deliberately models semantics rather than a wire encoding. The
-//! encoding is still an open protocol decision, while the channel split and
-//! state carried by each family are fixed by the specification.
+//! The serde impls here are the postcard payload encoding. The wire module
+//! adds the header and the limits a peer's message must respect.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionEpoch(pub [u8; 16]);
@@ -195,10 +194,43 @@ pub struct TouchContact {
     pub source_dimensions: Option<SourceDimensions>,
 }
 
-/// A complete touch state at one capture point.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(transparent)]
+/// A complete touch state at one capture point. It is encoded as a sequence of
+/// contacts, and decoding rejects a repeated contact id.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TouchState(BTreeMap<ContactId, TouchContact>);
+
+impl Serialize for TouchState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for TouchState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Contacts;
+
+        impl<'de> de::Visitor<'de> for Contacts {
+            type Value = TouchState;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("touch contacts with distinct ids")
+            }
+
+            // One insert per decoded contact: a forged length allocates nothing.
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<TouchState, A::Error> {
+                let mut state = TouchState::default();
+                while let Some(contact) = seq.next_element::<TouchContact>()? {
+                    if state.0.insert(contact.id, contact).is_some() {
+                        return Err(de::Error::custom("repeated touch contact id"));
+                    }
+                }
+                Ok(state)
+            }
+        }
+
+        deserializer.deserialize_seq(Contacts)
+    }
+}
 
 impl TouchState {
     pub fn new(contacts: impl IntoIterator<Item = TouchContact>) -> Result<Self, ContactId> {

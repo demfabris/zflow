@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use super::WireError;
 
-pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, WireError> {
-    postcard::to_allocvec(value).map_err(|error| WireError::Codec(error.to_string()))
+pub(crate) fn encode<T: Serialize>(value: &T, bytes: Vec<u8>) -> Result<Vec<u8>, WireError> {
+    postcard::to_extend(value, bytes).map_err(|error| WireError::Codec(error.to_string()))
 }
 
 pub(crate) fn decode<'de, T: Deserialize<'de>>(payload: &'de [u8]) -> Result<T, WireError> {

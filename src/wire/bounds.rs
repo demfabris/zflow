@@ -1,206 +1,86 @@
-use std::fmt;
+//! Limits a peer's message must respect. The family payload caps already bound
+//! what decoding can allocate, so these checks run on the decoded value.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use crate::core::{ReliableControl, TouchState};
+
+use super::{WireError, WireMessage};
 
 pub use crate::discovery::MAX_DISCOVERY_CANDIDATES;
 
 pub const MAX_CONTACTS: usize = 32;
 pub const MAX_HELD_KEYS: usize = 32;
 pub const MAX_HELD_BUTTONS: usize = 16;
-pub const MAX_CAPABILITIES: usize = 5;
-pub const MAX_POINTER_UNITS: usize = 2;
 pub const MAX_STRING_BYTES: usize = 255;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BoundedVec<T, const N: usize>(Vec<T>);
-
-impl<T, const N: usize> BoundedVec<T, N> {
-    pub(crate) fn try_from_vec(values: Vec<T>, name: &'static str) -> Result<Self, BoundError> {
-        if values.len() > N {
-            return Err(BoundError::Collection {
-                name,
-                actual: values.len(),
-                maximum: N,
-            });
+/// Runs before encoding and after decoding, so neither side sends or accepts
+/// a message the other would refuse.
+pub(super) fn validate(message: &WireMessage) -> Result<(), WireError> {
+    match message {
+        WireMessage::NegotiationOffer(offer) => limit(
+            "maximum contacts",
+            offer.maximum_contacts.into(),
+            MAX_CONTACTS,
+        ),
+        WireMessage::NegotiatedSession(session) => {
+            limit("contact limit", session.contact_limit.into(), MAX_CONTACTS)
         }
-        Ok(Self(values))
-    }
-
-    pub(crate) fn as_slice(&self) -> &[T] {
-        &self.0
-    }
-
-    pub(crate) fn into_vec(self) -> Vec<T> {
-        self.0
-    }
-}
-
-impl<T: Serialize, const N: usize> Serialize for BoundedVec<T, N> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for BoundedVec<T, N> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct BoundedVecVisitor<T, const N: usize>(std::marker::PhantomData<T>);
-
-        impl<'de, T: Deserialize<'de>, const N: usize> de::Visitor<'de> for BoundedVecVisitor<T, N> {
-            type Value = BoundedVec<T, N>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(formatter, "a sequence with at most {N} entries")
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: de::SeqAccess<'de>,
-            {
-                if let Some(length) = sequence.size_hint()
-                    && length > N
-                {
-                    return Err(de::Error::invalid_length(length, &self));
+        WireMessage::ReliableControl(message) => {
+            if let Some(anchor) = message.payload.motion_anchor() {
+                if anchor.activation_id != message.session.activation_id {
+                    return Err(WireError::Invalid(
+                        "motion anchor activation differs from the session".into(),
+                    ));
                 }
-
-                // Never trust a wire-provided size hint as an allocation request.
-                let capacity = sequence.size_hint().unwrap_or(0).min(N);
-                let mut values = Vec::with_capacity(capacity);
-                while let Some(value) = sequence.next_element()? {
-                    if values.len() == N {
-                        return Err(de::Error::invalid_length(N + 1, &self));
-                    }
-                    values.push(value);
+                touch(&anchor.final_touch_state)?;
+            }
+            match &message.payload {
+                ReliableControl::TouchBegin { initial_state } => touch(initial_state),
+                ReliableControl::StateSnapshot(snapshot) => {
+                    let held = &snapshot.held;
+                    limit("pressed keys", held.pressed_keys.len(), MAX_HELD_KEYS)?;
+                    limit(
+                        "pressed buttons",
+                        held.pressed_buttons.len(),
+                        MAX_HELD_BUTTONS,
+                    )?;
+                    touch(&held.active_touch)
                 }
-                Ok(BoundedVec(values))
+                _ => Ok(()),
             }
         }
-
-        deserializer.deserialize_seq(BoundedVecVisitor(std::marker::PhantomData))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct BoundedString<const N: usize>(String);
-
-impl<const N: usize> BoundedString<N> {
-    pub(crate) fn try_from_string(value: String, name: &'static str) -> Result<Self, BoundError> {
-        if value.len() > N {
-            return Err(BoundError::String {
-                name,
-                actual: value.len(),
-                maximum: N,
-            });
+        WireMessage::Motion(frame) => frame.touch_snapshot.as_ref().map_or(Ok(()), touch),
+        WireMessage::Probe(_) => Ok(()),
+        WireMessage::Pairing(offer) => {
+            if let Some(label) = &offer.device_label {
+                limit("device label bytes", label.len(), MAX_STRING_BYTES)?;
+            }
+            let candidates = &offer.input_candidates;
+            limit(
+                "input candidates",
+                candidates.len(),
+                MAX_DISCOVERY_CANDIDATES,
+            )?;
+            candidates.iter().try_for_each(|candidate| {
+                limit("input candidate bytes", candidate.len(), MAX_STRING_BYTES)
+            })
         }
-        Ok(Self(value))
-    }
-
-    pub(crate) fn into_string(self) -> String {
-        self.0
+        WireMessage::Desktop(message) => message
+            .validate()
+            .map_err(|error| WireError::Invalid(error.to_string())),
     }
 }
 
-impl<const N: usize> Serialize for BoundedString<N> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.0.serialize(serializer)
+fn touch(state: &TouchState) -> Result<(), WireError> {
+    limit("touch contacts", state.len(), MAX_CONTACTS)
+}
+
+fn limit(what: &'static str, actual: usize, maximum: usize) -> Result<(), WireError> {
+    if actual > maximum {
+        return Err(WireError::SizeLimit {
+            what,
+            actual,
+            maximum,
+        });
     }
+    Ok(())
 }
-
-impl<'de, const N: usize> Deserialize<'de> for BoundedString<N> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct BoundedStringVisitor<const N: usize>;
-
-        impl<'de, const N: usize> de::Visitor<'de> for BoundedStringVisitor<N> {
-            type Value = BoundedString<N>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(formatter, "a UTF-8 string no longer than {N} bytes")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                if value.len() > N {
-                    return Err(E::invalid_length(value.len(), &self));
-                }
-                Ok(BoundedString(value.to_owned()))
-            }
-
-            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                self.visit_str(value)
-            }
-
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                if value.len() > N {
-                    return Err(E::invalid_length(value.len(), &self));
-                }
-                Ok(BoundedString(value))
-            }
-        }
-
-        // Postcard's borrowed slice decoder runs the length check before this
-        // visitor allocates the owned String.
-        deserializer.deserialize_str(BoundedStringVisitor)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BoundError {
-    Collection {
-        name: &'static str,
-        actual: usize,
-        maximum: usize,
-    },
-    String {
-        name: &'static str,
-        actual: usize,
-        maximum: usize,
-    },
-    Duplicate(&'static str),
-    Invalid(&'static str),
-}
-
-impl fmt::Display for BoundError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Collection {
-                name,
-                actual,
-                maximum,
-            } => write!(
-                formatter,
-                "{name} has {actual} entries, exceeding the wire limit of {maximum}"
-            ),
-            Self::String {
-                name,
-                actual,
-                maximum,
-            } => write!(
-                formatter,
-                "{name} has {actual} bytes, exceeding the wire limit of {maximum}"
-            ),
-            Self::Duplicate(name) => write!(formatter, "{name} contains a duplicate identifier"),
-            Self::Invalid(reason) => formatter.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for BoundError {}

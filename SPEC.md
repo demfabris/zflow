@@ -181,15 +181,15 @@ The service-manager watchdog kills a killable hung daemon within the configured 
 
 The QUIC ALPN is the only protocol version. Input connections use `zflow/N` and pairing connections `zflow-pair/N`; any change to the wire format bumps them, so a peer on another version fails the TLS handshake and reports a version mismatch. Messages carry no version field.
 
-Each input-session message carries a message type, payload length, session epoch, transport generation, and activation identifier. Control and motion messages add their channel-specific sequences. Pairing uses handshake-scoped nonces and transcript identifiers before an input session exists.
+Each input-session message names its family and carries the session epoch, transport generation, and activation identifier. Control and motion messages add their channel-specific sequences. Pairing uses handshake-scoped nonces and transcript identifiers before an input session exists.
 
 The decoder MUST:
 
-- cap message, collection, contact, and string lengths before allocation;
+- cap each message's size before decoding, which bounds what decoding allocates, then check collection, contact, and string limits on the decoded value;
 - reject duplicate identifiers and invalid state transitions;
 - expose a fuzz target for every message family.
 
-Payloads use postcard inside the bounded envelope. The logical model below is fixed for the first prototype.
+Payloads are the core model types in postcard behind a three-byte header (magic and family); desktop metadata is JSON. The logical model below is fixed for the first prototype.
 
 Authenticated session negotiation selects the maximum datagram size, input capabilities, pointer units, scroll fields, contact limit, receiver lease, and checkpoint bound. A required capability mismatch prevents activation.
 

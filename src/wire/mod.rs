@@ -1,27 +1,25 @@
-//! Bounded, self-describing framing for the protocol domain model.
-//!
-//! The envelope is parsed before serde sees a byte: magic, family/type,
-//! payload length, then (for session traffic) epoch/generation/activation and
-//! channel sequences. The format has no version field of its own: the QUIC
-//! ALPN names the protocol, so a peer on another version never gets here.
+//! Framing for the protocol domain model: two magic bytes, a family byte, then
+//! the payload. Payloads are the core types in postcard, except desktop
+//! metadata, which is JSON. The format has no version field of its own: the
+//! QUIC ALPN names the protocol, so a peer on another version never gets here.
 
 mod bounds;
 mod codec;
 mod error;
-mod model;
 
-use crate::core::*;
+use serde::{Deserialize, Serialize};
 
-use bounds::BoundError;
-pub use error::WireError;
-pub use model::PairingOffer;
-use model::{
-    WireMotionBody, WireNegotiatedSession, WireNegotiationOffer, WirePairingOffer,
-    WireReliableControl,
+use crate::{
+    core::{
+        MotionFrame, NegotiatedSession, NegotiationOffer, ProbeMessage, ReliableControlMessage,
+    },
+    desktop::DesktopMessage,
 };
 
+pub use error::WireError;
+
 const MAGIC: [u8; 2] = *b"ZF";
-const FIXED_HEADER_BYTES: usize = 8;
+const HEADER_BYTES: usize = 3;
 
 pub const MAX_NEGOTIATION_PAYLOAD_BYTES: usize = 4 * 1_024;
 pub const MAX_RELIABLE_PAYLOAD_BYTES: usize = 32 * 1_024;
@@ -32,36 +30,24 @@ pub const MAX_PAIRING_PAYLOAD_BYTES: usize = 2 * 1_024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Family {
-    Negotiation = 1,
-    ReliableControl = 2,
-    Motion = 3,
-    Probe = 4,
-    Pairing = 5,
-    Desktop = 6,
+    NegotiationOffer = 1,
+    NegotiatedSession = 2,
+    ReliableControl = 3,
+    Motion = 4,
+    Probe = 5,
+    Pairing = 6,
+    Desktop = 7,
 }
 
 impl Family {
     fn maximum_payload_bytes(self) -> usize {
         match self {
-            Self::Negotiation => MAX_NEGOTIATION_PAYLOAD_BYTES,
+            Self::NegotiationOffer | Self::NegotiatedSession => MAX_NEGOTIATION_PAYLOAD_BYTES,
             Self::ReliableControl => MAX_RELIABLE_PAYLOAD_BYTES,
             Self::Motion => MAX_MOTION_PAYLOAD_BYTES,
             Self::Probe => MAX_PROBE_PAYLOAD_BYTES,
             Self::Pairing => MAX_PAIRING_PAYLOAD_BYTES,
-            Self::Desktop => crate::desktop::MAX_MESSAGE_BYTES + 8,
-        }
-    }
-
-    fn requires_session(self) -> bool {
-        matches!(self, Self::ReliableControl | Self::Motion | Self::Probe)
-    }
-
-    fn valid_message_type(self, message_type: u8) -> bool {
-        match self {
-            Self::Negotiation => matches!(message_type, 1 | 2),
-            Self::ReliableControl => (1..=11).contains(&message_type),
-            Self::Motion | Self::Pairing | Self::Desktop => message_type == 1,
-            Self::Probe => matches!(message_type, 1 | 2),
+            Self::Desktop => crate::desktop::MAX_MESSAGE_BYTES,
         }
     }
 }
@@ -71,12 +57,13 @@ impl TryFrom<u8> for Family {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::Negotiation),
-            2 => Ok(Self::ReliableControl),
-            3 => Ok(Self::Motion),
-            4 => Ok(Self::Probe),
-            5 => Ok(Self::Pairing),
-            6 => Ok(Self::Desktop),
+            1 => Ok(Self::NegotiationOffer),
+            2 => Ok(Self::NegotiatedSession),
+            3 => Ok(Self::ReliableControl),
+            4 => Ok(Self::Motion),
+            5 => Ok(Self::Probe),
+            6 => Ok(Self::Pairing),
+            7 => Ok(Self::Desktop),
             other => Err(WireError::UnknownFamily(other)),
         }
     }
@@ -90,13 +77,14 @@ pub enum WireMessage {
     Motion(MotionFrame),
     Probe(ProbeMessage),
     Pairing(PairingOffer),
-    Desktop(crate::desktop::DesktopMessage),
+    Desktop(DesktopMessage),
 }
 
 impl WireMessage {
     pub fn family(&self) -> Family {
         match self {
-            Self::NegotiationOffer(_) | Self::NegotiatedSession(_) => Family::Negotiation,
+            Self::NegotiationOffer(_) => Family::NegotiationOffer,
+            Self::NegotiatedSession(_) => Family::NegotiatedSession,
             Self::ReliableControl(_) => Family::ReliableControl,
             Self::Motion(_) => Family::Motion,
             Self::Probe(_) => Family::Probe,
@@ -106,421 +94,94 @@ impl WireMessage {
     }
 }
 
+/// Metadata exchanged only after the pairing-only TLS handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingOffer {
+    pub handshake_nonce: [u8; 32],
+    pub device_label: Option<String>,
+    pub input_port: u16,
+    pub input_candidates: Vec<String>,
+}
+
 pub fn encode(message: &WireMessage) -> Result<Vec<u8>, WireError> {
-    let encoded = prepare_payload(message)?;
-    if encoded.payload.len() > encoded.family.maximum_payload_bytes() {
-        return Err(WireError::SizeLimit {
-            what: "payload",
-            actual: encoded.payload.len(),
-            maximum: encoded.family.maximum_payload_bytes(),
-        });
-    }
-
-    let payload_length =
-        u32::try_from(encoded.payload.len()).map_err(|_| WireError::SizeLimit {
-            what: "payload",
-            actual: encoded.payload.len(),
-            maximum: u32::MAX as usize,
-        })?;
-
-    let mut bytes = Vec::with_capacity(
-        FIXED_HEADER_BYTES
-            + encoded.session.map_or(0, |_| 32)
-            + encoded.channel.encoded_len()
-            + encoded.payload.len(),
-    );
-    bytes.extend_from_slice(&MAGIC);
-    bytes.push(encoded.family as u8);
-    bytes.push(encoded.message_type);
-    bytes.extend_from_slice(&payload_length.to_le_bytes());
-
-    if let Some(session) = encoded.session {
-        bytes.extend_from_slice(&session.session_epoch.0);
-        bytes.extend_from_slice(&session.transport_generation.0.to_le_bytes());
-        bytes.extend_from_slice(&session.activation_id.0.to_le_bytes());
-    }
-    encoded.channel.encode(&mut bytes);
-    bytes.extend_from_slice(&encoded.payload);
-    Ok(bytes)
+    bounds::validate(message)?;
+    frame(message)
 }
 
 pub fn decode(bytes: &[u8]) -> Result<WireMessage, WireError> {
     decode_inner(bytes, None)
 }
 
-/// Decodes only one family, rejecting a mismatch immediately after the bounded
-/// header parse. Fuzz targets use this to keep each decoder family independent.
+/// Decodes only one family, rejecting a mismatch before the payload is read.
+/// Fuzz targets use this to keep each decoder family independent.
 pub fn decode_family(bytes: &[u8], expected: Family) -> Result<WireMessage, WireError> {
     decode_inner(bytes, Some(expected))
 }
 
+fn frame(message: &WireMessage) -> Result<Vec<u8>, WireError> {
+    let family = message.family();
+    let header = vec![MAGIC[0], MAGIC[1], family as u8];
+    let bytes = match message {
+        WireMessage::NegotiationOffer(offer) => codec::encode(offer, header)?,
+        WireMessage::NegotiatedSession(session) => codec::encode(session, header)?,
+        WireMessage::ReliableControl(message) => codec::encode(message, header)?,
+        WireMessage::Motion(frame) => codec::encode(frame, header)?,
+        WireMessage::Probe(probe) => codec::encode(probe, header)?,
+        WireMessage::Pairing(offer) => codec::encode(offer, header)?,
+        WireMessage::Desktop(message) => {
+            let mut bytes = header;
+            serde_json::to_writer(&mut bytes, message)
+                .map_err(|error| WireError::Invalid(error.to_string()))?;
+            bytes
+        }
+    };
+    check_payload_size(family, bytes.len() - HEADER_BYTES)?;
+    Ok(bytes)
+}
+
 fn decode_inner(bytes: &[u8], expected: Option<Family>) -> Result<WireMessage, WireError> {
-    let (header, payload) = parse_envelope(bytes)?;
+    let ([first, second, family], payload) = bytes
+        .split_first_chunk::<HEADER_BYTES>()
+        .ok_or(WireError::TooShort)?;
+    if [*first, *second] != MAGIC {
+        return Err(WireError::BadMagic);
+    }
+    let family = Family::try_from(*family)?;
     if let Some(expected) = expected
-        && header.family != expected
+        && family != expected
     {
         return Err(WireError::FamilyMismatch {
             expected,
-            actual: header.family,
+            actual: family,
         });
     }
-    decode_payload(&header, payload)
+    check_payload_size(family, payload.len())?;
+    let message = match family {
+        Family::NegotiationOffer => WireMessage::NegotiationOffer(codec::decode(payload)?),
+        Family::NegotiatedSession => WireMessage::NegotiatedSession(codec::decode(payload)?),
+        Family::ReliableControl => WireMessage::ReliableControl(codec::decode(payload)?),
+        Family::Motion => WireMessage::Motion(codec::decode(payload)?),
+        Family::Probe => WireMessage::Probe(codec::decode(payload)?),
+        Family::Pairing => WireMessage::Pairing(codec::decode(payload)?),
+        Family::Desktop => WireMessage::Desktop(
+            serde_json::from_slice(payload)
+                .map_err(|error| WireError::Invalid(error.to_string()))?,
+        ),
+    };
+    bounds::validate(&message)?;
+    Ok(message)
 }
 
-struct EncodedPayload {
-    family: Family,
-    message_type: u8,
-    session: Option<SessionContext>,
-    channel: ChannelFields,
-    payload: Vec<u8>,
-}
-
-fn prepare_payload(message: &WireMessage) -> Result<EncodedPayload, WireError> {
-    let bounds = |error: BoundError| WireError::Bounds(error.to_string());
-    Ok(match message {
-        WireMessage::NegotiationOffer(offer) => {
-            let value = WireNegotiationOffer::try_from(offer).map_err(bounds)?;
-            EncodedPayload {
-                family: Family::Negotiation,
-                message_type: 1,
-                session: None,
-                channel: ChannelFields::None,
-                payload: codec::encode(&value)?,
-            }
-        }
-        WireMessage::NegotiatedSession(session) => {
-            let value = WireNegotiatedSession::try_from(session).map_err(bounds)?;
-            EncodedPayload {
-                family: Family::Negotiation,
-                message_type: 2,
-                session: None,
-                channel: ChannelFields::None,
-                payload: codec::encode(&value)?,
-            }
-        }
-        WireMessage::ReliableControl(message) => {
-            validate_reliable_context(&message.payload, message.session)?;
-            let value = WireReliableControl::try_from(&message.payload).map_err(bounds)?;
-            let message_type = value.message_type();
-            EncodedPayload {
-                family: Family::ReliableControl,
-                message_type,
-                session: Some(message.session),
-                channel: ChannelFields::Control(message.sequence),
-                payload: codec::encode(&value)?,
-            }
-        }
-        WireMessage::Motion(frame) => {
-            let value = WireMotionBody::try_from(frame).map_err(bounds)?;
-            EncodedPayload {
-                family: Family::Motion,
-                message_type: 1,
-                session: Some(frame.session),
-                channel: ChannelFields::Motion {
-                    motion_sequence: frame.motion_sequence,
-                    control_watermark: frame.control_watermark,
-                },
-                payload: codec::encode(&value)?,
-            }
-        }
-        WireMessage::Probe(message) => {
-            let message_type = match message.payload {
-                ProbePayload::Probe { .. } => 1,
-                ProbePayload::ProbeEcho { .. } => 2,
-            };
-            EncodedPayload {
-                family: Family::Probe,
-                message_type,
-                session: Some(message.session),
-                channel: ChannelFields::None,
-                payload: codec::encode(&message.payload)?,
-            }
-        }
-        WireMessage::Desktop(message) => {
-            message
-                .validate()
-                .map_err(|e| WireError::Bounds(e.to_string()))?;
-            let json =
-                serde_json::to_string(message).map_err(|e| WireError::Bounds(e.to_string()))?;
-            let value =
-                bounds::BoundedString::<{ crate::desktop::MAX_MESSAGE_BYTES }>::try_from_string(
-                    json, "desktop",
-                )
-                .map_err(bounds)?;
-            EncodedPayload {
-                family: Family::Desktop,
-                message_type: 1,
-                session: None,
-                channel: ChannelFields::None,
-                payload: codec::encode(&value)?,
-            }
-        }
-        WireMessage::Pairing(pairing) => {
-            let value = WirePairingOffer::try_from(pairing).map_err(bounds)?;
-            EncodedPayload {
-                family: Family::Pairing,
-                message_type: 1,
-                session: None,
-                channel: ChannelFields::None,
-                payload: codec::encode(&value)?,
-            }
-        }
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ChannelFields {
-    None,
-    Control(ControlSequence),
-    Motion {
-        motion_sequence: MotionSequence,
-        control_watermark: ControlSequence,
-    },
-}
-
-impl ChannelFields {
-    fn encoded_len(self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::Control(_) => 8,
-            Self::Motion { .. } => 16,
-        }
-    }
-
-    fn encode(self, bytes: &mut Vec<u8>) {
-        match self {
-            Self::None => {}
-            Self::Control(sequence) => bytes.extend_from_slice(&sequence.0.to_le_bytes()),
-            Self::Motion {
-                motion_sequence,
-                control_watermark,
-            } => {
-                bytes.extend_from_slice(&motion_sequence.0.to_le_bytes());
-                bytes.extend_from_slice(&control_watermark.0.to_le_bytes());
-            }
-        }
-    }
-}
-
-struct Header {
-    family: Family,
-    message_type: u8,
-    session: Option<SessionContext>,
-    channel: ChannelFields,
-}
-
-fn parse_envelope(bytes: &[u8]) -> Result<(Header, &[u8]), WireError> {
-    if bytes.len() < FIXED_HEADER_BYTES {
-        return Err(WireError::TooShort);
-    }
-    let mut cursor = Cursor::new(bytes);
-    if cursor.take(2)? != MAGIC {
-        return Err(WireError::BadMagic);
-    }
-    let family = Family::try_from(cursor.u8()?)?;
-    let message_type = cursor.u8()?;
-    if !family.valid_message_type(message_type) {
-        return Err(WireError::UnknownMessageType {
-            family,
-            message_type,
-        });
-    }
-    let payload_length = usize::try_from(cursor.u32()?).map_err(|_| WireError::SizeLimit {
-        what: "payload",
-        actual: usize::MAX,
-        maximum: family.maximum_payload_bytes(),
-    })?;
-    if payload_length > family.maximum_payload_bytes() {
+fn check_payload_size(family: Family, actual: usize) -> Result<(), WireError> {
+    let maximum = family.maximum_payload_bytes();
+    if actual > maximum {
         return Err(WireError::SizeLimit {
-            what: "payload",
-            actual: payload_length,
-            maximum: family.maximum_payload_bytes(),
+            what: "payload bytes",
+            actual,
+            maximum,
         });
-    }
-    let session = if family.requires_session() {
-        let mut epoch = [0_u8; 16];
-        epoch.copy_from_slice(cursor.take(16)?);
-        Some(SessionContext {
-            session_epoch: SessionEpoch(epoch),
-            transport_generation: TransportGeneration(cursor.u64()?),
-            activation_id: ActivationId(cursor.u64()?),
-        })
-    } else {
-        None
-    };
-
-    let channel = match family {
-        Family::ReliableControl => ChannelFields::Control(ControlSequence(cursor.u64()?)),
-        Family::Motion => ChannelFields::Motion {
-            motion_sequence: MotionSequence(cursor.u64()?),
-            control_watermark: ControlSequence(cursor.u64()?),
-        },
-        _ => ChannelFields::None,
-    };
-
-    if cursor.remaining() != payload_length {
-        return Err(WireError::LengthMismatch);
-    }
-    let header = Header {
-        family,
-        message_type,
-        session,
-        channel,
-    };
-    Ok((header, cursor.take(payload_length)?))
-}
-
-fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireError> {
-    let bounds = |error: BoundError| WireError::Bounds(error.to_string());
-    match header.family {
-        Family::Negotiation => match header.message_type {
-            1 => {
-                let value: WireNegotiationOffer = codec::decode(payload)?;
-                Ok(WireMessage::NegotiationOffer(
-                    value.try_into().map_err(bounds)?,
-                ))
-            }
-            2 => {
-                let value: WireNegotiatedSession = codec::decode(payload)?;
-                Ok(WireMessage::NegotiatedSession(
-                    value.try_into().map_err(bounds)?,
-                ))
-            }
-            _ => unreachable!("message type checked during header parsing"),
-        },
-        Family::ReliableControl => {
-            let value: WireReliableControl = codec::decode(payload)?;
-            if value.message_type() != header.message_type {
-                return Err(WireError::InvalidEnvelope(
-                    "reliable control type disagrees with its payload",
-                ));
-            }
-            let session = header.session.ok_or(WireError::InvalidEnvelope(
-                "reliable control lacks session context",
-            ))?;
-            let sequence = match header.channel {
-                ChannelFields::Control(sequence) => sequence,
-                _ => return Err(WireError::InvalidEnvelope("control sequence is absent")),
-            };
-            let payload: ReliableControl = value.try_into().map_err(bounds)?;
-            validate_reliable_context(&payload, session)?;
-            Ok(WireMessage::ReliableControl(ReliableControlMessage {
-                session,
-                sequence,
-                payload,
-            }))
-        }
-        Family::Motion => {
-            let value: WireMotionBody = codec::decode(payload)?;
-            let session = header
-                .session
-                .ok_or(WireError::InvalidEnvelope("motion lacks session context"))?;
-            let (motion_sequence, control_watermark) = match header.channel {
-                ChannelFields::Motion {
-                    motion_sequence,
-                    control_watermark,
-                } => (motion_sequence, control_watermark),
-                _ => return Err(WireError::InvalidEnvelope("motion sequences are absent")),
-            };
-            Ok(WireMessage::Motion(
-                value
-                    .into_model(session, motion_sequence, control_watermark)
-                    .map_err(bounds)?,
-            ))
-        }
-        Family::Probe => {
-            let value: ProbePayload = codec::decode(payload)?;
-            let value_type = match value {
-                ProbePayload::Probe { .. } => 1,
-                ProbePayload::ProbeEcho { .. } => 2,
-            };
-            if value_type != header.message_type {
-                return Err(WireError::InvalidEnvelope(
-                    "probe type disagrees with its payload",
-                ));
-            }
-            Ok(WireMessage::Probe(ProbeMessage {
-                session: header
-                    .session
-                    .ok_or(WireError::InvalidEnvelope("probe lacks session context"))?,
-                payload: value,
-            }))
-        }
-        Family::Desktop => {
-            let value: bounds::BoundedString<{ crate::desktop::MAX_MESSAGE_BYTES }> =
-                codec::decode(payload)?;
-            let message: crate::desktop::DesktopMessage =
-                serde_json::from_str(&value.into_string())
-                    .map_err(|e| WireError::Bounds(e.to_string()))?;
-            message
-                .validate()
-                .map_err(|e| WireError::Bounds(e.to_string()))?;
-            Ok(WireMessage::Desktop(message))
-        }
-        Family::Pairing => {
-            let value: WirePairingOffer = codec::decode(payload)?;
-            Ok(WireMessage::Pairing(value.try_into().map_err(bounds)?))
-        }
-    }
-}
-
-fn validate_reliable_context(
-    payload: &ReliableControl,
-    session: SessionContext,
-) -> Result<(), WireError> {
-    if payload
-        .motion_anchor()
-        .is_some_and(|anchor| anchor.activation_id != session.activation_id)
-    {
-        return Err(WireError::InvalidEnvelope(
-            "motion anchor activation differs from the envelope",
-        ));
     }
     Ok(())
-}
-
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.position)
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], WireError> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or(WireError::LengthMismatch)?;
-        let value = self
-            .bytes
-            .get(self.position..end)
-            .ok_or(WireError::LengthMismatch)?;
-        self.position = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, WireError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, WireError> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("length checked"),
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, WireError> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("length checked"),
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -528,12 +189,27 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::core::*;
 
     fn session() -> SessionContext {
         SessionContext {
             session_epoch: SessionEpoch([0x11; 16]),
             transport_generation: TransportGeneration(7),
             activation_id: ActivationId(9),
+        }
+    }
+
+    fn contact(id: u32) -> TouchContact {
+        TouchContact {
+            id: ContactId(id),
+            x: 300,
+            y: 400,
+            pressure: None,
+            major: None,
+            minor: None,
+            orientation_millidegrees: None,
+            tool: TouchTool::Finger,
+            source_dimensions: None,
         }
     }
 
@@ -553,17 +229,7 @@ mod tests {
                     height: 1_080,
                 }),
             },
-            TouchContact {
-                id: ContactId(2),
-                x: 300,
-                y: 400,
-                pressure: None,
-                major: None,
-                minor: None,
-                orientation_millidegrees: None,
-                tool: TouchTool::Finger,
-                source_dimensions: None,
-            },
+            contact(2),
         ])
         .unwrap()
     }
@@ -579,67 +245,77 @@ mod tests {
         }
     }
 
+    fn control(payload: ReliableControl) -> WireMessage {
+        WireMessage::ReliableControl(ReliableControlMessage {
+            session: session(),
+            sequence: ControlSequence(33),
+            payload,
+        })
+    }
+
+    fn motion(touch_snapshot: Option<TouchState>) -> MotionFrame {
+        MotionFrame {
+            session: session(),
+            motion_sequence: MotionSequence(34),
+            control_watermark: ControlSequence(33),
+            sender_capture_time: MonotonicTimeMicros(1_234_890),
+            totals: CumulativeMotion::new(120, -80, 9, -6),
+            touch_snapshot,
+        }
+    }
+
+    fn offer() -> NegotiationOffer {
+        NegotiationOffer {
+            maximum_datagram_size: 1_200,
+            supported_capabilities: InputCapabilities::from([
+                InputCapability::Keyboard,
+                InputCapability::Pointer,
+                InputCapability::Scroll,
+                InputCapability::Touch,
+            ]),
+            required_capabilities: InputCapabilities::from([InputCapability::Keyboard]),
+            pointer_units: BTreeSet::from([PointerUnit::DeviceUnaccelerated]),
+            scroll_fields: ScrollFields {
+                high_resolution: true,
+                discrete_steps: true,
+                ..ScrollFields::default()
+            },
+            maximum_contacts: 10,
+            maximum_receiver_lease_ms: 1_000,
+            maximum_checkpoint_bound_ms: 250,
+        }
+    }
+
+    fn pairing() -> PairingOffer {
+        PairingOffer {
+            handshake_nonce: [0x33; 32],
+            device_label: Some("workstation".into()),
+            input_port: 43119,
+            input_candidates: vec!["192.0.2.1:43119".into()],
+        }
+    }
+
     fn corpus() -> Vec<WireMessage> {
-        let capabilities = InputCapabilities::from([
-            InputCapability::Keyboard,
-            InputCapability::Pointer,
-            InputCapability::Scroll,
-            InputCapability::Touch,
-        ]);
         vec![
-            WireMessage::NegotiationOffer(NegotiationOffer {
-                maximum_datagram_size: 1_200,
-                supported_capabilities: capabilities.clone(),
-                required_capabilities: InputCapabilities::from([InputCapability::Keyboard]),
-                pointer_units: BTreeSet::from([PointerUnit::DeviceUnaccelerated]),
-                scroll_fields: ScrollFields {
-                    high_resolution: true,
-                    source_unit: true,
-                    source_resolution: true,
-                    discrete_steps: true,
-                    phase: true,
-                    momentum_phase: true,
-                },
-                maximum_contacts: 10,
-                maximum_receiver_lease_ms: 1_000,
-                maximum_checkpoint_bound_ms: 250,
-            }),
+            WireMessage::NegotiationOffer(offer()),
             WireMessage::NegotiatedSession(NegotiatedSession {
                 maximum_datagram_size: 1_200,
-                capabilities,
+                capabilities: offer().supported_capabilities,
                 pointer_unit: Some(PointerUnit::DeviceUnaccelerated),
-                scroll_fields: ScrollFields {
-                    high_resolution: true,
-                    source_unit: true,
-                    source_resolution: true,
-                    discrete_steps: false,
-                    phase: true,
-                    momentum_phase: false,
-                },
+                scroll_fields: offer().scroll_fields,
                 contact_limit: 10,
                 receiver_lease_ms: 900,
                 checkpoint_bound_ms: 200,
             }),
-            WireMessage::ReliableControl(ReliableControlMessage {
-                session: session(),
-                sequence: ControlSequence(33),
-                payload: ReliableControl::StateSnapshot(StateSnapshot {
-                    held: HeldState {
-                        pressed_keys: BTreeSet::from([HidUsage::keyboard(4)]),
-                        pressed_buttons: BTreeSet::from([PointerButton::PRIMARY]),
-                        active_touch: touch_state(),
-                    },
-                    motion_anchor: anchor(),
-                }),
-            }),
-            WireMessage::Motion(MotionFrame {
-                session: session(),
-                motion_sequence: MotionSequence(34),
-                control_watermark: ControlSequence(33),
-                sender_capture_time: MonotonicTimeMicros(1_234_890),
-                totals: CumulativeMotion::new(120, -80, 9, -6),
-                touch_snapshot: Some(touch_state()),
-            }),
+            control(ReliableControl::StateSnapshot(StateSnapshot {
+                held: HeldState {
+                    pressed_keys: BTreeSet::from([HidUsage::keyboard(4)]),
+                    pressed_buttons: BTreeSet::from([PointerButton::PRIMARY]),
+                    active_touch: touch_state(),
+                },
+                motion_anchor: anchor(),
+            })),
+            WireMessage::Motion(motion(Some(touch_state()))),
             WireMessage::Probe(ProbeMessage {
                 session: session(),
                 payload: ProbePayload::ProbeEcho {
@@ -649,12 +325,7 @@ mod tests {
                     echoed_at: MonotonicTimeMicros(111),
                 },
             }),
-            WireMessage::Pairing(PairingOffer {
-                handshake_nonce: [0x33; 32],
-                device_label: Some("workstation".into()),
-                input_port: 43119,
-                input_candidates: vec!["192.0.2.1:43119".into()],
-            }),
+            WireMessage::Pairing(pairing()),
         ]
     }
 
@@ -667,22 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn every_control_message_round_trips_under_its_own_type() {
-        let anchor = |kind| MotionAnchor {
-            activation_id: session().activation_id,
-            through_motion_sequence: MotionSequence(3),
-            sender_capture_time: MonotonicTimeMicros(1_000),
-            totals: CumulativeMotion::new(5, -2, 0, 7),
-            final_touch_state: TouchState::default(),
-            kind,
+    fn every_control_message_round_trips() {
+        let terminal = MotionAnchor {
+            kind: AnchorKind::Terminal,
+            ..anchor()
         };
-        let held = HeldState {
-            pressed_keys: BTreeSet::from([HidUsage::keyboard(4)]),
-            pressed_buttons: BTreeSet::from([PointerButton::PRIMARY]),
-            active_touch: TouchState::default(),
-        };
-        let checkpoint = anchor(AnchorKind::Checkpoint);
-        let cases = [
+        for payload in [
             ReliableControl::Enter,
             ReliableControl::KeyDown {
                 key: HidUsage::keyboard(4),
@@ -692,70 +353,47 @@ mod tests {
             },
             ReliableControl::ButtonDown {
                 button: PointerButton::PRIMARY,
-                anchor: checkpoint.clone(),
+                anchor: anchor(),
             },
             ReliableControl::ButtonUp {
                 button: PointerButton::SECONDARY,
-                anchor: checkpoint.clone(),
+                anchor: anchor(),
             },
             ReliableControl::TouchBegin {
                 initial_state: touch_state(),
             },
-            ReliableControl::TouchEnd {
-                anchor: checkpoint.clone(),
-            },
-            ReliableControl::TouchCancel {
-                anchor: checkpoint.clone(),
-            },
-            ReliableControl::StateSnapshot(StateSnapshot {
-                held,
-                motion_anchor: checkpoint,
-            }),
+            ReliableControl::TouchEnd { anchor: terminal },
+            ReliableControl::TouchCancel { anchor: anchor() },
             ReliableControl::SnapshotAck(SnapshotAck {
                 snapshot_sequence: ControlSequence(4),
                 accepted_generation: TransportGeneration(7),
             }),
             ReliableControl::SessionClose {
-                reason: SessionCloseReason::LocalRelease,
-                final_anchor: Some(anchor(AnchorKind::Terminal)),
+                reason: SessionCloseReason::PermissionRevoked,
+                final_anchor: None,
             },
-        ];
-        for (message_type, payload) in (1..).zip(cases) {
-            let message = WireMessage::ReliableControl(ReliableControlMessage {
-                session: session(),
-                sequence: ControlSequence(5),
-                payload,
-            });
-            let bytes = encode(&message).unwrap();
-            assert_eq!(bytes[3], message_type);
-            assert_eq!(decode(&bytes).unwrap(), message);
+        ] {
+            let message = control(payload);
+            assert_eq!(decode(&encode(&message).unwrap()).unwrap(), message);
         }
     }
 
     #[test]
-    fn unknown_control_types_are_rejected() {
-        let mut bytes = encode(&corpus().remove(2)).unwrap();
-        for unknown in [0, 12, 255] {
-            bytes[3] = unknown;
-            assert_eq!(
-                decode(&bytes),
-                Err(WireError::UnknownMessageType {
-                    family: Family::ReliableControl,
-                    message_type: unknown,
-                })
-            );
-        }
-    }
+    fn malformed_headers_and_trailing_bytes_are_rejected() {
+        let bytes = encode(&corpus().remove(4)).unwrap();
+        assert_eq!(decode(&bytes[..2]), Err(WireError::TooShort));
 
-    #[test]
-    fn invalid_family_and_trailing_envelope_data_are_rejected() {
-        let mut bytes = encode(&corpus().remove(4)).unwrap();
-        bytes[2] = 0xff;
-        assert_eq!(decode(&bytes), Err(WireError::UnknownFamily(0xff)));
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] = b'X';
+        assert_eq!(decode(&bad_magic), Err(WireError::BadMagic));
 
-        let mut bytes = encode(&corpus().remove(4)).unwrap();
-        bytes.push(0);
-        assert_eq!(decode(&bytes), Err(WireError::LengthMismatch));
+        let mut unknown = bytes.clone();
+        unknown[2] = 0xff;
+        assert_eq!(decode(&unknown), Err(WireError::UnknownFamily(0xff)));
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_eq!(decode(&trailing), Err(WireError::TrailingPayload));
     }
 
     #[test]
@@ -771,66 +409,120 @@ mod tests {
     }
 
     #[test]
-    fn declared_oversize_payload_is_rejected_before_length_or_codec_work() {
-        let mut bytes = encode(&corpus().remove(4)).unwrap();
-        bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(matches!(
+    fn oversize_payload_is_rejected_before_codec_work() {
+        let mut bytes = vec![MAGIC[0], MAGIC[1], Family::Probe as u8];
+        bytes.resize(HEADER_BYTES + MAX_PROBE_PAYLOAD_BYTES + 1, 0);
+        assert_eq!(
             decode(&bytes),
             Err(WireError::SizeLimit {
-                what: "payload",
-                ..
+                what: "payload bytes",
+                actual: MAX_PROBE_PAYLOAD_BYTES + 1,
+                maximum: MAX_PROBE_PAYLOAD_BYTES,
             })
+        );
+    }
+
+    /// A hostile peer skips validation, so every limit must hold again after
+    /// decoding.
+    #[test]
+    fn decoded_messages_over_a_limit_are_rejected() {
+        let crowd = || TouchState::new((0..=bounds::MAX_CONTACTS as u32).map(contact)).unwrap();
+        let cases = [
+            (
+                WireMessage::NegotiationOffer(NegotiationOffer {
+                    maximum_contacts: bounds::MAX_CONTACTS as u16 + 1,
+                    ..offer()
+                }),
+                "maximum contacts",
+            ),
+            (
+                control(ReliableControl::TouchBegin {
+                    initial_state: crowd(),
+                }),
+                "touch contacts",
+            ),
+            (
+                control(ReliableControl::StateSnapshot(StateSnapshot {
+                    held: HeldState {
+                        pressed_keys: (0..=bounds::MAX_HELD_KEYS as u16)
+                            .map(HidUsage::keyboard)
+                            .collect(),
+                        ..HeldState::default()
+                    },
+                    motion_anchor: anchor(),
+                })),
+                "pressed keys",
+            ),
+            (WireMessage::Motion(motion(Some(crowd()))), "touch contacts"),
+            (
+                WireMessage::Pairing(PairingOffer {
+                    device_label: Some("x".repeat(bounds::MAX_STRING_BYTES + 1)),
+                    ..pairing()
+                }),
+                "device label bytes",
+            ),
+            (
+                WireMessage::Pairing(PairingOffer {
+                    input_candidates: (0..=bounds::MAX_DISCOVERY_CANDIDATES)
+                        .map(|port| format!("192.0.2.1:{}", port + 1))
+                        .collect(),
+                    ..pairing()
+                }),
+                "input candidates",
+            ),
+        ];
+        for (message, limit) in cases {
+            assert!(
+                matches!(encode(&message), Err(WireError::SizeLimit { what, .. }) if what == limit)
+            );
+            let bytes = frame(&message).unwrap();
+            assert!(
+                matches!(decode(&bytes), Err(WireError::SizeLimit { what, .. }) if what == limit)
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_touch_contact_ids_are_rejected() {
+        // A motion frame is its fields in order, so a tuple can carry a
+        // contact list that TouchState itself cannot hold.
+        let raw = |contacts: Vec<TouchContact>| {
+            let frame = motion(None);
+            let body = (
+                frame.session,
+                frame.motion_sequence,
+                frame.control_watermark,
+                frame.sender_capture_time,
+                frame.totals,
+                Some(contacts),
+            );
+            codec::encode(&body, vec![MAGIC[0], MAGIC[1], Family::Motion as u8]).unwrap()
+        };
+        let distinct = TouchState::new([contact(1), contact(2)]).unwrap();
+        assert_eq!(
+            decode(&raw(vec![contact(1), contact(2)])),
+            Ok(WireMessage::Motion(motion(Some(distinct))))
+        );
+        assert!(matches!(
+            decode(&raw(vec![contact(1), contact(1)])),
+            Err(WireError::Codec(_))
         ));
     }
 
     #[test]
-    fn collection_bound_is_enforced_by_the_decoder() {
-        let mut bytes = encode(&corpus().remove(0)).unwrap();
-        // Negotiation has no session/channel header. The body starts with the
-        // two-byte datagram size varint, then the capability count.
-        bytes[FIXED_HEADER_BYTES + 2] = (bounds::MAX_CAPABILITIES as u8) + 1;
-        assert!(decode(&bytes).is_err());
-    }
-
-    #[test]
-    fn strings_are_bounded() {
-        let message = WireMessage::Pairing(PairingOffer {
-            handshake_nonce: [0; 32],
-            device_label: Some("x".repeat(bounds::MAX_STRING_BYTES + 1)),
-            input_port: 43119,
-            input_candidates: Vec::new(),
-        });
-        assert!(matches!(encode(&message), Err(WireError::Bounds(_))));
-    }
-
-    #[test]
-    fn control_type_and_anchor_context_are_structurally_checked() {
-        let message = WireMessage::ReliableControl(ReliableControlMessage {
-            session: session(),
-            sequence: ControlSequence(1),
-            payload: ReliableControl::TouchEnd {
-                anchor: MotionAnchor {
-                    activation_id: ActivationId(999),
-                    ..anchor()
-                },
+    fn anchor_activation_must_match_the_session() {
+        let message = control(ReliableControl::TouchEnd {
+            anchor: MotionAnchor {
+                activation_id: ActivationId(999),
+                ..anchor()
             },
         });
-        assert_eq!(
-            encode(&message),
-            Err(WireError::InvalidEnvelope(
-                "motion anchor activation differs from the envelope"
-            ))
-        );
-
-        let mut bytes = encode(&corpus().remove(2)).unwrap();
-        bytes[3] = 1;
-        assert_eq!(
-            decode(&bytes),
-            Err(WireError::InvalidEnvelope(
-                "reliable control type disagrees with its payload"
-            ))
-        );
+        let mismatch =
+            WireError::Invalid("motion anchor activation differs from the session".into());
+        assert_eq!(encode(&message).unwrap_err(), mismatch);
+        assert_eq!(decode(&frame(&message).unwrap()).unwrap_err(), mismatch);
     }
+
     #[test]
     fn desktop_metadata_round_trips_with_bounded_json() {
         use crate::desktop::*;

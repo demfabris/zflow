@@ -4,5 +4,6 @@ use libfuzzer_sys::fuzz_target;
 use zflow::wire::{Family, decode_family};
 
 fuzz_target!(|data: &[u8]| {
-    let _ = decode_family(data, Family::Negotiation);
+    let _ = decode_family(data, Family::NegotiationOffer);
+    let _ = decode_family(data, Family::NegotiatedSession);
 });
