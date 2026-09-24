@@ -24,8 +24,8 @@ use crate::{
     linux::{
         CaptureFrame, CaptureReadError, CaptureSet, CaptureSetError, CaptureTransition,
         CapturedDeviceFrame, DeviceInfo, InjectionError, KeyState, OwnershipEffect, OwnershipPhase,
-        PeriodicDeviceScanner, SourceOwnership, VirtualInput, enumerate_devices,
-        evdev_button_to_pointer, evdev_key_to_hid,
+        SourceOwnership, VirtualInput, enumerate_devices, evdev_button_to_pointer,
+        evdev_key_to_hid,
     },
 };
 
@@ -507,7 +507,6 @@ struct RuntimeLoop {
     capture_tx: SyncSender<CapturedDeviceFrame>,
     status: Arc<Mutex<LinuxRuntimeStatus>>,
     config: LinuxRuntimeConfig,
-    scanner: PeriodicDeviceScanner,
     capture: CaptureSet,
     ownership: SourceOwnership,
     virtual_input: VirtualInput,
@@ -545,9 +544,8 @@ impl RuntimeLoop {
             ConfiguredChord::parse(&config.escape_chord)
                 .expect("runtime configuration was validated before thread startup"),
         );
-        let mut scanner = PeriodicDeviceScanner::new(RESCAN_INTERVAL);
-        scanner.refresh().map_err(RuntimeStartupError::DeviceScan)?;
-        let selection = select_configured(&config.capture_devices, scanner.known());
+        let scan = enumerate_devices().map_err(RuntimeStartupError::DeviceScan)?;
+        let selection = select_configured(&config.capture_devices, scan.physical_devices());
         let capture = if selection.capture_set().is_empty() {
             CaptureSet::default()
         } else {
@@ -563,7 +561,6 @@ impl RuntimeLoop {
             capture_tx,
             status,
             config,
-            scanner,
             capture,
             ownership: SourceOwnership::default(),
             virtual_input,
@@ -817,7 +814,6 @@ impl RuntimeLoop {
             self.ready_notified = false;
             self.next_readiness_probe = Instant::now();
         }
-        self.scanner = PeriodicDeviceScanner::new(RESCAN_INTERVAL);
         self.config = config;
         self.rescan();
         Ok(())
@@ -825,15 +821,15 @@ impl RuntimeLoop {
 
     fn rescan(&mut self) {
         self.deregister_capture_descriptors();
-        let result = match self.scanner.refresh() {
-            Ok(result) => result,
+        let scan = match enumerate_devices() {
+            Ok(scan) => scan,
             Err(_) => {
                 self.diagnostic(RuntimeDiagnostic::CaptureReadFailed);
                 let _ = self.register_capture_descriptors();
                 return;
             }
         };
-        let selection = select_configured(&self.config.capture_devices, self.scanner.known());
+        let selection = select_configured(&self.config.capture_devices, scan.physical_devices());
         let previous_selection_complete = self.capture_selection_complete;
         self.capture_selection_complete = selection.is_complete();
         if let Some(diagnostic) =
@@ -865,7 +861,7 @@ impl RuntimeLoop {
                 self.capture.suspend();
             }
         }
-        if !result.failures.is_empty() && selection.unmatched > 0 {
+        if !scan.failures.is_empty() && selection.unmatched > 0 {
             self.diagnostic(RuntimeDiagnostic::CaptureOpenFailed);
         }
         if self.register_capture_descriptors().is_err() {
@@ -1399,10 +1395,6 @@ mod tests {
             vendor,
             product,
             version: 1,
-            has_keyboard_keys: true,
-            has_pointer_buttons: false,
-            has_relative_pointer: false,
-            has_high_resolution_wheel: false,
         }
     }
 
