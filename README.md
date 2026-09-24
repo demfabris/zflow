@@ -28,9 +28,10 @@ System changes request administrator access once, through GNOME's password
 dialog when available, or `sudo` in the terminal.
 
 On macOS, the installer places `zflow.app` in `/Applications`. The release
-workflow signs Mac apps with Developer ID and includes Apple's notarization
-ticket. You can install the optional AWDL helper from the app with administrator
-approval.
+workflow signs Mac apps with Developer ID and notarizes them, but v0.1.0 was
+built before that: its Mac apps are ad-hoc signed. Input sharing works, but they
+can't install the optional AWDL helper. Releases built by the signing workflow
+can install it from the app with administrator approval.
 
 Repeat the command to update. It keeps your configuration and paired identities;
 updating the Linux service interrupts an active connection. Log out and back in
