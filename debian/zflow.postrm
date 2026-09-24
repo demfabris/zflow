@@ -12,6 +12,9 @@ case "$1" in
         ;;
     purge)
         rm -f /etc/udev/rules.d/71-zflow-capture.rules /etc/udev/71-zflow-capture.rules.disabled
+        # zflow setup --prelogin on writes this next to the configuration.
+        rm -f /etc/systemd/system/zflowd.service.d/zflowd-prelogin.conf
+        rmdir /etc/systemd/system/zflowd.service.d 2>/dev/null || true
         # Preserve identities and the system account even on purge.
         if [ -d /etc/zflow ] && [ ! -L /etc/zflow ]; then
             rm -f /etc/zflow/zflow.toml

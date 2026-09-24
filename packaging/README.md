@@ -138,11 +138,13 @@ sudo /usr/local/bin/zflow doctor
 ```
 
 The default service starts at `multi-user.target` and does not wait for
-`network-online.target`. Its drop-in orders daemon readiness before the display
-manager, but pre-login injection remains blocked by the global config and
-per-peer permission gates. The sleep hook stops an active daemon before
-suspend and starts a fresh process after resume. This releases every evdev
-grab and discards stale sessions and clock state.
+`network-online.target`. `zflow setup --prelogin on` adds
+`/etc/systemd/system/zflowd.service.d/zflowd-prelogin.conf`, which orders daemon
+readiness before the display manager; `--prelogin off` removes it. Pre-login
+injection also needs the per-peer permission. Purging the package or running
+the uninstaller with `--purge` deletes the drop-in. The sleep hook stops an
+active daemon before suspend and starts a fresh process after resume. This
+releases every evdev grab and discards stale sessions and clock state.
 
 The normal uninstaller keeps configuration, identity state, and the service
 account. It removes the capture rule to revoke event-device access:

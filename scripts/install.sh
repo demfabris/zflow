@@ -13,8 +13,9 @@ readonly CONFIG_DIR="/etc/zflow"
 readonly CONFIG_FILE="$CONFIG_DIR/zflow.toml"
 readonly STATE_DIR="/var/lib/zflow"
 readonly UNIT_FILE="/etc/systemd/system/zflowd.service"
-readonly PRELOGIN_DROPIN_DIR="/etc/systemd/system/zflowd.service.d"
-readonly PRELOGIN_DROPIN="$PRELOGIN_DROPIN_DIR/prelogin.conf"
+readonly DROPIN_DIR="/etc/systemd/system/zflowd.service.d"
+# Older installs ordered zflowd before the display manager on every boot.
+readonly LEGACY_PRELOGIN_DROPIN="$DROPIN_DIR/prelogin.conf"
 readonly UDEV_RULE_DIR="/etc/udev/rules.d"
 readonly VIRTUAL_RULE_FILE="$UDEV_RULE_DIR/70-zflow.rules"
 readonly CAPTURE_RULE_FILE="$UDEV_RULE_DIR/71-zflow-capture.rules"
@@ -64,7 +65,6 @@ for source in \
     "$REPO_ROOT/packaging/modules-load.d/zflow.conf" \
     "$REPO_ROOT/packaging/system-sleep/zflow" \
     "$REPO_ROOT/packaging/systemd/zflowd.service" \
-    "$REPO_ROOT/packaging/systemd/zflowd-prelogin.conf" \
     "$REPO_ROOT/packaging/udev/70-zflow.rules" \
     "$REPO_ROOT/packaging/udev/71-zflow-capture.rules"; do
     require_regular_source "$source"
@@ -107,24 +107,22 @@ refuse_symlink "$CONFIG_DIR"
 refuse_symlink "$CONFIG_FILE"
 refuse_symlink "$STATE_DIR"
 refuse_symlink "$UNIT_FILE"
-refuse_symlink "$PRELOGIN_DROPIN_DIR"
-refuse_symlink "$PRELOGIN_DROPIN"
 refuse_symlink "$VIRTUAL_RULE_FILE"
 refuse_symlink "$CAPTURE_RULE_FILE"
 refuse_symlink "$MODULE_FILE"
 refuse_symlink "$SLEEP_HOOK_FILE"
 
 install -d -o root -g root -m 0755 \
-    "$BIN_DIR" "$UDEV_RULE_DIR" /etc/modules-load.d /usr/lib/systemd/system-sleep \
-    "$PRELOGIN_DROPIN_DIR"
+    "$BIN_DIR" "$UDEV_RULE_DIR" /etc/modules-load.d /usr/lib/systemd/system-sleep
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$CONFIG_DIR" "$STATE_DIR"
 install -o root -g root -m 0755 "$binary_dir/zflow" "$BIN_DIR/zflow"
 install -o root -g root -m 0755 "$binary_dir/zflowd" "$BIN_DIR/zflowd"
 # Retire the old desktop launcher when upgrading an existing installation.
 rm -f -- "$BIN_DIR/zflow-gui" /usr/local/share/applications/io.zflow.zflow.desktop
+# zflow setup --prelogin on installs its own drop-in when pre-login input is wanted.
+rm -f -- "$LEGACY_PRELOGIN_DROPIN"
+rmdir -- "$DROPIN_DIR" 2>/dev/null || true
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/systemd/zflowd.service" "$UNIT_FILE"
-install -o root -g root -m 0644 \
-    "$REPO_ROOT/packaging/systemd/zflowd-prelogin.conf" "$PRELOGIN_DROPIN"
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/udev/70-zflow.rules" "$VIRTUAL_RULE_FILE"
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/modules-load.d/zflow.conf" "$MODULE_FILE"
 install -o root -g root -m 0755 "$REPO_ROOT/packaging/system-sleep/zflow" "$SLEEP_HOOK_FILE"

@@ -16,6 +16,8 @@ test -x /usr/bin/zflow
 test -f /usr/share/gnome-shell/extensions/zflow@demfabris/extension.js
 test -f /usr/share/applications/io.zflow.zflow.desktop
 test -f /usr/lib/systemd/system/zflowd.service
+# Pre-login boot ordering is opt-in through zflow setup --prelogin on.
+test ! -e /usr/lib/systemd/system/zflowd.service.d/prelogin.conf
 grep -qx 'ExecStart=/usr/bin/zflowd --config /etc/zflow/zflow.toml' /usr/lib/systemd/system/zflowd.service
 test "$(stat -c '%U:%G:%a' /etc/zflow/zflow.toml)" = zflow:zflow:600
 test "$(stat -c '%U:%G:%a' /var/lib/zflow)" = zflow:zflow:700
@@ -28,7 +30,10 @@ cp /etc/udev/rules.d/71-zflow-capture.rules /tmp/expected.rules
 dpkg -i /tmp/zflow.deb
 cmp /etc/zflow/zflow.toml /tmp/expected.toml
 cmp /etc/udev/rules.d/71-zflow-capture.rules /tmp/expected.rules
+mkdir -p /etc/systemd/system/zflowd.service.d
+printf '[Unit]\nBefore=display-manager.service\n' > /etc/systemd/system/zflowd.service.d/zflowd-prelogin.conf
 dpkg --remove zflow
+test -f /etc/systemd/system/zflowd.service.d/zflowd-prelogin.conf
 test ! -e /usr/bin/zflow
 test ! -e /etc/udev/rules.d/71-zflow-capture.rules
 cmp /etc/udev/71-zflow-capture.rules.disabled /tmp/expected.rules
@@ -40,6 +45,7 @@ cmp /etc/udev/rules.d/71-zflow-capture.rules /tmp/expected.rules
 cmp /etc/zflow/zflow.toml /tmp/expected.toml
 dpkg --purge zflow
 test ! -e /etc/zflow/zflow.toml
+test ! -e /etc/systemd/system/zflowd.service.d
 test ! -e /etc/udev/rules.d/71-zflow-capture.rules
 grep -qx 'identity sentinel' /var/lib/zflow/identity-test
 # A package must not silently shadow a previous /usr/local installation.
