@@ -443,19 +443,26 @@ static void event_tests(void) {
   ZFlowMacEvent captured;
   assert(zflow_mac_capture_poll(&captured) == 0);
 
-  const CGEventType disabled[] = {kCGEventTapDisabledByTimeout,
-                                  kCGEventTapDisabledByUserInput};
-  for (size_t i = 0; i < sizeof(disabled) / sizeof(disabled[0]); i++) {
-    reset();
-    assert(capture_cursor());
-    assert(event_callback(NULL, disabled[i], event, NULL) == event);
-    assert(zflow_mac_capture_stop_requested() == 1);
-    assert(zflow_mac_capture_pause_requested() == 0);
-    assert(g_capture_status == -1);
-    assert(event_callback(NULL, kCGEventMouseMoved, event, NULL) == event);
-    assert(zflow_mac_capture_poll(&captured) == 0);
-    assert(release_cursor());
-  }
+  reset();
+  g_event_tap = CFMachPortCreate(NULL, idle_port, NULL, NULL);
+  int enables = tap_enables;
+  assert(event_callback(NULL, kCGEventTapDisabledByTimeout, event, NULL) == event);
+  assert(tap_enables == enables + 1);
+  assert(zflow_mac_capture_stop_requested() == 0 && g_capture_status == 0);
+  assert(event_callback(NULL, kCGEventMouseMoved, event, NULL) == NULL);
+  assert(zflow_mac_capture_poll(&captured) == 1);
+  CFRelease(g_event_tap);
+  g_event_tap = NULL;
+
+  reset();
+  assert(capture_cursor());
+  assert(event_callback(NULL, kCGEventTapDisabledByUserInput, event, NULL) == event);
+  assert(zflow_mac_capture_stop_requested() == 1);
+  assert(zflow_mac_capture_pause_requested() == 0);
+  assert(g_capture_status == -1);
+  assert(event_callback(NULL, kCGEventMouseMoved, event, NULL) == event);
+  assert(zflow_mac_capture_poll(&captured) == 0);
+  assert(release_cursor());
 
   reset();
   CFRelease(event);

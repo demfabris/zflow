@@ -416,8 +416,12 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
                                  CGEventRef event, void *context) {
   (void)proxy;
   (void)context;
-  if (type == kCGEventTapDisabledByTimeout ||
-      type == kCGEventTapDisabledByUserInput) {
+  if (type == kCGEventTapDisabledByTimeout) {
+    // One slow callback should not end remote control.
+    if (g_event_tap) CGEventTapEnable(g_event_tap, true);
+    return event;
+  }
+  if (type == kCGEventTapDisabledByUserInput) {
     set_error("macOS disabled input capture; ending remote control");
     g_capture_status = -1;
     atomic_store(&g_stop, true);
