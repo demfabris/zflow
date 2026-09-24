@@ -122,14 +122,9 @@ impl NativeApp {
                 self.save_config()?;
                 self.restart();
             }
-            Request::HelperReady { ready } => {
-                if ready != self.helper_ready {
-                    self.helper_ready = ready;
-                    if self.document.saved().macos.block_awdl {
-                        self.restart();
-                    }
-                }
-            }
+            // Readiness only gates the next arming in tick(). One failed
+            // helper check must not pull input back from a live session.
+            Request::HelperReady { ready } => self.helper_ready = ready,
             Request::Move {
                 id,
                 x,
@@ -431,5 +426,29 @@ impl NativeApp {
             "receiver_error":self.receiver_error,"receiver_checked":self.checked && self.receiver_error.is_none(),"checking":self.probe.is_some(),
             "discovery_error":self.displays.error(),"desktop_error":self.detector.snapshot().1,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_readiness_does_not_restart_sharing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        std::fs::write(
+            &path,
+            "[transport]\ndiscovery = false\n[macos]\nblock_awdl = true\n",
+        )
+        .unwrap();
+        let mut app = NativeApp::open(path).unwrap();
+        app.restart = false;
+        app.checked = true;
+        for ready in [true, false, true] {
+            app.request(Request::HelperReady { ready }).unwrap();
+            assert_eq!(app.helper_ready, ready);
+            assert!(app.checked && !app.restart);
+        }
     }
 }
