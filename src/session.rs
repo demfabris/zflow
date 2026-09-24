@@ -791,15 +791,18 @@ async fn run_session(
                     && pending_probes.len() < MAX_PENDING_PROBES
                     && let Some(context) = active_context
                 {
+                    // The backend awaits above can take a while. A stale stamp
+                    // would inflate RTT and bias the clock offset.
+                    let sent_at = clock.now();
                     let probe = ProbeMessage {
                         session: context,
                         payload: ProbePayload::Probe {
                             sequence: next_probe_sequence,
-                            sent_at: now,
+                            sent_at,
                         },
                     };
                     channels.datagrams.send_probe(&probe)?;
-                    pending_probes.insert(next_probe_sequence, now);
+                    pending_probes.insert(next_probe_sequence, sent_at);
                     next_probe_sequence = ProbeSequence(
                         next_probe_sequence
                             .0
