@@ -12,6 +12,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+mdns-sd = { version = "0.21.1", default-features = false }
 zflow-kvm = { path = ".." }
 
 [[bin]]
@@ -52,6 +53,13 @@ bench = false
 [[bin]]
 name = "pairing"
 path = "fuzz_targets/pairing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "desktop"
+path = "fuzz_targets/desktop.rs"
 test = false
 doc = false
 bench = false
