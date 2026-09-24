@@ -1,6 +1,6 @@
 //! Desktop handoff metadata carried inside an authenticated input session.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub const FRACTION_MAX: u32 = 1_000_000;
@@ -154,11 +154,27 @@ impl ReturnMapping {
             ((remote - self.remote_start) / (self.remote_end - self.remote_start)).clamp(0.0, 1.0);
         let along = self.local_start + progress * (self.local_end - self.local_start);
         let point = edge_point(self.geometry.bounds()?, self.edge, along);
-        ensure!(
-            self.geometry.monitors.iter().any(|r| r.contains(point)),
-            "The return point is outside the active Mac displays; check the layout"
-        );
-        Ok(point)
+        // The receiver's barrier spans the whole shared range, which can include
+        // parts of this edge with no display behind them. Return to the nearest
+        // point on the edge that has one.
+        self.geometry
+            .monitors
+            .iter()
+            .filter_map(|r| {
+                let near = match self.edge {
+                    Edge::Left | Edge::Right => Point {
+                        y: point.y.clamp(r.y, r.y + r.height as i32 - 1),
+                        ..point
+                    },
+                    Edge::Top | Edge::Bottom => Point {
+                        x: point.x.clamp(r.x, r.x + r.width as i32 - 1),
+                        ..point
+                    },
+                };
+                r.contains(near).then_some(near)
+            })
+            .min_by_key(|near| near.x.abs_diff(point.x) + near.y.abs_diff(point.y))
+            .context("No active Mac display touches the return edge; check the layout")
     }
 }
 

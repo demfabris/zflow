@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn returning_into_a_missing_part_of_the_mac_desktop_is_rejected() {
+    fn returning_into_a_missing_part_of_the_mac_desktop_moves_to_the_nearest_display() {
         let (mut layout, mut geometry) = setup();
         layout.monitors[1].y = 0;
         geometry.monitors = vec![
@@ -435,7 +435,12 @@ mod tests {
             Point { x: 999, y: 0 },
         )
         .unwrap();
-        assert!(handoff.return_mapping.position(750_000).is_err());
+        // Only the upper display touches the right edge, but the receiver's
+        // barrier covers the whole shared range.
+        assert_eq!(
+            handoff.return_mapping.position(750_000).unwrap(),
+            Point { x: 996, y: 99 }
+        );
         assert_eq!(
             handoff.entry_region,
             Rect {
