@@ -67,118 +67,104 @@ impl SampleWindow {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct SessionMetricsSnapshotData {
-    capture_to_send_us: SampleWindow,
-    receive_to_inject_us: SampleWindow,
-    receive_to_runtime_dispatch_us: SampleWindow,
-    arming_to_grab_us: SampleWindow,
-    rtt_us: SampleWindow,
-    delay_variation_us: SampleWindow,
-    adaptive_delay_variation_percentile_us: SampleWindow,
-    playout_delay_us: SampleWindow,
-    scheduler_lateness_us: SampleWindow,
-    clock_residual_us: SampleWindow,
-    snapshot: SessionMetricsSnapshot,
-}
-
-impl SessionMetricsSnapshotData {
-    pub(crate) fn summarize(mut self) -> SessionMetricsSnapshot {
-        self.snapshot.capture_to_send_us = self.capture_to_send_us.into_summary();
-        self.snapshot.receive_to_inject_us = self.receive_to_inject_us.into_summary();
-        self.snapshot.receive_to_runtime_dispatch_us =
-            self.receive_to_runtime_dispatch_us.into_summary();
-        self.snapshot.arming_to_grab_us = self.arming_to_grab_us.into_summary();
-        self.snapshot.rtt_us = self.rtt_us.into_summary();
-        self.snapshot.delay_variation_us = self.delay_variation_us.into_summary();
-        self.snapshot.adaptive_delay_variation_percentile_us =
-            self.adaptive_delay_variation_percentile_us.into_summary();
-        self.snapshot.playout_delay_us = self.playout_delay_us.into_summary();
-        self.snapshot.scheduler_lateness_us = self.scheduler_lateness_us.into_summary();
-        self.snapshot.clock_residual_us = self.clock_residual_us.into_summary();
-        self.snapshot
-    }
-}
-
 fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     let index = ((sorted.len() - 1) as f64 * quantile).ceil() as usize;
     sorted[index]
 }
 
-#[derive(Debug, Default)]
-pub struct SessionMetrics {
-    pub capture_to_send_us: SampleWindow,
-    pub receive_to_inject_us: SampleWindow,
-    pub receive_to_runtime_dispatch_us: SampleWindow,
-    pub arming_to_grab_us: SampleWindow,
-    pub switch_time_leakage_events: u64,
-    pub rtt_us: SampleWindow,
-    pub delay_variation_us: SampleWindow,
-    pub adaptive_delay_variation_percentile_us: SampleWindow,
-    pub playout_delay_us: SampleWindow,
-    pub scheduler_lateness_us: SampleWindow,
-    pub clock_residual_us: SampleWindow,
-    pub clock_offset_us: Option<f64>,
-    pub clock_skew: Option<f64>,
-    pub clock_skew_ppm: Option<f64>,
-    pub loss: u64,
-    pub reordered: u64,
-    pub duplicate_datagrams: u64,
-    pub datagram_queue_drops: u64,
-    pub scheduler_late_events: u64,
-    pub catch_up_steps: u64,
-    pub catch_up_pointer_units: u64,
-    pub catch_up_scroll_units: u64,
-    pub lease_renewals: u64,
-    pub snapshot_acknowledgements: u64,
-    pub synthetic_releases: u64,
-    pub stale_events_rejected: u64,
-    pub unsupported_inputs_dropped: u64,
-    highest_motion_sequence: u64,
-    recent_motion_sequences: BTreeSet<u64>,
-    last_packet_delay_us: Option<u64>,
+/// Declares the live session metrics and their snapshot from one field list.
+/// A window becomes an optional percentile summary; a value is copied as is.
+macro_rules! session_metrics {
+    (
+        windows { $($(#[$window_doc:meta])* $window:ident,)* }
+        values { $($(#[$value_doc:meta])* $value:ident: $value_type:ty,)* }
+    ) => {
+        #[derive(Debug, Default)]
+        pub struct SessionMetrics {
+            $($(#[$window_doc])* pub $window: SampleWindow,)*
+            $($(#[$value_doc])* pub $value: $value_type,)*
+            highest_motion_sequence: u64,
+            recent_motion_sequences: BTreeSet<u64>,
+            last_packet_delay_us: Option<u64>,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct SessionMetricsSnapshot {
+            $($(#[$window_doc])* pub $window: Option<SampleSummary>,)*
+            $($(#[$value_doc])* pub $value: $value_type,)*
+        }
+
+        /// A copy taken under the session lock. Sorting the windows waits
+        /// until the lock is released.
+        #[derive(Debug)]
+        pub(crate) struct SessionMetricsSnapshotData {
+            $($window: SampleWindow,)*
+            $($value: $value_type,)*
+        }
+
+        impl SessionMetrics {
+            pub(crate) fn snapshot_data(&self) -> SessionMetricsSnapshotData {
+                SessionMetricsSnapshotData {
+                    $($window: self.$window.clone(),)*
+                    $($value: self.$value,)*
+                }
+            }
+        }
+
+        impl SessionMetricsSnapshotData {
+            pub(crate) fn summarize(self) -> SessionMetricsSnapshot {
+                SessionMetricsSnapshot {
+                    $($window: self.$window.into_summary(),)*
+                    $($value: self.$value,)*
+                }
+            }
+        }
+    };
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMetricsSnapshot {
-    pub capture_to_send_us: Option<SampleSummary>,
-    /// Network receive through successful uinput application.
-    pub receive_to_inject_us: Option<SampleSummary>,
-    /// Network receive through accepted runtime-command dispatch.
-    pub receive_to_runtime_dispatch_us: Option<SampleSummary>,
-    pub arming_to_grab_us: Option<SampleSummary>,
-    /// Mappable evdev events seen during the local Arming window, before the
-    /// physical devices were grabbed.
-    pub switch_time_leakage_events: u64,
-    pub rtt_us: Option<SampleSummary>,
-    pub delay_variation_us: Option<SampleSummary>,
-    /// Samples of the playout engine's rolling packet-delay percentile, not
-    /// raw per-datagram delay variation.
-    pub adaptive_delay_variation_percentile_us: Option<SampleSummary>,
-    pub playout_delay_us: Option<SampleSummary>,
-    /// How far past its deadline the session timer woke.
-    pub scheduler_lateness_us: Option<SampleSummary>,
-    pub clock_residual_us: Option<SampleSummary>,
-    pub clock_offset_us: Option<f64>,
-    pub clock_skew: Option<f64>,
-    pub clock_skew_ppm: Option<f64>,
-    /// Unrecovered motion-sequence gaps observed in this live session.
-    pub loss: u64,
-    pub reordered: u64,
-    pub duplicate_datagrams: u64,
-    /// Datagrams replaced in the bounded latest-wins application queue.
-    pub datagram_queue_drops: u64,
-    /// Motion targets that started playing after their playout deadline.
-    pub scheduler_late_events: u64,
-    pub catch_up_steps: u64,
-    pub catch_up_pointer_units: u64,
-    pub catch_up_scroll_units: u64,
-    pub lease_renewals: u64,
-    pub snapshot_acknowledgements: u64,
-    pub synthetic_releases: u64,
-    pub stale_events_rejected: u64,
-    /// Keys and buttons the local input backend cannot inject.
-    pub unsupported_inputs_dropped: u64,
+session_metrics! {
+    windows {
+        capture_to_send_us,
+        /// Network receive through successful uinput application.
+        receive_to_inject_us,
+        /// Network receive through accepted runtime-command dispatch.
+        receive_to_runtime_dispatch_us,
+        arming_to_grab_us,
+        rtt_us,
+        delay_variation_us,
+        /// Samples of the playout engine's rolling packet-delay percentile, not
+        /// raw per-datagram delay variation.
+        adaptive_delay_variation_percentile_us,
+        playout_delay_us,
+        /// How far past its deadline the session timer woke.
+        scheduler_lateness_us,
+        clock_residual_us,
+    }
+    values {
+        /// Mappable evdev events seen during the local Arming window, before the
+        /// physical devices were grabbed.
+        switch_time_leakage_events: u64,
+        clock_offset_us: Option<f64>,
+        clock_skew: Option<f64>,
+        clock_skew_ppm: Option<f64>,
+        /// Unrecovered motion-sequence gaps observed in this live session.
+        loss: u64,
+        reordered: u64,
+        duplicate_datagrams: u64,
+        /// Datagrams replaced in the bounded latest-wins application queue.
+        datagram_queue_drops: u64,
+        /// Motion targets that started playing after their playout deadline.
+        scheduler_late_events: u64,
+        catch_up_steps: u64,
+        catch_up_pointer_units: u64,
+        catch_up_scroll_units: u64,
+        lease_renewals: u64,
+        snapshot_acknowledgements: u64,
+        synthetic_releases: u64,
+        stale_events_rejected: u64,
+        /// Keys and buttons the local input backend cannot inject.
+        unsupported_inputs_dropped: u64,
+    }
 }
 
 impl SessionMetrics {
@@ -227,56 +213,6 @@ impl SessionMetrics {
             self.loss = self.loss.saturating_sub(1);
         } else {
             self.duplicate_datagrams = self.duplicate_datagrams.saturating_add(1);
-        }
-    }
-
-    pub fn snapshot(&self) -> SessionMetricsSnapshot {
-        self.snapshot_data().summarize()
-    }
-
-    pub(crate) fn snapshot_data(&self) -> SessionMetricsSnapshotData {
-        SessionMetricsSnapshotData {
-            capture_to_send_us: self.capture_to_send_us.clone(),
-            receive_to_inject_us: self.receive_to_inject_us.clone(),
-            receive_to_runtime_dispatch_us: self.receive_to_runtime_dispatch_us.clone(),
-            arming_to_grab_us: self.arming_to_grab_us.clone(),
-            rtt_us: self.rtt_us.clone(),
-            delay_variation_us: self.delay_variation_us.clone(),
-            adaptive_delay_variation_percentile_us: self
-                .adaptive_delay_variation_percentile_us
-                .clone(),
-            playout_delay_us: self.playout_delay_us.clone(),
-            scheduler_lateness_us: self.scheduler_lateness_us.clone(),
-            clock_residual_us: self.clock_residual_us.clone(),
-            snapshot: SessionMetricsSnapshot {
-                capture_to_send_us: None,
-                receive_to_inject_us: None,
-                receive_to_runtime_dispatch_us: None,
-                arming_to_grab_us: None,
-                rtt_us: None,
-                delay_variation_us: None,
-                adaptive_delay_variation_percentile_us: None,
-                playout_delay_us: None,
-                scheduler_lateness_us: None,
-                clock_residual_us: None,
-                switch_time_leakage_events: self.switch_time_leakage_events,
-                clock_offset_us: self.clock_offset_us,
-                clock_skew: self.clock_skew,
-                clock_skew_ppm: self.clock_skew_ppm,
-                loss: self.loss,
-                reordered: self.reordered,
-                duplicate_datagrams: self.duplicate_datagrams,
-                datagram_queue_drops: self.datagram_queue_drops,
-                scheduler_late_events: self.scheduler_late_events,
-                catch_up_steps: self.catch_up_steps,
-                catch_up_pointer_units: self.catch_up_pointer_units,
-                catch_up_scroll_units: self.catch_up_scroll_units,
-                lease_renewals: self.lease_renewals,
-                snapshot_acknowledgements: self.snapshot_acknowledgements,
-                synthetic_releases: self.synthetic_releases,
-                stale_events_rejected: self.stale_events_rejected,
-                unsupported_inputs_dropped: self.unsupported_inputs_dropped,
-            },
         }
     }
 }
@@ -344,5 +280,49 @@ mod tests {
 
         assert_eq!(snapshot.capture_to_send_us.unwrap().maximum, 20.0);
         assert_eq!(snapshot.loss, 3);
+    }
+
+    #[test]
+    fn snapshot_json_keeps_its_field_names() {
+        let snapshot = SessionMetrics::default().snapshot_data().summarize();
+        let json = serde_json::to_value(snapshot).unwrap();
+        let names: BTreeSet<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "adaptive_delay_variation_percentile_us",
+                "arming_to_grab_us",
+                "capture_to_send_us",
+                "catch_up_pointer_units",
+                "catch_up_scroll_units",
+                "catch_up_steps",
+                "clock_offset_us",
+                "clock_residual_us",
+                "clock_skew",
+                "clock_skew_ppm",
+                "datagram_queue_drops",
+                "delay_variation_us",
+                "duplicate_datagrams",
+                "lease_renewals",
+                "loss",
+                "playout_delay_us",
+                "receive_to_inject_us",
+                "receive_to_runtime_dispatch_us",
+                "reordered",
+                "rtt_us",
+                "scheduler_late_events",
+                "scheduler_lateness_us",
+                "snapshot_acknowledgements",
+                "stale_events_rejected",
+                "switch_time_leakage_events",
+                "synthetic_releases",
+                "unsupported_inputs_dropped",
+            ])
+        );
     }
 }
