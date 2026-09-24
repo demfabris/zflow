@@ -1080,6 +1080,31 @@ mod tests {
     }
 
     #[test]
+    fn frames_waiting_on_a_future_watermark_are_bounded() {
+        let clock = identity_clock();
+        let config = PlayoutConfig {
+            maximum_queued_frames: 4,
+            ..PlayoutConfig::default()
+        };
+        let mut playout = ReceiverPlayout::new(config, session(1)).unwrap();
+        for sequence in 1..=4 {
+            let capture = sequence * 1_000;
+            playout
+                .ingest_frame(
+                    frame(sequence, capture, sequence as i64, 2),
+                    time(capture + 1_000),
+                    &clock,
+                )
+                .unwrap();
+        }
+        assert!(playout.poll(time(100_000)).unwrap().is_none());
+        assert!(matches!(
+            playout.ingest_frame(frame(5, 5_000, 5, 2), time(100_000), &clock),
+            Err(PlayoutError::QueueFull)
+        ));
+    }
+
+    #[test]
     fn cumulative_frames_repair_loss_and_play_repeats_once() {
         fn drain(playout: &mut ReceiverPlayout, now: u64) -> i64 {
             let mut dx = 0;

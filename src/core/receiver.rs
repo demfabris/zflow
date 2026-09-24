@@ -4,23 +4,18 @@
 //! explicitly authorizes epochs and supplies monotonic time; the receiver only
 //! emits backend-neutral effects.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Duration,
-};
+use std::{collections::BTreeSet, time::Duration};
 
 use thiserror::Error;
 
 use super::{
     ActivationId, ActiveScroll, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage,
-    Modifier, MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionFrame, MotionSequence,
-    PlayoutStep, PointerButton, ReliableControl, ReliableControlMessage, ScrollId,
-    SessionCloseReason, SessionContext, SessionEpoch, SnapshotAck, TakeoverAccepted, TouchState,
-    TransportGeneration,
+    Modifier, MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionSequence, PlayoutStep,
+    PointerButton, ReliableControl, ReliableControlMessage, ScrollId, SessionCloseReason,
+    SessionContext, SessionEpoch, SnapshotAck, TakeoverAccepted, TouchState, TransportGeneration,
 };
 
 const MAX_HELD_STATE_LEASE: Duration = Duration::from_secs(1);
-const MAX_PENDING_MOTION_FRAMES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiverConfig {
@@ -68,7 +63,6 @@ pub enum RejectionReason {
     DuplicateControl,
     ControlGap,
     DuplicateOrReorderedMotion,
-    MotionPastTerminalCutoff,
     AnchorActivationMismatch,
     AnchorMovedBackwards,
     InvalidTransition,
@@ -161,11 +155,8 @@ struct ActivationState {
     session: SessionContext,
     last_control_sequence: ControlSequence,
     held: HeldState,
-    highest_seen_motion: MotionSequence,
     last_injected_motion: MotionSequence,
     injected_totals: CumulativeMotion,
-    pending_motion: BTreeMap<MotionSequence, MotionFrame>,
-    terminal_cutoff: Option<MotionSequence>,
     lease_deadline: Option<MonotonicTimeMicros>,
 }
 
@@ -175,11 +166,8 @@ impl ActivationState {
             session,
             last_control_sequence: ControlSequence(0),
             held: HeldState::default(),
-            highest_seen_motion: MotionSequence(0),
             last_injected_motion: MotionSequence(0),
             injected_totals: CumulativeMotion::ZERO,
-            pending_motion: BTreeMap::new(),
-            terminal_cutoff: None,
             lease_deadline: None,
         }
     }
@@ -363,8 +351,6 @@ impl Receiver {
         };
 
         let mut close = None;
-        let mut snapshot_ack = None;
-        let mut drain_failure = None;
         {
             let state = self.activation.as_mut().expect("checked above");
             if let (Some(anchor), Some(delta)) = (message.payload.motion_anchor(), anchor_delta) {
@@ -441,9 +427,12 @@ impl Receiver {
                 }
                 ReliableControl::StateSnapshot(snapshot) => {
                     reconcile_held(state, &snapshot.held, &mut effects);
-                    snapshot_ack = Some(SnapshotAck {
-                        snapshot_sequence: message.sequence,
-                        accepted_generation: state.session.transport_generation,
+                    effects.push(ReceiverEffect::SnapshotAck {
+                        session: state.session,
+                        ack: SnapshotAck {
+                            snapshot_sequence: message.sequence,
+                            accepted_generation: state.session.transport_generation,
+                        },
                     });
                 }
                 ReliableControl::SessionClose { reason, .. } => close = Some(*reason),
@@ -456,95 +445,10 @@ impl Receiver {
 
             state.last_control_sequence = message.sequence;
             refresh_lease(state, now, self.config.held_state_lease);
-            if close.is_none() {
-                drain_failure = drain_mature_motion(state, &mut effects).err();
-            }
-            if drain_failure.is_none()
-                && let Some(ack) = snapshot_ack
-            {
-                effects.push(ReceiverEffect::SnapshotAck {
-                    session: state.session,
-                    ack,
-                });
-            }
         }
 
-        if let Some(failure) = drain_failure {
-            self.close_activation(failure.close_reason(), &mut effects);
-            return Ok(effects);
-        }
         if let Some(reason) = close {
             self.close_activation(reason, &mut effects);
-        }
-        Ok(effects)
-    }
-
-    pub fn receive_motion(
-        &mut self,
-        frame: MotionFrame,
-        now: MonotonicTimeMicros,
-    ) -> Result<Vec<ReceiverEffect>, ReceiverError> {
-        self.observe_time(now)?;
-        let mut effects = Vec::new();
-        self.expire_lease(now, &mut effects);
-        if let Some(reason) = self.session_rejection(frame.session, false) {
-            effects.push(rejected(frame.session, reason));
-            return Ok(effects);
-        }
-        if self
-            .closed_activations
-            .contains(&(frame.session.session_epoch, frame.session.activation_id))
-        {
-            effects.push(rejected(frame.session, RejectionReason::ClosedActivation));
-            return Ok(effects);
-        }
-        let Some(state) = self.activation.as_mut() else {
-            effects.push(rejected(frame.session, RejectionReason::NoOpenActivation));
-            return Ok(effects);
-        };
-        if state.session.activation_id != frame.session.activation_id {
-            let reason = if self
-                .closed_activations
-                .contains(&(frame.session.session_epoch, frame.session.activation_id))
-            {
-                RejectionReason::ClosedActivation
-            } else {
-                RejectionReason::StaleActivation
-            };
-            effects.push(rejected(frame.session, reason));
-            return Ok(effects);
-        }
-        if state
-            .terminal_cutoff
-            .is_some_and(|cutoff| frame.motion_sequence <= cutoff)
-        {
-            effects.push(rejected(
-                frame.session,
-                RejectionReason::MotionPastTerminalCutoff,
-            ));
-            return Ok(effects);
-        }
-        if frame.motion_sequence <= state.last_injected_motion
-            || state.pending_motion.contains_key(&frame.motion_sequence)
-        {
-            effects.push(rejected(
-                frame.session,
-                RejectionReason::DuplicateOrReorderedMotion,
-            ));
-            return Ok(effects);
-        }
-
-        state.highest_seen_motion = state.highest_seen_motion.max(frame.motion_sequence);
-        state.pending_motion.insert(frame.motion_sequence, frame);
-        let drain_failure = drain_mature_motion(state, &mut effects).err();
-        if let Some(failure) = drain_failure {
-            self.close_activation(failure.close_reason(), &mut effects);
-        } else if self
-            .activation
-            .as_ref()
-            .is_some_and(|state| state.pending_motion.len() > MAX_PENDING_MOTION_FRAMES)
-        {
-            self.close_activation(SessionCloseReason::ProtocolViolation, &mut effects);
         }
         Ok(effects)
     }
@@ -580,13 +484,6 @@ impl Receiver {
             effects.push(rejected(session, RejectionReason::StaleActivation));
             return Ok(effects);
         }
-        if state
-            .terminal_cutoff
-            .is_some_and(|cutoff| step.through_sequence <= cutoff)
-        {
-            effects.push(rejected(session, RejectionReason::MotionPastTerminalCutoff));
-            return Ok(effects);
-        }
         if step.through_sequence <= state.last_injected_motion {
             effects.push(rejected(
                 session,
@@ -611,7 +508,6 @@ impl Receiver {
             }
         };
         state.injected_totals = totals;
-        state.highest_seen_motion = state.highest_seen_motion.max(step.through_sequence);
         if step.delta != MotionDelta::default() {
             effects.push(ReceiverEffect::Motion {
                 delta: step.delta,
@@ -629,9 +525,6 @@ impl Receiver {
         }
         if step.target_reached {
             state.last_injected_motion = step.through_sequence;
-            state
-                .pending_motion
-                .retain(|sequence, _| *sequence > step.through_sequence);
         }
         Ok(effects)
     }
@@ -753,7 +646,6 @@ impl Receiver {
         reconcile_held(state, &takeover.authoritative_held_state, &mut effects);
         state.session.transport_generation = takeover.proposed_generation;
         state.last_control_sequence = message.sequence;
-        state.pending_motion.clear();
         refresh_lease(state, now, self.config.held_state_lease);
         self.accepted_generation = Some(takeover.proposed_generation);
         self.accepted_takeovers
@@ -920,12 +812,6 @@ fn apply_anchor(
     delta: MotionDelta,
     effects: &mut Vec<ReceiverEffect>,
 ) {
-    state
-        .pending_motion
-        .retain(|sequence, _| *sequence > anchor.through_motion_sequence);
-    state.highest_seen_motion = state
-        .highest_seen_motion
-        .max(anchor.through_motion_sequence);
     state.last_injected_motion = anchor.through_motion_sequence;
     state.injected_totals = anchor.totals;
     if delta != MotionDelta::default() {
@@ -941,76 +827,6 @@ fn apply_anchor(
             synthetic: true,
         });
     }
-    if anchor.kind == AnchorKind::Terminal {
-        state.terminal_cutoff = Some(anchor.through_motion_sequence);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainFailure {
-    MotionOverflow,
-    InvalidTouchLifecycle,
-}
-
-impl DrainFailure {
-    fn close_reason(self) -> SessionCloseReason {
-        match self {
-            Self::MotionOverflow => SessionCloseReason::MotionOverflow,
-            Self::InvalidTouchLifecycle => SessionCloseReason::ProtocolViolation,
-        }
-    }
-}
-
-fn drain_mature_motion(
-    state: &mut ActivationState,
-    effects: &mut Vec<ReceiverEffect>,
-) -> Result<(), DrainFailure> {
-    let candidate = state
-        .pending_motion
-        .iter()
-        .rev()
-        .find(|(_, frame)| frame.control_watermark <= state.last_control_sequence)
-        .map(|(sequence, _)| *sequence);
-    let Some(sequence) = candidate else {
-        return Ok(());
-    };
-    let frame = state
-        .pending_motion
-        .remove(&sequence)
-        .expect("candidate came from map");
-    state.pending_motion.retain(|queued, _| *queued > sequence);
-    if sequence <= state.last_injected_motion {
-        return Ok(());
-    }
-    if frame
-        .touch_snapshot
-        .as_ref()
-        .is_some_and(|touch| state.held.active_touch.is_empty() && !touch.is_empty())
-    {
-        return Err(DrainFailure::InvalidTouchLifecycle);
-    }
-    let delta = frame
-        .totals
-        .checked_delta_from(state.injected_totals)
-        .map_err(|_| DrainFailure::MotionOverflow)?;
-    state.last_injected_motion = sequence;
-    state.injected_totals = frame.totals;
-    if delta != MotionDelta::default() {
-        effects.push(ReceiverEffect::Motion {
-            delta,
-            through_sequence: sequence,
-        });
-    }
-    if let Some(touch) = frame.touch_snapshot
-        && state.held.active_touch != touch
-    {
-        state.held.replace_touch(touch.clone());
-        effects.push(ReceiverEffect::TouchReplaced {
-            state: touch,
-            synthetic: false,
-        });
-    }
-    Ok(())
 }
 
 fn reconcile_held(
@@ -1125,7 +941,6 @@ fn release_all(state: &mut ActivationState, effects: &mut Vec<ReceiverEffect>) {
     let neutral = HeldState::default();
     reconcile_held(state, &neutral, effects);
     state.lease_deadline = None;
-    state.pending_motion.clear();
 }
 
 #[cfg(test)]
@@ -1243,17 +1058,9 @@ mod tests {
                 SessionContext { transport_generation: TransportGeneration(generation), ..new },
                 SessionContext { activation_id: ActivationId(activation), ..new },
             ] {
-                let effects = receiver.receive_motion(
-                    MotionFrame {
-                        session: stale,
-                        motion_sequence: MotionSequence(1),
-                        control_watermark: ControlSequence(1),
-                        sender_capture_time: MonotonicTimeMicros(2),
-                        totals: CumulativeMotion::new(99, 0, 0, 0),
-                        touch_snapshot: None,
-                    },
-                    MonotonicTimeMicros(2),
-                ).unwrap();
+                let effects = receiver
+                    .receive_playout_step(stale, step(1, 99), MonotonicTimeMicros(2))
+                    .unwrap();
                 prop_assert!(!effects.iter().any(ReceiverEffect::is_injection));
             }
         }
@@ -1434,89 +1241,15 @@ mod tests {
     }
 
     #[test]
-    fn latest_mature_cumulative_frame_repairs_lost_and_reordered_motion() {
-        let session = context(1, 1, 1);
-        let mut receiver = receiver(900);
-        enter(&mut receiver, session, 0);
-        let frame = |sequence, total| MotionFrame {
-            session,
-            motion_sequence: MotionSequence(sequence),
-            control_watermark: ControlSequence(1),
-            sender_capture_time: MonotonicTimeMicros(sequence),
-            totals: CumulativeMotion::new(total, 0, 0, 0),
-            touch_snapshot: None,
-        };
-
-        let effects = receiver
-            .receive_motion(frame(3, 30), MonotonicTimeMicros(1))
-            .unwrap();
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            ReceiverEffect::Motion { delta, .. } if delta.dx == 30
-        )));
-        let effects = receiver
-            .receive_motion(frame(2, 20), MonotonicTimeMicros(2))
-            .unwrap();
-        assert!(!effects.iter().any(ReceiverEffect::is_injection));
-    }
-
-    #[test]
-    fn reordered_older_frame_can_mature_while_newer_frame_waits_on_control() {
-        let session = context(1, 1, 1);
-        let mut receiver = receiver(900);
-        enter(&mut receiver, session, 0);
-        let frame = |sequence, watermark, total| MotionFrame {
-            session,
-            motion_sequence: MotionSequence(sequence),
-            control_watermark: ControlSequence(watermark),
-            sender_capture_time: MonotonicTimeMicros(sequence),
-            totals: CumulativeMotion::new(total, 0, 0, 0),
-            touch_snapshot: None,
-        };
-
-        assert!(
-            receiver
-                .receive_motion(frame(3, 2, 30), MonotonicTimeMicros(1))
-                .unwrap()
-                .is_empty()
-        );
-        let older = receiver
-            .receive_motion(frame(2, 1, 20), MonotonicTimeMicros(2))
-            .unwrap();
-        assert_eq!(motion_dx(&older), 20);
-        let control = receiver
-            .receive_control(
-                ReliableControlMessage {
-                    session,
-                    sequence: ControlSequence(2),
-                    payload: ReliableControl::KeyDown {
-                        key: HidUsage::keyboard(4),
-                    },
-                },
-                MonotonicTimeMicros(3),
-            )
-            .unwrap();
-        assert_eq!(motion_dx(&control), 10);
-    }
-
-    #[test]
     fn adversarial_motion_counter_overflow_closes_activation() {
         let session = context(1, 1, 1);
         let mut receiver = receiver(900);
         enter(&mut receiver, session, 0);
-        let frame = |sequence, total| MotionFrame {
-            session,
-            motion_sequence: MotionSequence(sequence),
-            control_watermark: ControlSequence(1),
-            sender_capture_time: MonotonicTimeMicros(sequence),
-            totals: CumulativeMotion::new(total, 0, 0, 0),
-            touch_snapshot: None,
-        };
         receiver
-            .receive_motion(frame(1, i64::MIN), MonotonicTimeMicros(1))
+            .receive_playout_step(session, step(1, i64::MAX), MonotonicTimeMicros(1))
             .unwrap();
         let effects = receiver
-            .receive_motion(frame(2, i64::MAX), MonotonicTimeMicros(2))
+            .receive_playout_step(session, step(2, 1), MonotonicTimeMicros(2))
             .unwrap();
 
         assert!(effects.iter().any(|effect| matches!(
@@ -1527,40 +1260,6 @@ mod tests {
             }
         )));
         assert!(receiver.active_context().is_none());
-    }
-
-    #[test]
-    fn future_watermark_motion_is_bounded_and_closes_the_activation() {
-        let session = context(1, 1, 1);
-        let mut receiver = receiver(900);
-        enter(&mut receiver, session, 0);
-        let mut final_effects = Vec::new();
-
-        for sequence in 1..=(MAX_PENDING_MOTION_FRAMES as u64 + 1) {
-            final_effects = receiver
-                .receive_motion(
-                    MotionFrame {
-                        session,
-                        motion_sequence: MotionSequence(sequence),
-                        control_watermark: ControlSequence(2),
-                        sender_capture_time: MonotonicTimeMicros(sequence),
-                        totals: CumulativeMotion::new(sequence as i64, 0, 0, 0),
-                        touch_snapshot: None,
-                    },
-                    MonotonicTimeMicros(sequence),
-                )
-                .unwrap();
-        }
-
-        assert!(final_effects.iter().any(|effect| matches!(
-            effect,
-            ReceiverEffect::ActivationClosed {
-                reason: SessionCloseReason::ProtocolViolation,
-                ..
-            }
-        )));
-        assert!(receiver.active_context().is_none());
-        assert!(receiver.is_closed(session.session_epoch, session.activation_id));
     }
 
     #[test]
@@ -1667,27 +1366,12 @@ mod tests {
         let session = context(1, 1, 1);
         let mut receiver = receiver(900);
         enter(&mut receiver, session, 0);
-        let touch = TouchState::new([crate::core::TouchContact {
-            id: crate::core::ContactId(1),
-            x: 0,
-            y: 0,
-            pressure: None,
-            major: None,
-            minor: None,
-            orientation_millidegrees: None,
-            tool: crate::core::TouchTool::Finger,
-            source_dimensions: None,
-        }])
-        .unwrap();
         let effects = receiver
-            .receive_motion(
-                MotionFrame {
-                    session,
-                    motion_sequence: MotionSequence(1),
-                    control_watermark: ControlSequence(1),
-                    sender_capture_time: MonotonicTimeMicros(1),
-                    totals: CumulativeMotion::ZERO,
-                    touch_snapshot: Some(touch),
+            .receive_playout_step(
+                session,
+                PlayoutStep {
+                    touch_snapshot: Some(one_finger()),
+                    ..step(1, 0)
                 },
                 MonotonicTimeMicros(1),
             )
@@ -1893,19 +1577,24 @@ mod tests {
                 .any(|effect| matches!(effect, ReceiverEffect::TakeoverAccepted { .. }))
         );
         let stale = receiver
-            .receive_motion(
-                MotionFrame {
-                    session,
-                    motion_sequence: MotionSequence(1),
-                    control_watermark: ControlSequence(1),
-                    sender_capture_time: MonotonicTimeMicros(2),
-                    totals: CumulativeMotion::new(1, 0, 0, 0),
-                    touch_snapshot: None,
-                },
-                MonotonicTimeMicros(2),
-            )
+            .receive_playout_step(session, step(1, 1), MonotonicTimeMicros(2))
             .unwrap();
         assert!(!stale.iter().any(ReceiverEffect::is_injection));
+    }
+
+    fn step(through: u64, dx: i64) -> PlayoutStep {
+        PlayoutStep {
+            mapped_capture_time: MonotonicTimeMicros(0),
+            through_sequence: MotionSequence(through),
+            delta: MotionDelta {
+                dx,
+                ..MotionDelta::default()
+            },
+            touch_snapshot: None,
+            target_reached: true,
+            pointer_catch_up_limited: false,
+            scroll_catch_up_limited: false,
+        }
     }
 
     fn motion_dx(effects: &[ReceiverEffect]) -> i64 {
