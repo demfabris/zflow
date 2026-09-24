@@ -463,7 +463,8 @@ static void event_tests(void) {
   assert(event);
   CGEventSetIntegerValueField(event, kCGKeyboardEventKeycode, 51);
   CGEventSetFlags(event, kCGEventFlagMaskControl | kCGEventFlagMaskCommand);
-  event_callback(NULL, kCGEventKeyDown, event, NULL);
+  // The chord must not reach the frontmost Mac app.
+  assert(event_callback(NULL, kCGEventKeyDown, event, NULL) == NULL);
   assert(zflow_mac_capture_stop_requested() == 1);
   assert(zflow_mac_capture_pause_requested() == 1);
   assert(zflow_mac_capture_poll(&captured) == 1);
@@ -475,7 +476,7 @@ static void event_tests(void) {
     assert(enqueue(&motion_event));
   }
   assert(!enqueue(&motion_event));
-  event_callback(NULL, kCGEventKeyDown, event, NULL);
+  assert(event_callback(NULL, kCGEventKeyDown, event, NULL) == NULL);
   assert(zflow_mac_capture_stop_requested() == 1);
   assert(zflow_mac_capture_pause_requested() == 1);
   while (zflow_mac_capture_poll(&captured)) {

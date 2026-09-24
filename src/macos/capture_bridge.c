@@ -442,7 +442,7 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
         enqueue(&captured);
         atomic_store(&g_stop, true);
         stop_capture_run_loop();
-        return event;
+        return NULL;
       }
       captured.kind = ZFLOW_EVENT_KEY;
       captured.code = keycode;
