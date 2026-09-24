@@ -700,8 +700,11 @@ async fn run_endpoint(
                             break;
                         }
                         Some(SessionEventKind::OutboundEnded) => {
+                            // The session ends remote control when the receiver stops
+                            // acknowledging, for example after a Wi-Fi stall outlived its
+                            // lease. Return at the entry point and keep sharing armed.
                             stop_reason = "remote ownership ended";
-                            terminal_error = Some(anyhow!("remote input ownership ended"));
+                            returned = options.handoff.as_ref().map(|handoff| handoff.position);
                             break;
                         }
                         None => {
