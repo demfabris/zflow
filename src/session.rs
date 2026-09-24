@@ -31,7 +31,6 @@ const SESSION_TICK: Duration = Duration::from_millis(1);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_MAX_AGE: Duration = Duration::from_secs(2);
 const MAX_PENDING_PROBES: usize = 64;
-const CLOSE_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 const MAX_CONTROL_MESSAGES_PER_SECOND: u32 = 20_000;
 const MAX_DATAGRAMS_PER_SECOND: u32 = 50_000;
 // QUIC only guarantees 1200-byte packets, which leave Quinn about 1162 bytes
@@ -595,17 +594,11 @@ async fn run_session(
                         }
                     }
                     SessionCommand::Close(reason) => {
-                        if let Some(mut active) = sender.take()
-                            && active.is_remote()
-                            && let Ok(close) = active.leave(reason, clock.now())
-                        {
-                            let _ = tokio::time::timeout(
-                                CLOSE_SEND_TIMEOUT,
-                                channels.control_send.send_control(&close),
-                            )
-                            .await;
-                        }
-                        capture_merge.clear();
+                        // The caller closes the transport right away. Connection
+                        // loss releases the peer's receiver state; a Leave sent
+                        // here would race that close and usually be lost.
+                        tracing::debug!(%peer, session_id, ?reason, "input session closed locally");
+                        sender = None;
                         break;
                     }
                 }
@@ -836,15 +829,21 @@ async fn run_session(
     } else {
         Ok(())
     };
-    let cleanup_result = close_receiver(
-        &mut receiver,
-        &events,
-        session_id,
-        &peer,
-        clock.now(),
-        ReceiverLifecycle::ConnectionLost,
-        &metrics,
-    )
+    let cleanup_result = async {
+        let effects = receiver.lifecycle(ReceiverLifecycle::ConnectionLost, clock.now())?;
+        emit_receiver_effects(
+            &mut channels,
+            effects,
+            &mut response_sequence,
+            &events,
+            session_id,
+            &peer,
+            &metrics,
+            Instant::now(),
+            None,
+        )
+        .await
+    }
     .await;
     outbound_cleanup_result?;
     cleanup_result?;
@@ -1797,9 +1796,10 @@ async fn emit_receiver_effects(
                 .saturating_add(synthetic_releases as u64);
         }
         let (applied, receipt) = oneshot::channel();
-        emit_event(
-            events,
-            SessionEvent {
+        // Wait for queue space: this also runs during cleanup, where
+        // dropping synthetic releases would leave keys held.
+        events
+            .send(SessionEvent {
                 session_id,
                 peer: peer.to_owned(),
                 kind: SessionEventKind::ReceiverEffects {
@@ -1808,8 +1808,9 @@ async fn emit_receiver_effects(
                     received_at,
                     applied,
                 },
-            },
-        )?;
+            })
+            .await
+            .map_err(|_| anyhow!("daemon session event router stopped"))?;
         receipt
             .await
             .map_err(|_| anyhow!("daemon dropped the receiver backend apply receipt"))?
@@ -1828,49 +1829,6 @@ async fn emit_receiver_effects(
                 payload,
             })
             .await?;
-    }
-    Ok(())
-}
-
-async fn close_receiver(
-    receiver: &mut Receiver,
-    events: &mpsc::Sender<SessionEvent>,
-    session_id: u64,
-    peer: &str,
-    now: MonotonicTimeMicros,
-    lifecycle: ReceiverLifecycle,
-    metrics: &Arc<Mutex<SessionMetrics>>,
-) -> Result<()> {
-    let effects = receiver.lifecycle(lifecycle, now)?;
-    if !effects.is_empty() {
-        let synthetic_releases = effects
-            .iter()
-            .filter(|effect| is_synthetic_release(effect))
-            .count();
-        if synthetic_releases > 0 {
-            let mut metrics = lock_metrics(metrics);
-            metrics.synthetic_releases = metrics
-                .synthetic_releases
-                .saturating_add(synthetic_releases as u64);
-        }
-        let (applied, receipt) = oneshot::channel();
-        events
-            .send(SessionEvent {
-                session_id,
-                peer: peer.to_owned(),
-                kind: SessionEventKind::ReceiverEffects {
-                    effects,
-                    touch_captured_at: None,
-                    received_at: Instant::now(),
-                    applied,
-                },
-            })
-            .await
-            .map_err(|_| anyhow!("daemon session event router stopped during cleanup"))?;
-        receipt
-            .await
-            .map_err(|_| anyhow!("daemon dropped the receiver cleanup apply receipt"))?
-            .map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
