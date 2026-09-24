@@ -1014,11 +1014,9 @@ fn claim_inbound(
 
 fn is_release(effect: &ReceiverEffect) -> bool {
     match effect {
-        ReceiverEffect::Key { pressed, .. }
-        | ReceiverEffect::Button { pressed, .. }
-        | ReceiverEffect::Modifier { pressed, .. } => !pressed,
+        ReceiverEffect::Key { pressed, .. } | ReceiverEffect::Button { pressed, .. } => !pressed,
         ReceiverEffect::TouchReplaced { state, .. } => state.is_empty(),
-        ReceiverEffect::ScrollEnded { .. } | ReceiverEffect::ActivationClosed { .. } => true,
+        ReceiverEffect::ActivationClosed { .. } => true,
         _ => false,
     }
 }
