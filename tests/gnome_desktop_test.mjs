@@ -13,7 +13,6 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     const timers = new Map();
     const handlers = new Map();
     let next = 1;
-    const sessionMode = {isLocked: false, isGreeter: false};
     const seat = {warp_pointer(x, y) {pointer = {x, y};}};
     const backend = {get_default_seat: () => seat};
     const watch = {};
@@ -23,7 +22,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
         Indicator: class { destroy() {} },
         global: {backend: {capabilities: 1}, stage: {get_context: () => ({get_backend: () => backend})},
             get_pointer: () => [pointer.x, pointer.y]},
-        Main: {sessionMode, layoutManager: {monitors, connect(name, fn) {handlers.set(name, fn); return 1;}, disconnect() {}}},
+        Main: {layoutManager: {monitors, connect(name, fn) {handlers.set(name, fn); return 1;}, disconnect() {}}},
         GLib: {
             PRIORITY_DEFAULT: 0, PRIORITY_DEFAULT_IDLE: 0, SOURCE_CONTINUE: true, SOURCE_REMOVE: false,
             get_monotonic_time: () => now,
@@ -55,7 +54,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     vm.runInNewContext(source, context);
     const extension = new context.TestExtension();
     extension.enable();
-    return {extension, barriers, context, seat, backend, watch, sessionMode, handlers, timers, advance(ms) {
+    return {extension, barriers, context, seat, backend, watch, handlers, timers, advance(ms) {
         now += ms * 1000;
         for (const [id, timer] of timers) {
             if (timer.due > now) continue;
@@ -184,10 +183,10 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     assert.ok(d.barriers.every(b => b.destroyed));
     await assert.rejects(d.extension._request({command: 'poll', token: 7}), /expired|ended/);
     await d.extension._request(prepare('top', {token: 8}));
-    d.sessionMode.isLocked = true;
-    d.advance(250);
+    d.context.Main.layoutManager.monitors.length = 0;
+    d.handlers.get('monitors-changed')();
     assert.ok(d.barriers.every(b => b.destroyed));
-    await assert.rejects(d.extension._request(prepare()), /Unlock/);
+    await assert.rejects(d.extension._request(prepare()), /no active monitors/);
     d.extension.disable();
 }
 {
@@ -260,4 +259,4 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.extension.disable();
     assert.equal(d.watch.removed, 2);
 }
-console.log('GNOME desktop entry, return, geometry, stale requests, lease, lock, placement and caller checks passed');
+console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement and caller checks passed');

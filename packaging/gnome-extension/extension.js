@@ -31,7 +31,7 @@ export default class ZflowExtension extends Extension {
         this._object.export(Gio.DBus.session, PATH);
         this._busId = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS, Gio.BusNameOwnerFlags.NONE, null, null);
         this._timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
-            if (this._lease && (GLib.get_monotonic_time() - this._lease.renewed >= LEASE_US || !this._available()))
+            if (this._lease && GLib.get_monotonic_time() - this._lease.renewed >= LEASE_US)
                 this._clear();
             return GLib.SOURCE_CONTINUE;
         });
@@ -52,10 +52,6 @@ export default class ZflowExtension extends Extension {
         this._busId = this._agentWatch = 0;
     }
 
-    _available() {
-        return !Main.sessionMode.isLocked && !Main.sessionMode.isGreeter && Main.layoutManager.monitors.length > 0;
-    }
-
     _clear() {
         if (this._lease)
             for (const reply of this._lease.polls) reply(new Error('Desktop handoff expired or ended'));
@@ -65,7 +61,8 @@ export default class ZflowExtension extends Extension {
     }
 
     _snapshot() {
-        if (!this._available()) throw new Error('Unlock the local GNOME session to receive input');
+        // Shell disables this extension while locked, so only the monitors need checking.
+        if (!Main.layoutManager.monitors.length) throw new Error('GNOME has no active monitors');
         const monitors = Main.layoutManager.monitors.map(m => ({x: m.x, y: m.y, width: m.width, height: m.height}));
         if (monitors.length > 16) throw new Error('At most 16 monitors are supported');
         const [x, y] = global.get_pointer();
