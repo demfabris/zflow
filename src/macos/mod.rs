@@ -455,8 +455,6 @@ async fn run_endpoint(
         tokio::pin!(setup, acquisition);
         let mut acquired = !options.reduce_wifi_latency;
         let mut connected = None;
-        let mut renewal = tokio::time::interval(awdl::RENEW_INTERVAL);
-        renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
@@ -466,13 +464,10 @@ async fn run_endpoint(
                     return Ok(None);
                 },
                 result = &mut acquisition, if !acquired => {
-                    awdl_lease = Some(result?);
+                    awdl_lease = Some(result?.hold());
                     acquired = true;
                 },
                 result = &mut setup, if connected.is_none() => connected = Some(result?),
-                _ = renewal.tick(), if awdl_lease.is_some() => {
-                    if let Some(lease) = awdl_lease.as_mut() { lease.renew().await?; }
-                },
             }
             if acquired && let Some(session) = connected.take() { break session; }
         }
@@ -581,8 +576,6 @@ async fn run_endpoint(
 
         let mut interval = tokio::time::interval(CAPTURE_POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut awdl_renewal = tokio::time::interval(awdl::RENEW_INTERVAL);
-        awdl_renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut secure_input_check = tokio::time::interval(SECURE_INPUT_CHECK_INTERVAL);
         secure_input_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut touch_active = false;
@@ -635,12 +628,11 @@ async fn run_endpoint(
                         }
                     }
                 },
-                _ = awdl_renewal.tick(), if awdl_lease.is_some() => {
-                    if let Err(error) = awdl_lease.as_mut().expect("active AWDL lease").renew().await {
-                        stop_reason = "AWDL renewal failed";
-                        terminal_error = Some(error);
-                        break;
-                    }
+                error = lease_failed(&mut awdl_lease) => {
+                    awdl_lease = None;
+                    stop_reason = "AWDL renewal failed";
+                    terminal_error = Some(error);
+                    break;
                 }
                 _ = secure_input_check.tick() => {
                     if secure_input_enabled() {
@@ -894,6 +886,14 @@ fn validate_finished(response: Result<DesktopResponse>) -> Result<()> {
             bail!("receiver could not finish desktop handoff: {reason}")
         }
         _ => bail!("receiver did not confirm desktop handoff cleanup"),
+    }
+}
+
+/// Resolves only when a held AWDL lease fails to renew.
+async fn lease_failed(lease: &mut Option<awdl::HeldLease>) -> anyhow::Error {
+    match lease {
+        Some(lease) => lease.failed().await,
+        None => std::future::pending().await,
     }
 }
 

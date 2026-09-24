@@ -1,14 +1,16 @@
 use std::{process::Stdio, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
-    time::timeout,
+    sync::oneshot,
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior, interval_at, timeout},
 };
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
-pub(super) const RENEW_INTERVAL: Duration = Duration::from_millis(500);
+const RENEW_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Owns the pipe that keeps the helper's two-second AWDL lease alive.
 pub(super) struct AwDlLease {
@@ -109,6 +111,47 @@ impl Drop for AwDlLease {
     }
 }
 
+/// Renews a lease on its own task, so a slow Prepare or cleanup cannot outlast
+/// the helper's two-second lease. Dropping it releases the lease too.
+pub(super) struct HeldLease {
+    release: oneshot::Sender<()>,
+    task: JoinHandle<Result<()>>,
+}
+
+impl AwDlLease {
+    pub(super) fn hold(mut self) -> HeldLease {
+        let (release, mut released) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut renewal = interval_at(Instant::now() + RENEW_INTERVAL, RENEW_INTERVAL);
+            renewal.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut released => return self.release().await,
+                    _ = renewal.tick() => self.renew().await?,
+                }
+            }
+        });
+        HeldLease { release, task }
+    }
+}
+
+impl HeldLease {
+    /// Resolves only when renewal fails; the helper then restores AWDL itself.
+    pub(super) async fn failed(&mut self) -> anyhow::Error {
+        match (&mut self.task).await {
+            Ok(Ok(())) => anyhow!("AWDL lease ended unexpectedly"),
+            Ok(Err(error)) => error,
+            Err(error) => anyhow!("AWDL lease task stopped: {error}"),
+        }
+    }
+
+    pub(super) async fn release(self) -> Result<()> {
+        let _ = self.release.send(());
+        self.task.await.context("AWDL lease task stopped")?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +167,18 @@ while IFS= read -r -n 1 command; do
 done
 [ -z "$1" ] || : > "$1"
 printf 'RELEASED\n'
+"#;
+
+    // Like the real helper, this one gives up when a heartbeat is late.
+    const EXPIRING_PEER: &str = r#"
+printf 'READY\n'
+IFS= read -r -n 1 command || exit 1
+[ "$command" = A ] || exit 2
+printf 'ACTIVE\n'
+while IFS= read -r -t 1 -n 1 command; do
+    case "$command" in H) printf 'HELD\n' ;; R) printf 'RELEASED\n'; exit 0 ;; *) exit 3 ;; esac
+done
+exit 4
 "#;
 
     fn peer(script: &str) -> Command {
@@ -194,6 +249,53 @@ printf 'RELEASED\n'
             .await
             .unwrap();
         assert!(lease.renew().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn held_lease_outlives_waits_longer_than_the_lease() {
+        let idle = AwDlLease::start(peer(EXPIRING_PEER), RESPONSE_TIMEOUT)
+            .await
+            .unwrap();
+        let held = AwDlLease::start(peer(EXPIRING_PEER), RESPONSE_TIMEOUT)
+            .await
+            .unwrap()
+            .hold();
+        // Longer than the fake lease, like a slow Prepare or cleanup.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert!(idle.release().await.is_err());
+        held.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn held_lease_reports_a_helper_that_exits() {
+        let mut held = AwDlLease::start(
+            peer("printf 'READY\n'; IFS= read -r -n 1 command; printf 'ACTIVE\n'; exit 1"),
+            RESPONSE_TIMEOUT,
+        )
+        .await
+        .unwrap()
+        .hold();
+        timeout(RESPONSE_TIMEOUT, held.failed()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_held_lease_releases_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let restored = directory.path().join("restored");
+        let mut command = peer(PEER);
+        command.arg(&restored);
+        let held = AwDlLease::start(command, RESPONSE_TIMEOUT)
+            .await
+            .unwrap()
+            .hold();
+        drop(held);
+        timeout(RESPONSE_TIMEOUT, async {
+            while !restored.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
