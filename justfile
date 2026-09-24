@@ -77,7 +77,7 @@ test-desktop:
 
 # Exercise native GTK controls through D-Bus on the current display.
 test-gtk: (_platform "linux")
-    dbus-run-session -- cargo test --locked app::gnome::tests -- --ignored
+    dbus-run-session -- cargo test --locked --lib app:: -- --ignored --skip native_desktop_geometry
     GTK_A11Y=none GIO_USE_VFS=local dbus-run-session -- gjs -m tests/gnome_settings_test.js
 
 # Exercise installation and recovery without changing the host (requires Python 3).
