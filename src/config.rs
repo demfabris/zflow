@@ -113,6 +113,10 @@ pub struct DeviceSelector {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phys: Option<String>,
+    /// Tells apart identical devices behind one Bluetooth adapter, which
+    /// share name, phys and vendor/product.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uniq: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1420,6 +1420,10 @@ pub fn capture_selector_matches(selector: &ConfigDeviceSelector, device: &Device
             .phys
             .as_deref()
             .is_none_or(|physical| device.physical_path.as_deref() == Some(physical))
+        && selector
+            .uniq
+            .as_deref()
+            .is_none_or(|uniq| device.unique_name.as_deref() == Some(uniq))
         && selector.vendor.is_none_or(|vendor| device.vendor == vendor)
         && selector
             .product
@@ -1652,6 +1656,7 @@ mod tests {
             path: path.into(),
             name: Some(name.into()),
             phys: Some(physical_path.into()),
+            uniq: None,
             vendor: Some(0x1234),
             product: Some(0x5678),
         }
@@ -1713,6 +1718,7 @@ mod tests {
             path: "/dev/input/event3".into(),
             name: Some("Legacy Keyboard".into()),
             phys: None,
+            uniq: None,
             vendor: Some(0x1234),
             product: Some(0x5678),
         };
@@ -1845,11 +1851,30 @@ mod tests {
     }
 
     #[test]
+    fn uniq_separates_identical_devices_behind_one_bluetooth_adapter() {
+        // Bluetooth devices report the adapter address as phys.
+        let keyboard = |path: &str, uniq: &str| DeviceInfo {
+            unique_name: Some(uniq.into()),
+            ..device(path, "BT Keyboard", "aa:aa:aa:aa:aa:aa", 0x1234, 0x5678)
+        };
+        let first = keyboard("/dev/input/event8", "11:11:11:11:11:11");
+        let second = keyboard("/dev/input/event9", "22:22:22:22:22:22");
+        let mut configured = selector("/dev/input/event3", "BT Keyboard", "aa:aa:aa:aa:aa:aa");
+        configured.uniq = Some("22:22:22:22:22:22".into());
+
+        let selection = select_configured(&[configured], [&first, &second].into_iter());
+
+        assert!(selection.is_complete());
+        assert_eq!(selection.capture_set()[0].path, second.path);
+    }
+
+    #[test]
     fn exact_path_fallback_does_not_capture_zflow_virtual_devices() {
         let configured = ConfigDeviceSelector {
             path: "/dev/input/event8".into(),
             name: None,
             phys: None,
+            uniq: None,
             vendor: None,
             product: None,
         };

@@ -230,6 +230,7 @@ mod tests {
             path: "/dev/input/event1".into(),
             name: Some("Trackpad".into()),
             phys: Some("test/input0".into()),
+            uniq: None,
             vendor: Some(0x05ac),
             product: Some(0x030e),
         });

@@ -1082,6 +1082,7 @@ fn resolve_device_selector(path: PathBuf) -> Result<crate::config::DeviceSelecto
         path,
         name: info.name,
         phys: info.physical_path,
+        uniq: info.unique_name.filter(|uniq| !uniq.is_empty()),
         vendor: Some(info.vendor),
         product: Some(info.product),
     })
@@ -1093,6 +1094,7 @@ fn resolve_device_selector(path: PathBuf) -> Result<crate::config::DeviceSelecto
         path,
         name: None,
         phys: None,
+        uniq: None,
         vendor: None,
         product: None,
     })
@@ -1169,6 +1171,12 @@ fn render_capture_rules(devices: &[crate::config::DeviceSelector]) -> Result<Str
             ", ATTRS{{phys}}==\"{}\"",
             escape_udev_value(physical_path)?
         ));
+        if let Some(uniq) = &device.uniq {
+            matches.push_str(&format!(
+                ", ATTRS{{uniq}}==\"{}\"",
+                escape_udev_value(uniq)?
+            ));
+        }
         matches.push_str(", ENV{ZFLOW_CAPTURE}=\"1\", GROUP=\"zflow\", MODE=\"0640\"\n");
         text.push_str(&matches);
     }
@@ -1575,6 +1583,7 @@ mod tests {
                 path: "/dev/input/event7".into(),
                 name: Some("Example Keyboard".into()),
                 phys: Some("usb-1/input0".into()),
+                uniq: Some("aa:bb:cc:dd:ee:ff".into()),
                 vendor: Some(0x1234),
                 product: Some(0xabcd),
             }],
@@ -1585,6 +1594,7 @@ mod tests {
         assert!(rule.contains("ATTRS{id/product}==\"abcd\""));
         assert!(rule.contains("ENV{ZFLOW_CAPTURE_EXCLUDE}!=\"1\""));
         assert!(rule.contains("ATTRS{phys}==\"usb-1/input0\""));
+        assert!(rule.contains("ATTRS{uniq}==\"aa:bb:cc:dd:ee:ff\""));
     }
 
     #[test]
@@ -1600,6 +1610,7 @@ mod tests {
                     path: "/dev/input/event7".into(),
                     name: Some("Indistinguishable Keyboard".into()),
                     phys,
+                    uniq: None,
                     vendor: Some(0x1234),
                     product: Some(0xabcd),
                 }],
@@ -1893,6 +1904,7 @@ mod tests {
             path: "/dev/input/event7".into(),
             name: Some("Indistinguishable Keyboard".into()),
             phys: None,
+            uniq: None,
             vendor: Some(0x1234),
             product: Some(0xabcd),
         }];
