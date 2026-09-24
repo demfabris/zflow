@@ -449,10 +449,6 @@ impl Shared {
             let config = self.config.read().await;
             peer_name_for_spki(&config, connection.peer_spki())?
         };
-        if self.sessions.lock().await.contains_key(&peer) {
-            connection.close();
-            bail!("peer {peer} already has an established input connection");
-        }
         let generation = self.allocate_generation()?;
         let options = {
             let config = self.config.read().await;
@@ -466,24 +462,34 @@ impl Shared {
             self.session_events.clone(),
         )
         .await?;
-        let _policy = self.policy.lock().await;
-        let current_peer = {
-            let config = self.config.read().await;
-            peer_name_for_spki(&config, &peer_spki)
-        };
-        if self.policy_generation.load(Ordering::Acquire) != policy_generation
-            || !matches!(current_peer.as_deref(), Ok(current) if current == peer)
-        {
-            session.close(SessionCloseReason::PermissionRevoked);
-            bail!("peer authorization changed during inbound connection negotiation");
+        // A peer that reconnects after a silent network loss would otherwise
+        // wait for its old session's idle timeout. The new session is already
+        // authenticated, so it replaces the old one, but only after the old
+        // one's close has run and released anything it still held.
+        loop {
+            {
+                let _policy = self.policy.lock().await;
+                let current_peer = {
+                    let config = self.config.read().await;
+                    peer_name_for_spki(&config, &peer_spki)
+                };
+                if self.policy_generation.load(Ordering::Acquire) != policy_generation
+                    || !matches!(current_peer.as_deref(), Ok(current) if current == peer)
+                {
+                    session.close(SessionCloseReason::PermissionRevoked);
+                    bail!("peer authorization changed during inbound connection negotiation");
+                }
+                let mut sessions = self.sessions.lock().await;
+                match sessions.get(&peer) {
+                    None => {
+                        sessions.insert(peer, session);
+                        return Ok(());
+                    }
+                    Some(old) => old.close(SessionCloseReason::Superseded),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let mut sessions = self.sessions.lock().await;
-        if sessions.contains_key(&peer) {
-            session.close(SessionCloseReason::Superseded);
-            bail!("peer {peer} established another input connection during negotiation");
-        }
-        sessions.insert(peer, session);
-        Ok(())
     }
 
     fn allocate_generation(&self) -> Result<TransportGeneration> {
