@@ -7,7 +7,6 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -17,6 +16,10 @@ use evdev::KeyCode;
 use mio::{Events, Interest, Poll, Token, Waker, unix::SourceFd};
 use sd_notify::NotifyState;
 use thiserror::Error;
+use tokio::sync::mpsc::{
+    self,
+    error::{TryRecvError, TrySendError},
+};
 
 use crate::{
     config::{Config, DeviceSelector as ConfigDeviceSelector},
@@ -89,7 +92,6 @@ pub enum RuntimeCommand {
         config: LinuxRuntimeConfig,
         applied: tokio::sync::oneshot::Sender<Result<(), LinuxRuntimeError>>,
     },
-    Stop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,66 +236,54 @@ pub enum RuntimeCommandError {
 
 #[derive(Clone)]
 pub struct LinuxRuntimeControl {
-    commands: SyncSender<RuntimeCommand>,
+    commands: mpsc::Sender<RuntimeCommand>,
     waker: Arc<Waker>,
     status: Arc<Mutex<LinuxRuntimeStatus>>,
-    alive: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 }
 
 impl LinuxRuntimeControl {
     pub fn send(&self, command: RuntimeCommand) -> Result<(), RuntimeCommandError> {
-        if !self.alive.load(Ordering::Acquire) {
-            return Err(RuntimeCommandError::Stopped);
-        }
         match self.commands.try_send(command) {
-            Ok(()) => self.waker.wake().map_err(|_| RuntimeCommandError::Wake),
+            Ok(()) => self.wake(),
             Err(TrySendError::Full(_)) => Err(RuntimeCommandError::Full),
-            Err(TrySendError::Disconnected(_)) => Err(RuntimeCommandError::Stopped),
+            Err(TrySendError::Closed(_)) => Err(RuntimeCommandError::Stopped),
         }
     }
 
     /// Delivers a fail-safe lifecycle command through temporary queue
-    /// backpressure. Callers must tear down the daemon if this bounded retry
+    /// backpressure. Callers must tear down the daemon if this bounded wait
     /// still fails, because the descriptor-owning thread cannot otherwise know
     /// that a terminal write completed.
-    pub fn send_critical(
+    pub async fn send_critical(
         &self,
-        mut command: RuntimeCommand,
+        command: RuntimeCommand,
         timeout: Duration,
     ) -> Result<(), RuntimeCommandError> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(Instant::now);
-        loop {
-            if !self.alive.load(Ordering::Acquire) {
-                return Err(RuntimeCommandError::Stopped);
-            }
-            match self.commands.try_send(command) {
-                Ok(()) => return self.waker.wake().map_err(|_| RuntimeCommandError::Wake),
-                Err(TrySendError::Full(returned)) => {
-                    command = returned;
-                    if Instant::now() >= deadline {
-                        return Err(RuntimeCommandError::Full);
-                    }
-                    self.waker.wake().map_err(|_| RuntimeCommandError::Wake)?;
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    return Err(RuntimeCommandError::Stopped);
-                }
-            }
+        // A full queue drains only while the input thread runs.
+        self.wake()?;
+        match tokio::time::timeout(timeout, self.commands.send(command)).await {
+            Ok(Ok(())) => self.wake(),
+            Ok(Err(_)) => Err(RuntimeCommandError::Stopped),
+            Err(_) => Err(RuntimeCommandError::Full),
         }
     }
 
     pub fn status(&self) -> LinuxRuntimeStatus {
         lock_status(&self.status).clone()
     }
+
+    fn wake(&self) -> Result<(), RuntimeCommandError> {
+        self.waker.wake().map_err(|_| RuntimeCommandError::Wake)
+    }
 }
 
+/// The input thread plus the queues it fills. The daemon awaits both
+/// receivers; the thread never blocks on them.
 pub struct LinuxRuntime {
     control: LinuxRuntimeControl,
-    events: Receiver<RuntimeEvent>,
-    captured_frames: Receiver<CapturedDeviceFrame>,
+    pub events: mpsc::Receiver<RuntimeEvent>,
+    pub captured: mpsc::Receiver<CapturedDeviceFrame>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -303,15 +293,15 @@ impl LinuxRuntime {
         let poll = Poll::new().map_err(LinuxRuntimeError::Poll)?;
         let waker =
             Arc::new(Waker::new(poll.registry(), WAKE_TOKEN).map_err(LinuxRuntimeError::Poll)?);
-        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
-        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
-        let (capture_tx, capture_rx) = mpsc::sync_channel(CAPTURE_CAPACITY);
-        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
+        let (capture_tx, capture_rx) = mpsc::channel(CAPTURE_CAPACITY);
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
         let status = Arc::new(Mutex::new(LinuxRuntimeStatus::default()));
-        let alive = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
 
         let thread_status = status.clone();
-        let thread_alive = alive.clone();
+        let thread_stop = stop.clone();
         let thread = thread::Builder::new()
             .name("zflow-linux-input".into())
             .spawn(move || {
@@ -319,6 +309,7 @@ impl LinuxRuntime {
                     poll,
                     config,
                     command_rx,
+                    thread_stop,
                     event_tx,
                     capture_tx,
                     thread_status,
@@ -331,7 +322,6 @@ impl LinuxRuntime {
                         let _ = startup_tx.send(Err(error));
                     }
                 }
-                thread_alive.store(false, Ordering::Release);
             })
             .map_err(LinuxRuntimeError::Spawn)?;
 
@@ -341,10 +331,10 @@ impl LinuxRuntime {
                     commands: command_tx,
                     waker,
                     status,
-                    alive,
+                    stop,
                 },
                 events: event_rx,
-                captured_frames: capture_rx,
+                captured: capture_rx,
                 thread: Some(thread),
             }),
             Ok(Err(error)) => {
@@ -362,18 +352,6 @@ impl LinuxRuntime {
         self.control.clone()
     }
 
-    pub fn events(&self) -> &Receiver<RuntimeEvent> {
-        &self.events
-    }
-
-    pub fn captured_frames(&self) -> &Receiver<CapturedDeviceFrame> {
-        &self.captured_frames
-    }
-
-    pub fn status(&self) -> LinuxRuntimeStatus {
-        self.control.status()
-    }
-
     pub fn shutdown(mut self) -> Result<(), LinuxRuntimeError> {
         self.stop_and_join()
     }
@@ -382,11 +360,10 @@ impl LinuxRuntime {
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
-        // A full command queue must not turn normal teardown into a detached
-        // descriptor-owning thread. Wake the loop, then wait for one bounded
-        // channel slot so Stop is guaranteed to be observed.
+        // A flag rather than a queued command, so a full queue cannot delay
+        // teardown or leave a detached descriptor-owning thread.
+        self.control.stop.store(true, Ordering::Release);
         let _ = self.control.waker.wake();
-        let _ = self.control.commands.send(RuntimeCommand::Stop);
         thread.join().map_err(|_| LinuxRuntimeError::ThreadPanicked)
     }
 }
@@ -502,9 +479,10 @@ struct RegisteredDevice {
 struct RuntimeLoop {
     poll: Poll,
     poll_events: Events,
-    commands: Receiver<RuntimeCommand>,
-    event_tx: SyncSender<RuntimeEvent>,
-    capture_tx: SyncSender<CapturedDeviceFrame>,
+    commands: mpsc::Receiver<RuntimeCommand>,
+    stop: Arc<AtomicBool>,
+    event_tx: mpsc::Sender<RuntimeEvent>,
+    capture_tx: mpsc::Sender<CapturedDeviceFrame>,
     status: Arc<Mutex<LinuxRuntimeStatus>>,
     config: LinuxRuntimeConfig,
     capture: CaptureSet,
@@ -530,9 +508,10 @@ impl RuntimeLoop {
     fn new(
         poll: Poll,
         config: LinuxRuntimeConfig,
-        commands: Receiver<RuntimeCommand>,
-        event_tx: SyncSender<RuntimeEvent>,
-        capture_tx: SyncSender<CapturedDeviceFrame>,
+        commands: mpsc::Receiver<RuntimeCommand>,
+        stop: Arc<AtomicBool>,
+        event_tx: mpsc::Sender<RuntimeEvent>,
+        capture_tx: mpsc::Sender<CapturedDeviceFrame>,
         status: Arc<Mutex<LinuxRuntimeStatus>>,
     ) -> Result<Self, RuntimeStartupError> {
         let virtual_input = VirtualInput::create(config.experimental_touchpad)?;
@@ -557,6 +536,7 @@ impl RuntimeLoop {
             poll,
             poll_events: Events::with_capacity(128),
             commands,
+            stop,
             event_tx,
             capture_tx,
             status,
@@ -698,6 +678,9 @@ impl RuntimeLoop {
                 self.commands_pending = true;
             }
         }
+        if self.stop.load(Ordering::Acquire) {
+            self.stopping = true;
+        }
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) {
@@ -719,7 +702,6 @@ impl RuntimeLoop {
             RuntimeCommand::Reload { config, applied } => {
                 let _ = applied.send(self.reload(config));
             }
-            RuntimeCommand::Stop => self.stopping = true,
         }
     }
 
@@ -935,7 +917,7 @@ impl RuntimeLoop {
                     self.diagnostic(RuntimeDiagnostic::CapturedFrameQueueFull);
                     self.force_source_release(RuntimeCloseReason::Backpressure);
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                Err(TrySendError::Closed(_)) => {
                     self.force_source_release(RuntimeCloseReason::Backpressure);
                 }
             },
@@ -1109,7 +1091,7 @@ impl RuntimeLoop {
         match self.event_tx.try_send(event) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => false,
-            Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Closed(_)) => {
                 self.stopping = true;
                 false
             }
@@ -1360,23 +1342,62 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn critical_command_reports_a_full_queue_at_its_bound() {
+    fn queue(capacity: usize) -> (LinuxRuntimeControl, mpsc::Receiver<RuntimeCommand>, Poll) {
         let poll = Poll::new().unwrap();
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN).unwrap());
-        let (commands, _receiver) = mpsc::sync_channel(1);
-        commands.try_send(RuntimeCommand::Stop).unwrap();
+        let (commands, receiver) = mpsc::channel(capacity);
         let control = LinuxRuntimeControl {
             commands,
             waker,
             status: Arc::new(Mutex::new(LinuxRuntimeStatus::default())),
-            alive: Arc::new(AtomicBool::new(true)),
+            stop: Arc::new(AtomicBool::new(false)),
         };
+        (control, receiver, poll)
+    }
 
+    fn release() -> RuntimeCommand {
+        RuntimeCommand::Release {
+            transport_live: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn critical_command_reports_a_full_queue_at_its_bound() {
+        let (control, _receiver, _poll) = queue(1);
+        control.send(release()).unwrap();
+        assert_eq!(control.send(release()), Err(RuntimeCommandError::Full));
         assert_eq!(
-            control.send_critical(RuntimeCommand::Stop, Duration::ZERO),
+            control.send_critical(release(), Duration::ZERO).await,
             Err(RuntimeCommandError::Full)
         );
+    }
+
+    #[tokio::test]
+    async fn critical_command_waits_for_the_input_thread_to_drain() {
+        let (control, mut receiver, mut poll) = queue(1);
+        control.send(release()).unwrap();
+        let drain = std::thread::spawn(move || {
+            // The input thread sleeps in poll until the sender wakes it.
+            let mut events = Events::with_capacity(4);
+            poll.poll(&mut events, Some(Duration::from_secs(5)))
+                .unwrap();
+            assert!(events.iter().any(|event| event.token() == WAKE_TOKEN));
+            assert!(receiver.try_recv().is_ok());
+            receiver
+        });
+        control
+            .send_critical(release(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut receiver = drain.join().unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeCommand::Release {
+                transport_live: false
+            })
+        ));
+        drop(receiver);
+        assert_eq!(control.send(release()), Err(RuntimeCommandError::Stopped));
     }
 
     fn device(

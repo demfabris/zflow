@@ -47,7 +47,6 @@ const SESSION_EVENT_CAPACITY: usize = 1_024;
 mod desktop;
 mod peer_view;
 const ACCEPT_EVENT_CAPACITY: usize = 64;
-const RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
@@ -87,7 +86,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     fs::set_permissions(&config.daemon.state_dir, fs::Permissions::from_mode(0o700))?;
     let identity = Arc::new(Identity::load_or_create(&config.daemon.state_dir)?);
     let process_epoch = random_epoch()?;
-    let runtime = LinuxRuntime::spawn(LinuxRuntimeConfig::from_config(&config))?;
+    let mut runtime = LinuxRuntime::spawn(LinuxRuntimeConfig::from_config(&config))?;
 
     let endpoint = Endpoint::client(config.transport.listen).with_context(|| {
         format!(
@@ -143,8 +142,6 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     let session_setup_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
     let local_slots = Arc::new(Semaphore::new(MAX_LOCAL_CLIENTS));
     let seat_watcher = tokio::spawn(watch_seat(shared.clone()));
-    let mut runtime_tick = tokio::time::interval(RUNTIME_DRAIN_INTERVAL);
-    runtime_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut discovery_retry = tokio::time::interval(DISCOVERY_RETRY_INTERVAL);
     discovery_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -238,7 +235,23 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                 };
                 shared.handle_session_event(event).await?;
             }
-            _ = runtime_tick.tick() => drain_runtime(&runtime, &shared).await?,
+            event = runtime.events.recv() => {
+                let Some(event) = event else {
+                    bail!("Linux input runtime event channel closed");
+                };
+                handle_runtime_event(event, &shared).await?;
+            }
+            frame = runtime.captured.recv() => {
+                let Some(frame) = frame else {
+                    bail!("Linux input runtime capture channel closed");
+                };
+                // The input thread sends the switch to Remote before the frames
+                // it covers, so handle queued events first.
+                while let Ok(event) = runtime.events.try_recv() {
+                    handle_runtime_event(event, &shared).await?;
+                }
+                shared.forward_capture(frame).await?;
+            }
             signal = next_discovery_signal(discovery.as_ref()), if discovery.is_some() => {
                 match signal {
                     DiscoverySignal::Event(Ok(DiscoveryEvent::Candidate(candidate))) => {
@@ -583,7 +596,26 @@ impl Shared {
                 RuntimeCommand::TerminalSent { transport_live },
                 TERMINAL_SEND_TIMEOUT,
             )
+            .await
             .map_err(|error| anyhow!(error))
+    }
+
+    /// Sends a captured frame to its peer, or releases local input if it
+    /// cannot go anywhere.
+    async fn forward_capture(&self, frame: crate::linux::CapturedDeviceFrame) -> Result<()> {
+        if let Err(error) = self.route_capture(frame).await {
+            tracing::warn!(%error, "captured input could not reach its peer");
+            self.runtime
+                .send_critical(
+                    RuntimeCommand::Release {
+                        transport_live: false,
+                    },
+                    TERMINAL_SEND_TIMEOUT,
+                )
+                .await
+                .map_err(|error| anyhow!(error))?;
+        }
+        Ok(())
     }
 
     async fn route_capture(&self, frame: crate::linux::CapturedDeviceFrame) -> Result<()> {
@@ -696,41 +728,6 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
     }
 }
 
-async fn drain_runtime(runtime: &LinuxRuntime, shared: &Arc<Shared>) -> Result<()> {
-    for _ in 0..1_024 {
-        match runtime.events().try_recv() {
-            Ok(event) => handle_runtime_event(event, shared).await?,
-            Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                bail!("Linux input runtime event channel closed")
-            }
-        }
-    }
-    for _ in 0..4_096 {
-        match runtime.captured_frames().try_recv() {
-            Ok(frame) => {
-                if let Err(error) = shared.route_capture(frame).await {
-                    tracing::warn!(%error, "captured input could not reach its peer");
-                    shared
-                        .runtime
-                        .send_critical(
-                            RuntimeCommand::Release {
-                                transport_live: false,
-                            },
-                            TERMINAL_SEND_TIMEOUT,
-                        )
-                        .map_err(|error| anyhow!(error))?;
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                bail!("Linux input runtime capture channel closed")
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Result<()> {
     match event {
         RuntimeEvent::Ready => tracing::info!("Linux input runtime is ready"),
@@ -785,6 +782,7 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
                         },
                         TERMINAL_SEND_TIMEOUT,
                     )
+                    .await
                     .map_err(|error| anyhow!(error))?;
             }
         }
@@ -1237,6 +1235,7 @@ impl Shared {
                             },
                             TERMINAL_SEND_TIMEOUT,
                         )
+                        .await
                         .map_err(|error| anyhow!(error))?;
                 }
             }
@@ -1277,6 +1276,7 @@ impl Shared {
                             },
                             TERMINAL_SEND_TIMEOUT,
                         )
+                        .await
                         .map_err(|error| anyhow!(error))?;
                 }
                 let mut inbound = self.inbound_owner.lock().await;
@@ -1358,7 +1358,9 @@ impl Shared {
                 applied: Some(applied_tx),
             };
             let result = if safety_release {
-                self.runtime.send_critical(command, TERMINAL_SEND_TIMEOUT)
+                self.runtime
+                    .send_critical(command, TERMINAL_SEND_TIMEOUT)
+                    .await
             } else {
                 self.runtime.send(command)
             };
