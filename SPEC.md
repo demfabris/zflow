@@ -684,7 +684,7 @@ The prototype requires:
 
 - property tests over the protocol state machine: lease expiry, epoch/generation/activation ordering, anchor-before-transition, snapshot reconciliation by difference;
 - fuzz targets for every decoder message family;
-- deterministic sender, receiver, playout, and loopback session tests covering: isolated and burst loss; duplicate and reordered datagrams; 40-150 ms jitter bursts; control/datagram cross-ordering; final-datagram loss followed by idle; delayed snapshots after lease expiry; connection loss; held keys, buttons, and touches during each failure.
+- deterministic sender, receiver, playout, and loopback session tests covering: isolated and burst loss; duplicate and reordered datagrams; 40-150 ms jitter bursts; control/datagram cross-ordering; final-datagram loss followed by idle; delayed snapshots after lease expiry; and release of held input on lease expiry and connection loss.
 
 These pass when the sender enqueues a reliable cumulative checkpoint within 250 ms after totals change; keys, buttons, and touches release within the lease bound; a click never overtakes its motion anchor; and closed activations inject nothing.
 
