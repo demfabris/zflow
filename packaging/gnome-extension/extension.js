@@ -12,6 +12,7 @@ const PATH = '/org/gnome/Shell/Extensions/Zflow';
 const AGENT = 'io.zflow.Desktop';
 const MAX = 1000000;
 const LEASE_US = 2000000;
+const WARP_US = 100000;
 // src/desktop.rs mirrors this hold duration.
 const POLL_HOLD_MS = 200;
 const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>`;
@@ -176,14 +177,18 @@ export default class ZflowExtension extends Extension {
                 });
                 this._barriers.push(barrier);
             }
-            // The seat processes a warp asynchronously; inspect the compositor
-            // on the next main-loop turn before accepting the entry.
-            await new Promise(resolve => GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {resolve(); return GLib.SOURCE_REMOVE;}));
-            if (this._lease !== lease) throw new Error('Desktop changed during entry');
-            const actual = this._snapshot();
-            if (Math.abs(actual.position.x - point.x) > 2 || Math.abs(actual.position.y - point.y) > 2)
-                throw new Error('GNOME did not place the cursor at the requested entry');
-            return {status: 'prepared', ...actual};
+            // Mutter applies the warp on its input thread, and a slow frame can
+            // delay it past the next main-loop turn. Keep checking for a while.
+            const deadline = GLib.get_monotonic_time() + WARP_US;
+            for (;;) {
+                await new Promise(resolve => GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {resolve(); return GLib.SOURCE_REMOVE;}));
+                if (this._lease !== lease) throw new Error('Desktop changed during entry');
+                const actual = this._snapshot();
+                if (Math.abs(actual.position.x - point.x) <= 2 && Math.abs(actual.position.y - point.y) <= 2)
+                    return {status: 'prepared', ...actual};
+                if (GLib.get_monotonic_time() >= deadline)
+                    throw new Error('GNOME did not place the cursor at the requested entry');
+            }
         } catch (error) {
             if (this._lease === lease) this._clear();
             throw error;

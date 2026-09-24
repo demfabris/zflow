@@ -191,7 +191,25 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.extension.disable();
 }
 {
+    // Mutter can apply a warp a few main-loop turns late on a slow frame.
     const d = desktop();
+    const warp = d.seat.warp_pointer;
+    const idle = d.context.GLib.idle_add;
+    let turns = 0, pending;
+    d.seat.warp_pointer = (x, y) => {pending = () => warp(x, y);};
+    d.context.GLib.idle_add = (priority, fn) => {
+        d.advance(10);
+        if (++turns === 3) pending();
+        return idle(priority, fn);
+    };
+    assert.equal((await d.extension._request(prepare())).status, 'prepared');
+    assert.equal(turns, 3);
+    d.extension.disable();
+}
+{
+    const d = desktop();
+    const idle = d.context.GLib.idle_add;
+    d.context.GLib.idle_add = (priority, fn) => {d.advance(10); return idle(priority, fn);};
     d.seat.warp_pointer = () => {};
     await assert.rejects(d.extension._request(prepare()), /did not place/);
     assert.ok(d.barriers.every(b => b.destroyed));
