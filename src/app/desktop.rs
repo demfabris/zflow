@@ -110,11 +110,27 @@ async fn run(
 ) -> anyhow::Result<()> {
     use crate::desktop::{DesktopRequest, DesktopResponse};
     use anyhow::{Context, ensure};
+    const ENABLE: &str = "Enable the zflow GNOME integration; a newly installed extension may require logging out and back in";
     let bus = zbus::fdo::DBusProxy::new(connection).await?;
-    let owner = bus
-        .get_name_owner(crate::desktop::BUS_NAME.try_into()?)
-        .await
-        .context("Enable the zflow GNOME integration; a newly installed extension may require logging out and back in")?;
+    // Login can start this agent before Shell enables the extension. Wait for
+    // its name quietly instead of failing or asking D-Bus to start it.
+    let mut waiting = false;
+    let owner = loop {
+        match bus
+            .get_name_owner(crate::desktop::BUS_NAME.try_into()?)
+            .await
+        {
+            Ok(owner) => break owner,
+            Err(zbus::fdo::Error::NameHasNoOwner(_)) if !waiting => {
+                tracing::debug!("waiting for the zflow GNOME extension");
+                state.lock().unwrap_or_else(|e| e.into_inner()).message = ENABLE.into();
+                waiting = true;
+            }
+            Err(zbus::fdo::Error::NameHasNoOwner(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
     // Trust replies only from GNOME Shell, and keep talking to that connection
     // even if another program takes the name later.
     ensure!(
@@ -128,8 +144,9 @@ async fn run(
         crate::desktop::BUS_NAME,
     )
     .await?;
-    let snapshot=call(&proxy,&DesktopRequest::Snapshot).await
-        .context("Enable the zflow GNOME integration; a newly installed extension may require logging out and back in")?;
+    let snapshot = call(&proxy, &DesktopRequest::Snapshot)
+        .await
+        .context(ENABLE)?;
     if let DesktopResponse::Unavailable { reason } = snapshot {
         anyhow::bail!("{reason}");
     }
@@ -324,11 +341,28 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
-    async fn receiver_trusts_only_gnome_shell_and_calls_from_its_own_connection() {
+    async fn receiver_waits_for_gnome_shell_and_calls_from_its_own_connection() {
         use crate::desktop::{BUS_NAME, OBJECT_PATH};
         let state = Arc::new(Mutex::new(State::default()));
         let generation = std::sync::atomic::AtomicU64::new(1);
         let agent = zbus::Connection::session().await.unwrap();
+        // Login can start the agent before Shell enables the extension.
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(700),
+            run(&agent, &state, &generation, 1),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "the receiver keeps waiting for the extension"
+        );
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .message
+                .starts_with("Enable the zflow")
+        );
         let shell = zbus::connection::Builder::session()
             .unwrap()
             .name("org.gnome.Shell")
