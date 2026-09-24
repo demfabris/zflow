@@ -15,79 +15,165 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use clap::{
+    ArgAction, Args, Parser, Subcommand,
+    builder::{PossibleValuesParser, TypedValueParser},
+};
 use serde::Serialize;
 
 use crate::{
-    config::{Config, PeerConfig, PeerPermissions},
+    config::{Config, PeerConfig, PeerPermissions, PlayoutMode},
     control::{DaemonStatus, Request, Response, read_message, write_message},
     identity::Identity,
 };
 
-#[derive(Debug)]
-pub enum Command {
+#[derive(Debug, Parser)]
+#[command(name = "zflow", version, about = "Headless zflow setup and control")]
+pub struct Cli {
+    /// Configuration file used by setup and offline diagnostics.
+    #[arg(long, global = true, default_value = "/etc/zflow/zflow.toml")]
+    config: PathBuf,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Open native GNOME settings. Closing the window leaves sharing running.
     Settings,
+    /// Run the GNOME session integration without a window.
     DesktopAgent {
+        /// Install the GNOME extension and start this agent at login.
+        #[arg(long)]
         install: bool,
     },
-    Setup {
-        listen: Option<std::net::SocketAddr>,
-        devices: Vec<PathBuf>,
-        activation_chord: Vec<String>,
-        escape_chord: Vec<String>,
-        udev_rules: Option<PathBuf>,
-        allow_prelogin: Option<bool>,
-        experimental_touchpad: Option<bool>,
-    },
+    /// Create or update the local configuration.
+    Setup(SetupOptions),
+    /// Show daemon and ownership state.
     Status {
+        /// Emit stable machine-readable output.
+        #[arg(long)]
         json: bool,
     },
+    /// Check Linux input, permissions, service, and configuration.
     Doctor,
+    /// List physical input devices and capture-set membership.
     Devices,
+    /// List paired peers and their permissions.
     Peers,
-    PairConnect {
-        peer: String,
-        address: SocketAddr,
-        advertised: Vec<SocketAddr>,
-        code: Option<String>,
-        timeout: Duration,
+    /// Pair with another logged-in zflow CLI using an authenticated code.
+    Pair {
+        #[command(subcommand)]
+        command: PairCommand,
     },
-    PairListen {
-        peer: String,
-        listen: SocketAddr,
-        advertised: Vec<SocketAddr>,
-        code: Option<String>,
-        timeout: Duration,
+    /// Change one paired peer.
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
     },
-    RevokePeer {
-        peer: String,
-    },
-    AllowPrelogin {
-        peer: String,
-        allowed: bool,
-    },
-    Switch {
-        peer: String,
-    },
+    /// Arm remote ownership for a paired peer.
+    Switch { peer: String },
+    /// Return input ownership to this machine.
     Local,
+    /// Change persistent receiver playout settings.
     Playout {
-        mode: crate::config::PlayoutMode,
+        #[arg(value_parser = playout_mode())]
+        mode: PlayoutMode,
+        #[arg(long)]
         fixed_delay_ms: Option<u64>,
+        #[arg(long)]
         minimum_delay_ms: Option<u64>,
+        #[arg(long)]
         maximum_delay_ms: Option<u64>,
+        #[arg(long)]
         percentile: Option<f64>,
     },
 }
 
+#[derive(Debug, Default, Args)]
 struct SetupOptions {
-    listen: Option<std::net::SocketAddr>,
+    /// Override the QUIC listen address; changes require a daemon restart.
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// Select a physical evdev node; repeated values replace the capture set.
+    #[arg(long = "device")]
     devices: Vec<PathBuf>,
+    /// Set one evdev key in the activation chord; repeat for every key.
+    #[arg(long = "activation-key", value_name = "EVDEV_KEY")]
     activation_chord: Vec<String>,
+    /// Set one evdev key in the local escape chord; repeat for every key.
+    #[arg(long = "escape-key", value_name = "EVDEV_KEY")]
     escape_chord: Vec<String>,
+    /// Write explicit capture permissions for the selected devices.
+    #[arg(long)]
     udev_rules: Option<PathBuf>,
+    /// Enable or disable injection outside an unlocked authenticated session.
+    #[arg(long = "prelogin", value_name = "on|off", value_parser = on_off())]
     allow_prelogin: Option<bool>,
+    /// Enable or disable experimental raw touchpad forwarding.
+    #[arg(long = "experimental-touchpad", value_name = "on|off", value_parser = on_off())]
     experimental_touchpad: Option<bool>,
-    /// Where `--prelogin` installs or removes the boot ordering drop-in.
-    prelogin_dropin: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum PeerCommand {
+    /// Revoke a peer and close its future access.
+    Revoke { peer: String },
+    /// Grant or revoke the separate pre-login permission.
+    AllowPrelogin {
+        peer: String,
+        #[arg(action = ArgAction::Set, value_parser = on_off())]
+        value: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PairCommand {
+    /// Connect to a peer's temporary pairing listener.
+    Connect {
+        /// Local name to assign to the peer.
+        peer: String,
+        /// Peer pairing address, normally port 43120.
+        address: SocketAddr,
+        /// Extra local input address to send to the peer.
+        #[arg(long = "advertise")]
+        advertised: Vec<SocketAddr>,
+        /// Code displayed by the peer; prompts on a terminal when omitted.
+        #[arg(long)]
+        code: Option<String>,
+        /// Stop waiting after this many seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+    },
+    /// Accept one connection on a temporary pairing listener.
+    Listen {
+        /// Local name to assign to the peer.
+        peer: String,
+        /// Pairing listener address.
+        #[arg(long, default_value = "[::]:43120")]
+        listen: SocketAddr,
+        /// Extra local input address to send to the peer.
+        #[arg(long = "advertise")]
+        advertised: Vec<SocketAddr>,
+        /// Code displayed by the peer; prompts on a terminal when omitted.
+        #[arg(long)]
+        code: Option<String>,
+        /// Stop waiting after this many seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+    },
+}
+
+fn on_off() -> impl TypedValueParser<Value = bool> {
+    PossibleValuesParser::new(["on", "off"]).map(|value| value == "on")
+}
+
+fn playout_mode() -> impl TypedValueParser<Value = PlayoutMode> {
+    PossibleValuesParser::new(["fixed", "adaptive"]).map(|mode| match mode.as_str() {
+        "fixed" => PlayoutMode::Fixed,
+        _ => PlayoutMode::Adaptive,
+    })
 }
 
 /// Orders zflowd before the display manager so input works at the greeter.
@@ -97,8 +183,9 @@ struct SetupOptions {
 const PRELOGIN_DROPIN: &str = "/etc/systemd/system/zflowd.service.d/prelogin.conf";
 const PRELOGIN_ORDERING: &str = include_str!("../packaging/systemd/zflowd-prelogin.conf");
 
-pub fn run(path: PathBuf, command: Command) -> Result<()> {
-    match command {
+pub fn run(cli: Cli) -> Result<()> {
+    let path = cli.config;
+    match cli.command {
         Command::Settings => {
             #[cfg(target_os = "linux")]
             {
@@ -120,47 +207,35 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
                 bail!("The desktop agent requires Linux with GNOME")
             }
         }
-        Command::Setup {
-            listen,
-            devices,
-            activation_chord,
-            escape_chord,
-            udev_rules,
-            allow_prelogin,
-            experimental_touchpad,
-        } => setup(
+        Command::Setup(options) => setup(
             path,
-            SetupOptions {
-                listen,
-                devices,
-                activation_chord,
-                escape_chord,
-                udev_rules,
-                allow_prelogin,
-                experimental_touchpad,
-                prelogin_dropin: cfg!(target_os = "linux").then(|| PRELOGIN_DROPIN.into()),
-            },
+            options,
+            cfg!(target_os = "linux").then(|| PRELOGIN_DROPIN.into()),
         ),
         Command::Status { json } => status(path, json),
         Command::Doctor => doctor(path),
         Command::Devices => devices(path),
         Command::Peers => peers(path),
-        Command::PairConnect {
-            peer,
-            address,
-            advertised,
-            code,
-            timeout,
-        } => pair_connect(path, peer, address, advertised, code, timeout),
-        Command::PairListen {
-            peer,
-            listen,
-            advertised,
-            code,
-            timeout,
-        } => pair_listen(path, peer, listen, advertised, code, timeout),
-        Command::RevokePeer { peer } => revoke_peer(path, peer),
-        Command::AllowPrelogin { peer, allowed } => allow_prelogin(path, peer, allowed),
+        Command::Pair { command } => match command {
+            PairCommand::Connect {
+                peer,
+                address,
+                advertised,
+                code,
+                timeout_seconds,
+            } => pair_connect(path, peer, address, advertised, code, timeout_seconds),
+            PairCommand::Listen {
+                peer,
+                listen,
+                advertised,
+                code,
+                timeout_seconds,
+            } => pair_listen(path, peer, listen, advertised, code, timeout_seconds),
+        },
+        Command::Peer { command } => match command {
+            PeerCommand::Revoke { peer } => revoke_peer(path, peer),
+            PeerCommand::AllowPrelogin { peer, value } => allow_prelogin(path, peer, value),
+        },
         Command::Switch { peer } => daemon_command(path, Request::Activate { peer }),
         Command::Local => daemon_command(path, Request::Local),
         Command::Playout {
@@ -180,7 +255,9 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
     }
 }
 
-fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
+/// `prelogin_dropin` is where `--prelogin` installs or removes the boot
+/// ordering drop-in; none leaves boot ordering alone.
+fn setup(path: PathBuf, options: SetupOptions, prelogin_dropin: Option<PathBuf>) -> Result<()> {
     let SetupOptions {
         listen,
         devices,
@@ -189,7 +266,6 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
         udev_rules,
         allow_prelogin,
         experimental_touchpad,
-        prelogin_dropin,
     } = options;
     let existed = path.exists();
     let mut config = if existed {
@@ -1287,7 +1363,7 @@ fn pair_connect(
     address: SocketAddr,
     advertised: Vec<SocketAddr>,
     code: Option<String>,
-    timeout: Duration,
+    timeout_seconds: u64,
 ) -> Result<()> {
     let config = Config::load(&path)?;
     let identity = load_or_create_identity(&config.daemon.state_dir)?;
@@ -1302,9 +1378,12 @@ fn pair_connect(
         .enable_all()
         .build()?;
     let session = runtime.block_on(async {
-        tokio::time::timeout(timeout, crate::pairing::connect(&identity, address, &offer))
-            .await
-            .context("pairing timed out")?
+        tokio::time::timeout(
+            Duration::from_secs(timeout_seconds),
+            crate::pairing::connect(&identity, address, &offer),
+        )
+        .await
+        .context("pairing timed out")?
     })?;
     confirm_and_store(path, peer, session.observation().clone(), code)
 }
@@ -1315,7 +1394,7 @@ fn pair_listen(
     listen: SocketAddr,
     advertised: Vec<SocketAddr>,
     code: Option<String>,
-    timeout: Duration,
+    timeout_seconds: u64,
 ) -> Result<()> {
     let config = Config::load(&path)?;
     let identity = load_or_create_identity(&config.daemon.state_dir)?;
@@ -1331,7 +1410,7 @@ fn pair_listen(
     let session = runtime.block_on(async {
         let listener = crate::pairing::PairingListener::bind(&identity, listen, offer)?;
         println!("pairing listener: {}", listener.local_addr()?);
-        tokio::time::timeout(timeout, listener.accept())
+        tokio::time::timeout(Duration::from_secs(timeout_seconds), listener.accept())
             .await
             .context("pairing timed out")?
     })?;
@@ -1486,6 +1565,19 @@ fn playout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_line_definition_is_consistent() {
+        use clap::CommandFactory as _;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn setup_cannot_move_paths_the_sandboxed_daemon_depends_on() {
+        for flag in ["--state-dir", "--control-socket"] {
+            assert!(Cli::try_parse_from(["zflow", "setup", flag, "/tmp/zflow"]).is_err());
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1682,15 +1774,10 @@ mod tests {
         setup(
             path.clone(),
             SetupOptions {
-                listen: None,
-                devices: Vec::new(),
-                activation_chord: Vec::new(),
-                escape_chord: Vec::new(),
-                udev_rules: None,
                 allow_prelogin: Some(false),
-                experimental_touchpad: None,
-                prelogin_dropin: None,
+                ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -1709,15 +1796,10 @@ mod tests {
         setup(
             path.clone(),
             SetupOptions {
-                listen: None,
-                devices: Vec::new(),
-                activation_chord: Vec::new(),
-                escape_chord: Vec::new(),
-                udev_rules: None,
-                allow_prelogin: None,
                 experimental_touchpad: Some(true),
-                prelogin_dropin: None,
+                ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -1743,14 +1825,9 @@ mod tests {
             path.clone(),
             SetupOptions {
                 listen: Some(new_listen),
-                devices: Vec::new(),
-                activation_chord: Vec::new(),
-                escape_chord: Vec::new(),
-                udev_rules: None,
-                allow_prelogin: None,
-                experimental_touchpad: None,
-                prelogin_dropin: None,
+                ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -1784,14 +1861,9 @@ mod tests {
             path.clone(),
             SetupOptions {
                 listen: Some(new_listen),
-                devices: Vec::new(),
-                activation_chord: Vec::new(),
-                escape_chord: Vec::new(),
-                udev_rules: None,
-                allow_prelogin: None,
-                experimental_touchpad: None,
-                prelogin_dropin: None,
+                ..Default::default()
             },
+            None,
         )
         .unwrap();
         let pending = fs::read(&path).unwrap();
@@ -1799,15 +1871,10 @@ mod tests {
         let result = setup(
             path.clone(),
             SetupOptions {
-                listen: None,
-                devices: Vec::new(),
-                activation_chord: Vec::new(),
-                escape_chord: Vec::new(),
-                udev_rules: None,
                 allow_prelogin: Some(false),
-                experimental_touchpad: None,
-                prelogin_dropin: None,
+                ..Default::default()
             },
+            None,
         );
 
         assert!(result.is_err());
@@ -1834,15 +1901,10 @@ mod tests {
         let result = setup(
             path.clone(),
             SetupOptions {
-                listen: None,
-                devices: Vec::new(),
-                activation_chord: Vec::new(),
-                escape_chord: Vec::new(),
-                udev_rules: None,
                 allow_prelogin: Some(false),
-                experimental_touchpad: None,
-                prelogin_dropin: None,
+                ..Default::default()
             },
+            None,
         );
 
         assert!(result.is_err());
@@ -1863,15 +1925,10 @@ mod tests {
         let result = setup(
             path.clone(),
             SetupOptions {
-                listen: None,
-                devices: Vec::new(),
                 activation_chord: vec!["KEY_THIS_DOES_NOT_EXIST".into()],
-                escape_chord: Vec::new(),
-                udev_rules: None,
-                allow_prelogin: None,
-                experimental_touchpad: None,
-                prelogin_dropin: None,
+                ..Default::default()
             },
+            None,
         );
 
         assert!(result.is_err());
@@ -1902,15 +1959,10 @@ mod tests {
         let result = setup(
             path.clone(),
             SetupOptions {
-                listen: None,
-                devices: Vec::new(),
-                activation_chord: Vec::new(),
-                escape_chord: Vec::new(),
                 udev_rules: Some(rules_path.clone()),
-                allow_prelogin: None,
-                experimental_touchpad: None,
-                prelogin_dropin: None,
+                ..Default::default()
             },
+            None,
         );
 
         assert!(result.is_err());
