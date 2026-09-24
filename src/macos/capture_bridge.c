@@ -403,6 +403,19 @@ static void stop_capture_run_loop(void) {
   pthread_mutex_unlock(&g_run_loop_lock);
 }
 
+// Queue a captured event and swallow it. Dropping one on a full queue could
+// lose a release, so end capture instead; ending remote input releases
+// everything held on the other computer.
+static CGEventRef forward(const ZFlowMacEvent *event) {
+  if (!enqueue(event)) {
+    set_error("the capture queue overflowed; input returned to the Mac");
+    g_capture_status = -1;
+    atomic_store(&g_stop, true);
+    stop_capture_run_loop();
+  }
+  return NULL;
+}
+
 uint8_t zflow_mac_should_forward_scroll(uint8_t raw_touch,
                                         uint8_t raw_contact_active,
                                         int64_t scroll_phase,
@@ -455,8 +468,7 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
           : type == kCGEventKeyDown;
       if (g_check_entry && keycode < 128 &&
           !owns_transition(&g_forwarded_keys[keycode], captured.pressed)) return event;
-      enqueue(&captured);
-      return NULL;
+      return forward(&captured);
     }
     case kCGEventLeftMouseDown:
     case kCGEventRightMouseDown:
@@ -472,8 +484,7 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
                          type == kCGEventOtherMouseDown;
       if (g_check_entry && captured.button < 33 &&
           !owns_transition(&g_forwarded_buttons[captured.button], captured.pressed)) return event;
-      enqueue(&captured);
-      return NULL;
+      return forward(&captured);
     case kCGEventMouseMoved:
     case kCGEventLeftMouseDragged:
     case kCGEventRightMouseDragged:
@@ -482,7 +493,7 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
         captured.kind = ZFLOW_EVENT_MOTION;
         captured.dx = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX);
         captured.dy = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY);
-        enqueue(&captured);
+        return forward(&captured);
       }
       return NULL;
     case kCGEventScrollWheel:
@@ -495,7 +506,7 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
             event, kCGScrollWheelEventPointDeltaAxis2);
         captured.scroll_y = CGEventGetIntegerValueField(
             event, kCGScrollWheelEventPointDeltaAxis1);
-        enqueue(&captured);
+        return forward(&captured);
       }
       return NULL;
     default:

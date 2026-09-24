@@ -490,6 +490,19 @@ static void event_tests(void) {
     assert(captured.kind == ZFLOW_EVENT_MOTION);
   }
   CFRelease(event);
+
+  // A release that does not fit must end capture instead of vanishing.
+  reset();
+  for (size_t i = 0; i < ZFLOW_QUEUE_CAPACITY - 1; i++) {
+    assert(enqueue(&motion_event));
+  }
+  event = CGEventCreateKeyboardEvent(NULL, 0, false);
+  assert(event);
+  assert(event_callback(NULL, kCGEventKeyUp, event, NULL) == NULL);
+  assert(zflow_mac_capture_stop_requested() == 1);
+  assert(zflow_mac_capture_pause_requested() == 0);
+  assert(g_capture_status == -1 && strstr(g_error, "overflowed"));
+  CFRelease(event);
 }
 
 int main(void) {

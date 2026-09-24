@@ -33,6 +33,9 @@ use crate::{
 };
 
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// Yield to the session between batches so a backlog after a stall cannot
+// overflow its 512-command queue in one burst.
+const MAX_EVENTS_PER_POLL: usize = 256;
 const TOUCH_STALE_TIMEOUT: Duration = Duration::from_millis(150);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -624,7 +627,7 @@ async fn run_endpoint(
                 _ = interval.tick() => {
                     max_poll_gap = max_poll_gap.max(last_capture_poll.elapsed());
                     last_capture_poll = Instant::now();
-                    while let Some(event) = capture.poll() {
+                    for event in std::iter::from_fn(|| capture.poll()).take(MAX_EVENTS_PER_POLL) {
                         captured_events += 1;
                         if event.kind == NativeEventKind::Escape as u32 {
                             let _ = status.send(SourceStatus::PauseRequested);
