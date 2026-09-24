@@ -183,6 +183,11 @@ impl Sender {
         self.last_control_sequence
     }
 
+    /// The latest time any call has passed in. Earlier times are rejected.
+    pub fn last_observed_time(&self) -> MonotonicTimeMicros {
+        self.last_observed_time
+    }
+
     pub fn last_acknowledged_checkpoint(&self) -> Option<(ControlSequence, &StateSnapshot)> {
         self.last_acknowledged
             .as_ref()

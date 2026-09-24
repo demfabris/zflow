@@ -555,14 +555,15 @@ async fn run_session(
                             continue;
                         };
                         let captured_at = frame.captured_at;
+                        // Stamp input with when it was captured, not when this
+                        // actor got to it. Clamp so sender time never runs
+                        // backwards or ahead of now.
+                        let at = clock
+                            .at(captured_at)
+                            .min(clock.now())
+                            .max(active.last_observed_time());
                         let frame = capture_merge.merge(frame);
-                        send_capture(
-                            &mut channels,
-                            active,
-                            &negotiated,
-                            frame,
-                            clock.now(),
-                        ).await?;
+                        send_capture(&mut channels, active, &negotiated, frame, at).await?;
                         lock_metrics(&metrics)
                             .capture_to_send_us
                             .record(captured_at.elapsed().as_secs_f64() * 1_000_000.0);
@@ -1943,7 +1944,12 @@ impl MonotonicClock {
     }
 
     fn now(&self) -> MonotonicTimeMicros {
-        MonotonicTimeMicros(u64::try_from(self.0.elapsed().as_micros()).unwrap_or(u64::MAX))
+        self.at(Instant::now())
+    }
+
+    fn at(&self, instant: Instant) -> MonotonicTimeMicros {
+        let elapsed = instant.saturating_duration_since(self.0);
+        MonotonicTimeMicros(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX))
     }
 }
 
@@ -3400,6 +3406,93 @@ mod tests {
         })
         .await
         .expect("silent receiver regression timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anchors_carry_capture_time_not_handling_time() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (channels, mut peer, _client, _server) = input_channel_pair().await;
+            let (commands, command_rx) = mpsc::channel(8);
+            let (events, _event_rx) = mpsc::channel(16);
+            let (ready, receipt) = oneshot::channel();
+            let actor = tokio::spawn(run_session(
+                1,
+                "capture-time-peer".into(),
+                channels,
+                command_rx,
+                options(),
+                events,
+                Arc::new(Mutex::new(SessionMetrics::default())),
+                ready,
+            ));
+            let negotiated = negotiate(&mut peer, &options().offer).await.unwrap();
+            peer.datagrams
+                .configure_maximum(negotiated.maximum_datagram_size)
+                .unwrap();
+            receipt.await.unwrap().unwrap();
+            let button = |button, state, captured_at| {
+                SessionCommand::Capture(CapturedDeviceFrame {
+                    device_path: "fake".into(),
+                    captured_at,
+                    frame: CaptureFrame {
+                        transitions: vec![CaptureTransition::Button { button, state }],
+                        ..CaptureFrame::default()
+                    },
+                })
+            };
+
+            commands
+                .send(SessionCommand::BeginOutbound(context()))
+                .await
+                .unwrap();
+            let InputControlMessage::Reliable(enter) =
+                peer.control_receive.receive().await.unwrap()
+            else {
+                panic!("expected Enter");
+            };
+            assert_eq!(enter.payload, ReliableControl::Enter);
+            let mut next_anchor = async || loop {
+                let InputControlMessage::Reliable(message) =
+                    peer.control_receive.receive().await.unwrap()
+                else {
+                    panic!("expected reliable control");
+                };
+                if let Some(anchor) = message.payload.motion_anchor() {
+                    break anchor.sender_capture_time.0;
+                }
+            };
+            // Captured 8 ms apart, handled together after a stall.
+            let base = Instant::now();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            for (target, state, offset) in [
+                (PointerButton::PRIMARY, KeyState::Pressed, 0),
+                (PointerButton(2), KeyState::Pressed, 8),
+                (PointerButton::PRIMARY, KeyState::Released, 4),
+            ] {
+                let captured_at = base + Duration::from_millis(offset);
+                commands
+                    .send(button(target, state, captured_at))
+                    .await
+                    .unwrap();
+            }
+            let first = next_anchor().await;
+            let second = next_anchor().await;
+            let third = next_anchor().await;
+            assert!(
+                (second - first).abs_diff(8_000) <= 1,
+                "capture spacing became {} us",
+                second - first
+            );
+            assert_eq!(third, second, "an older capture moved sender time back");
+            assert!(!actor.is_finished());
+            commands
+                .send(SessionCommand::Close(SessionCloseReason::LocalRelease))
+                .await
+                .unwrap();
+            actor.await.unwrap().unwrap();
+        })
+        .await
+        .expect("capture time regression timed out");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
