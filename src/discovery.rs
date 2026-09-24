@@ -18,6 +18,7 @@ use thiserror::Error;
 
 use crate::{
     core::{InputCapabilities, InputCapability, ProtocolVersion},
+    identity::encode_hex,
     wire::CURRENT_PROTOCOL_VERSION,
 };
 
@@ -93,11 +94,7 @@ impl EphemeralInstanceId {
 
 impl fmt::Display for EphemeralInstanceId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(INSTANCE_PREFIX)?;
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        write!(formatter, "{INSTANCE_PREFIX}{}", encode_hex(&self.0))
     }
 }
 

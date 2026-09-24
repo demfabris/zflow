@@ -29,7 +29,7 @@ use crate::{
         SessionEpoch, TransportGeneration,
     },
     discovery::{Advertisement, Discovery, DiscoveryError},
-    identity::Identity,
+    identity::{Identity, encode_hex},
     linux::{InjectionGate, OwnershipPhase, SeatState, watch_primary_seat},
     runtime::{
         LinuxRuntime, LinuxRuntimeConfig, LinuxRuntimeControl, RuntimeCloseReason, RuntimeCommand,
@@ -1170,15 +1170,6 @@ fn random_epoch() -> Result<SessionEpoch> {
     getrandom::fill(&mut epoch)
         .map_err(|error| anyhow!("could not generate the process session epoch: {error}"))?;
     Ok(SessionEpoch(epoch))
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
 }
 
 fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {

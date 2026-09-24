@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::identity::encode_hex;
+
 pub const CONFIG_VERSION: u32 = 1;
 pub const MAX_LEASE: Duration = Duration::from_secs(1);
 pub const MAX_CHECKPOINT: Duration = Duration::from_millis(250);
@@ -385,16 +387,6 @@ fn validate_spki(spki: &[u8]) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {

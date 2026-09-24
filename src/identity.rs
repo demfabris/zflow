@@ -63,7 +63,7 @@ impl Identity {
     }
 
     pub fn fingerprint_hex(&self) -> String {
-        hex(&self.fingerprint)
+        encode_hex(&self.fingerprint)
     }
 
     /// Six decimal digits derived from both identities and the pairing transcript.
@@ -140,11 +140,12 @@ fn store_private_key(path: &Path, bytes: &[u8]) -> Result<(), IdentityError> {
         })
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Lowercase hexadecimal, two digits per byte.
+pub fn encode_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        write!(&mut output, "{byte:02x}").unwrap();
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
     }
     output
 }
