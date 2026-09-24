@@ -115,11 +115,9 @@ pub struct Advertisement {
 }
 
 impl Advertisement {
-    /// `addresses` is ignored because mdns-sd follows the host's interfaces
-    /// itself. It goes away once daemon.rs stops passing a snapshot.
+    /// mdns-sd follows the host's interfaces itself, so no addresses are taken.
     pub fn new(
         quic_port: u16,
-        _addresses: impl IntoIterator<Item = IpAddr>,
         capabilities: impl IntoIterator<Item = InputCapability>,
     ) -> Result<Self, DiscoveryError> {
         if quic_port == 0 {
@@ -772,7 +770,6 @@ mod tests {
     fn advertisement() -> Advertisement {
         Advertisement::new(
             43_119,
-            std::iter::empty(),
             [
                 InputCapability::Keyboard,
                 InputCapability::Pointer,
@@ -826,10 +823,9 @@ mod tests {
 
     #[test]
     fn advertisement_needs_a_port_but_no_addresses() {
-        let no_addresses = std::iter::empty::<IpAddr>;
-        assert!(Advertisement::new(0, no_addresses(), [InputCapability::Keyboard]).is_err());
+        assert!(Advertisement::new(0, [InputCapability::Keyboard]).is_err());
         // Registering before the network is up is fine; mdns-sd adds addresses later.
-        assert!(Advertisement::new(43_119, no_addresses(), [InputCapability::Keyboard]).is_ok());
+        assert!(Advertisement::new(43_119, [InputCapability::Keyboard]).is_ok());
     }
 
     #[test]

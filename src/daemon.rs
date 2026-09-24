@@ -1095,7 +1095,6 @@ fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {
         let mut discovery = Discovery::new()?;
         discovery.register(Advertisement::new(
             listen.port(),
-            Vec::<std::net::IpAddr>::new(),
             advertised_capabilities(config),
         )?)?;
         discovery.browse()?;

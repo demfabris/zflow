@@ -1301,7 +1301,7 @@ fn pair_connect(
     let config = Config::load(&path)?;
     let identity = load_or_create_identity(&config.daemon.state_dir)?;
     let offer = crate::pairing::make_offer(
-        local_device_label(),
+        crate::pairing::local_device_label(),
         config.transport.listen.port(),
         advertised,
     )?;
@@ -1329,7 +1329,7 @@ fn pair_listen(
     let config = Config::load(&path)?;
     let identity = load_or_create_identity(&config.daemon.state_dir)?;
     let offer = crate::pairing::make_offer(
-        local_device_label(),
+        crate::pairing::local_device_label(),
         config.transport.listen.port(),
         advertised,
     )?;
@@ -1406,26 +1406,6 @@ fn confirm_and_store(
     println!("paired {peer} ({fingerprint})");
     println!("pre-login permission remains off");
     Ok(())
-}
-
-fn local_device_label() -> Option<String> {
-    // bash does not export $HOSTNAME, and sudo and systemd never set it.
-    #[cfg(target_os = "linux")]
-    let label = {
-        let mut name = [0_u8; 256];
-        // SAFETY: gethostname writes at most name.len() bytes into the buffer.
-        if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
-            return None;
-        }
-        std::ffi::CStr::from_bytes_until_nul(&name)
-            .ok()?
-            .to_str()
-            .ok()?
-            .to_owned()
-    };
-    #[cfg(not(target_os = "linux"))]
-    let label = std::env::var("HOSTNAME").ok()?;
-    Some(label).filter(|label| !label.is_empty() && label.len() <= 255)
 }
 
 fn revoke_peer(path: PathBuf, peer: String) -> Result<()> {
@@ -1977,7 +1957,10 @@ mod tests {
     #[test]
     fn pairing_label_is_the_kernel_hostname_without_environment() {
         let hostname = fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
-        assert_eq!(local_device_label().as_deref(), Some(hostname.trim()));
+        assert_eq!(
+            crate::pairing::local_device_label().as_deref(),
+            Some(hostname.trim())
+        );
     }
 
     #[test]
