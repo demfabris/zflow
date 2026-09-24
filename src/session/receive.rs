@@ -345,6 +345,9 @@ impl Inbound {
                 self.reporter.metrics().begin_activation();
                 // Motion sequences restart with each activation.
                 self.motion_received_at.clear();
+                // Probes only run during an activation, so an old fit may have
+                // drifted, or missed a Mac sleep, while the session sat idle.
+                self.clock = ClockMapper::new(ClockConfig::default())?;
                 self.playout = Some(ReceiverPlayout::new(
                     self.playout_config,
                     self.receiver.active_context().expect("activation opened"),
