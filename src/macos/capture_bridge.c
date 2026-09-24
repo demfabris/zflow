@@ -153,6 +153,9 @@ typedef struct {
   uint8_t pressed;
   uint8_t contact_count;
   uint8_t padding[2];
+  // The trackpad's size in hundredths of a millimetre, 0 when unknown.
+  int32_t surface_width;
+  int32_t surface_height;
   ZFlowMacContact contacts[ZFLOW_MAX_CONTACTS];
 } ZFlowMacEvent;
 
@@ -200,6 +203,7 @@ static CGError (*g_set_connection_property)(int, int, CFStringRef, CFTypeRef);
 static void *g_multitouch;
 static CFMutableArrayRef g_device_list;
 static MTDeviceRef g_raw_devices[8];
+static int32_t g_raw_surfaces[8][2];
 static size_t g_raw_device_count;
 static CFMutableArrayRef (*MTDeviceCreateList)(void);
 static void (*MTRegisterContactFrameCallback)(MTDeviceRef, MTContactCallback);
@@ -207,6 +211,7 @@ static void (*MTUnregisterContactFrameCallback)(MTDeviceRef, MTContactCallback);
 static int (*MTDeviceStart)(MTDeviceRef, int);
 static int (*MTDeviceStop)(MTDeviceRef);
 static bool (*MTDeviceIsBuiltIn)(MTDeviceRef);
+static int (*MTDeviceGetSensorSurfaceDimensions)(MTDeviceRef, int32_t *, int32_t *);
 
 static void set_error(const char *message) {
   snprintf(g_error, sizeof(g_error), "%s", message ? message : "unknown error");
@@ -378,11 +383,19 @@ static void clear_capture_queue(void) {
 
 static int contact_callback(MTDeviceRef device, MTTouch *touches, int count,
                             double timestamp, int frame) {
-  (void)device;
   (void)timestamp;
   (void)frame;
   ZFlowMacEvent event = {0};
   event.kind = ZFLOW_EVENT_TOUCH;
+  // Scans every entry instead of reading the count, which unloading resets
+  // while a last frame may still be in flight.
+  for (size_t i = 0; i < sizeof(g_raw_devices) / sizeof(g_raw_devices[0]); i++) {
+    if (g_raw_devices[i] == device) {
+      event.surface_width = g_raw_surfaces[i][0];
+      event.surface_height = g_raw_surfaces[i][1];
+      break;
+    }
+  }
   for (int i = 0; i < count && event.contact_count < ZFLOW_MAX_CONTACTS; i++) {
     if (touches[i].state != 3 && touches[i].state != 4) continue;
 
@@ -631,6 +644,9 @@ static bool load_multitouch(void) {
   MTDeviceStart = dlsym(g_multitouch, "MTDeviceStart");
   MTDeviceStop = dlsym(g_multitouch, "MTDeviceStop");
   MTDeviceIsBuiltIn = dlsym(g_multitouch, "MTDeviceIsBuiltIn");
+  // Optional: without it, contacts carry an unknown size.
+  MTDeviceGetSensorSurfaceDimensions =
+      dlsym(g_multitouch, "MTDeviceGetSensorSurfaceDimensions");
   if (!MTDeviceCreateList || !MTRegisterContactFrameCallback ||
       !MTDeviceStart || !MTDeviceIsBuiltIn) {
     set_error("MultitouchSupport is missing required symbols");
@@ -645,6 +661,11 @@ static bool load_multitouch(void) {
     MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(g_device_list, i);
     if (MTDeviceIsBuiltIn(device)) continue;
     found = true;
+    // Read once here so the contact callback only copies it.
+    int32_t *surface = g_raw_surfaces[g_raw_device_count];
+    if (!MTDeviceGetSensorSurfaceDimensions ||
+        MTDeviceGetSensorSurfaceDimensions(device, &surface[0], &surface[1]) != 0)
+      surface[0] = surface[1] = 0;
     // Only registered devices are kept, so unloading never stops a device
     // that was never started.
     g_raw_devices[g_raw_device_count++] = device;

@@ -285,6 +285,17 @@ static int fake_mt_stop(MTDeviceRef device) {
   return 0;
 }
 
+// The size lookup is optional: it can be missing or fail.
+static bool mt_size_missing;
+static int mt_size_status;
+
+static int fake_mt_size(MTDeviceRef device, int32_t *width, int32_t *height) {
+  assert(device == (MTDeviceRef)2);
+  *width = 16030;
+  *height = 11490;
+  return mt_size_status;
+}
+
 static void *fake_dlopen(const char *path, int mode) {
   assert(strstr(path, "MultitouchSupport") && mode == RTLD_NOW);
   return &fake_multitouch;
@@ -302,6 +313,8 @@ static void *fake_dlsym(void *handle, const char *symbol) {
     if (strcmp(symbol, "MTRegisterContactFrameCallback") == 0) return (void *)fake_mt_register;
     if (strcmp(symbol, "MTUnregisterContactFrameCallback") == 0) return (void *)fake_mt_unregister;
     if (strcmp(symbol, "MTDeviceStart") == 0) return (void *)fake_mt_start;
+    if (strcmp(symbol, "MTDeviceGetSensorSurfaceDimensions") == 0)
+      return mt_size_missing ? NULL : (void *)fake_mt_size;
     assert(strcmp(symbol, "MTDeviceStop") == 0);
     return (void *)fake_mt_stop;
   }
@@ -567,12 +580,32 @@ static void multitouch_tests(void) {
   reset();
   assert(zflow_mac_capture_start(1, &entry, NULL) == 1);
   assert(mt_registered == 1 && mt_started == 1);
+  assert(g_raw_devices[0] == (MTDeviceRef)2);
+  assert(g_raw_surfaces[0][0] == 16030 && g_raw_surfaces[0][1] == 11490);
   assert(zflow_mac_capture_stop() == 0);
   assert(mt_stopped == 1 && mt_unregistered == 1);
+
+  // Without a size, raw touch still starts and reports the size as unknown.
+  mt_size_status = -1;
+  reset();
+  assert(zflow_mac_capture_start(1, &entry, NULL) == 1);
+  assert(g_raw_surfaces[0][0] == 0 && g_raw_surfaces[0][1] == 0);
+  assert(zflow_mac_capture_stop() == 0);
+  mt_size_status = 0;
+  mt_size_missing = true;
+  reset();
+  assert(zflow_mac_capture_start(1, &entry, NULL) == 1);
+  assert(g_raw_surfaces[0][0] == 0 && g_raw_surfaces[0][1] == 0);
+  assert(zflow_mac_capture_stop() == 0);
+  mt_size_missing = false;
+  assert(mt_started == 3 && mt_stopped == 3);
 }
 
 static void touch_tests(void) {
   reset();
+  g_raw_devices[0] = (MTDeviceRef)2;
+  g_raw_surfaces[0][0] = 16030;
+  g_raw_surfaces[0][1] = 11490;
   MTTouch touches[2] = {0};
   touches[0].state = 4;
   touches[0].identifier = 1;
@@ -581,14 +614,19 @@ static void touch_tests(void) {
   touches[1].identifier = 2;
   touches[1].normalized.pos = (MTPoint){0.5f, 0.25f};
   // A contact just past the pad edge keeps the frame, clamped.
-  contact_callback(NULL, touches, 2, 0, 0);
+  contact_callback((MTDeviceRef)2, touches, 2, 0, 0);
   ZFlowMacEvent captured;
   assert(zflow_mac_capture_poll(&captured) && captured.kind == ZFLOW_EVENT_TOUCH);
   assert(captured.contact_count == 2);
+  assert(captured.surface_width == 16030 && captured.surface_height == 11490);
   assert(captured.contacts[0].x == 1.0f && captured.contacts[0].y == 0.0f);
   assert(captured.contacts[1].x == 0.5f && captured.contacts[1].y == 0.25f);
+  // A device the bridge never sized reports an unknown size.
+  contact_callback((MTDeviceRef)3, touches, 2, 0, 0);
+  assert(zflow_mac_capture_poll(&captured));
+  assert(captured.surface_width == 0 && captured.surface_height == 0);
   touches[0].normalized.pos.x = NAN;
-  contact_callback(NULL, touches, 2, 0, 0);
+  contact_callback((MTDeviceRef)2, touches, 2, 0, 0);
   assert(!zflow_mac_capture_poll(&captured));
 }
 

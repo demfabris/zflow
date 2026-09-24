@@ -330,7 +330,7 @@ A backend advertises its supported subset. It MUST NOT invent phase or momentum 
 
 A touch snapshot carries contact identifier, position, pressure, major/minor size, orientation, tool type, and source dimensions when available. The target backend maps that snapshot to a virtual touch device.
 
-Positions and source dimensions are hundredths of a millimetre on the source surface, with the origin at its top-left corner. The Linux target exposes a 200 x 150 mm virtual touchpad at 30 units/mm and places each contact by millimetres with the source surface centered, clamped to the pad. A contact without source dimensions is treated as coming from a 100 x 73 mm surface. libinput's gesture thresholds and pointer acceleration are in millimetres, so they see the finger travel the source measured.
+Positions and source dimensions are hundredths of a millimetre on the source surface, with the origin at its top-left corner. The Mac source reads each trackpad's size from MultitouchSupport and assumes a Magic Trackpad 2 (160 x 115 mm) when it cannot. The Linux target exposes a 200 x 150 mm virtual touchpad at 30 units/mm and places each contact by millimetres with the source surface centered, clamped to the pad. A contact without source dimensions is treated as coming from a 100 x 73 mm surface. libinput's gesture thresholds and pointer acceleration are in millimetres, so they see the finger travel the source measured.
 
 Touch forwarding remains an experiment because Linux libinput requires a correctly classified touchpad and macOS lacks a public high-level gesture injection constructor.
 

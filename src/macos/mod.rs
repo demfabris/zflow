@@ -9,6 +9,7 @@ use std::{
     os::raw::c_char,
     path::PathBuf,
     pin::Pin,
+    sync::Once,
     time::{Duration, Instant},
 };
 
@@ -33,6 +34,13 @@ pub use link::{Crossing, LinkState, Links};
 // overflow its 512-command queue in one burst.
 const MAX_EVENTS_PER_DRAIN: usize = 256;
 const TOUCH_STALE_TIMEOUT: Duration = Duration::from_millis(150);
+/// A Magic Trackpad 2, 160 x 115 mm, in hundredths of a millimetre.
+const FALLBACK_TRACKPAD_SIZE: SourceDimensions = SourceDimensions {
+    width: 16_000,
+    height: 11_500,
+};
+/// 500 mm. A larger reported side is not a trackpad.
+const MAX_TRACKPAD_EXTENT: i32 = 50_000;
 const SECURE_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const SECURE_INPUT_RETURNED: &str = "Secure keyboard entry turned on in a Mac app, so typing \
     could not be shared. Input returned to the Mac";
@@ -767,12 +775,13 @@ fn native_frame(event: NativeEvent) -> Result<Option<CapturedDeviceFrame>> {
             ..CaptureFrame::default()
         },
         kind if kind == NativeEventKind::Touch as u32 => {
+            let size = trackpad_size(event.surface_width, event.surface_height);
             let count = usize::from(event.contact_count).min(MAX_TOUCHPAD_CONTACTS);
             let contacts = event.contacts[..count].iter().filter_map(|contact| {
                 let id = u32::try_from(contact.id).ok()?;
-                let x = normalized_axis(contact.x);
+                let x = surface_axis(contact.x, size.width);
                 // MultitouchSupport uses a bottom-left origin; Linux touchpads use top-left.
-                let y = normalized_axis(1.0 - contact.y);
+                let y = surface_axis(1.0 - contact.y, size.height);
                 Some(TouchContact {
                     id: ContactId(id),
                     x,
@@ -782,10 +791,7 @@ fn native_frame(event: NativeEvent) -> Result<Option<CapturedDeviceFrame>> {
                     minor: None,
                     orientation_millidegrees: None,
                     tool: TouchTool::Finger,
-                    source_dimensions: Some(SourceDimensions {
-                        width: u16::MAX.into(),
-                        height: u16::MAX.into(),
-                    }),
+                    source_dimensions: Some(size),
                 })
             });
             let state = TouchState::new(contacts)
@@ -813,8 +819,30 @@ fn touch_frame(state: TouchState) -> CapturedDeviceFrame {
     }
 }
 
-fn normalized_axis(value: f32) -> i32 {
-    (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as i32
+/// The trackpad's size in hundredths of a millimetre, as MultitouchSupport
+/// reported it, or a Magic Trackpad 2's when the report is missing or absurd.
+fn trackpad_size(width: i32, height: i32) -> SourceDimensions {
+    let plausible = |extent: i32| (1..=MAX_TRACKPAD_EXTENT).contains(&extent);
+    if plausible(width) && plausible(height) {
+        return SourceDimensions {
+            width: width as u32,
+            height: height as u32,
+        };
+    }
+    static LOGGED: Once = Once::new();
+    LOGGED.call_once(|| {
+        tracing::warn!(
+            width,
+            height,
+            "trackpad size unavailable; assuming a Magic Trackpad 2"
+        );
+    });
+    FALLBACK_TRACKPAD_SIZE
+}
+
+/// Converts a 0..1 MultitouchSupport position to hundredths of a millimetre.
+fn surface_axis(value: f32, extent: u32) -> i32 {
+    (f64::from(value.clamp(0.0, 1.0)) * f64::from(extent)).round() as i32
 }
 
 fn pressed_state(pressed: u8) -> KeyState {
@@ -978,6 +1006,8 @@ struct NativeEvent {
     pressed: u8,
     contact_count: u8,
     padding: [u8; 2],
+    surface_width: i32,
+    surface_height: i32,
     contacts: [NativeContact; MAX_TOUCHPAD_CONTACTS],
 }
 
@@ -1261,6 +1291,65 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), stop_requested(&mut receiver))
             .await
             .unwrap();
+    }
+
+    fn touch_event(width: i32, height: i32, contacts: &[(i32, f32, f32)]) -> NativeEvent {
+        let mut event = NativeEvent {
+            kind: NativeEventKind::Touch as u32,
+            contact_count: contacts.len() as u8,
+            surface_width: width,
+            surface_height: height,
+            ..NativeEvent::default()
+        };
+        for (slot, &(id, x, y)) in event.contacts.iter_mut().zip(contacts) {
+            *slot = NativeContact { id, x, y };
+        }
+        event
+    }
+
+    fn touch_state(event: NativeEvent) -> TouchState {
+        native_frame(event)
+            .unwrap()
+            .unwrap()
+            .frame
+            .touch_snapshot
+            .unwrap()
+    }
+
+    #[test]
+    fn trackpad_contacts_are_sent_in_hundredths_of_a_millimetre() {
+        // MultitouchSupport's origin is bottom-left; the wire's is top-left.
+        let state = touch_state(touch_event(
+            15_600,
+            9_600,
+            &[(1, 0.25, 0.75), (2, 1.0, 0.0)],
+        ));
+        let size = SourceDimensions {
+            width: 15_600,
+            height: 9_600,
+        };
+        let first = state.get(ContactId(1)).unwrap();
+        assert_eq!((first.x, first.y), (3_900, 2_400));
+        assert_eq!(first.source_dimensions, Some(size));
+        let corner = state.get(ContactId(2)).unwrap();
+        assert_eq!((corner.x, corner.y), (15_600, 9_600));
+    }
+
+    #[test]
+    fn unknown_or_absurd_trackpad_size_falls_back_to_a_magic_trackpad() {
+        for (width, height) in [(0, 0), (-1, 11_000), (16_000, 50_001), (i32::MAX, 1)] {
+            let state = touch_state(touch_event(width, height, &[(1, 0.5, 0.5)]));
+            let contact = state.get(ContactId(1)).unwrap();
+            assert_eq!((contact.x, contact.y), (8_000, 5_750));
+            assert_eq!(contact.source_dimensions, Some(FALLBACK_TRACKPAD_SIZE));
+        }
+        assert_eq!(
+            trackpad_size(50_000, 1),
+            SourceDimensions {
+                width: 50_000,
+                height: 1,
+            }
+        );
     }
 
     #[test]
