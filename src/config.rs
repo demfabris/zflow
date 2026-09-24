@@ -250,7 +250,14 @@ pub(crate) fn save_text(path: &Path, text: &str) -> Result<(), ConfigError> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| ConfigError::InvalidPath(path.to_owned()))?;
-    let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    // Random rather than the PID: a file left by a SIGKILLed writer must not
+    // block later saves once the PID is reused.
+    let mut suffix = [0_u8; 8];
+    getrandom::fill(&mut suffix).map_err(|error| ConfigError::Write {
+        path: parent.to_owned(),
+        source: std::io::Error::other(error),
+    })?;
+    let temporary = parent.join(format!(".{file_name}.tmp-{}", encode_hex(&suffix)));
     #[cfg(unix)]
     let existing_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
@@ -298,6 +305,14 @@ pub(crate) fn save_text(path: &Path, text: &str) -> Result<(), ConfigError> {
             source,
         });
     }
+    // Without this the rename itself may not survive a crash.
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ConfigError::Write {
+            path: parent.to_owned(),
+            source,
+        })?;
     Ok(())
 }
 
@@ -467,6 +482,29 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn save_ignores_a_temporary_file_left_by_a_killed_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let leftover = directory
+            .path()
+            .join(format!(".zflow.toml.tmp-{}", std::process::id()));
+        fs::write(&leftover, "partial").unwrap();
+
+        Config::default().save(&path).unwrap();
+        Config::default().save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), Config::default());
+        let mut names = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [leftover.file_name().unwrap(), "zflow.toml".as_ref()]
+        );
     }
 
     #[test]
