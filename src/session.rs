@@ -9,7 +9,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    capture::{CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS},
+    capture::{
+        CaptureFrame, CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS,
+    },
     config::{Config, PlayoutMode},
     core::{
         ClockConfig, ClockMapper, ControlSequence, HeldState, HidUsage, HidUsagePage,
@@ -491,7 +493,7 @@ async fn run_session(
     let mut probe_context = None;
     let mut control_rate = EventRate::new(MAX_CONTROL_MESSAGES_PER_SECOND);
     let mut datagram_rate = EventRate::new(MAX_DATAGRAMS_PER_SECOND);
-    let mut next_probe_at = add_duration(clock.now(), PROBE_INTERVAL);
+    let mut next_probe_at = clock.now().saturating_add(PROBE_INTERVAL);
     let mut last_tick_at = clock.now();
 
     let run_result: Result<()> = async {
@@ -514,7 +516,7 @@ async fn run_session(
         if probe_context != active_context {
             pending_probes.clear();
             probe_context = active_context;
-            next_probe_at = add_duration(clock.now(), PROBE_INTERVAL);
+            next_probe_at = clock.now().saturating_add(PROBE_INTERVAL);
         }
         let deadline = session_deadline(
             sender.as_ref(), &receiver, playout.as_ref(), !pending_controls.is_empty(),
@@ -568,7 +570,7 @@ async fn run_session(
                         channels.control_send.send_control(&enter).await?;
                         sender = Some(next);
                     }
-                    SessionCommand::Capture(frame) => {
+                    SessionCommand::Capture(mut frame) => {
                         // Frames queued before the activation ended are stale.
                         let Some(active) = sender.as_mut() else {
                             let mut metrics = lock_metrics(&metrics);
@@ -583,8 +585,9 @@ async fn run_session(
                             .at(captured_at)
                             .min(clock.now())
                             .max(active.last_observed_time());
-                        let frame = capture_merge.merge(frame);
-                        send_capture(&mut channels, active, &negotiated, frame, at).await?;
+                        let transitions = capture_merge.merge(&mut frame);
+                        send_capture(&mut channels, active, &negotiated, frame.frame, transitions, at)
+                            .await?;
                         lock_metrics(&metrics)
                             .capture_to_send_us
                             .record(captured_at.elapsed().as_secs_f64() * 1_000_000.0);
@@ -825,7 +828,7 @@ async fn run_session(
                     );
                 }
                 if now >= next_probe_at {
-                    next_probe_at = add_duration(now, PROBE_INTERVAL);
+                    next_probe_at = now.saturating_add(PROBE_INTERVAL);
                 }
             }
         }
@@ -885,7 +888,7 @@ fn session_deadline(
         sender.and_then(Sender::next_deadline),
         receiver.lease_deadline(),
         playout.and_then(ReceiverPlayout::next_deadline),
-        (catch_up || pending_controls).then(|| add_duration(last_tick_at, SESSION_TICK)),
+        (catch_up || pending_controls).then(|| last_tick_at.saturating_add(SESSION_TICK)),
         receiver.active_context().map(|_| next_probe_at),
     ]
     .into_iter()
@@ -1111,18 +1114,22 @@ struct CaptureMerger {
 }
 
 impl CaptureMerger {
-    fn merge(&mut self, mut captured: CapturedDeviceFrame) -> CapturedDeviceFrame {
+    /// Takes the frame's transitions and returns the presses and releases of
+    /// the union of all devices. Repeats never change it.
+    fn merge(&mut self, captured: &mut CapturedDeviceFrame) -> Vec<(CaptureMember, bool)> {
         let mut aggregate = Vec::with_capacity(captured.frame.transitions.len());
-        for transition in captured.frame.transitions {
+        for transition in captured.frame.transitions.drain(..) {
             let (member, state) = match transition {
                 CaptureTransition::Key { usage, state } => (CaptureMember::Key(usage), state),
                 CaptureTransition::Button { button, state } => {
                     (CaptureMember::Button(button), state)
                 }
             };
-            if state == KeyState::Repeat {
-                continue;
-            }
+            let pressed = match state {
+                KeyState::Pressed => true,
+                KeyState::Released => false,
+                KeyState::Repeat => continue,
+            };
             let held_before = self
                 .held_by_device
                 .values()
@@ -1131,10 +1138,10 @@ impl CaptureMerger {
                 .held_by_device
                 .entry(captured.device_path.clone())
                 .or_default();
-            let changed = match state {
-                KeyState::Pressed => device.insert(member),
-                KeyState::Released => device.remove(&member),
-                KeyState::Repeat => unreachable!(),
+            let changed = if pressed {
+                device.insert(member)
+            } else {
+                device.remove(&member)
             };
             if !changed {
                 continue;
@@ -1144,15 +1151,11 @@ impl CaptureMerger {
                 .values()
                 .any(|held| held.contains(&member));
             if held_before != held_after {
-                aggregate.push(match member {
-                    CaptureMember::Key(usage) => CaptureTransition::Key { usage, state },
-                    CaptureMember::Button(button) => CaptureTransition::Button { button, state },
-                });
+                aggregate.push((member, pressed));
             }
         }
         self.held_by_device.retain(|_, held| !held.is_empty());
-        captured.frame.transitions = aggregate;
-        captured
+        aggregate
     }
 
     fn clear(&mut self) {
@@ -1164,15 +1167,16 @@ async fn send_capture(
     channels: &mut InputChannels,
     sender: &mut Sender,
     negotiated: &NegotiatedSession,
-    captured: CapturedDeviceFrame,
+    frame: CaptureFrame,
+    transitions: Vec<(CaptureMember, bool)>,
     now: MonotonicTimeMicros,
 ) -> Result<()> {
     let touch = negotiated
         .capabilities
         .contains(InputCapability::Touch)
-        .then_some(captured.frame.touch_snapshot)
+        .then_some(frame.touch_snapshot)
         .flatten();
-    let motion = captured.frame.motion;
+    let motion = frame.motion;
     match touch {
         Some(state) if sender.held_state().active_touch.is_empty() && !state.is_empty() => {
             let begin = sender.touch_begin(state, now)?;
@@ -1200,36 +1204,14 @@ async fn send_capture(
         }
         _ => {}
     }
-    for transition in captured.frame.transitions {
-        let message = match transition {
-            CaptureTransition::Key {
-                usage,
-                state: KeyState::Pressed,
-            } => Some(sender.key_down(usage, now)?),
-            CaptureTransition::Key {
-                usage,
-                state: KeyState::Released,
-            } => Some(sender.key_up(usage, now)?),
-            CaptureTransition::Key {
-                state: KeyState::Repeat,
-                ..
-            } => None,
-            CaptureTransition::Button {
-                button,
-                state: KeyState::Pressed,
-            } => Some(sender.button_down(button, now)?),
-            CaptureTransition::Button {
-                button,
-                state: KeyState::Released,
-            } => Some(sender.button_up(button, now)?),
-            CaptureTransition::Button {
-                state: KeyState::Repeat,
-                ..
-            } => None,
+    for (member, pressed) in transitions {
+        let message = match (member, pressed) {
+            (CaptureMember::Key(usage), true) => sender.key_down(usage, now)?,
+            (CaptureMember::Key(usage), false) => sender.key_up(usage, now)?,
+            (CaptureMember::Button(button), true) => sender.button_down(button, now)?,
+            (CaptureMember::Button(button), false) => sender.button_up(button, now)?,
         };
-        if let Some(message) = message {
-            channels.control_send.send_control(&message).await?;
-        }
+        channels.control_send.send_control(&message).await?;
     }
     Ok(())
 }
@@ -1283,7 +1265,7 @@ fn pending_control_is_ready(
         update_clock_metrics(&mut lock_metrics(metrics), clock);
     }
     let mapped_capture_time = clock.map(anchor.sender_capture_time)?;
-    Ok(add_duration(mapped_capture_time, delay) <= now)
+    Ok(mapped_capture_time.saturating_add(delay) <= now)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1715,21 +1697,24 @@ fn emit_event(sender: &mpsc::Sender<SessionEvent>, event: SessionEvent) -> Resul
 }
 
 fn is_synthetic_release(effect: &ReceiverEffect) -> bool {
-    matches!(
-        effect,
+    match effect {
         ReceiverEffect::Key {
             pressed: false,
             synthetic: true,
             ..
-        } | ReceiverEffect::Button {
+        }
+        | ReceiverEffect::Button {
             pressed: false,
             synthetic: true,
             ..
-        } | ReceiverEffect::TouchReplaced {
+        } => true,
+        // A synthetic replacement can carry contacts; only an empty one lifts.
+        ReceiverEffect::TouchReplaced {
+            state,
             synthetic: true,
-            ..
-        }
-    )
+        } => state.is_empty(),
+        _ => false,
+    }
 }
 
 fn update_clock_metrics(metrics: &mut SessionMetrics, clock: &ClockMapper) {
@@ -1755,13 +1740,6 @@ fn random_nonzero_u64() -> Result<u64> {
             return Ok(value);
         }
     }
-}
-
-fn add_duration(time: MonotonicTimeMicros, duration: Duration) -> MonotonicTimeMicros {
-    MonotonicTimeMicros(
-        time.0
-            .saturating_add(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)),
-    )
 }
 
 struct MonotonicClock(Instant);
@@ -1817,7 +1795,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        capture::CaptureFrame,
         core::{
             ActivationId, AnchorKind, CumulativeMotion, HidUsage, MotionDelta, PointerButton,
             ProtocolVersion, SessionEpoch, SnapshotAck,
@@ -2045,47 +2022,53 @@ mod tests {
     fn capture_merge_keeps_overlapping_devices_held_until_the_last_release() {
         let key = HidUsage::keyboard(0xe0);
         let mut merge = CaptureMerger::default();
-        let frame = |device: &str, state| CapturedDeviceFrame {
-            device_path: device.into(),
-            frame: CaptureFrame {
-                transitions: vec![CaptureTransition::Key { usage: key, state }],
-                motion: MotionDelta::default(),
-                touch_snapshot: None,
-                event_count: 1,
-            },
-            captured_at: Instant::now(),
+        let mut frame = |device: &str, state| {
+            merge.merge(&mut CapturedDeviceFrame {
+                device_path: device.into(),
+                frame: CaptureFrame {
+                    transitions: vec![CaptureTransition::Key { usage: key, state }],
+                    motion: MotionDelta::default(),
+                    touch_snapshot: None,
+                    event_count: 1,
+                },
+                captured_at: Instant::now(),
+            })
         };
 
-        assert_eq!(
-            merge
-                .merge(frame("/dev/input/one", KeyState::Pressed))
-                .frame
-                .transitions
-                .len(),
-            1
-        );
-        assert!(
-            merge
-                .merge(frame("/dev/input/two", KeyState::Pressed))
-                .frame
-                .transitions
-                .is_empty()
-        );
-        assert!(
-            merge
-                .merge(frame("/dev/input/one", KeyState::Released))
-                .frame
-                .transitions
-                .is_empty()
-        );
-        assert_eq!(
-            merge
-                .merge(frame("/dev/input/two", KeyState::Released))
-                .frame
-                .transitions
-                .len(),
-            1
-        );
+        let key = CaptureMember::Key(key);
+        assert_eq!(frame("/dev/input/one", KeyState::Pressed), [(key, true)]);
+        assert!(frame("/dev/input/two", KeyState::Pressed).is_empty());
+        assert!(frame("/dev/input/one", KeyState::Repeat).is_empty());
+        assert!(frame("/dev/input/one", KeyState::Released).is_empty());
+        assert_eq!(frame("/dev/input/two", KeyState::Released), [(key, false)]);
+    }
+
+    #[test]
+    fn only_an_empty_synthetic_touch_counts_as_a_release() {
+        let touching = TouchState::new([crate::core::TouchContact {
+            id: crate::core::ContactId(1),
+            x: 0,
+            y: 0,
+            pressure: None,
+            major: None,
+            minor: None,
+            orientation_millidegrees: None,
+            tool: crate::core::TouchTool::Finger,
+            source_dimensions: None,
+        }])
+        .unwrap();
+        let touch = |state: &TouchState, synthetic| ReceiverEffect::TouchReplaced {
+            state: state.clone(),
+            synthetic,
+        };
+        assert!(is_synthetic_release(&touch(&TouchState::default(), true)));
+        assert!(!is_synthetic_release(&touch(&touching, true)));
+        assert!(!is_synthetic_release(&touch(&TouchState::default(), false)));
+        assert!(is_synthetic_release(&ReceiverEffect::Key {
+            key: HidUsage::keyboard(4),
+            pressed: false,
+            synthetic: true,
+        }));
     }
 
     #[test]

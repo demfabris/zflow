@@ -318,7 +318,7 @@ impl Sender {
             message.sequence,
             PendingSnapshot {
                 snapshot,
-                ack_deadline: add_duration(now, self.config.receiver_lease),
+                ack_deadline: now.saturating_add(self.config.receiver_lease),
             },
         );
         self.last_snapshot_at = now;
@@ -331,15 +331,15 @@ impl Sender {
         if !self.remote {
             return None;
         }
-        let periodic = add_duration(self.last_snapshot_at, self.config.checkpoint_interval);
+        let periodic = self
+            .last_snapshot_at
+            .saturating_add(self.config.checkpoint_interval);
         let dirty = self
             .dirty_since
-            .map(|since| add_duration(since, self.config.checkpoint_interval));
+            .map(|since| since.saturating_add(self.config.checkpoint_interval));
         let renewal = (!self.held.is_neutral()).then(|| {
-            add_duration(
-                self.last_snapshot_at,
-                one_third_rounded_down(self.config.receiver_lease),
-            )
+            self.last_snapshot_at
+                .saturating_add(one_third_rounded_down(self.config.receiver_lease))
         });
         let ack_timeout = self
             .pending_snapshots
@@ -367,16 +367,18 @@ impl Sender {
             ));
         }
 
-        let periodic_due =
-            add_duration(self.last_snapshot_at, self.config.checkpoint_interval) <= now;
+        let periodic_due = self
+            .last_snapshot_at
+            .saturating_add(self.config.checkpoint_interval)
+            <= now;
         let dirty_due = self
             .dirty_since
-            .is_some_and(|since| add_duration(since, self.config.checkpoint_interval) <= now);
+            .is_some_and(|since| since.saturating_add(self.config.checkpoint_interval) <= now);
         let renewal_due = !self.held.is_neutral()
-            && add_duration(
-                self.last_snapshot_at,
-                one_third_rounded_down(self.config.receiver_lease),
-            ) <= now;
+            && self
+                .last_snapshot_at
+                .saturating_add(one_third_rounded_down(self.config.receiver_lease))
+                <= now;
         if periodic_due || dirty_due || renewal_due {
             return self.snapshot(now).map(Box::new).map(SenderTick::Checkpoint);
         }
@@ -475,11 +477,6 @@ impl Sender {
         self.last_observed_time = now;
         Ok(())
     }
-}
-
-fn add_duration(time: MonotonicTimeMicros, duration: Duration) -> MonotonicTimeMicros {
-    let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
-    MonotonicTimeMicros(time.0.saturating_add(micros))
 }
 
 fn one_third_rounded_down(duration: Duration) -> Duration {

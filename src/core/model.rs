@@ -4,7 +4,10 @@
 //! encoding is still an open protocol decision, while the channel split and
 //! state carried by each family are fixed by the specification.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +38,15 @@ pub struct ContactId(pub u32);
 /// A timestamp from one process's monotonic clock, with no shared origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MonotonicTimeMicros(pub u64);
+
+impl MonotonicTimeMicros {
+    pub fn saturating_add(self, duration: Duration) -> Self {
+        Self(
+            self.0
+                .saturating_add(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContext {

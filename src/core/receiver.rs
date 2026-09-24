@@ -522,12 +522,7 @@ fn rejected(session: SessionContext, reason: RejectionReason) -> ReceiverEffect 
 }
 
 fn refresh_lease(state: &mut ActivationState, now: MonotonicTimeMicros, lease: Duration) {
-    state.lease_deadline = (!state.held.is_neutral()).then(|| add_duration(now, lease));
-}
-
-fn add_duration(time: MonotonicTimeMicros, duration: Duration) -> MonotonicTimeMicros {
-    let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
-    MonotonicTimeMicros(time.0.saturating_add(micros))
+    state.lease_deadline = (!state.held.is_neutral()).then(|| now.saturating_add(lease));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
