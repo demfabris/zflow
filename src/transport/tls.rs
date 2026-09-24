@@ -27,7 +27,7 @@ use crate::identity::Identity;
 use super::TransportError;
 
 pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/1";
-pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/1";
+pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/2";
 
 /// A Quinn client configuration that authenticates one exact peer SPKI.
 #[derive(Clone)]
@@ -352,10 +352,9 @@ fn pairing_server_transport_config() -> quinn::TransportConfig {
 
 fn pairing_transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
-    // The initiator opens one metadata stream. Each side may open one bounded
-    // unidirectional stream for the post-exchange readiness handshake.
+    // The initiator opens the one pairing stream. Nothing else is allowed.
     config
-        .max_concurrent_uni_streams(1_u8.into())
+        .max_concurrent_uni_streams(0_u8.into())
         .datagram_receive_buffer_size(None)
         .datagram_send_buffer_size(0)
         .keep_alive_interval(None);

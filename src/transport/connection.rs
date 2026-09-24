@@ -11,6 +11,7 @@ use std::{
 use bytes::Bytes;
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt};
 use rustls::pki_types::CertificateDer;
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::{
@@ -18,8 +19,8 @@ use crate::{
         MotionFrame, NegotiatedSession, NegotiationOffer, ProbeMessage, ReliableControlMessage,
     },
     wire::{
-        MAX_PAIRING_PAYLOAD_BYTES, MAX_RELIABLE_PAYLOAD_BYTES, PairingOffer, WireMessage,
-        decode as decode_wire, encode as encode_wire,
+        Family, MAX_PAIRING_PAYLOAD_BYTES, MAX_RELIABLE_PAYLOAD_BYTES, PairingOffer, WireMessage,
+        decode as decode_wire, decode_family, encode as encode_wire,
     },
 };
 
@@ -30,9 +31,8 @@ use super::{
 
 const SERVER_NAME_PLACEHOLDER: &str = "zflow.invalid";
 const CONTROL_STREAM_PREFACE: &[u8] = b"zflow-control-v1\0";
-const PAIRING_STREAM_PREFACE: &[u8] = b"zflow-pair-v1\0";
-const PAIRING_CLIENT_READY: &[u8] = b"zflow-pair-ready-v1\0";
-const PAIRING_SERVER_ACK: &[u8] = b"zflow-pair-ack-v1\0";
+const PAIRING_STREAM_PREFACE: &[u8] = b"zflow-pair-v2\0";
+const PAIRING_COMMITMENT_LABEL: &[u8] = b"zflow pairing commitment v2\0";
 const MAX_CONTROL_FRAME_BYTES: usize = MAX_RELIABLE_PAYLOAD_BYTES + 1_024 + 64;
 const MAX_PAIRING_FRAME_BYTES: usize = MAX_PAIRING_PAYLOAD_BYTES + 64;
 const CRITICAL_STREAM_ERROR: VarInt = VarInt::from_u32(0x100);
@@ -696,7 +696,12 @@ impl PairingConnection {
         self.connection.remote_address()
     }
 
-    /// Exchange one bounded metadata offer on the pairing-only stream.
+    /// Exchange bounded offers by commit then reveal on the one pairing stream.
+    ///
+    /// The initiator sends a hash of its offer, the responder answers with its
+    /// offer, and only then does the initiator reveal. Each side fixes its offer
+    /// before it sees the other one, so a man in the middle cannot search for
+    /// offers that make the codes on both screens match.
     pub async fn exchange_offer(
         &mut self,
         local: &PairingOffer,
@@ -708,21 +713,65 @@ impl PairingConnection {
                 maximum: MAX_PAIRING_FRAME_BYTES,
             });
         }
-        let length = u32::try_from(encoded.len()).expect("pairing frame bound fits u32");
-        self.send
-            .write_all(&length.to_be_bytes())
-            .await
-            .map_err(|error| TransportError::PairingStream(error.to_string()))?;
-        self.send
-            .write_all(&encoded)
-            .await
-            .map_err(|error| TransportError::PairingStream(error.to_string()))?;
+        match self.role {
+            PairingRole::Client => {
+                self.write(&pairing_commitment(&encoded)).await?;
+                let frame = self.read_frame().await?;
+                let peer = self.decode_offer(&frame)?;
+                self.write_frame(&encoded).await?;
+                Ok(peer)
+            }
+            PairingRole::Server => {
+                let mut commitment = [0_u8; 32];
+                self.read_exact(&mut commitment).await?;
+                self.write_frame(&encoded).await?;
+                let frame = self.read_frame().await?;
+                if pairing_commitment(&frame) != commitment {
+                    close_protocol(
+                        &self.connection,
+                        b"pairing offer does not match its commitment",
+                    );
+                    return Err(TransportError::PairingCommitmentMismatch);
+                }
+                self.decode_offer(&frame)
+            }
+        }
+    }
 
-        let mut length = [0_u8; 4];
-        self.receive
-            .read_exact(&mut length)
+    fn decode_offer(&self, frame: &[u8]) -> Result<PairingOffer, TransportError> {
+        // Only the pairing decoder is reachable before trust exists.
+        match decode_family(frame, Family::Pairing)?.message {
+            WireMessage::Pairing(offer) => Ok(offer),
+            _ => {
+                close_protocol(&self.connection, b"message on pairing-only stream");
+                Err(TransportError::InvalidPairingFamily)
+            }
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        self.send
+            .write_all(bytes)
             .await
-            .map_err(|error| TransportError::PairingStream(error.to_string()))?;
+            .map_err(|error| TransportError::PairingStream(error.to_string()))
+    }
+
+    async fn write_frame(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+        let length = u32::try_from(frame.len()).expect("pairing frame bound fits u32");
+        self.write(&length.to_be_bytes()).await?;
+        self.write(frame).await
+    }
+
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), TransportError> {
+        self.receive
+            .read_exact(buffer)
+            .await
+            .map_err(|error| TransportError::PairingStream(error.to_string()))
+    }
+
+    async fn read_frame(&mut self) -> Result<Vec<u8>, TransportError> {
+        let mut length = [0_u8; 4];
+        self.read_exact(&mut length).await?;
         let length = u32::from_be_bytes(length) as usize;
         if length == 0 || length > MAX_PAIRING_FRAME_BYTES {
             close_protocol(&self.connection, b"invalid pairing frame size");
@@ -732,135 +781,8 @@ impl PairingConnection {
             });
         }
         let mut frame = vec![0_u8; length];
-        self.receive
-            .read_exact(&mut frame)
-            .await
-            .map_err(|error| TransportError::PairingStream(error.to_string()))?;
-        self.send
-            .finish()
-            .map_err(|error| TransportError::PairingStream(error.to_string()))?;
-        self.receive
-            .read_to_end(0)
-            .await
-            .map_err(|error| TransportError::PairingStream(error.to_string()))?;
-        match self.send.stopped().await {
-            Ok(None) => {}
-            Ok(Some(code)) => {
-                return Err(TransportError::PairingStream(format!(
-                    "peer stopped the pairing stream with code {code}"
-                )));
-            }
-            Err(error) => {
-                return Err(TransportError::PairingStream(format!(
-                    "offer acknowledgement failed: {error}"
-                )));
-            }
-        }
-        let offer = match decode_wire(&frame)?.message {
-            WireMessage::Pairing(offer) => offer,
-            _ => {
-                close_protocol(&self.connection, b"message on pairing-only stream");
-                return Err(TransportError::InvalidPairingFamily);
-            }
-        };
-        self.synchronize().await?;
-        Ok(offer)
-    }
-
-    async fn synchronize(&self) -> Result<(), TransportError> {
-        match self.role {
-            PairingRole::Client => {
-                let mut ready = self.connection.open_uni().await.map_err(|error| {
-                    TransportError::PairingStream(format!(
-                        "client readiness stream failed: {error}"
-                    ))
-                })?;
-                ready
-                    .write_all(PAIRING_CLIENT_READY)
-                    .await
-                    .map_err(|error| {
-                        TransportError::PairingStream(format!(
-                            "client readiness write failed: {error}"
-                        ))
-                    })?;
-                ready.finish().map_err(|error| {
-                    TransportError::PairingStream(format!(
-                        "client readiness finish failed: {error}"
-                    ))
-                })?;
-
-                let mut ack = self.connection.accept_uni().await.map_err(|error| {
-                    TransportError::PairingStream(format!(
-                        "server acknowledgement stream failed: {error}"
-                    ))
-                })?;
-                let received =
-                    ack.read_to_end(PAIRING_SERVER_ACK.len())
-                        .await
-                        .map_err(|error| {
-                            TransportError::PairingStream(format!(
-                                "server acknowledgement read failed: {error}"
-                            ))
-                        })?;
-                if received != PAIRING_SERVER_ACK {
-                    close_protocol(&self.connection, b"invalid pairing acknowledgement");
-                    return Err(TransportError::PairingStream(
-                        "invalid pairing acknowledgement".into(),
-                    ));
-                }
-            }
-            PairingRole::Server => {
-                let mut ready = self.connection.accept_uni().await.map_err(|error| {
-                    TransportError::PairingStream(format!(
-                        "client readiness stream failed: {error}"
-                    ))
-                })?;
-                let received = ready
-                    .read_to_end(PAIRING_CLIENT_READY.len())
-                    .await
-                    .map_err(|error| {
-                        TransportError::PairingStream(format!(
-                            "client readiness read failed: {error}"
-                        ))
-                    })?;
-                if received != PAIRING_CLIENT_READY {
-                    close_protocol(&self.connection, b"invalid pairing readiness");
-                    return Err(TransportError::PairingStream(
-                        "invalid pairing readiness".into(),
-                    ));
-                }
-
-                let mut ack = self.connection.open_uni().await.map_err(|error| {
-                    TransportError::PairingStream(format!(
-                        "server acknowledgement stream failed: {error}"
-                    ))
-                })?;
-                ack.write_all(PAIRING_SERVER_ACK).await.map_err(|error| {
-                    TransportError::PairingStream(format!(
-                        "server acknowledgement write failed: {error}"
-                    ))
-                })?;
-                ack.finish().map_err(|error| {
-                    TransportError::PairingStream(format!(
-                        "server acknowledgement finish failed: {error}"
-                    ))
-                })?;
-                match ack.stopped().await {
-                    Ok(None) => {}
-                    Ok(Some(code)) => {
-                        return Err(TransportError::PairingStream(format!(
-                            "peer stopped the pairing acknowledgement with code {code}"
-                        )));
-                    }
-                    Err(error) => {
-                        return Err(TransportError::PairingStream(format!(
-                            "server acknowledgement delivery failed: {error}"
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.read_exact(&mut frame).await?;
+        Ok(frame)
     }
 
     pub fn close(&self) {
@@ -947,6 +869,14 @@ fn verify_connection(
     Ok(presented)
 }
 
+fn pairing_commitment(encoded_offer: &[u8]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(PAIRING_COMMITMENT_LABEL)
+        .chain_update(encoded_offer)
+        .finalize()
+        .into()
+}
+
 fn close_critical(connection: &Connection, reason: &'static [u8]) {
     connection.close(CRITICAL_STREAM_ERROR, reason);
 }
@@ -1018,6 +948,63 @@ mod tests {
         assert!(!queue.enqueue(
             PendingDatagramClass::Probe,
             Bytes::from_static(b"closed probe")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+    use crate::{
+        identity::Identity,
+        transport::{pairing_client_config, pairing_server_config},
+        wire::PairingMethod,
+    };
+
+    fn offer(label: &str) -> PairingOffer {
+        PairingOffer {
+            handshake_nonce: [0x11; 32],
+            method: PairingMethod::ShortAuthenticationString,
+            device_label: Some(label.into()),
+            input_port: 43119,
+            input_candidates: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn responder_rejects_an_offer_that_does_not_match_the_commitment() {
+        let client_directory = tempfile::tempdir().unwrap();
+        let server_directory = tempfile::tempdir().unwrap();
+        let client_identity = Identity::load_or_create(client_directory.path()).unwrap();
+        let server_identity = Identity::load_or_create(server_directory.path()).unwrap();
+        let client_config = pairing_client_config(&client_identity).unwrap();
+        let server_config = pairing_server_config(&server_identity).unwrap();
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let server_endpoint = Endpoint::server(server_config.quinn_config(), loopback).unwrap();
+        let server_address = server_endpoint.local_addr().unwrap();
+        let client_endpoint = Endpoint::client(loopback).unwrap();
+        let (client, server) = tokio::join!(
+            connect_pairing(&client_endpoint, server_address, &client_config),
+            async { accept_pairing(server_endpoint.accept().await.unwrap(), &server_config).await }
+        );
+        let (mut client, mut server) = (client.unwrap(), server.unwrap());
+
+        // A man in the middle commits to one offer, sees the responder's offer,
+        // then tries to reveal a different one.
+        let committed = encode_wire(&WireMessage::Pairing(offer("committed"))).unwrap();
+        let revealed = encode_wire(&WireMessage::Pairing(offer("revealed"))).unwrap();
+        let cheat = async {
+            client.write(&pairing_commitment(&committed)).await.unwrap();
+            client.read_frame().await.unwrap();
+            client.write_frame(&revealed).await.unwrap();
+        };
+        let server_offer = offer("server");
+        let (result, ()) = tokio::join!(server.exchange_offer(&server_offer), cheat);
+        assert!(matches!(
+            result,
+            Err(TransportError::PairingCommitmentMismatch)
         ));
     }
 }
