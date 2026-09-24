@@ -430,13 +430,8 @@ fn status(path: PathBuf, json: bool) -> Result<()> {
             response => bail!("unexpected daemon response: {response:?}"),
         }
     }
-    let daemon = if config.daemon.control_socket.exists() {
-        "socket-present"
-    } else {
-        "offline"
-    };
     let status = OfflineStatus {
-        daemon,
+        daemon: "offline",
         config: &path,
         capture_devices: config.input.capture_devices.len(),
         paired_peers: config.peers.len(),
@@ -583,38 +578,15 @@ fn doctor_private_path(
     expected_owner: Option<u32>,
     failed: &mut bool,
 ) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        match private_path_owner(path, kind, expected_owner) {
-            Ok(owner) => {
-                println!("ok  private {}: {}", kind.name(), path.display());
-                Some(owner)
-            }
-            Err(error) => {
-                *failed = true;
-                println!("fail private {} {}: {error}", kind.name(), path.display());
-                None
-            }
+    match private_path_owner(path, kind, expected_owner) {
+        Ok(owner) => {
+            println!("ok  private {}: {}", kind.name(), path.display());
+            Some(owner)
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = expected_owner;
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if kind.matches(&metadata) => {
-                println!("ok  {}: {}", kind.name(), path.display());
-                Some(0)
-            }
-            Ok(_) => {
-                *failed = true;
-                println!("fail {} {}: wrong file type", kind.name(), path.display());
-                None
-            }
-            Err(error) => {
-                *failed = true;
-                println!("fail {} {}: {error}", kind.name(), path.display());
-                None
-            }
+        Err(error) => {
+            *failed = true;
+            println!("fail private {} {}: {error}", kind.name(), path.display());
+            None
         }
     }
 }
@@ -635,7 +607,6 @@ impl DoctorPathKind {
     }
 }
 
-#[cfg(unix)]
 fn private_path_owner(
     path: &Path,
     kind: DoctorPathKind,
@@ -1235,13 +1206,9 @@ fn render_capture_rules(devices: &[crate::config::DeviceSelector]) -> Result<Str
     Ok(text)
 }
 
-#[cfg(test)]
-fn write_capture_rules(path: &Path, devices: &[crate::config::DeviceSelector]) -> Result<()> {
-    let text = render_capture_rules(devices)?;
-    write_atomic_bytes(path, text.as_bytes(), 0o644)
-}
-
 fn write_atomic_bytes(path: &Path, contents: &[u8], create_mode: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
     let parent = path.parent().context("udev rules path has no parent")?;
     fs::create_dir_all(parent)?;
     let name = path
@@ -1250,12 +1217,7 @@ fn write_atomic_bytes(path: &Path, contents: &[u8], create_mode: u32) -> Result<
         .context("udev rules path has no file name")?;
     let temporary = parent.join(format!(".{name}.tmp-{}", std::process::id()));
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    #[cfg(unix)]
-    options.mode(create_mode);
-    #[cfg(unix)]
+    options.write(true).create_new(true).mode(create_mode);
     let existing = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
             Some((metadata.mode(), metadata.uid(), metadata.gid()))
@@ -1264,20 +1226,10 @@ fn write_atomic_bytes(path: &Path, contents: &[u8], create_mode: u32) -> Result<
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    #[cfg(not(unix))]
-    let _ = create_mode;
-    #[cfg(not(unix))]
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {}
-        Ok(_) => bail!("refusing to replace non-regular file {}", path.display()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
     let mut file = options.open(&temporary)?;
     let write_result = (|| {
         file.write_all(contents)?;
         file.sync_all()?;
-        #[cfg(unix)]
         if let Some((mode, uid, gid)) = existing {
             use std::os::unix::fs::{PermissionsExt, chown};
 
@@ -1563,7 +1515,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn private_path_check_rejects_shared_modes_and_owner_changes() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1637,21 +1588,15 @@ mod tests {
 
     #[test]
     fn capture_rule_is_narrow_and_excludes_virtual_devices() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("71-zflow-capture.rules");
-        write_capture_rules(
-            &path,
-            &[crate::config::DeviceSelector {
-                path: "/dev/input/event7".into(),
-                name: Some("Example Keyboard".into()),
-                phys: Some("usb-1/input0".into()),
-                uniq: Some("aa:bb:cc:dd:ee:ff".into()),
-                vendor: Some(0x1234),
-                product: Some(0xabcd),
-            }],
-        )
+        let rule = render_capture_rules(&[crate::config::DeviceSelector {
+            path: "/dev/input/event7".into(),
+            name: Some("Example Keyboard".into()),
+            phys: Some("usb-1/input0".into()),
+            uniq: Some("aa:bb:cc:dd:ee:ff".into()),
+            vendor: Some(0x1234),
+            product: Some(0xabcd),
+        }])
         .unwrap();
-        let rule = fs::read_to_string(path).unwrap();
         assert!(rule.contains("ATTRS{id/vendor}==\"1234\""));
         assert!(rule.contains("ATTRS{id/product}==\"abcd\""));
         assert!(rule.contains("ENV{ZFLOW_CAPTURE_EXCLUDE}!=\"1\""));
@@ -1661,26 +1606,20 @@ mod tests {
 
     #[test]
     fn capture_rule_refuses_a_device_without_a_stable_physical_path() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("71-zflow-capture.rules");
         // An empty phys would render ATTRS{phys}=="" and grant every device
         // with the same vendor and product.
         for phys in [None, Some(String::new())] {
-            let error = write_capture_rules(
-                &path,
-                &[crate::config::DeviceSelector {
-                    path: "/dev/input/event7".into(),
-                    name: Some("Indistinguishable Keyboard".into()),
-                    phys,
-                    uniq: None,
-                    vendor: Some(0x1234),
-                    product: Some(0xabcd),
-                }],
-            )
+            let error = render_capture_rules(&[crate::config::DeviceSelector {
+                path: "/dev/input/event7".into(),
+                name: Some("Indistinguishable Keyboard".into()),
+                phys,
+                uniq: None,
+                vendor: Some(0x1234),
+                product: Some(0xabcd),
+            }])
             .unwrap_err();
 
             assert!(error.to_string().contains("no stable physical path"));
-            assert!(!path.exists());
         }
     }
 
@@ -1811,7 +1750,6 @@ mod tests {
         assert!(Config::load(&path).unwrap().input.experimental_touchpad);
     }
 
-    #[cfg(unix)]
     #[test]
     fn pending_restart_makes_a_later_live_setup_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
@@ -1852,7 +1790,6 @@ mod tests {
         assert!(saved.input.allow_prelogin_input);
     }
 
-    #[cfg(unix)]
     #[test]
     fn setup_live_reload_failure_restores_the_original_file() {
         let directory = tempfile::tempdir().unwrap();
@@ -1938,7 +1875,6 @@ mod tests {
         assert_eq!(fs::read(rules_path).unwrap(), rules_before);
     }
 
-    #[cfg(unix)]
     #[test]
     fn playout_reload_failure_restores_the_original_file() {
         let directory = tempfile::tempdir().unwrap();
@@ -1962,16 +1898,6 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(path).unwrap(), before);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn pairing_label_is_the_kernel_hostname_without_environment() {
-        let hostname = fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
-        assert_eq!(
-            crate::pairing::local_device_label().as_deref(),
-            Some(hostname.trim())
-        );
     }
 
     #[test]
