@@ -161,15 +161,12 @@ struct HealthView: View {
             Button("Retry") { model.send(CoreRequest(command: "retry")) }.disabled(state.checking)
           }
         }
-        if let issue = state.layoutError ?? state.desktopError {
+        if let issue = state.layoutError {
           Text(issue).font(.callout).foregroundStyle(.secondary)
         }
         if let issue = state.configError {
           Text(issue).font(.callout).foregroundStyle(.orange)
           Button("Open Configuration…") { model.openConfig() }
-        }
-        if let issue = state.discoveryError {
-          Text("Discovery: \(issue)").font(.callout).foregroundStyle(.secondary)
         }
         Divider()
         Text(state.notice).font(.callout).foregroundStyle(.secondary)

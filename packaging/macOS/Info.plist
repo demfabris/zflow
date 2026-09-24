@@ -29,7 +29,6 @@
     <key>NSBonjourServices</key>
     <array>
         <string>_zflow._udp</string>
-        <string>_zflow-display._udp</string>
     </array>
 </dict>
 </plist>

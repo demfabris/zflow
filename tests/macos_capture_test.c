@@ -66,7 +66,10 @@ static int tap_calls;
 static bool tap_available;
 static int tap_enables;
 static bool lose_stop;
+static _Atomic bool invalidate_tap;
 static _Atomic int loop_runs;
+static _Atomic int wakes;
+static const ZFlowMacRect entry = {-1200, -100, 9, 200};
 static CGPoint warped_position;
 static CGPoint cursor_position = {-1200, -50};
 static int held_key = -1;
@@ -135,16 +138,12 @@ static void desktop_and_permission_tests(void) {
   assert(zflow_mac_desktop_rectangles(rectangles, 64) == 2);
   assert(rectangles[1].x == -1920 && rectangles[1].y == -200);
   assert(zflow_mac_desktop_rectangles(rectangles, 1) == -1);
-  assert(zflow_mac_warp_cursor(position) == 0);
-  assert(warped_position.x == -1200 && warped_position.y == -50);
-  assert(zflow_mac_warp_cursor((ZFlowMacPosition){NAN, 0}) == -1);
   assert(zflow_mac_input_is_neutral());
   held_key = 55; assert(!zflow_mac_input_is_neutral()); held_key = -1;
   held_button = 0; assert(!zflow_mac_input_is_neutral()); held_button = -1;
   held_flags = kCGEventFlagMaskCommand; assert(!zflow_mac_input_is_neutral());
   held_flags = kCGEventFlagMaskAlphaShift; assert(zflow_mac_input_is_neutral());
   held_flags = 0;
-  g_check_entry = true;
   g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
   assert(capture_entry_allowed() == 0);
   held_key = 10; assert(capture_entry_allowed() == -2); held_key = -1;
@@ -180,7 +179,6 @@ static void desktop_and_permission_tests(void) {
   g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
   cursor_position.x = NAN; assert(capture_entry_allowed() == -1);
   cursor_position = CGPointMake(-1200, -50);
-  g_check_entry = false;
   assert(!zflow_mac_accessibility_authorized(0));
   assert(permission_prompts == 0);
   assert(!zflow_mac_accessibility_authorized(1));
@@ -188,7 +186,6 @@ static void desktop_and_permission_tests(void) {
 }
 
 static void startup_release_tests(void) {
-  g_check_entry = true;
   memset(g_forwarded_keys, 0, sizeof(g_forwarded_keys));
   memset(g_forwarded_buttons, 0, sizeof(g_forwarded_buttons));
   atomic_store(&g_stop, false);
@@ -232,7 +229,6 @@ static void startup_release_tests(void) {
   }
   assert(!zflow_mac_capture_poll(&captured));
   CFRelease(caps);
-  g_check_entry = false;
 }
 
 static CGError record(char call) {
@@ -365,6 +361,8 @@ static void fake_tap_enable(CFMachPortRef tap, bool enable) {
 static CFRunLoopRunResult fake_run_loop(CFRunLoopMode mode, CFTimeInterval seconds,
                                         Boolean once) {
   atomic_fetch_add(&loop_runs, 1);
+  // With its tap invalidated, the mode has no sources left to run.
+  if (atomic_load(&invalidate_tap)) return kCFRunLoopRunFinished;
   if (lose_stop) {
     // A stop that lands just before the loop runs is dropped by CFRunLoopStop.
     lose_stop = false;
@@ -391,11 +389,16 @@ static void reset(void) {
   expect_return_warp = false;
   g_return_pending = false;
   g_queue_head = g_queue_tail = 0;
+  memset(g_forwarded_keys, 0, sizeof(g_forwarded_keys));
+  memset(g_forwarded_buttons, 0, sizeof(g_forwarded_buttons));
+  held_key = held_button = -1;
   tap_available = true;
 }
 
+static void count_wake(void) { atomic_fetch_add(&wakes, 1); }
+
 static void start_capture(void) {
-  assert(zflow_mac_capture_start(0, NULL) == 0);
+  assert(zflow_mac_capture_start(0, &entry, count_wake) == 0);
   assert(g_thread_valid && strcmp(calls, "BHD") == 0);
 }
 
@@ -404,16 +407,59 @@ static void secure_input_tests(void) {
   reset();
   secure_input = true;
   assert(zflow_mac_secure_input_enabled() == 1);
-  assert(zflow_mac_capture_start(0, NULL) == -2);
+  assert(zflow_mac_capture_start(0, &entry, NULL) == -2);
   assert(strstr(g_error, "secure keyboard entry"));
   assert(call_count == 0 && !g_thread_valid);
-  g_check_entry = true;
-  g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
   assert(capture_entry_allowed() == -2);
   secure_input = false;
   assert(capture_entry_allowed() == 0);
-  g_check_entry = false;
   assert(zflow_mac_secure_input_enabled() == 0);
+}
+
+static void admission_tests(void) {
+  // Capture always needs a crossing edge to check once its tap is installed.
+  reset();
+  int taps = tap_calls;
+  assert(zflow_mac_capture_start(0, NULL, NULL) == -1);
+  assert(tap_calls == taps && !g_thread_valid);
+  reset();
+  held_button = 0;
+  assert(zflow_mac_capture_start(0, &entry, NULL) == -2);
+  assert(strstr(g_error, "release held keys"));
+  assert(tap_calls == taps + 1 && call_count == 0 && !g_thread_valid);
+  held_button = -1;
+  cursor_position.x = -1150;
+  assert(zflow_mac_capture_start(0, &entry, NULL) == -2);
+  assert(strstr(g_error, "left the configured crossing edge"));
+  cursor_position.x = -1200;
+}
+
+static void wake_tests(void) {
+  // Each queued event and the end of capture wake the consumer.
+  reset();
+  atomic_store(&wakes, 0);
+  start_capture();
+  int started = atomic_load(&wakes);
+  ZFlowMacEvent motion = {.kind = ZFLOW_EVENT_MOTION};
+  assert(enqueue(&motion));
+  assert(atomic_load(&wakes) == started + 1);
+  assert(zflow_mac_capture_stop() == 0);
+  assert(atomic_load(&wakes) == started + 2);
+  g_wake = NULL;
+}
+
+static void invalidated_tap_tests(void) {
+  // macOS invalidating the tap ends the crossing as a failure, never a pause.
+  reset();
+  start_capture();
+  atomic_store(&invalidate_tap, true);
+  while (!zflow_mac_capture_stop_requested()) sched_yield();
+  atomic_store(&invalidate_tap, false);
+  assert(zflow_mac_capture_stop() == -1);
+  assert(strstr(g_error, "macOS stopped input capture"));
+  assert(zflow_mac_capture_pause_requested() == 0);
+  assert(strcmp(calls, "BHDCSb") == 0);
+  g_wake = NULL;
 }
 
 static void lost_stop_tests(void) {
@@ -519,10 +565,7 @@ static void cursor_lifecycle_tests(void) {
 
 static void multitouch_tests(void) {
   reset();
-  // The preflight only looks for a device; it never touches device state.
-  assert(zflow_mac_raw_touch_available() == 1);
-  assert(!mt_registered && !mt_started && !mt_stopped && !mt_unregistered);
-  assert(zflow_mac_capture_start(1, NULL) == 1);
+  assert(zflow_mac_capture_start(1, &entry, NULL) == 1);
   assert(mt_registered == 1 && mt_started == 1);
   assert(zflow_mac_capture_stop() == 0);
   assert(mt_stopped == 1 && mt_unregistered == 1);
@@ -587,6 +630,22 @@ static void event_tests(void) {
   assert(zflow_mac_capture_stop_requested() == 0 && g_capture_status == 0);
   assert(event_callback(NULL, kCGEventMouseMoved, event, NULL) == NULL);
   assert(zflow_mac_capture_poll(&captured) == 1);
+
+  // Releases made while the tap was off reached the Mac. Re-enabling sends
+  // them to the other computer for keys and buttons no longer down.
+  reset();
+  g_forwarded_keys[4] = g_forwarded_keys[55] = true;
+  g_forwarded_buttons[1] = g_forwarded_buttons[2] = true;
+  held_key = 55;
+  held_button = 1;
+  assert(event_callback(NULL, kCGEventTapDisabledByTimeout, event, NULL) == event);
+  assert(zflow_mac_capture_poll(&captured) == 1);
+  assert(captured.kind == ZFLOW_EVENT_KEY && captured.code == 4 && !captured.pressed);
+  assert(zflow_mac_capture_poll(&captured) == 1);
+  assert(captured.kind == ZFLOW_EVENT_BUTTON && captured.button == 1 && !captured.pressed);
+  assert(zflow_mac_capture_poll(&captured) == 0);
+  assert(!g_forwarded_keys[4] && g_forwarded_keys[55]);
+  assert(!g_forwarded_buttons[1] && g_forwarded_buttons[2]);
   CFRelease(g_event_tap);
   g_event_tap = NULL;
 
@@ -634,6 +693,7 @@ static void event_tests(void) {
   }
   event = CGEventCreateKeyboardEvent(NULL, 0, false);
   assert(event);
+  g_forwarded_keys[0] = true;
   assert(event_callback(NULL, kCGEventKeyUp, event, NULL) == NULL);
   assert(zflow_mac_capture_stop_requested() == 1);
   assert(zflow_mac_capture_pause_requested() == 0);
@@ -648,8 +708,11 @@ int main(void) {
   startup_release_tests();
   cursor_lifecycle_tests();
   secure_input_tests();
+  admission_tests();
   lost_stop_tests();
   return_cursor_tests();
+  wake_tests();
+  invalidated_tap_tests();
   multitouch_tests();
   touch_tests();
   event_tests();
@@ -657,7 +720,7 @@ int main(void) {
   tap_available = false;
   int taps = tap_calls;
   atomic_store(&g_pause_requested, true);
-  assert(zflow_mac_capture_start(0, NULL) == -1);
+  assert(zflow_mac_capture_start(0, &entry, NULL) == -1);
   assert(zflow_mac_capture_pause_requested() == 0);
   assert(tap_calls == taps + 1 && call_count == 0);
   assert(!g_thread_valid);

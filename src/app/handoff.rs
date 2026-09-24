@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 
 use crate::desktop::{Edge, FRACTION_MAX, Geometry, Point, Rect, ReturnMapping};
 
-use super::layout_model::{self, Layout};
+use super::layout_model::Layout;
 
 #[derive(Clone, Debug)]
 pub(super) struct Handoff {
@@ -62,12 +62,7 @@ pub(super) fn crossing(
             continue;
         }
         let peer = layout.monitors[transition.target].peer.as_ref()?;
-        let local_edge = match transition.edge {
-            layout_model::Edge::Left => Edge::Left,
-            layout_model::Edge::Right => Edge::Right,
-            layout_model::Edge::Top => Edge::Top,
-            layout_model::Edge::Bottom => Edge::Bottom,
-        };
+        let local_edge = transition.edge;
         let (entered, along) = match local_edge {
             Edge::Left => (
                 current.x <= bounds.x + 1 && previous.x > bounds.x + 1,
@@ -203,12 +198,10 @@ fn opposite(edge: Edge) -> Edge {
 }
 
 fn contains(geometry: &Geometry, point: Point) -> bool {
-    geometry.monitors.iter().any(|r| {
-        point.x >= r.x
-            && point.y >= r.y
-            && i64::from(point.x) < i64::from(r.x) + i64::from(r.width)
-            && i64::from(point.y) < i64::from(r.y) + i64::from(r.height)
-    })
+    geometry
+        .monitors
+        .iter()
+        .any(|monitor| monitor.contains(point))
 }
 
 #[cfg(test)]

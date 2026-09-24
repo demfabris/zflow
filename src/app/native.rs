@@ -1,13 +1,12 @@
 use super::{
-    displays::{Desktop, DesktopDetector, DisplayDiscovery},
     handoff,
-    layout_model::{LayoutDocument, Monitor},
+    layout_model::{self, LayoutDocument, Monitor},
     model::ConfigDocument,
     nearby::NearbyBrowser,
     pairing::Pairing,
-    probe::Probe,
-    sharing::Observer,
+    sharing::{self, Observer},
 };
+use crate::macos::{LinkState, Links};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -17,6 +16,9 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+const MAINTENANCE: Duration = Duration::from_secs(2);
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -56,20 +58,20 @@ pub(crate) enum Request {
 pub(crate) struct NativeApp {
     document: ConfigDocument,
     layout: LayoutDocument,
+    // The observer drops first, so a live crossing is told to return input
+    // before the links wait for their sessions to close.
     observer: Observer,
-    detector: DesktopDetector,
-    displays: DisplayDiscovery,
+    links: Links,
     nearby: NearbyBrowser,
     pairing: Pairing,
-    probe: Option<Probe>,
-    desktops: BTreeMap<String, Desktop>,
-    checked: bool,
+    /// Receiver desktop sizes read over each peer's session.
+    desktops: BTreeMap<String, (u32, u32)>,
+    accessibility: bool,
     helper_ready: bool,
-    restart: bool,
     emergency_paused: bool,
     config_error: Option<String>,
     layout_error: Option<String>,
-    receiver_error: Option<String>,
+    crossing_error: Option<String>,
     maintenance: Instant,
     retry_at: Instant,
 }
@@ -81,27 +83,26 @@ impl NativeApp {
         if document.is_new() {
             document.save()?;
         }
-        let layout = LayoutDocument::open(&document.path)?;
-        Ok(Self {
+        let layout = LayoutDocument::beside(&document.path)?;
+        let mut app = Self {
             document,
             layout,
             observer: Observer::default(),
-            detector: DesktopDetector::default(),
-            displays: DisplayDiscovery::default(),
+            links: Links::new()?,
             nearby: NearbyBrowser::default(),
             pairing: Pairing::default(),
-            probe: None,
             desktops: BTreeMap::new(),
-            checked: false,
+            accessibility: crate::macos::accessibility_authorized(false),
             helper_ready: false,
-            restart: true,
             emergency_paused: false,
             config_error: None,
             layout_error: None,
-            receiver_error: None,
-            maintenance: Instant::now() - Duration::from_secs(3),
+            crossing_error: None,
+            maintenance: Instant::now() - MAINTENANCE,
             retry_at: Instant::now(),
-        })
+        };
+        app.sync_links();
+        Ok(app)
     }
 
     pub fn request(&mut self, request: Request) -> Result<Value> {
@@ -167,9 +168,13 @@ impl NativeApp {
                 self.restart();
             }
             Request::AllowAccessibility => {
-                crate::macos::accessibility_authorized(true);
+                self.accessibility = crate::macos::accessibility_authorized(true);
             }
-            Request::Retry => self.restart(),
+            Request::Retry => {
+                self.crossing_error = None;
+                self.links.retry();
+                self.restart();
+            }
         }
         Ok(self.snapshot())
     }
@@ -183,11 +188,18 @@ impl NativeApp {
         Ok(())
     }
 
+    /// Disarms and rearms on the next tick with the saved settings. Links
+    /// reconnect only when their peer or session settings changed.
     fn restart(&mut self) {
         self.observer.stop();
-        self.restart = true;
-        self.checked = false;
         self.retry_at = Instant::now();
+        self.sync_links();
+    }
+
+    fn sync_links(&mut self) {
+        let config = self.document.saved();
+        let sharing = config.macos.sharing && !self.emergency_paused;
+        self.links.sync(sharing.then_some(config));
     }
 
     fn reload(&mut self) {
@@ -200,7 +212,7 @@ impl NativeApp {
             Ok(_) => self.config_error=Some("Configuration was deleted. Restore it to apply changes. The last valid settings are still in use.".into()),
             Err(error) => self.config_error=Some(format!("{error:#}. The last valid settings are still in use.")),
         }
-        match LayoutDocument::open(&self.document.path) {
+        match LayoutDocument::beside(&self.document.path) {
             Ok(layout) if !layout.is_new() || self.layout.is_new() => {
                 if layout.draft != self.layout.draft {
                     self.layout = layout;
@@ -220,9 +232,8 @@ impl NativeApp {
 
     pub fn tick(&mut self) {
         let was_enabled = self.observer.is_enabled();
-        self.observer.tick();
+        self.observer.tick(&self.links);
         if was_enabled && !self.observer.is_enabled() {
-            self.checked = false;
             if self.observer.pause_requested {
                 self.emergency_paused = true;
                 self.document.draft.macos.sharing = false;
@@ -230,95 +241,74 @@ impl NativeApp {
                 if self.save_config().is_err() {
                     self.document.draft.macos.sharing = false;
                 }
-                self.restart = false;
+                self.sync_links();
             } else {
-                self.receiver_error = Some(self.observer.notice.clone());
-                self.retry_at = Instant::now() + Duration::from_secs(5);
+                self.crossing_error = Some(self.observer.notice.clone());
+                self.retry_at = Instant::now() + RETRY_AFTER_FAILURE;
             }
         }
-        if self.maintenance.elapsed() >= Duration::from_secs(2) {
+        if self.maintenance.elapsed() >= MAINTENANCE {
             self.maintenance = Instant::now();
             self.reload();
-            self.detector.refresh();
-            let config = self.document.saved();
-            self.displays
-                .update(self.detector.snapshot().0, config.transport.discovery);
-            if config.transport.discovery {
+            // Also a fallback for display and permission changes that sent no callback.
+            sharing::forget_geometry();
+            self.accessibility = crate::macos::accessibility_authorized(false);
+            if self.document.saved().transport.discovery {
                 self.nearby.start();
             } else {
                 self.nearby.stop();
             }
-            self.observer.nearby = self.nearby_addresses();
+            self.links.set_nearby(self.nearby_addresses());
             if let Err(error) = self.sync_layout() {
                 self.layout_error = Some(format!("{error:#}"));
             }
         }
-        if self.probe.as_ref().is_some_and(Probe::finished) {
-            match self.probe.take().unwrap().finish() {
-                Ok(result) => {
-                    // Results from an older configuration are discarded after a restart.
-                    if !self.restart {
-                        self.desktops = result.desktops;
-                        self.checked = !self.desktops.is_empty();
-                        self.receiver_error =
-                            (!result.errors.is_empty()).then(|| result.errors.join("\n"));
-                        self.retry_at = Instant::now() + Duration::from_secs(5);
-                        if let Err(error) = self.sync_layout() {
-                            self.layout_error = Some(format!("{error:#}"));
-                        }
-                    }
-                }
-                Err(error) => {
-                    self.receiver_error = Some(format!("{error:#}"));
-                    self.retry_at = Instant::now() + Duration::from_secs(5);
-                }
+        if self.links.changed() {
+            self.desktops = self
+                .links
+                .states()
+                .filter_map(|(name, state)| match state {
+                    LinkState::Ready(geometry) => geometry
+                        .bounds()
+                        .ok()
+                        .map(|bounds| (name.to_owned(), (bounds.width, bounds.height))),
+                    _ => None,
+                })
+                .collect();
+            if let Err(error) = self.sync_layout() {
+                self.layout_error = Some(format!("{error:#}"));
             }
         }
-        if self.observer.has_session() || self.probe.is_some() {
+        if self.observer.has_session() {
             return;
-        }
-        if self.restart {
-            self.restart = false;
         }
         let config = self.document.saved();
         if self.emergency_paused || !config.macos.sharing || self.pairing.active() {
             return;
         }
-        if config.peers.is_empty() || !crate::macos::accessibility_authorized(false) {
+        if config.peers.is_empty() || !self.accessibility {
             self.observer.stop();
-            self.checked = false;
             return;
         }
         if config.macos.block_awdl && !self.helper_ready {
             return;
         }
-        if !self.checked && !self.observer.is_enabled() && Instant::now() >= self.retry_at {
-            match Probe::start(config.clone(), self.nearby_addresses()) {
-                Ok(probe) => self.probe = Some(probe),
-                Err(error) => {
-                    self.receiver_error = Some(error.to_string());
-                    self.retry_at = Instant::now() + Duration::from_secs(5);
-                }
-            }
-        }
-        if self.checked && !self.observer.is_enabled() {
+        if !self.observer.is_enabled() && Instant::now() >= self.retry_at && self.any_ready() {
             self.observer.reduce_wifi_latency = config.macos.block_awdl;
-            let mut available = self.layout.draft.clone();
-            available.monitors.retain(|m| {
-                m.peer
-                    .as_ref()
-                    .is_none_or(|peer| self.desktops.contains_key(peer))
-            });
-            if let Err(error) = self
-                .observer
-                .enable(&self.document.path, config, &available)
-            {
-                self.layout_error = Some(format!("{error:#}"));
-                if self.receiver_error.is_some() {
-                    self.checked = false;
+            match self.observer.enable(config, &self.layout.draft) {
+                Ok(()) => self.crossing_error = None,
+                Err(error) => {
+                    self.layout_error = Some(format!("{error:#}"));
+                    self.retry_at = Instant::now() + Duration::from_secs(1);
                 }
             }
         }
+    }
+
+    fn any_ready(&self) -> bool {
+        self.links
+            .states()
+            .any(|(_, state)| matches!(state, LinkState::Ready(_)))
     }
 
     /// Discovered receivers let a connection find a peer whose address changed.
@@ -335,27 +325,31 @@ impl NativeApp {
         if self.layout_error.is_some() {
             return Ok(());
         }
-        let Some(local) = self.detector.snapshot().0 else {
+        let Ok(local) = sharing::local_geometry().and_then(|geometry| geometry.bounds()) else {
             return Ok(());
         };
-        let mut sizes = self.displays.remote(self.document.saved());
-        sizes.extend(self.desktops.clone());
+        let fits = |width: u32, height: u32| {
+            (1..=layout_model::MAX_DIMENSION).contains(&width)
+                && (1..=layout_model::MAX_DIMENSION).contains(&height)
+        };
+        if !fits(local.width, local.height) {
+            return Ok(());
+        }
         let previous = self.layout.draft.clone();
         let mut monitors = Vec::new();
         let owners = std::iter::once(None).chain(self.document.saved().peers.keys().map(Some));
         for owner in owners {
             let old = previous.monitors.iter().find(|m| m.peer.as_ref() == owner);
             let size = if let Some(name) = owner {
-                sizes.get(name).copied().or_else(|| {
-                    old.map(|m| Desktop {
-                        width: m.width,
-                        height: m.height,
-                    })
-                })
+                self.desktops
+                    .get(name)
+                    .copied()
+                    .filter(|&(width, height)| fits(width, height))
+                    .or_else(|| old.map(|m| (m.width, m.height)))
             } else {
-                Some(local)
+                Some((local.width, local.height))
             };
-            let Some(size) = size else {
+            let Some((width, height)) = size else {
                 continue;
             };
             let right = monitors
@@ -371,11 +365,11 @@ impl NativeApp {
                 peer: owner.cloned(),
                 x: old.map_or(right, |m| m.x),
                 y: old.map_or(0, |m| m.y),
-                width: size.width,
-                height: size.height,
+                width,
+                height,
             };
             monitors.push(monitor.clone());
-            if (super::layout_model::Layout {
+            if (layout_model::Layout {
                 monitors: monitors.clone(),
             })
             .validate()
@@ -402,41 +396,54 @@ impl NativeApp {
 
     fn snapshot(&self) -> Value {
         let config = self.document.saved();
-        let accessibility = crate::macos::accessibility_authorized(false);
-        let layout_issue = super::sharing::local_geometry()
+        let layout_issue = sharing::local_geometry()
             .and_then(|g| handoff::validate(&self.layout.draft, &g))
             .err()
             .map(|e| e.to_string());
+        let mut ready = false;
+        let mut connecting = false;
+        let mut link_errors = Vec::new();
+        for (name, state) in self.links.states() {
+            match state {
+                LinkState::Ready(_) => ready = true,
+                LinkState::Connecting => connecting = true,
+                LinkState::Down(error) => link_errors.push(format!("{name}: {error}")),
+            }
+        }
+        let receiver_error = self
+            .crossing_error
+            .clone()
+            .or_else(|| (!link_errors.is_empty()).then(|| link_errors.join("\n")));
+        let checking = !ready && connecting;
         let sharing = config.macos.sharing && !self.emergency_paused;
         let status = if !sharing {
             "paused"
         } else if config.peers.is_empty() {
             "setup"
-        } else if !accessibility
+        } else if !self.accessibility
             || (config.macos.block_awdl && !self.helper_ready)
-            || self.receiver_error.is_some()
+            || receiver_error.is_some()
             || self.config_error.is_some()
             || self.layout_error.is_some()
         {
             "attention"
         } else if self.observer.has_session() {
             "sharing"
-        } else if self.observer.is_enabled() {
+        } else if self.observer.is_enabled() && ready {
             "ready"
-        } else if self.probe.is_some() {
+        } else if checking {
             "checking"
         } else {
             "attention"
         };
         json!({
             "config_path":self.document.path,"layout_path":self.layout.path,"status":status,
-            "sharing":sharing,"block_awdl":config.macos.block_awdl,"accessibility":accessibility,
+            "sharing":sharing,"block_awdl":config.macos.block_awdl,"accessibility":self.accessibility,
             "notice":self.observer.notice,"peers":config.peers.keys().collect::<Vec<_>>(),
             "layout":self.layout.draft,"pairing":self.pairing.snapshot(),
             "nearby":self.nearby.snapshot().records.values().collect::<Vec<_>>(),
             "config_error":self.config_error,"layout_error":self.layout_error.as_ref().or(layout_issue.as_ref()),
-            "receiver_error":self.receiver_error,"receiver_checked":self.checked && self.receiver_error.is_none(),"checking":self.probe.is_some(),
-            "discovery_error":self.displays.error(),"desktop_error":self.detector.snapshot().1,
+            "receiver_error":receiver_error,"receiver_checked":ready && receiver_error.is_none(),"checking":checking,
         })
     }
 }
@@ -455,12 +462,11 @@ mod tests {
         )
         .unwrap();
         let mut app = NativeApp::open(path).unwrap();
-        app.restart = false;
-        app.checked = true;
+        let armed_at = app.retry_at;
         for ready in [true, false, true] {
             app.request(Request::HelperReady { ready }).unwrap();
             assert_eq!(app.helper_ready, ready);
-            assert!(app.checked && !app.restart);
+            assert_eq!(app.retry_at, armed_at);
         }
     }
 }

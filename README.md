@@ -80,9 +80,10 @@ dimensions, and return barriers.
    sharing. Resume from the menu-bar menu when you are ready.
 
 Closing Settings leaves sharing running. **Pause Sharing** returns input to
-the Mac; **Quit zflow** stops the engine and finishes cleanup. The engine checks
-the authenticated receiver before arming and again at each crossing. Failed
-connections retry while sharing is enabled; emergency pause stays paused.
+the Mac; **Quit zflow** stops the engine and finishes cleanup. While sharing is
+on, the engine keeps one authenticated connection open to each paired receiver,
+reads its desktop, and reuses the connection for every crossing. A lost
+connection reconnects on its own; emergency pause stays paused.
 GNOME must be unlocked. Other Linux desktops do not yet supply this return path.
 
 ## Settings and configuration
@@ -127,19 +128,18 @@ including vertical offsets. Nearby edges snap together; overlapping tiles are
 rejected. Only the touching portion of an edge permits crossing. Physical
 monitor placement inside a computer remains the operating system's job.
 
-The app detects desktop sizes and saves positions beside the configuration in
-`zflow.toml.layout.toml`. Display advertisements help arrange known paired
-computers; authenticated receiver geometry is checked before capture. No
-unpaired announcement creates a trusted computer. Moving, resizing, or removing
-a tile stops the old arrangement before the updated layout arms.
+The app reads each paired computer's desktop size over its authenticated
+connection and saves positions beside the configuration in
+`zflow.toml.layout.toml`. The receiver's geometry is checked again at each
+crossing. Moving, resizing, or removing a tile stops the old arrangement before
+the updated layout arms.
 
 ## Discover nearby computers
 
 Pairing lists receivers advertised on the local network. Discovery does not
 verify identity; both sides must confirm the six-digit codes. Manual addresses
-remain available. The Linux daemon advertises the receiver and the desktop
-agent advertises its desktop dimensions. Browsing continues while the Mac app
-is running, even with Settings closed.
+remain available. The Linux daemon advertises the receiver. Browsing continues
+while the Mac app is running, even with Settings closed.
 
 If the list stays empty, check zflow under **System Settings → Privacy & Security
 → Local Network**, or use a manual address. Terminal tools have different
@@ -249,10 +249,12 @@ control it hides the Mac cursor and disconnects cursor position from physical
 movement, while forwarding relative deltas and raw trackpad contacts. It does
 not warp the cursor back to screen center. On exit it reconnects and shows the
 cursor. If macOS disables the event tap after a callback timeout, it re-enables
-the tap; if user input disables it, it ends forwarding and runs cleanup.
-It handles Ctrl+Cmd+Backspace, SIGINT, SIGTERM, and SIGHUP.
+the tap and releases on the other computer any key or button let go meanwhile.
+If user input disables the tap or macOS invalidates it, forwarding ends, cleanup
+runs, and sharing retries without pausing. Ctrl+Cmd+Backspace returns input and
+pauses sharing.
 
-For background cursor visibility, the CLI resolves the private
+For background cursor visibility, the app resolves the private
 `SetsCursorInBackground` connection property at runtime, following Deskflow's
 approach. Missing symbols or a failed cursor API call prevent activation.
 Apple documents cursor disconnection for foreground apps; verify the behavior
@@ -288,8 +290,9 @@ Enable **Block AWDL while sharing** in Settings. If the background helper is
 missing, use **Install…**; if macOS needs approval, use **Allow…**. macOS owns the
 authorization prompt. zflow never reads or stores an administrator password.
 
-The signed bundle registers its daemon with `SMAppService`. The helper and its
-client enforce matching Team IDs and exact signing identifiers through XPC.
+The signed bundle registers its daemon with `SMAppService`. The app connects to
+it over XPC directly, and each side requires the same Team ID and the other's
+exact signing identifier, so only the signed zflow app can take a lease.
 The privileged service can only check `awdl0` or lease its suppression. It
 accepts no shell commands or arbitrary interface names. Installation and health
 checks do not change radio state.
@@ -297,7 +300,7 @@ checks do not change radio state.
 The helper remembers AWDL's initial up/down state, suppresses it during remote
 capture, and restores it on return, failed activation, or disconnect. A pipe and
 a two-second renewable lease cover sender crashes and stalls. Missing heartbeat
-acknowledgements end remote capture. The daemon serializes leases across clients.
+acknowledgements end remote capture. The daemon grants one lease at a time.
 
 AirDrop and Continuity may disconnect while suppression is active. Restoring
 AWDL does not resume interrupted transfers. `llw0` and Bluetooth are unchanged.
@@ -315,8 +318,8 @@ qualify the new signed XPC installation path.
 
 AWDLToggle's interface-monitoring approach informed this feature. No code was
 copied: its repository had no detected license when inspected. This guardian
-uses interface notifications plus a bounded 100 ms fallback check, with no
-per-tick shell processes. A short AWDL-only run measured 5.93 ms p95 RTT with
+rechecks `awdl0` every 100 ms while leased, with no per-tick shell processes.
+A short AWDL-only run measured 5.93 ms p95 RTT with
 `llw0` up, and fabrico reported smooth input. Normal return, sender crash, and
 sender freeze restored AWDL in live tests. The longer radio soak and remaining
 failure cases in [TESTPLAN.md](TESTPLAN.md) still gate broader qualification.

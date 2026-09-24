@@ -28,6 +28,8 @@ use super::TransportError;
 
 pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/1";
 pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/2";
+const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
+const INPUT_IDLE_TIMEOUT_MS: u32 = 15_000;
 
 /// A Quinn client configuration that authenticates one exact peer SPKI.
 #[derive(Clone)]
@@ -334,7 +336,11 @@ fn datagram_transport_config() -> quinn::TransportConfig {
         // application keeps one additional latest-wins slot and counts every
         // replacement before using send_datagram_wait.
         .datagram_send_buffer_size(4 * 1_024)
-        .keep_alive_interval(None);
+        // Sessions stay open between crossings. A ping when nothing else was
+        // sent keeps an idle session alive, and a dead path ends it within
+        // the idle timeout so the source reconnects.
+        .keep_alive_interval(Some(INPUT_KEEP_ALIVE))
+        .max_idle_timeout(Some(quinn::VarInt::from_u32(INPUT_IDLE_TIMEOUT_MS).into()));
     config
 }
 

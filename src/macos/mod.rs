@@ -1,99 +1,56 @@
-//! Foreground macOS source capture for the first Mac-to-Linux path.
+//! macOS input source: native capture, and crossings over a receiver's session.
 
 mod awdl;
+mod link;
 
 use std::{
-    collections::BTreeSet,
     ffi::CStr,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    future::Future,
     os::raw::c_char,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    pin::Pin,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use quinn::Endpoint;
-use tokio::sync::{mpsc, watch};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::{
     capture::{
         CaptureFrame, CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS,
     },
-    config::Config,
     core::{
-        ActivationId, ContactId, HidUsage, InputCapability, MotionDelta, PointerButton,
-        SessionCloseReason, SessionContext, SessionEpoch, SourceDimensions, TouchContact,
-        TouchState, TouchTool, TransportGeneration,
+        ContactId, HidUsage, MotionDelta, PointerButton, SessionCloseReason, SessionContext,
+        SourceDimensions, TouchContact, TouchState, TouchTool,
     },
-    desktop::{DesktopRequest, DesktopResponse, Edge},
-    identity::Identity,
-    session::{SessionEventKind, SessionOptions, start_session},
-    transport::{InputClientConfig, InputConnection, connect_input, input_client_config},
-    wire::CURRENT_PROTOCOL_VERSION,
+    desktop::{DesktopRequest, DesktopResponse, Edge, Point, Rect, ReturnMapping},
+    session::{SessionEvent, SessionEventKind, SessionHandle},
 };
 
-const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+pub use link::{Crossing, LinkState, Links};
+
 // Yield to the session between batches so a backlog after a stall cannot
 // overflow its 512-command queue in one burst.
-const MAX_EVENTS_PER_POLL: usize = 256;
+const MAX_EVENTS_PER_DRAIN: usize = 256;
 const TOUCH_STALE_TIMEOUT: Duration = Duration::from_millis(150);
 const SECURE_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const SECURE_INPUT_RETURNED: &str = "Secure keyboard entry turned on in a Mac app, so typing \
     could not be shared. Input returned to the Mac";
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// A working pinned address wins before other hosts on the network are tried.
-const NEARBY_DELAY: Duration = Duration::from_millis(300);
+const RELEASE_TIMEOUT: Duration = Duration::from_millis(200);
+// Prepare starts the receiver's two-second handoff lease, which only polling
+// renews, and polling starts once the AWDL lease is held.
+const AWDL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(crate::desktop::LEASE_MS / 2);
 
-#[derive(Clone, Debug)]
-pub struct SourceOptions {
-    pub config_path: PathBuf,
-    pub config: Option<Config>,
-    pub peer: String,
-    pub address: Option<SocketAddr>,
-    /// Discovered receiver addresses, tried after the peer's own addresses.
-    pub nearby: Vec<SocketAddr>,
-    pub raw_touch: bool,
-    pub reduce_wifi_latency: bool,
-    pub handoff: Option<HandoffOptions>,
-}
+/// Woken by the capture bridge whenever it queues an event or stops.
+static CAPTURE_WAKE: Notify = Notify::const_new();
 
-#[derive(Clone, Debug)]
-pub struct HandoffOptions {
-    pub entry_position: CursorPosition,
-    pub entry_region: DesktopRect,
-    pub return_mapping: crate::desktop::ReturnMapping,
-    pub edge: Edge,
-    pub start: u32,
-    pub end: u32,
-    pub position: u32,
-    pub expected_width: u32,
-    pub expected_height: u32,
-}
-
-pub async fn run(options: SourceOptions) -> Result<()> {
-    let (stop, stopped) = watch::channel(false);
-    let (status, _events) = mpsc::unbounded_channel();
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let signals = tokio::spawn(async move {
-        tokio::select! {
-            _ = terminate.recv() => {},
-            _ = interrupt.recv() => {},
-            _ = hangup.recv() => {},
-        }
-        let _ = stop.send(true);
-    });
-    let result = run_controlled(options, stopped, status).await;
-    signals.abort();
-    result
+extern "C" fn wake_capture() {
+    CAPTURE_WAKE.notify_one();
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceStatus {
     PauseRequested,
-    Connecting,
     Sharing,
     LocalInputRestored,
     Returned { position: u32 },
@@ -114,6 +71,20 @@ fn failure_status(error: &anyhow::Error) -> SourceStatus {
     }
 }
 
+/// Keeps the first failure. A cleanup failure still replaces success or a
+/// cancellation, because input may not be back on the Mac.
+fn keep_first_failure<T>(result: &mut Result<T>, cleanup: Result<()>, operation: &str) {
+    if let Err(error) = cleanup {
+        tracing::warn!(operation, error = %format!("{error:#}"), "crossing cleanup failed");
+        if result
+            .as_ref()
+            .map_or_else(|error| error.is::<AdmissionCancelled>(), |_| true)
+        {
+            *result = Err(error.context(format!("Could not finish {operation}")));
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CursorPosition {
@@ -128,29 +99,6 @@ pub struct DesktopRect {
     pub y: f64,
     pub width: f64,
     pub height: f64,
-}
-
-impl DesktopRect {
-    pub fn contains(self, position: CursorPosition) -> bool {
-        [
-            self.x,
-            self.y,
-            self.width,
-            self.height,
-            self.x + self.width,
-            self.y + self.height,
-            position.x,
-            position.y,
-        ]
-        .iter()
-        .all(|v| v.is_finite())
-            && self.width > 0.0
-            && self.height > 0.0
-            && position.x >= self.x
-            && position.y >= self.y
-            && position.x < self.x + self.width
-            && position.y < self.y + self.height
-    }
 }
 
 /// `prompt` asks macOS to show its normal Accessibility permission UI.
@@ -186,23 +134,10 @@ pub fn active_desktop_rectangles() -> Result<Vec<DesktopRect>> {
     Ok(rectangles)
 }
 
-/// Move the local cursor after source cleanup, using global desktop coordinates.
-pub fn warp_cursor(position: CursorPosition) -> Result<()> {
-    let _guard = SourceGuard::acquire()?;
-    if !position.x.is_finite()
-        || !position.y.is_finite()
-        || !active_desktop_rectangles()?
-            .iter()
-            .any(|rect| rect.contains(position))
-    {
-        bail!("cursor return position is outside the active Mac displays");
-    }
-    // SAFETY: finite, visible coordinates were checked; no source can start
-    // while this operation holds the source guard.
-    if unsafe { zflow_mac_warp_cursor(position) } != 0 {
-        bail!("could not return the Mac cursor to its display");
-    }
-    Ok(())
+/// Changes whenever macOS reconfigures a display.
+pub fn display_generation() -> u32 {
+    // SAFETY: the bridge registers its reconfiguration callback once.
+    unsafe { zflow_mac_display_generation() }
 }
 
 pub fn input_is_neutral() -> bool {
@@ -217,19 +152,42 @@ pub fn secure_input_enabled() -> bool {
     unsafe { zflow_mac_secure_input_enabled() == 1 }
 }
 
-/// Stop by setting the watch value to true or dropping its sender, then await
-/// completion so cursor, session and optional radio cleanup can finish.
-pub async fn run_controlled(
-    options: SourceOptions,
+#[derive(Clone, Debug)]
+pub struct HandoffOptions {
+    pub entry_position: CursorPosition,
+    pub entry_region: Rect,
+    pub return_mapping: ReturnMapping,
+    pub edge: Edge,
+    pub start: u32,
+    pub end: u32,
+    pub position: u32,
+    pub expected_width: u32,
+    pub expected_height: u32,
+}
+
+/// What one crossing borrows from its link.
+struct Activation<'a> {
+    session: &'a SessionHandle,
+    events: &'a mut mpsc::Receiver<SessionEvent>,
+    context: SessionContext,
+    raw_touch: bool,
+}
+
+type DesktopPoll<'a> = Pin<Box<dyn Future<Output = Result<DesktopResponse>> + Send + 'a>>;
+
+/// Runs one crossing and reports how it ended. The status sender drops only
+/// after cleanup, so the observer rearms once the Mac owns input again.
+/// Returns true when the crossing failed.
+async fn run_crossing(
+    activation: Activation<'_>,
+    handoff: HandoffOptions,
+    reduce_wifi_latency: bool,
     mut stop: watch::Receiver<bool>,
     status: mpsc::UnboundedSender<SourceStatus>,
-) -> Result<()> {
+) -> bool {
     let started = Instant::now();
-    tracing::info!(peer = %options.peer, raw_touch = options.raw_touch,
-        reduce_wifi_latency = options.reduce_wifi_latency, "source worker started");
-    let _ = status.send(SourceStatus::Connecting);
-    let result = run_source(options, &mut stop, &status).await;
-    let final_status = match &result {
+    let result = cross(activation, handoff, reduce_wifi_latency, &mut stop, &status).await;
+    let outcome = match &result {
         Ok(returned) => {
             if let Some(position) = returned {
                 let _ = status.send(SourceStatus::Returned {
@@ -243,19 +201,475 @@ pub async fn run_controlled(
             if matches!(outcome, SourceStatus::Cancelled(_)) {
                 tracing::info!(error = %format!("{error:#}"), "crossing cancelled");
             } else {
-                tracing::error!(error = %format!("{error:#}"), "source worker failed");
-                eprintln!("Remote input failed: {error:#}");
+                tracing::error!(error = %format!("{error:#}"), "crossing failed");
             }
             outcome
         }
     };
-    let _ = status.send(final_status);
+    let failed = matches!(outcome, SourceStatus::Failed(_));
+    let _ = status.send(outcome);
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis() as u64,
         success = result.is_ok(),
-        "source worker completed"
+        "crossing completed"
     );
-    result.map(|_| ())
+    failed
+}
+
+/// Prepares the receiver's desktop, forwards input until it returns, and
+/// finishes the handoff. The session outlives the crossing, so every desktop
+/// request is awaited: dropping one closes the transport.
+async fn cross(
+    mut activation: Activation<'_>,
+    mut handoff: HandoffOptions,
+    reduce_wifi_latency: bool,
+    stop: &mut watch::Receiver<bool>,
+    status: &mpsc::UnboundedSender<SourceStatus>,
+) -> Result<Option<u32>> {
+    refuse_waiting_events(activation.events)?;
+    if stopped(stop) {
+        return Ok(None);
+    }
+    let local_desktop = active_desktop_rectangles()?;
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow!("could not create a desktop handoff token: {error}"))?;
+    let token = handoff_token(random);
+    let prepare = prepare_request(&mut handoff, token)?;
+    let preparing = Instant::now();
+    // Await Prepare even after Stop so Finish can use the same session.
+    let (lease, prepared) = tokio::join!(
+        acquire_lease(reduce_wifi_latency),
+        activation.session.desktop_request(prepare)
+    );
+    tracing::info!(
+        elapsed_ms = preparing.elapsed().as_millis() as u64,
+        "desktop preparation completed"
+    );
+    let (mut lease, mut result) = match lease {
+        Ok(lease) => (lease, Ok(None)),
+        Err(error) => (None, Err(error)),
+    };
+    if result.is_ok() {
+        result = async {
+            // The link's snapshot already showed the receiver handles desktop
+            // requests, so a failure here is the session or the receiver.
+            validate_prepared(
+                &handoff,
+                prepared.context("Could not prepare the receiver's desktop")?,
+            )?;
+            if stopped(stop) {
+                return Ok(None);
+            }
+            ensure!(
+                local_desktop == active_desktop_rectangles()?,
+                "the Mac desktop changed while preparing the crossing; refresh and save its layout"
+            );
+            remote(
+                &mut activation,
+                &handoff,
+                &local_desktop,
+                token,
+                &mut lease,
+                stop,
+                status,
+            )
+            .await
+        }
+        .await;
+    }
+    let finishing = Instant::now();
+    let finished = validate_finished(
+        activation
+            .session
+            .desktop_request(DesktopRequest::Finish { token })
+            .await,
+    );
+    tracing::info!(
+        elapsed_ms = finishing.elapsed().as_millis() as u64,
+        success = finished.is_ok(),
+        "desktop handoff cleanup completed"
+    );
+    keep_first_failure(&mut result, finished, "desktop handoff cleanup");
+    if let Some(lease) = lease {
+        keep_first_failure(&mut result, lease.release().await, "AWDL restoration");
+    }
+    result
+}
+
+async fn acquire_lease(reduce_wifi_latency: bool) -> Result<Option<awdl::HeldLease>> {
+    if !reduce_wifi_latency {
+        return Ok(None);
+    }
+    // Dropping a late acquisition closes its pipes, so the helper restores AWDL.
+    let lease = tokio::time::timeout(AWDL_ACQUIRE_TIMEOUT, awdl::AwDlLease::acquire())
+        .await
+        .context("the AWDL helper did not grant a lease in time")??;
+    Ok(Some(lease.hold()))
+}
+
+/// Samples the cursor again, since it kept moving after the edge was detected.
+fn prepare_request(handoff: &mut HandoffOptions, token: u64) -> Result<DesktopRequest> {
+    let current = cursor_position()?;
+    let point = Point {
+        x: current.x.floor() as i32,
+        y: current.y.floor() as i32,
+    };
+    let original_position = handoff.position;
+    let refreshed = handoff.entry_region.contains(point);
+    if refreshed {
+        handoff.position = handoff.return_mapping.fraction(point)?;
+    }
+    tracing::debug!(
+        original_position,
+        position = handoff.position,
+        refreshed,
+        current_x = current.x,
+        current_y = current.y,
+        displacement_x = current.x - handoff.entry_position.x,
+        displacement_y = current.y - handoff.entry_position.y,
+        "entry fraction sampled before desktop preparation"
+    );
+    let request = DesktopRequest::Prepare {
+        token,
+        edge: handoff.edge,
+        start: handoff.start,
+        end: handoff.end,
+        position: handoff.position,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+/// Owns input on the receiver: activation, native capture, and release.
+async fn remote(
+    activation: &mut Activation<'_>,
+    handoff: &HandoffOptions,
+    local_desktop: &[DesktopRect],
+    token: u64,
+    lease: &mut Option<awdl::HeldLease>,
+    stop: &mut watch::Receiver<bool>,
+    status: &mpsc::UnboundedSender<SourceStatus>,
+) -> Result<Option<u32>> {
+    let session = activation.session;
+    session.begin_outbound(activation.context)?;
+    let mut poll = None;
+    let mut result = capture(
+        activation,
+        handoff,
+        local_desktop,
+        token,
+        &mut poll,
+        lease,
+        stop,
+        status,
+    )
+    .await;
+    let releasing = Instant::now();
+    let released = tokio::time::timeout(
+        RELEASE_TIMEOUT,
+        session.end_outbound(SessionCloseReason::LocalRelease),
+    )
+    .await
+    .context("timed out releasing remote input")
+    .and_then(|result| result);
+    tracing::info!(
+        elapsed_ms = releasing.elapsed().as_millis() as u64,
+        success = released.is_ok(),
+        "remote input release completed"
+    );
+    if released.is_err() {
+        // Closing the session makes the receiver release everything it holds.
+        session.close(SessionCloseReason::LocalRelease);
+    }
+    keep_first_failure(&mut result, released, "remote input release");
+    // Keep the poll alive through Leave, then finish it before Finish. Late
+    // responses cannot change the cursor placement or the capture result.
+    if let Some(poll) = poll {
+        tracing::debug!("waiting for desktop poll before cleanup");
+        let response = poll.await;
+        tracing::debug!(?response, "desktop poll wait completed");
+    }
+    result
+}
+
+/// Why forwarding stopped.
+struct Ended {
+    reason: &'static str,
+    returned: Option<u32>,
+    error: Option<anyhow::Error>,
+    touch_active: bool,
+    events: u64,
+}
+
+impl Ended {
+    fn failed(mut self, reason: &'static str, error: anyhow::Error) -> Self {
+        self.reason = reason;
+        self.error = Some(error);
+        self
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn capture<'a>(
+    activation: &mut Activation<'a>,
+    handoff: &HandoffOptions,
+    local_desktop: &[DesktopRect],
+    token: u64,
+    poll: &mut Option<DesktopPoll<'a>>,
+    lease: &mut Option<awdl::HeldLease>,
+    stop: &mut watch::Receiver<bool>,
+    status: &mpsc::UnboundedSender<SourceStatus>,
+) -> Result<Option<u32>> {
+    let started = Instant::now();
+    let mut capture =
+        MacCapture::start(activation.raw_touch, handoff.entry_region).inspect_err(|error| {
+            tracing::warn!(elapsed_ms = started.elapsed().as_millis() as u64,
+                cursor = ?cursor_position().ok().map(|p| (p.x, p.y)),
+                error = %error, "native capture start rejected");
+        })?;
+    if activation.raw_touch && !capture.raw_touch {
+        tracing::info!(reason = %MacCapture::last_error(),
+            "raw touch unavailable; forwarding pointer and scroll");
+    }
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        raw_touch = capture.raw_touch,
+        cursor = ?cursor_position().ok().map(|p| (p.x, p.y)),
+        "native capture started"
+    );
+    let _ = status.send(SourceStatus::Sharing);
+    // Polling renews the receiver's handoff and reports its return edge.
+    *poll = Some(poll_desktop(activation.session, token));
+    let ended = forward(
+        &mut capture,
+        activation,
+        handoff,
+        token,
+        poll,
+        lease,
+        stop,
+        status,
+    )
+    .await;
+    tracing::info!(reason = ended.reason, captured_events = ended.events,
+        active_ms = started.elapsed().as_millis() as u64,
+        error = ?ended.error.as_ref().map(|error| format!("{error:#}")), "stopping native capture");
+    let mut error = ended.error;
+    let return_point = match ended
+        .returned
+        .map(|position| return_point(handoff, local_desktop, position))
+    {
+        Some(Ok(point)) => Some(point),
+        Some(Err(failure)) => {
+            error.get_or_insert(failure);
+            None
+        }
+        None => None,
+    };
+    if let Err(failure) = capture.stop_at(return_point) {
+        error.get_or_insert(failure);
+    } else if return_point.is_some() {
+        tracing::info!(point = ?return_point, "Mac cursor positioned before local input resumed");
+        let _ = status.send(SourceStatus::LocalInputRestored);
+    }
+    // Escape must stay paused even when the event queue was full or cleanup failed.
+    if capture.pause_requested() {
+        let _ = status.send(SourceStatus::PauseRequested);
+    }
+    if ended.touch_active {
+        let _ = activation
+            .session
+            .capture(touch_frame(TouchState::default()));
+    }
+    error.map_or(Ok(ended.returned), Err)
+}
+
+fn return_point(
+    handoff: &HandoffOptions,
+    local_desktop: &[DesktopRect],
+    position: u32,
+) -> Result<CursorPosition> {
+    let point = handoff.return_mapping.position(position)?;
+    ensure!(
+        local_desktop == active_desktop_rectangles()?,
+        "the Mac desktop changed before returning input"
+    );
+    Ok(CursorPosition {
+        x: f64::from(point.x),
+        y: f64::from(point.y),
+    })
+}
+
+/// Forwards captured input until the crossing ends and reports why.
+#[allow(clippy::too_many_arguments)]
+async fn forward<'a>(
+    capture: &mut MacCapture,
+    activation: &mut Activation<'a>,
+    handoff: &HandoffOptions,
+    token: u64,
+    poll: &mut Option<DesktopPoll<'a>>,
+    lease: &mut Option<awdl::HeldLease>,
+    stop: &mut watch::Receiver<bool>,
+    status: &mpsc::UnboundedSender<SourceStatus>,
+) -> Ended {
+    let session = activation.session;
+    let mut ended = Ended {
+        reason: "stop requested",
+        returned: None,
+        error: None,
+        touch_active: false,
+        events: 0,
+    };
+    let mut secure_input_check = tokio::time::interval(SECURE_INPUT_CHECK_INTERVAL);
+    secure_input_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_touch = Instant::now();
+    loop {
+        let touch_expiry = tokio::time::Instant::from_std(last_touch + TOUCH_STALE_TIMEOUT);
+        tokio::select! {
+            biased;
+            _ = stop_requested(stop) => return ended,
+            response = next_poll(poll) => match response {
+                Ok(DesktopResponse::Active) => *poll = Some(poll_desktop(session, token)),
+                Ok(DesktopResponse::Returned { position }) => {
+                    tracing::info!(position, "receiver reported return edge");
+                    ended.reason = "GNOME return edge";
+                    if position < handoff.start || position > handoff.end {
+                        ended.error =
+                            Some(anyhow!("receiver returned outside the configured edge range"));
+                    } else {
+                        ended.returned = Some(position);
+                    }
+                    return ended;
+                }
+                Ok(DesktopResponse::Unavailable { reason }) => {
+                    let error = anyhow!("receiver desktop unavailable: {reason}");
+                    return ended.failed("desktop unavailable", error);
+                }
+                Ok(_) => {
+                    let error = anyhow!("unexpected receiver desktop response");
+                    return ended.failed("unexpected desktop response", error);
+                }
+                Err(error) => return ended.failed("desktop request failed", error),
+            },
+            error = lease_failed(lease) => {
+                *lease = None;
+                return ended.failed("AWDL renewal failed", error);
+            }
+            _ = secure_input_check.tick() => {
+                if secure_input_enabled() {
+                    let error = AdmissionCancelled(SECURE_INPUT_RETURNED.into()).into();
+                    return ended.failed("secure keyboard entry", error);
+                }
+                // A stop the wake missed still ends capture.
+                if capture.stop_requested() {
+                    CAPTURE_WAKE.notify_one();
+                }
+            }
+            () = CAPTURE_WAKE.notified() => {
+                let mut drained = 0;
+                while drained < MAX_EVENTS_PER_DRAIN {
+                    let Some(event) = capture.poll() else { break };
+                    drained += 1;
+                    ended.events += 1;
+                    if event.kind == NativeEventKind::Escape as u32 {
+                        let _ = status.send(SourceStatus::PauseRequested);
+                        ended.reason = "native escape event";
+                        return ended;
+                    }
+                    if event.kind == NativeEventKind::Touch as u32 {
+                        last_touch = Instant::now();
+                        ended.touch_active = event.contact_count > 0;
+                    }
+                    if let Err(error) = native_frame(event)
+                        .and_then(|frame| frame.map_or(Ok(()), |frame| session.capture(frame)))
+                    {
+                        return ended.failed("capture forwarding failed", error);
+                    }
+                }
+                if drained == MAX_EVENTS_PER_DRAIN {
+                    // More may be queued. Let the session send this batch first.
+                    tokio::task::yield_now().await;
+                    CAPTURE_WAKE.notify_one();
+                } else if capture.stop_requested() {
+                    ended.reason = "native capture requested stop";
+                    return ended;
+                }
+            }
+            () = tokio::time::sleep_until(touch_expiry), if ended.touch_active => {
+                if let Err(error) = session.capture(touch_frame(TouchState::default())) {
+                    return ended.failed("capture forwarding failed", error);
+                }
+                ended.touch_active = false;
+            }
+            event = activation.events.recv() => match event.map(|event| event.kind) {
+                Some(SessionEventKind::OutboundEnded) => {
+                    // The session ends remote control when the receiver stops
+                    // acknowledging, for example after a Wi-Fi stall outlived its
+                    // lease. Return at the entry point and keep sharing armed.
+                    ended.reason = "remote ownership ended";
+                    ended.returned = Some(handoff.position);
+                    return ended;
+                }
+                Some(SessionEventKind::Closed { reason }) => {
+                    let error = anyhow!("input session closed: {reason}");
+                    return ended.failed("input session closed", error);
+                }
+                Some(kind) => refuse_inbound(kind),
+                None => {
+                    let error = anyhow!("input session event channel closed");
+                    return ended.failed("input session closed", error);
+                }
+            },
+        }
+    }
+}
+
+async fn next_poll(poll: &mut Option<DesktopPoll<'_>>) -> Result<DesktopResponse> {
+    let response = match poll.as_mut() {
+        Some(pending) => pending.await,
+        None => std::future::pending().await,
+    };
+    *poll = None;
+    response
+}
+
+/// The Mac only sends input. Refuse whatever a receiver would handle.
+fn refuse_inbound(kind: SessionEventKind) {
+    match kind {
+        SessionEventKind::Desktop { reply, .. } => {
+            let _ = reply.send(DesktopResponse::unavailable(
+                "Mac source cannot receive desktop handoffs",
+            ));
+        }
+        SessionEventKind::ReceiverEffects { applied, .. } => {
+            let _ = applied.send(Err(
+                "the Mac does not accept input from other computers".into()
+            ));
+        }
+        SessionEventKind::OutboundEnded | SessionEventKind::Closed { .. } => {}
+    }
+}
+
+/// Answers events that arrived while the link was idle, including the
+/// OutboundEnded that trails the previous crossing's release.
+fn refuse_waiting_events(events: &mut mpsc::Receiver<SessionEvent>) -> Result<()> {
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                if let SessionEventKind::Closed { reason } = event.kind {
+                    bail!("input session closed: {reason}");
+                }
+                refuse_inbound(event.kind);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::error::TryRecvError::Disconnected) => bail!("input session closed"),
+        }
+    }
+}
+
+fn stopped(stop: &watch::Receiver<bool>) -> bool {
+    *stop.borrow() || stop.has_changed().is_err()
 }
 
 async fn stop_requested(stop: &mut watch::Receiver<bool>) {
@@ -264,583 +678,6 @@ async fn stop_requested(stop: &mut watch::Receiver<bool>) {
             return;
         }
     }
-}
-
-static SOURCE_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-struct SourceGuard;
-
-impl SourceGuard {
-    fn acquire() -> Result<Self> {
-        SOURCE_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| anyhow!("a macOS input source is already running"))?;
-        Ok(Self)
-    }
-}
-
-impl Drop for SourceGuard {
-    fn drop(&mut self) {
-        SOURCE_ACTIVE.store(false, Ordering::Release);
-    }
-}
-
-struct SourceEndpoint(Endpoint);
-
-impl SourceEndpoint {
-    async fn shutdown(&self) -> Result<()> {
-        let started = Instant::now();
-        tracing::debug!("QUIC endpoint shutdown started");
-        self.0.close(0_u32.into(), b"foreground source stopped");
-        // Keep the worker runtime alive until Quinn has sent the disconnect.
-        // Otherwise a new crossing can reach Ubuntu before the old session ends.
-        let result = tokio::time::timeout(Duration::from_secs(2), self.0.wait_idle())
-            .await
-            .context("timed out closing the input connection; sharing remains off");
-        tracing::info!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            success = result.is_ok(),
-            "QUIC endpoint shutdown completed"
-        );
-        result
-    }
-}
-
-impl Drop for SourceEndpoint {
-    fn drop(&mut self) {
-        self.0.close(0_u32.into(), b"foreground source stopped");
-    }
-}
-
-/// Check an authenticated receiver before arming edge sharing. The endpoint is fully
-/// closed before returning so the next crossing can use the peer's session slot.
-pub(crate) async fn receiver_snapshot(
-    config: &Config,
-    name: &str,
-    nearby: &[SocketAddr],
-) -> Result<crate::desktop::Geometry> {
-    let _guard = SourceGuard::acquire()?;
-    let peer = config.peers.get(name).context("Unknown paired computer")?;
-    anyhow::ensure!(
-        peer.permissions.connect && peer.permissions.receive_normal,
-        "{name} does not allow input sharing"
-    );
-    let identity = Identity::load_or_create(&config.daemon.state_dir)?;
-    let client = input_client_config(&identity, &peer.spki_der()?)?;
-    let address = *peer
-        .addresses
-        .first()
-        .context("Computer has no input address")?;
-    let bind = match address.ip() {
-        IpAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-        IpAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-    };
-    let endpoint = SourceEndpoint(Endpoint::client(bind)?);
-    let (events, _received) = mpsc::channel(128);
-    let result = async {
-        let (_, connection) = connect_peer(&endpoint.0, &client, &peer.addresses, nearby).await?;
-        let session = start_session(
-            connection,
-            name.to_owned(),
-            TransportGeneration(1),
-            SessionOptions::from_config(config)?,
-            events,
-        )
-        .await?;
-        let response = session
-            .desktop_request(crate::desktop::DesktopRequest::Snapshot)
-            .await;
-        session.close(SessionCloseReason::LocalRelease);
-        let response = response?;
-        response.validate()?;
-        match response {
-            DesktopResponse::Snapshot { geometry, .. } => Ok(geometry),
-            DesktopResponse::Unavailable { reason } => bail!("{reason}"),
-            _ => bail!("Unexpected receiver response"),
-        }
-    }
-    .await;
-    let cleanup = endpoint.shutdown().await;
-    cleanup?;
-    result
-}
-
-async fn run_source(
-    options: SourceOptions,
-    stop: &mut watch::Receiver<bool>,
-    status: &mpsc::UnboundedSender<SourceStatus>,
-) -> Result<Option<u32>> {
-    if *stop.borrow() || stop.has_changed().is_err() {
-        return Ok(None);
-    }
-    let _guard = SourceGuard::acquire()?;
-    let mut config = match &options.config {
-        Some(config) => config.clone(),
-        None => Config::load(&options.config_path)?,
-    };
-    let peer = config
-        .peers
-        .get(&options.peer)
-        .cloned()
-        .with_context(|| format!("unknown paired peer {}", options.peer))?;
-    if !peer.permissions.connect || !peer.permissions.receive_normal {
-        bail!(
-            "peer {} is not permitted to receive normal input",
-            options.peer
-        );
-    }
-
-    let raw_requested = options.raw_touch && config.input.experimental_touchpad;
-    let raw_available = raw_requested && MacCapture::raw_touch_available();
-    if raw_requested && !raw_available {
-        eprintln!(
-            "raw Magic Trackpad capture unavailable: {}; falling back to pointer and scroll",
-            MacCapture::last_error()
-        );
-    }
-    config.input.experimental_touchpad = raw_available;
-
-    let pinned = options
-        .address
-        .map_or_else(|| peer.addresses.clone(), |address| vec![address]);
-    let address = *pinned
-        .first()
-        .with_context(|| format!("peer {} has no input address", options.peer))?;
-    let identity = Identity::load_or_create(&config.daemon.state_dir)?;
-    let client_config = input_client_config(&identity, &peer.spki_der()?)?;
-    let bind_address = match address.ip() {
-        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    };
-    let endpoint = SourceEndpoint(Endpoint::client(bind_address)?);
-    run_endpoint(
-        &endpoint,
-        &client_config,
-        pinned,
-        config,
-        options,
-        stop,
-        status,
-    )
-    .await
-}
-
-async fn run_endpoint(
-    endpoint: &SourceEndpoint,
-    client_config: &InputClientConfig,
-    pinned: Vec<SocketAddr>,
-    config: Config,
-    mut options: SourceOptions,
-    stop: &mut watch::Receiver<bool>,
-    status: &mpsc::UnboundedSender<SourceStatus>,
-) -> Result<Option<u32>> {
-    let mut awdl_lease = None;
-    let result = async {
-    let raw_available = config.input.experimental_touchpad;
-    let connecting = Instant::now();
-    tracing::info!(peer = %options.peer, ?pinned, nearby = options.nearby.len(), "input connection starting");
-    println!("connecting to {} at {pinned:?}", options.peer);
-    let (session_events, mut events) = mpsc::channel(128);
-    let session = {
-        let setup = async {
-            let (address, connection) =
-                connect_peer(&endpoint.0, client_config, &pinned, &options.nearby).await?;
-            tracing::info!(%address, elapsed_ms = connecting.elapsed().as_millis() as u64,
-                "QUIC connection established");
-            let negotiating = Instant::now();
-            let session = start_session(connection, options.peer.clone(), TransportGeneration(1),
-                SessionOptions::from_config(&config)?, session_events).await?;
-            tracing::info!(session_id = session.id(),
-                elapsed_ms = negotiating.elapsed().as_millis() as u64, "input session negotiated");
-            Ok::<_, anyhow::Error>(session)
-        };
-        let acquisition = awdl::AwDlLease::acquire();
-        tokio::pin!(setup, acquisition);
-        let mut acquired = !options.reduce_wifi_latency;
-        let mut connected = None;
-        loop {
-            tokio::select! {
-                biased;
-                _ = stop_requested(stop) => {
-                    tracing::info!(elapsed_ms = connecting.elapsed().as_millis() as u64,
-                        "cancelled during connection setup");
-                    return Ok(None);
-                },
-                result = &mut acquisition, if !acquired => {
-                    awdl_lease = Some(result?.hold());
-                    acquired = true;
-                },
-                result = &mut setup, if connected.is_none() => connected = Some(result?),
-            }
-            if acquired && let Some(session) = connected.take() { break session; }
-        }
-    };
-    // A receiver without Touch drops contact snapshots, so keep pointer and
-    // scroll instead of suppressing them while a finger is down.
-    let raw_touch = raw_available && session.capabilities().contains(InputCapability::Touch);
-    if raw_available && !raw_touch {
-        eprintln!("{} does not accept raw touch; falling back to pointer and scroll", options.peer);
-    }
-
-    let mut prepared = None;
-    let mut activation_started = false;
-    let mut returned = None;
-    let local_desktop = options
-        .handoff
-        .as_ref()
-        .map(|_| active_desktop_rectangles())
-        .transpose()?;
-
-    let desktop_poll = poll_desktop(&session, None);
-    tokio::pin!(desktop_poll);
-    let mut desktop_poll_pending = false;
-    let result = async {
-        if *stop.borrow() || stop.has_changed().is_err() {
-            return Ok(());
-        }
-        if let Some(handoff) = &mut options.handoff {
-            let preparing = Instant::now();
-            tracing::info!("desktop preparation starting");
-            let mut token_bytes = [0_u8; 8];
-            getrandom::fill(&mut token_bytes)
-                .map_err(|error| anyhow!("could not create a desktop handoff token: {error}"))?;
-            let token = handoff_token(token_bytes);
-            let current = cursor_position()?;
-            let original_position = handoff.position;
-            let refreshed = handoff.entry_region.contains(current);
-            if refreshed {
-                handoff.position = handoff.return_mapping.fraction(crate::desktop::Point {
-                    x: current.x.floor() as i32,
-                    y: current.y.floor() as i32,
-                })?;
-            }
-            tracing::debug!(original_position, position = handoff.position, refreshed,
-                current_x = current.x, current_y = current.y,
-                displacement_x = current.x - handoff.entry_position.x,
-                displacement_y = current.y - handoff.entry_position.y,
-                "entry fraction sampled before desktop preparation");
-            let request = DesktopRequest::Prepare {
-                token, edge: handoff.edge, start: handoff.start,
-                end: handoff.end, position: handoff.position,
-            };
-            request.validate()?;
-            if *stop.borrow() || stop.has_changed().is_err() {
-                return Ok(());
-            }
-            prepared = Some(token);
-            // Await the bounded reply even after Stop so Finish can use the same transport.
-            let response = session.desktop_request(request).await.context(
-                "Could not prepare desktop handoff. On Ubuntu, run just install-linux to update and restart the installed zflowd service; just run updates only the GUI. If the GNOME integration was newly installed, log out and back in, then enable desktop handoff in the Ubuntu app"
-            )?;
-            validate_prepared(handoff, response)?;
-            tracing::info!(elapsed_ms = preparing.elapsed().as_millis() as u64, "desktop preparation completed");
-        }
-        if *stop.borrow() || stop.has_changed().is_err() {
-            return Ok(());
-        }
-        if options.handoff.is_some() && !input_is_neutral() {
-            return Err(AdmissionCancelled("Release held keys and buttons before crossing to the other computer".into()).into());
-        }
-        if let Some(handoff) = &options.handoff {
-            let current = cursor_position()?;
-            tracing::debug!(expected_x = handoff.entry_position.x, expected_y = handoff.entry_position.y,
-                current_x = current.x, current_y = current.y, "checking cursor before capture");
-            validate_entry_position(handoff.entry_region, current)?;
-            if local_desktop.as_ref() != Some(&active_desktop_rectangles()?) {
-                bail!("the Mac desktop changed while connecting; refresh and save its layout");
-            }
-        }
-        let mut epoch = [0_u8; 16];
-        getrandom::fill(&mut epoch)
-            .map_err(|error| anyhow!("could not create the source session epoch: {error}"))?;
-        session.begin_outbound(SessionContext {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            session_epoch: SessionEpoch(epoch),
-            transport_generation: session.generation(),
-            activation_id: ActivationId(1),
-        })?;
-        activation_started = true;
-
-        let capture_start = Instant::now();
-        tracing::debug!("native capture starting");
-        let mut capture = MacCapture::start(raw_touch, options.handoff.as_ref().map(|h| h.entry_region))
-            .inspect_err(|error| {
-                tracing::warn!(elapsed_ms = capture_start.elapsed().as_millis() as u64,
-                    cursor = ?cursor_position().ok().map(|p| (p.x, p.y)),
-                    error = %error, "native capture start rejected");
-            })?;
-        tracing::info!(elapsed_ms = capture_start.elapsed().as_millis() as u64,
-            connection_to_capture_ms = connecting.elapsed().as_millis() as u64, "native capture started");
-        let _ = status.send(SourceStatus::Sharing);
-        println!(
-            "remote input active: raw_touch={}; escape with Ctrl+Cmd+Backspace or Ctrl+C",
-            capture.raw_touch
-        );
-
-        let mut interval = tokio::time::interval(CAPTURE_POLL_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut secure_input_check = tokio::time::interval(SECURE_INPUT_CHECK_INTERVAL);
-        secure_input_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut touch_active = false;
-        let mut last_touch = Instant::now();
-        let mut terminal_error = None;
-        let mut stop_reason = "stop requested";
-        let mut captured_events = 0_u64;
-        let mut last_capture_poll = Instant::now();
-        let mut max_poll_gap = Duration::ZERO;
-        desktop_poll.set(poll_desktop(&session, prepared));
-        desktop_poll_pending = prepared.is_some();
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = stop_requested(stop) => break,
-                response = &mut desktop_poll, if desktop_poll_pending => {
-                    desktop_poll_pending = false;
-                    match response {
-                        Ok(DesktopResponse::Active) => {
-                            desktop_poll.set(poll_desktop(&session, prepared));
-                            desktop_poll_pending = true;
-                        },
-                        Ok(DesktopResponse::Returned { position }) => {
-                            stop_reason = "GNOME return edge";
-                            tracing::info!(position, "receiver reported return edge");
-                            if let Some(handoff) = &options.handoff
-                                && (position < handoff.start || position > handoff.end)
-                            {
-                                terminal_error = Some(anyhow!("receiver returned outside the configured edge range"));
-                            } else {
-                                returned = Some(position);
-                            }
-                            break;
-                        },
-                        Ok(DesktopResponse::Unavailable { reason }) => {
-                            stop_reason = "desktop unavailable";
-                            terminal_error = Some(anyhow!("receiver desktop unavailable: {reason}"));
-                            break;
-                        },
-                        Ok(_) => {
-                            stop_reason = "unexpected desktop response";
-                            terminal_error = Some(anyhow!("unexpected receiver desktop response"));
-                            break;
-                        },
-                        Err(error) => {
-                            stop_reason = "desktop request failed";
-                            terminal_error = Some(error);
-                            break;
-                        }
-                    }
-                },
-                error = lease_failed(&mut awdl_lease) => {
-                    awdl_lease = None;
-                    stop_reason = "AWDL renewal failed";
-                    terminal_error = Some(error);
-                    break;
-                }
-                _ = secure_input_check.tick() => {
-                    if secure_input_enabled() {
-                        stop_reason = "secure keyboard entry";
-                        terminal_error = Some(AdmissionCancelled(SECURE_INPUT_RETURNED.into()).into());
-                        break;
-                    }
-                }
-                _ = interval.tick() => {
-                    max_poll_gap = max_poll_gap.max(last_capture_poll.elapsed());
-                    last_capture_poll = Instant::now();
-                    for event in std::iter::from_fn(|| capture.poll()).take(MAX_EVENTS_PER_POLL) {
-                        captured_events += 1;
-                        if event.kind == NativeEventKind::Escape as u32 {
-                            let _ = status.send(SourceStatus::PauseRequested);
-                            stop_reason = "native escape event";
-                            break;
-                        }
-                        if event.kind == NativeEventKind::Touch as u32 {
-                            last_touch = Instant::now();
-                            touch_active = event.contact_count > 0;
-                        }
-                        match native_frame(event).and_then(|frame| {
-                            frame.map_or(Ok(()), |frame| session.capture(frame))
-                        }) {
-                            Ok(()) => {},
-                            Err(error) => {
-                                stop_reason = "capture forwarding failed";
-                                terminal_error = Some(error);
-                                break;
-                            }
-                        }
-                    }
-                    if capture.stop_requested() || terminal_error.is_some() {
-                        if terminal_error.is_none() && stop_reason != "native escape event" {
-                            stop_reason = "native capture requested stop";
-                        }
-                        break;
-                    }
-                    if touch_active && last_touch.elapsed() >= TOUCH_STALE_TIMEOUT {
-                        if let Err(error) = session.capture(touch_frame(TouchState::default())) {
-                            terminal_error = Some(error);
-                            break;
-                        }
-                        touch_active = false;
-                    }
-                }
-                event = events.recv() => {
-                    match event.map(|event| event.kind) {
-                        Some(SessionEventKind::Desktop { reply, .. }) => {
-                            let _ = reply.send(DesktopResponse::unavailable("Mac source cannot receive desktop handoffs"));
-                        }
-                        Some(SessionEventKind::ReceiverEffects { applied, .. }) => {
-                            let message = "foreground macOS source does not inject received input".to_owned();
-                            let _ = applied.send(Err(message.clone()));
-                            terminal_error = Some(anyhow!(message));
-                            break;
-                        }
-                        Some(SessionEventKind::Closed { reason }) => {
-                            stop_reason = "input session closed";
-                            terminal_error = Some(anyhow!("input session closed: {reason}"));
-                            break;
-                        }
-                        Some(SessionEventKind::OutboundEnded) => {
-                            // The session ends remote control when the receiver stops
-                            // acknowledging, for example after a Wi-Fi stall outlived its
-                            // lease. Return at the entry point and keep sharing armed.
-                            stop_reason = "remote ownership ended";
-                            returned = options.handoff.as_ref().map(|handoff| handoff.position);
-                            break;
-                        }
-                        None => {
-                            stop_reason = "session event channel closed";
-                            terminal_error = Some(anyhow!("input session event channel closed"));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        tracing::info!(reason = stop_reason, captured_events,
-            active_ms = capture_start.elapsed().as_millis() as u64,
-            max_capture_poll_gap_ms = max_poll_gap.as_millis() as u64,
-            error = ?terminal_error.as_ref().map(|error| format!("{error:#}")), "stopping native capture");
-        let return_point = returned.and_then(|position| {
-            let result = options.handoff.as_ref().context("missing desktop return mapping")
-                .and_then(|handoff| handoff.return_mapping.position(position))
-                .and_then(|point| {
-                    anyhow::ensure!(local_desktop.as_ref() == Some(&active_desktop_rectangles()?),
-                        "the Mac desktop changed before returning input");
-                    Ok(CursorPosition { x: f64::from(point.x), y: f64::from(point.y) })
-                });
-            match result {
-                Ok(point) => Some(point),
-                Err(error) => { terminal_error.get_or_insert(error); None }
-            }
-        });
-        if let Err(error) = capture.stop_at(return_point) {
-            eprintln!("{error:#}");
-            terminal_error.get_or_insert(error);
-        } else if return_point.is_some() {
-            tracing::info!(point = ?return_point, "Mac cursor positioned before local input resumed");
-            let _ = status.send(SourceStatus::LocalInputRestored);
-        }
-        // Escape must stay paused even when the event queue was full or cleanup failed.
-        if capture.pause_requested() {
-            let _ = status.send(SourceStatus::PauseRequested);
-        }
-        if touch_active {
-            let _ = session.capture(touch_frame(TouchState::default()));
-        }
-        println!("remote input capture stopped");
-        terminal_error.map_or(Ok(()), Err)
-    }.await;
-    let mut result = result;
-    if activation_started {
-        let releasing = Instant::now();
-        let released = tokio::time::timeout(
-            Duration::from_millis(200),
-            session.end_outbound(SessionCloseReason::LocalRelease),
-        )
-        .await
-        .context("timed out releasing remote input")
-        .and_then(|result| result);
-        tracing::info!(
-            elapsed_ms = releasing.elapsed().as_millis() as u64,
-            success = released.is_ok(),
-            "remote input release completed"
-        );
-        if let Err(error) = released {
-            eprintln!("Could not confirm remote input release: {error:#}");
-            if result.is_ok()
-                || result
-                    .as_ref()
-                    .is_err_and(|error| error.is::<AdmissionCancelled>())
-            {
-                result = Err(error);
-            }
-            session.close(SessionCloseReason::LocalRelease);
-        }
-    }
-    // Keep the poll alive through Leave, then finish it before requesting cleanup.
-    // Late responses cannot change the cursor placement or the capture result.
-    if desktop_poll_pending {
-        let waiting = Instant::now();
-        tracing::debug!("waiting for desktop poll before cleanup");
-        let response = desktop_poll.await;
-        tracing::debug!(
-            elapsed_ms = waiting.elapsed().as_millis() as u64,
-            ?response,
-            "desktop poll wait completed"
-        );
-    }
-    if let Some(token) = prepared {
-        let finishing = Instant::now();
-        let finished = session
-            .desktop_request(DesktopRequest::Finish { token })
-            .await;
-        let finished = validate_finished(finished);
-        tracing::info!(
-            elapsed_ms = finishing.elapsed().as_millis() as u64,
-            success = finished.is_ok(),
-            "desktop handoff cleanup completed"
-        );
-        if let Err(error) = finished {
-            eprintln!("Could not confirm desktop handoff cleanup: {error:#}");
-            if result.is_ok()
-                || result
-                    .as_ref()
-                    .is_err_and(|error| error.is::<AdmissionCancelled>())
-            {
-                result = Err(error);
-            }
-        }
-    }
-    session.close(SessionCloseReason::LocalRelease);
-
-    result.map(|_| returned)
-    }.await;
-    let release = async {
-        if let Some(lease) = awdl_lease.take() {
-            lease.release().await
-        } else {
-            Ok(())
-        }
-    };
-    let (shutdown, restoration) = tokio::join!(endpoint.shutdown(), release);
-    let mut result = result;
-    for (cleanup, operation) in [
-        (shutdown, "input connection shutdown"),
-        (restoration, "AWDL restoration"),
-    ] {
-        if let Err(error) = cleanup {
-            eprintln!("Could not finish {operation}: {error:#}");
-            if result.is_ok()
-                || result
-                    .as_ref()
-                    .is_err_and(|error| error.is::<AdmissionCancelled>())
-            {
-                result = Err(error);
-            }
-        }
-    }
-    result
 }
 
 fn validate_prepared(handoff: &HandoffOptions, response: DesktopResponse) -> Result<()> {
@@ -864,27 +701,6 @@ fn handoff_token(random: [u8; 8]) -> u64 {
     (u64::from_ne_bytes(random) & crate::desktop::MAX_TOKEN).max(1)
 }
 
-fn validate_entry_position(region: DesktopRect, current: CursorPosition) -> Result<()> {
-    anyhow::ensure!(
-        region.contains(CursorPosition {
-            x: region.x,
-            y: region.y
-        }),
-        "The configured crossing edge is invalid"
-    );
-    anyhow::ensure!(
-        current.x.is_finite() && current.y.is_finite(),
-        "Could not read the Mac cursor position"
-    );
-    if !region.contains(current) {
-        return Err(AdmissionCancelled(
-            "The Mac cursor left the configured edge while connecting".into(),
-        )
-        .into());
-    }
-    Ok(())
-}
-
 fn validate_finished(response: Result<DesktopResponse>) -> Result<()> {
     match response? {
         DesktopResponse::Finished => Ok(()),
@@ -895,54 +711,6 @@ fn validate_finished(response: Result<DesktopResponse>) -> Result<()> {
     }
 }
 
-/// Race the peer's pinned addresses, then discovered receivers after a short
-/// delay, all within one timeout. SPKI pinning rejects every host that is not
-/// this peer, so unverified addresses are safe to try.
-async fn connect_peer(
-    endpoint: &Endpoint,
-    client: &InputClientConfig,
-    pinned: &[SocketAddr],
-    nearby: &[SocketAddr],
-) -> Result<(SocketAddr, InputConnection)> {
-    let ipv4 = pinned
-        .first()
-        .context("Computer has no input address")?
-        .is_ipv4();
-    let mut tried = BTreeSet::new();
-    let mut attempts = tokio::task::JoinSet::new();
-    let candidates = pinned.iter().map(|address| (*address, Duration::ZERO));
-    let candidates = candidates.chain(nearby.iter().map(|address| (*address, NEARBY_DELAY)));
-    // The endpoint is bound to the family of the first pinned address.
-    for (address, delay) in candidates.filter(|(address, _)| address.is_ipv4() == ipv4) {
-        if !tried.insert(address) {
-            continue;
-        }
-        let (endpoint, client) = (endpoint.clone(), client.clone());
-        attempts.spawn(async move {
-            tokio::time::sleep(delay).await;
-            let connection = connect_input(&endpoint, address, &client)
-                .await
-                .with_context(|| format!("could not connect to {address}"))?;
-            Ok::<_, anyhow::Error>((address, connection))
-        });
-    }
-    tokio::time::timeout(CONNECT_TIMEOUT, async {
-        let mut failure = anyhow!("no input address to try");
-        while let Some(attempt) = attempts.join_next().await {
-            match attempt
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result)
-            {
-                Ok(connected) => return Ok(connected),
-                Err(error) => failure = error,
-            }
-        }
-        Err(failure)
-    })
-    .await
-    .context("input connection timed out")?
-}
-
 /// Resolves only when a held AWDL lease fails to renew.
 async fn lease_failed(lease: &mut Option<awdl::HeldLease>) -> anyhow::Error {
     match lease {
@@ -951,21 +719,18 @@ async fn lease_failed(lease: &mut Option<awdl::HeldLease>) -> anyhow::Error {
     }
 }
 
-async fn poll_desktop(
-    session: &crate::session::SessionHandle,
-    token: Option<u64>,
-) -> Result<DesktopResponse> {
-    let started = Instant::now();
-    let response = session
-        .desktop_request(DesktopRequest::Poll {
-            token: token.context("desktop handoff has no token")?,
-        })
-        .await;
-    // Older receivers reply immediately; limit their poll rate before repeating.
-    if matches!(&response, Ok(DesktopResponse::Active)) {
-        tokio::time::sleep_until((started + Duration::from_millis(50)).into()).await;
-    }
-    response
+fn poll_desktop(session: &SessionHandle, token: u64) -> DesktopPoll<'_> {
+    Box::pin(async move {
+        let started = Instant::now();
+        let response = session
+            .desktop_request(DesktopRequest::Poll { token })
+            .await;
+        // Older receivers reply immediately; limit their poll rate before repeating.
+        if matches!(&response, Ok(DesktopResponse::Active)) {
+            tokio::time::sleep_until((started + Duration::from_millis(50)).into()).await;
+        }
+        response
+    })
 }
 
 fn native_frame(event: NativeEvent) -> Result<Option<CapturedDeviceFrame>> {
@@ -1220,11 +985,14 @@ unsafe extern "C" {
     fn zflow_mac_accessibility_authorized(prompt: i32) -> i32;
     fn zflow_mac_cursor_position(position: *mut CursorPosition) -> i32;
     fn zflow_mac_desktop_rectangles(rectangles: *mut DesktopRect, capacity: u32) -> i32;
-    fn zflow_mac_warp_cursor(position: CursorPosition) -> i32;
+    fn zflow_mac_display_generation() -> u32;
     fn zflow_mac_input_is_neutral() -> i32;
     fn zflow_mac_secure_input_enabled() -> i32;
-    fn zflow_mac_raw_touch_available() -> i32;
-    fn zflow_mac_capture_start(raw_touch: i32, entry: *const DesktopRect) -> i32;
+    fn zflow_mac_capture_start(
+        raw_touch: i32,
+        entry: *const DesktopRect,
+        wake: extern "C" fn(),
+    ) -> i32;
     fn zflow_mac_capture_stop_at(position: *const CursorPosition) -> i32;
     fn zflow_mac_capture_poll(event: *mut NativeEvent) -> i32;
     fn zflow_mac_capture_stop_requested() -> i32;
@@ -1247,19 +1015,19 @@ struct MacCapture {
 }
 
 impl MacCapture {
-    fn raw_touch_available() -> bool {
-        // SAFETY: the C preflight owns and releases all temporary framework objects.
-        unsafe { zflow_mac_raw_touch_available() == 1 }
-    }
-
-    fn start(raw_touch: bool, entry: Option<DesktopRect>) -> Result<Self> {
-        // SAFETY: start initializes the native thread before returning.
-        let status = unsafe {
-            zflow_mac_capture_start(
-                i32::from(raw_touch),
-                entry.as_ref().map_or(std::ptr::null(), |position| position),
-            )
+    /// Installs the event tap. The bridge then admits the crossing only if the
+    /// cursor is still in `entry` and no key or button is held; checking after
+    /// the tap is installed leaves no gap for a press to slip through.
+    fn start(raw_touch: bool, entry: Rect) -> Result<Self> {
+        let entry = DesktopRect {
+            x: f64::from(entry.x),
+            y: f64::from(entry.y),
+            width: f64::from(entry.width),
+            height: f64::from(entry.height),
         };
+        // SAFETY: start initializes the native thread before returning; the
+        // wake callback is a plain function that only touches a static Notify.
+        let status = unsafe { zflow_mac_capture_start(i32::from(raw_touch), &entry, wake_capture) };
         if status < 0 {
             return Err(capture_start_error(status, Self::last_error()));
         }
@@ -1283,10 +1051,6 @@ impl MacCapture {
     fn pause_requested(&self) -> bool {
         // SAFETY: the bridge exposes this flag atomically and preserves it after stop.
         unsafe { zflow_mac_capture_pause_requested() == 1 }
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        self.stop_at(None)
     }
 
     fn stop_at(&mut self, position: Option<CursorPosition>) -> Result<()> {
@@ -1327,8 +1091,8 @@ fn capture_start_error(status: i32, reason: String) -> anyhow::Error {
 
 impl Drop for MacCapture {
     fn drop(&mut self) {
-        if let Err(error) = self.stop() {
-            eprintln!("{error:#}");
+        if let Err(error) = self.stop_at(None) {
+            tracing::warn!(error = %format!("{error:#}"), "macOS capture cleanup failed");
         }
     }
 }
@@ -1337,184 +1101,9 @@ impl Drop for MacCapture {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn source_worker_shutdown_notifies_peer_before_its_runtime_exits() {
-        use crate::transport::{accept_input, input_server_config};
-
-        let left_dir = tempfile::tempdir().unwrap();
-        let right_dir = tempfile::tempdir().unwrap();
-        let left = Identity::load_or_create(left_dir.path()).unwrap();
-        let right = Identity::load_or_create(right_dir.path()).unwrap();
-        let client_config = input_client_config(&left, right.spki()).unwrap();
-        let server_config = input_server_config(&right, left.spki()).unwrap();
-        let server =
-            Endpoint::server(server_config.quinn_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
-        let address = server.local_addr().unwrap();
-        // A crossing uses a fresh thread and runtime. Observe each disconnect
-        // from a separate runtime, including when the client runtime is gone.
-        for _ in 0..3 {
-            let client_config = client_config.clone();
-            let (accepted, ready) = tokio::sync::oneshot::channel();
-            let worker = std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async {
-                        let endpoint = SourceEndpoint(
-                            Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap(),
-                        );
-                        let _connection = connect_input(&endpoint.0, address, &client_config)
-                            .await
-                            .unwrap();
-                        ready.await.unwrap();
-                        endpoint.shutdown().await.unwrap();
-                    });
-            });
-            let connection = tokio::time::timeout(Duration::from_secs(3), async {
-                accept_input(server.accept().await.unwrap(), &server_config)
-                    .await
-                    .unwrap()
-            })
-            .await
-            .unwrap();
-            accepted.send(()).unwrap();
-            tokio::task::spawn_blocking(move || worker.join().unwrap())
-                .await
-                .unwrap();
-            let reason = tokio::time::timeout(Duration::from_millis(250), connection.closed())
-                .await
-                .expect("the peer must not wait for the old connection's idle timeout");
-            assert!(matches!(
-                reason,
-                quinn::ConnectionError::ApplicationClosed(_)
-            ));
-        }
-        server.close(0_u32.into(), b"test finished");
-    }
-
-    #[tokio::test]
-    async fn connection_finds_a_moved_peer_and_rejects_other_receivers() {
-        use crate::transport::{accept_input, input_server_config};
-
-        let directories = [(); 3].map(|_| tempfile::tempdir().unwrap());
-        let [mac, linux, stranger] =
-            [0, 1, 2].map(|index| Identity::load_or_create(directories[index].path()).unwrap());
-        let client = input_client_config(&mac, linux.spki()).unwrap();
-        let mut servers = Vec::new();
-        for identity in [&stranger, &linux] {
-            let config = input_server_config(identity, mac.spki()).unwrap();
-            let server =
-                Endpoint::server(config.quinn_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
-            let accepting = server.clone();
-            tokio::spawn(async move {
-                let mut accepted = Vec::new();
-                while let Some(incoming) = accepting.accept().await {
-                    accepted.push(accept_input(incoming, &config).await);
-                }
-            });
-            servers.push(server);
-        }
-        let [stranger, linux] = [&servers[0], &servers[1]].map(|s| s.local_addr().unwrap());
-        // The pinned address stopped answering, as after a DHCP change.
-        let stale = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        let (address, _connection) = connect_peer(
-            &endpoint,
-            &client,
-            &[stale.local_addr().unwrap()],
-            &[stranger, linux],
-        )
-        .await
-        .unwrap();
-        assert_eq!(address, linux);
-        assert!(
-            connect_peer(&endpoint, &client, &[stranger], &[])
-                .await
-                .is_err()
-        );
-        endpoint.close(0_u32.into(), b"test finished");
-        for server in servers {
-            server.close(0_u32.into(), b"test finished");
-        }
-    }
-
-    #[tokio::test]
-    async fn raw_touch_needs_a_receiver_that_negotiates_touch() {
-        use crate::transport::{accept_input, input_server_config};
-
-        let left_dir = tempfile::tempdir().unwrap();
-        let right_dir = tempfile::tempdir().unwrap();
-        let left = Identity::load_or_create(left_dir.path()).unwrap();
-        let right = Identity::load_or_create(right_dir.path()).unwrap();
-        let client_config = input_client_config(&left, right.spki()).unwrap();
-        let server_config = input_server_config(&right, left.spki()).unwrap();
-        let server =
-            Endpoint::server(server_config.quinn_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
-        let address = server.local_addr().unwrap();
-        let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        let mut sender = Config::default();
-        sender.input.experimental_touchpad = true;
-        for touch in [false, true] {
-            let mut receiver = Config::default();
-            receiver.input.experimental_touchpad = touch;
-            let (server, server_config) = (server.clone(), server_config.clone());
-            let accepted = tokio::spawn(async move {
-                let incoming = server.accept().await.unwrap();
-                let connection = accept_input(incoming, &server_config).await.unwrap();
-                let options = SessionOptions::from_config(&receiver).unwrap();
-                let (events, received) = mpsc::channel(8);
-                let session = start_session(
-                    connection,
-                    "mac".into(),
-                    TransportGeneration(1),
-                    options,
-                    events,
-                );
-                (session.await.unwrap(), received)
-            });
-            let connection = connect_input(&client, address, &client_config)
-                .await
-                .unwrap();
-            let options = SessionOptions::from_config(&sender).unwrap();
-            let (events, _received) = mpsc::channel(8);
-            let session = start_session(
-                connection,
-                "linux".into(),
-                TransportGeneration(1),
-                options,
-                events,
-            )
-            .await
-            .unwrap();
-            let (remote, _remote_events) = accepted.await.unwrap();
-            assert_eq!(
-                session.capabilities().contains(InputCapability::Touch),
-                touch
-            );
-            session.close(SessionCloseReason::LocalRelease);
-            remote.close(SessionCloseReason::LocalRelease);
-        }
-        client.close(0_u32.into(), b"test finished");
-        server.close(0_u32.into(), b"test finished");
-    }
-
     #[test]
     fn admission_cancellation_is_typed_and_survives_context() {
-        let region = DesktopRect {
-            x: 0.0,
-            y: 0.0,
-            width: 9.0,
-            height: 100.0,
-        };
-        let cancelled = validate_entry_position(region, CursorPosition { x: 10.0, y: 50.0 })
-            .unwrap_err()
-            .context("while preparing capture");
-        assert!(matches!(
-            failure_status(&cancelled),
-            SourceStatus::Cancelled(_)
-        ));
-        let native = capture_start_error(-2, "held button".into());
+        let native = capture_start_error(-2, "held button".into()).context("while starting");
         assert!(matches!(
             failure_status(&native),
             SourceStatus::Cancelled(_)
@@ -1522,25 +1111,64 @@ mod tests {
         for error in [
             capture_start_error(-1, "crossing cancelled".into()),
             anyhow!("crossing cancelled"),
-            validate_entry_position(
-                DesktopRect {
-                    width: 0.0,
-                    ..region
-                },
-                CursorPosition { x: 0.0, y: 50.0 },
-            )
-            .unwrap_err(),
-            validate_entry_position(
-                region,
-                CursorPosition {
-                    x: f64::NAN,
-                    y: 50.0,
-                },
-            )
-            .unwrap_err(),
         ] {
             assert!(matches!(failure_status(&error), SourceStatus::Failed(_)));
         }
+    }
+
+    #[test]
+    fn cleanup_failures_replace_success_and_cancellation_but_not_failure() {
+        let cancelled = || -> Result<Option<u32>> {
+            Err(AdmissionCancelled("cursor left the edge".into()).into())
+        };
+        for mut result in [Ok(Some(7)), cancelled()] {
+            keep_first_failure(&mut result, Err(anyhow!("Finish lost")), "cleanup");
+            let error = result.unwrap_err();
+            assert!(!error.is::<AdmissionCancelled>());
+            assert!(format!("{error:#}").contains("Finish lost"));
+        }
+        let mut failed: Result<Option<u32>> = Err(anyhow!("Prepare timed out"));
+        keep_first_failure(&mut failed, Err(anyhow!("Finish lost")), "cleanup");
+        assert_eq!(failed.unwrap_err().to_string(), "Prepare timed out");
+        let mut kept = cancelled();
+        keep_first_failure(&mut kept, Ok(()), "cleanup");
+        assert!(kept.unwrap_err().is::<AdmissionCancelled>());
+    }
+
+    #[tokio::test]
+    async fn idle_events_are_answered_and_a_closed_session_refuses_the_crossing() {
+        let event = |kind| SessionEvent {
+            session_id: 1,
+            peer: "linux".into(),
+            kind,
+        };
+        let (sender, mut events) = mpsc::channel(8);
+        let (reply, desktop) = tokio::sync::oneshot::channel();
+        sender
+            .send(event(SessionEventKind::OutboundEnded))
+            .await
+            .unwrap();
+        sender
+            .send(event(SessionEventKind::Desktop {
+                request: DesktopRequest::Snapshot,
+                reply,
+            }))
+            .await
+            .unwrap();
+        refuse_waiting_events(&mut events).unwrap();
+        assert!(matches!(
+            desktop.await.unwrap(),
+            DesktopResponse::Unavailable { .. }
+        ));
+        sender
+            .send(event(SessionEventKind::Closed {
+                reason: "lost".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(refuse_waiting_events(&mut events).is_err());
+        drop(sender);
+        assert!(refuse_waiting_events(&mut events).is_err());
     }
 
     #[test]
@@ -1551,49 +1179,11 @@ mod tests {
     }
 
     #[test]
-    fn entry_admission_allows_recorded_along_edge_motion_but_rejects_departure() {
-        let region = DesktopRect {
-            x: 0.0,
-            y: 62.0,
-            width: 9.0,
-            height: 1620.0,
-        };
-        for y in [928.8125, 917.8125, 62.0, 1681.99] {
-            assert!(validate_entry_position(region, CursorPosition { x: 0.0, y }).is_ok());
-        }
-        for point in [
-            CursorPosition {
-                x: 9.0,
-                y: 917.8125,
-            },
-            CursorPosition {
-                x: -1.0,
-                y: 917.8125,
-            },
-            CursorPosition { x: 0.0, y: 61.99 },
-            CursorPosition { x: 0.0, y: 1682.0 },
-            CursorPosition {
-                x: f64::NAN,
-                y: 917.8125,
-            },
-        ] {
-            assert!(validate_entry_position(region, point).is_err());
-        }
-        assert!(
-            !DesktopRect {
-                width: f64::INFINITY,
-                ..region
-            }
-            .contains(CursorPosition { x: 0.0, y: 100.0 })
-        );
-    }
-
-    #[test]
     fn handoff_requires_prepared_geometry_to_match_saved_target() {
         let handoff = HandoffOptions {
             return_mapping: crate::desktop::ReturnMapping {
                 geometry: crate::desktop::Geometry {
-                    monitors: vec![crate::desktop::Rect {
+                    monitors: vec![Rect {
                         x: -100,
                         y: 0,
                         width: 100,
@@ -1607,11 +1197,11 @@ mod tests {
                 remote_end: 1.0,
             },
             entry_position: CursorPosition { x: -1.0, y: 50.0 },
-            entry_region: DesktopRect {
-                x: -9.0,
-                y: 0.0,
-                width: 9.0,
-                height: 100.0,
+            entry_region: Rect {
+                x: -9,
+                y: 0,
+                width: 9,
+                height: 100,
             },
             edge: Edge::Left,
             start: 0,
@@ -1622,14 +1212,14 @@ mod tests {
         };
         let prepared = DesktopResponse::Prepared {
             geometry: crate::desktop::Geometry {
-                monitors: vec![crate::desktop::Rect {
+                monitors: vec![Rect {
                     x: -2880,
                     y: -200,
                     width: 2880,
                     height: 1620,
                 }],
             },
-            position: crate::desktop::Point { x: -2879, y: 610 },
+            position: Point { x: -2879, y: 610 },
         };
         assert!(validate_prepared(&handoff, prepared.clone()).is_ok());
         assert!(
@@ -1656,64 +1246,6 @@ mod tests {
             validate_finished(Ok(DesktopResponse::unavailable("receiver still active"))).is_err()
         );
         assert!(validate_finished(Err(anyhow!("disconnected"))).is_err());
-    }
-
-    #[test]
-    fn source_guard_excludes_concurrent_sources_and_releases_on_drop() {
-        let guard = SourceGuard::acquire().unwrap();
-        assert!(SourceGuard::acquire().is_err());
-        drop(guard);
-        assert!(SourceGuard::acquire().is_ok());
-    }
-
-    #[test]
-    fn desktop_positions_preserve_negative_origins_and_exclude_outer_boundary() {
-        let rect = DesktopRect {
-            x: -1920.0,
-            y: -200.0,
-            width: 1920.0,
-            height: 1080.0,
-        };
-        assert!(rect.contains(CursorPosition {
-            x: -1919.0,
-            y: -199.0
-        }));
-        assert!(!rect.contains(CursorPosition { x: 0.0, y: 0.0 }));
-        assert!(!rect.contains(CursorPosition { x: -1.0, y: 880.0 }));
-        assert!(!rect.contains(CursorPosition {
-            x: f64::NAN,
-            y: 0.0
-        }));
-    }
-
-    #[tokio::test]
-    async fn controlled_source_cancels_before_config_or_capture() {
-        for close_sender in [false, true] {
-            let (stop, receiver) = watch::channel(!close_sender);
-            if close_sender {
-                drop(stop);
-            }
-            let (status, mut events) = mpsc::unbounded_channel();
-            run_controlled(
-                SourceOptions {
-                    config: None,
-                    config_path: PathBuf::from("/nonexistent-zflow-test-config"),
-                    peer: "unused".into(),
-                    address: None,
-                    nearby: Vec::new(),
-                    raw_touch: false,
-                    reduce_wifi_latency: false,
-                    handoff: None,
-                },
-                receiver,
-                status,
-            )
-            .await
-            .unwrap();
-            assert_eq!(events.recv().await, Some(SourceStatus::Connecting));
-            assert_eq!(events.recv().await, Some(SourceStatus::Stopped));
-            assert_eq!(events.recv().await, None);
-        }
     }
 
     #[tokio::test]

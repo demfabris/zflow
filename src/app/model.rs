@@ -1,29 +1,57 @@
-use std::{fs, io::ErrorKind, path::PathBuf};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{config::Config, session::SessionOptions};
 
-pub struct ConfigDocument {
+/// A TOML file being edited. `saved` is what the file held when it was read
+/// or last written, and saving refuses to overwrite a file changed since.
+pub struct Document<T> {
     pub path: PathBuf,
-    pub draft: Config,
-    saved: Config,
+    pub draft: T,
+    saved: T,
     disk_contents: Option<Vec<u8>>,
 }
 
-impl ConfigDocument {
+pub type ConfigDocument = Document<Config>;
+
+/// What a document holds.
+pub trait Contents: Clone + PartialEq + Serialize + DeserializeOwned {
+    const NAME: &'static str;
+    /// The contents of a file that does not exist yet.
+    fn missing(path: &Path) -> Self;
+    /// Checks a file as it is read.
+    fn check_read(&self) -> Result<()>;
+    /// Checks everything before a save.
+    fn check_save(&self) -> Result<()> {
+        self.check_read()
+    }
+    /// The text to write, given what the file held before.
+    fn render(&self, _saved: &Self, _disk: Option<&str>) -> Result<String> {
+        Ok(toml::to_string_pretty(self)?)
+    }
+}
+
+impl<T: Contents> Document<T> {
     pub fn open(path: PathBuf) -> Result<Self> {
-        let path = std::path::absolute(path).context("Could not resolve configuration path")?;
+        let path = std::path::absolute(path)
+            .with_context(|| format!("Could not resolve {} path", T::NAME))?;
         let disk_contents = read_contents(&path)?;
         let draft = match &disk_contents {
             Some(bytes) => {
-                let text = std::str::from_utf8(bytes).context("Configuration is not UTF-8")?;
-                let config: Config = toml::from_str(text)
+                let text = std::str::from_utf8(bytes)
+                    .with_context(|| format!("The {} is not UTF-8", T::NAME))?;
+                let contents: T = toml::from_str(text)
                     .with_context(|| format!("Could not parse {}", path.display()))?;
-                config.validate()?;
-                config
+                contents.check_read()?;
+                contents
             }
-            None => new_config(&path),
+            None => T::missing(&path),
         };
         Ok(Self {
             path,
@@ -37,7 +65,7 @@ impl ConfigDocument {
         self.draft != self.saved
     }
 
-    pub fn saved(&self) -> &Config {
+    pub fn saved(&self) -> &T {
         &self.saved
     }
 
@@ -46,41 +74,65 @@ impl ConfigDocument {
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.draft.validate()?;
-        SessionOptions::from_config(&self.draft)?;
-        #[cfg(target_os = "linux")]
-        crate::runtime::LinuxRuntimeConfig::from_config(&self.draft).validate()?;
-        Ok(())
+        self.draft.check_save()
     }
 
     pub fn save(&mut self) -> Result<()> {
         self.validate()?;
-        let next = toml::to_string_pretty(&self.draft)?;
-        let next_contents = if let Some(bytes) = &self.disk_contents {
-            let mut document = std::str::from_utf8(bytes)?.parse::<toml_edit::DocumentMut>()?;
-            let before = toml::to_string_pretty(&self.saved)?.parse::<toml_edit::DocumentMut>()?;
-            let after = next.parse::<toml_edit::DocumentMut>()?;
-            merge_changes(document.as_table_mut(), before.as_table(), after.as_table());
-            document.to_string()
-        } else {
-            next
-        };
+        let disk = self
+            .disk_contents
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()?;
+        let text = self.draft.render(&self.saved, disk)?;
         if read_contents(&self.path)? != self.disk_contents {
             bail!(
                 "{} changed on disk. Reload it before saving; keep a copy of your edits first.",
                 self.path.display()
             );
         }
-        crate::config::save_text(&self.path, &next_contents)?;
-        self.disk_contents = Some(next_contents.into_bytes());
+        crate::config::save_text(&self.path, &text)?;
+        self.disk_contents = Some(text.into_bytes());
         self.saved = self.draft.clone();
         Ok(())
     }
 
     pub fn reload(&mut self) -> Result<()> {
-        let replacement = Self::open(self.path.clone())?;
-        *self = replacement;
+        *self = Self::open(self.path.clone())?;
         Ok(())
+    }
+}
+
+impl Contents for Config {
+    const NAME: &'static str = "configuration";
+
+    fn missing(path: &Path) -> Self {
+        new_config(path)
+    }
+
+    fn check_read(&self) -> Result<()> {
+        Ok(self.validate()?)
+    }
+
+    fn check_save(&self) -> Result<()> {
+        self.validate()?;
+        SessionOptions::from_config(self)?;
+        #[cfg(target_os = "linux")]
+        crate::runtime::LinuxRuntimeConfig::from_config(self).validate()?;
+        Ok(())
+    }
+
+    /// Patches only the changed fields into the user's file, keeping comments.
+    fn render(&self, saved: &Self, disk: Option<&str>) -> Result<String> {
+        let next = toml::to_string_pretty(self)?;
+        let Some(disk) = disk else {
+            return Ok(next);
+        };
+        let mut document = disk.parse::<toml_edit::DocumentMut>()?;
+        let before = toml::to_string_pretty(saved)?.parse::<toml_edit::DocumentMut>()?;
+        let after = next.parse::<toml_edit::DocumentMut>()?;
+        merge_changes(document.as_table_mut(), before.as_table(), after.as_table());
+        Ok(document.to_string())
     }
 }
 
@@ -139,7 +191,7 @@ fn items_equal(left: &toml_edit::Item, right: &toml_edit::Item) -> bool {
     }
 }
 
-fn new_config(path: &std::path::Path) -> Config {
+fn new_config(path: &Path) -> Config {
     let mut config = Config::default();
     if cfg!(target_os = "macos") {
         let directory = path.parent().expect("absolute configuration path");
@@ -149,7 +201,7 @@ fn new_config(path: &std::path::Path) -> Config {
     config
 }
 
-fn read_contents(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+fn read_contents(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(contents) => Ok(Some(contents)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),

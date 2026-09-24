@@ -1,14 +1,10 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    io::ErrorKind,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, path::Path};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::config::save_text;
+use super::model::{Contents, Document};
+use crate::desktop::Edge;
 
 pub const MAX_MONITORS: usize = 32;
 pub const MAX_COORDINATE: i32 = 100_000;
@@ -31,14 +27,6 @@ pub struct Monitor {
     pub y: i32,
     pub width: u32,
     pub height: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Edge {
-    Left,
-    Right,
-    Top,
-    Bottom,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -211,82 +199,36 @@ impl Layout {
     }
 }
 
-pub struct LayoutDocument {
-    pub path: PathBuf,
-    pub draft: Layout,
-    saved: Layout,
-    disk_contents: Option<Vec<u8>>,
+pub type LayoutDocument = Document<Layout>;
+
+impl Contents for Layout {
+    const NAME: &'static str = "layout";
+
+    fn missing(_: &Path) -> Self {
+        Self::default()
+    }
+
+    fn check_read(&self) -> Result<()> {
+        self.validate()
+    }
 }
 
 impl LayoutDocument {
-    pub fn open(config_path: &Path) -> Result<Self> {
+    /// Opens the layout saved beside the configuration as `NAME.layout.toml`.
+    pub fn beside(config_path: &Path) -> Result<Self> {
         let mut file_name = config_path
             .file_name()
             .context("Configuration path needs a filename")?
             .to_os_string();
         file_name.push(".layout.toml");
-        Self::open_path(config_path.with_file_name(file_name))
-    }
-
-    fn open_path(path: PathBuf) -> Result<Self> {
-        let path = std::path::absolute(path).context("Could not resolve layout path")?;
-        let disk_contents = read_contents(&path)?;
-        let draft: Layout = match &disk_contents {
-            Some(bytes) => {
-                toml::from_str(std::str::from_utf8(bytes).context("Layout is not UTF-8")?)
-                    .with_context(|| format!("Could not parse {}", path.display()))?
-            }
-            None => Layout::default(),
-        };
-        draft.validate()?;
-        Ok(Self {
-            path,
-            saved: draft.clone(),
-            draft,
-            disk_contents,
-        })
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.draft != self.saved
-    }
-
-    pub fn is_new(&self) -> bool {
-        self.disk_contents.is_none()
-    }
-
-    pub fn save(&mut self) -> Result<()> {
-        self.draft.validate()?;
-        let text = toml::to_string_pretty(&self.draft)?;
-        if read_contents(&self.path)? != self.disk_contents {
-            bail!(
-                "{} changed on disk. Reload it before saving; keep a copy of your edits first.",
-                self.path.display()
-            );
-        }
-        save_text(&self.path, &text)?;
-        self.disk_contents = Some(text.into_bytes());
-        self.saved = self.draft.clone();
-        Ok(())
-    }
-
-    pub fn reload(&mut self) -> Result<()> {
-        *self = Self::open_path(self.path.clone())?;
-        Ok(())
-    }
-}
-
-fn read_contents(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(contents) => Ok(Some(contents)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("Could not read {}", path.display())),
+        Self::open(config_path.with_file_name(file_name))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn monitor(id: &str, x: i32, y: i32, width: u32, height: u32) -> Monitor {
         Monitor {
@@ -452,7 +394,7 @@ mod tests {
     fn sidecar_is_explicit_and_round_trips_without_touching_config() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("new/zflow.toml");
-        let mut document = LayoutDocument::open(&config).unwrap();
+        let mut document = LayoutDocument::beside(&config).unwrap();
         assert!(document.is_new());
         assert!(!document.is_dirty());
         assert!(!config.parent().unwrap().exists());
@@ -466,7 +408,10 @@ mod tests {
         assert!(!config.exists());
         assert!(!document.is_new());
         assert!(!document.is_dirty());
-        assert_eq!(LayoutDocument::open(&config).unwrap().draft, document.draft);
+        assert_eq!(
+            LayoutDocument::beside(&config).unwrap().draft,
+            document.draft
+        );
         document.draft.monitors.clear();
         document.reload().unwrap();
         assert_eq!(document.draft.monitors.len(), 1);
@@ -476,7 +421,7 @@ mod tests {
     fn external_create_edit_delete_and_malformed_reload_preserve_draft() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("zflow.toml");
-        let mut document = LayoutDocument::open(&config).unwrap();
+        let mut document = LayoutDocument::beside(&config).unwrap();
         fs::write(&document.path, "monitors = []\n").unwrap();
         assert!(document.save().is_err());
         document.reload().unwrap();
@@ -485,7 +430,7 @@ mod tests {
             .monitors
             .push(monitor("local", 0, 0, 100, 100));
         fs::write(&document.path, "monitors = [unfinished").unwrap();
-        assert!(LayoutDocument::open(&config).is_err());
+        assert!(LayoutDocument::beside(&config).is_err());
         assert!(document.reload().is_err());
         assert!(document.save().is_err());
         assert_eq!(document.draft.monitors.len(), 1);
@@ -497,7 +442,7 @@ mod tests {
     #[test]
     fn invalid_save_preserves_existing_contents() {
         let directory = tempfile::tempdir().unwrap();
-        let mut document = LayoutDocument::open(&directory.path().join("zflow.toml")).unwrap();
+        let mut document = LayoutDocument::beside(&directory.path().join("zflow.toml")).unwrap();
         document.save().unwrap();
         let before = fs::read(&document.path).unwrap();
         document.draft.monitors.push(monitor("local", 0, 0, 0, 100));

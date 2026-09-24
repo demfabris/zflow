@@ -40,8 +40,6 @@ struct Snapshot: Decodable, Sendable {
   var receiverError: String?
   var receiverChecked: Bool
   var checking: Bool
-  var discoveryError: String?
-  var desktopError: String?
 
   var title: String {
     switch status {

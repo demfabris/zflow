@@ -390,7 +390,7 @@ Known peers may derive rotating discovery tokens. Discovery loss cannot revoke o
 
 ### Application probes
 
-Quinn's keepalive timer prevents idle timeout after inactivity; it does not create a fixed bilateral sampling stream. zflow uses an explicit authenticated Probe and ProbeEcho datagram when it needs RTT, path health, or a radio-wake cadence. See [Quinn TransportConfig](https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html#method.keep_alive_interval).
+Quinn's keepalive timer prevents idle timeout after inactivity; it does not create a fixed bilateral sampling stream. Input sessions send one after 5 s without other traffic and time out after 15 s, so a source can keep its session open between crossings; that rate is far below any radio-wake cadence. zflow uses an explicit authenticated Probe and ProbeEcho datagram when it needs RTT, path health, or a radio-wake cadence. See [Quinn TransportConfig](https://docs.rs/quinn/latest/quinn/struct.TransportConfig.html#method.keep_alive_interval).
 
 The first radio experiment compares:
 
@@ -535,8 +535,9 @@ ei_gestures carries recognized gestures rather than raw MT contacts. It cannot r
 
 The current source-only app runs capture and networking in its user process.
 SwiftUI owns the menu and Settings window; a Rust worker owns engine lifetimes.
-A separate SMAppService daemon handles only leased AWDL suppression. Its XPC
-peers require the same signing team and exact client/daemon identifiers. The
+A separate SMAppService daemon handles only leased AWDL suppression. The app
+connects to it over XPC directly; each side requires the same signing team and
+the other's exact identifier. The
 build script bundles and signs these executables with hardened runtime enabled;
 notarization and distribution qualification are separate release steps.
 
@@ -565,7 +566,7 @@ The adapter:
 - preserves documented continuous-scroll, delta, phase, and momentum fields;
 - decodes recognized legacy system-defined media payloads through a version-tested empirical path and maps them to HID Consumer usages; unknown payloads remain opaque;
 - keeps the tap callback bounded and moves work off the callback thread;
-- re-enables taps disabled by timeout or user input;
+- re-enables a tap disabled by timeout and releases on the peer any key or button let go while it was off; a tap disabled by user input or invalidated by macOS ends capture;
 - recreates invalid taps after sleep, session change, or repeated failure;
 - releases all forwarded state before reconnection.
 

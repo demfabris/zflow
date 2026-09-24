@@ -117,7 +117,7 @@ Native UI and live matrix:
 - Keep Settings closed and cross repeatedly. Repeat on another Space, through
   Pause, emergency return, display changes, receiver loss, and clean Quit.
 - Run `zflow desktop-agent --install` as the Linux desktop user, then test
-  GNOME login autostart, daemon restart/reconnect, and display advertisements.
+  GNOME login autostart and daemon restart/reconnect.
 
 Actual input capture, radio changes, OS authorization, and two-computer latency
 remain live qualification steps. A successful build does not establish them.
@@ -305,16 +305,16 @@ The user still needs to verify the returning cursor with the updated Mac build.
 
 The Mac now samples the cursor again immediately before Prepare and maps it
 through the same inverse mapping used at edge detection. Compare
-`entry fraction sampled before desktop preparation` with `checking cursor before
-capture` to measure the remaining movement during Prepare. Do not add a catch-up
+`entry fraction sampled before desktop preparation` with the cursor logged by
+`native capture started` to measure the remaining movement during Prepare. Do not add a catch-up
 motion frame until this measurement shows a visible residual jump; the receiver
 applies libinput acceleration to relative motion.
 
 The daemon rejects a second session from the same peer before the old session
-closes, so the Mac still waits for the two-second-bounded QUIC drain before
-rearming. With Reduce Wi-Fi latency enabled, AWDL acquisition overlaps connection
-setup and release overlaps endpoint shutdown. Keep the helper lease renewed
-while a connection is pending. The previous 17:32 Mac log shows about 15 ms for
+closes. Since September 24 the Mac keeps one session per receiver while sharing
+is on, so a crossing no longer waits for a handshake and rearming no longer
+waits for a QUIC drain. With Reduce Wi-Fi latency enabled, AWDL acquisition
+overlaps Prepare and release follows Finish. The previous 17:32 Mac log shows about 15 ms for
 acquisition and 25 ms for release with the switch on; measure the updated build
 before claiming a reduction. The under-60-ms rearm target remains unverified.
 
@@ -322,11 +322,12 @@ Complete this live checklist with matching Mac, Linux desktop-agent, daemon and 
 builds. Use `just debug mac`, `just debug linux` and `just debug-daemon`:
 
 - Cross five times each way, including one 60-second stay on Ubuntu. Record
-  `connection_to_capture_ms` and request-ID growth; target about 300 polls/minute.
+  `elapsed_ms` on `edge observer saw capture start` and request-ID growth;
+  target about 300 polls/minute.
 - Press Escape twice. Require `waiting for desktop poll before cleanup`, a
   successful `remote input release completed`, and successful Finish without
   `BackendUnavailable` from dropping the poll.
-- Click during connect and overshoot the entry region. Require `crossing
+- Click during Prepare and overshoot the entry region. Require `crossing
   cancelled`, `enabled=true` when the worker finishes, and a successful next
   crossing after moving back inside the Mac. Stop must still disable sharing.
 - Check that polls cause no logind calls. The daemon learns seat changes from
@@ -348,6 +349,26 @@ apps or installed Ubuntu daemon/extension.
 Live results for these changes remain pending. Existing logs describe the
 previous build; automated checks do not establish crossing latency or hidden
 window behavior. Keep `PLAN.md` until this checklist has measured results.
+
+### Persistent sessions, September 24
+
+The Mac now keeps one input session per receiver while sharing is on and
+reuses it for the desktop snapshot and every crossing. Input sessions send a
+QUIC keep-alive after 5 s without traffic and time out after 15 s. The AWDL
+helper takes leases from the app over XPC, with no relay process. Loopback
+tests cover two activations on one session, reconnection after the receiver
+drops a session, and a prompt close. These need live checks on real hardware:
+
+- Cross 20 times each way. Record `elapsed_ms` on `edge observer saw capture
+  start`; `input link connected` must not appear between crossings. Return and
+  cross again within 150 ms.
+- Leave sharing on and idle for 10 minutes, then cross without a reconnect.
+- Turn Wi-Fi off for 30 seconds while idle, and again while controlling
+  Ubuntu. Expect `input link lost`, a reconnect after Wi-Fi returns, and a
+  working crossing. Repeat with a zflowd restart and a one-minute Mac sleep.
+- With a signed build, install the AWDL helper, confirm Settings reports it
+  ready, and cross with **Block AWDL while sharing** on. `ifconfig awdl0` must
+  show it down during capture and restored after return.
 
 ## Historical configuration GUI observations
 
