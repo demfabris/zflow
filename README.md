@@ -177,7 +177,8 @@ sudo zflow doctor
 
 `zflow doctor` should report the keyboard, pointer, and experimental touchpad
 as ready. On the receiving machine, `sudo libinput list-devices` should list
-`zflow remote touchpad` with `pointer gesture` capabilities.
+`zflow remote touchpad` with `pointer gesture` capabilities and a size of
+`200x150mm`. Contacts keep their real size on it, centered.
 
 Setup records stable physical attributes. It refuses to write a broad udev
 rule for hardware without a unique physical path. The service account is not

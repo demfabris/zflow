@@ -174,6 +174,7 @@ pub enum TouchTool {
     Unknown,
 }
 
+/// The physical size of the touch surface, in hundredths of a millimetre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceDimensions {
     pub width: u32,
@@ -181,6 +182,8 @@ pub struct SourceDimensions {
 }
 
 /// Integer source coordinates keep the logical model exact and codec-neutral.
+/// `x` and `y` are hundredths of a millimetre from the top-left corner of the
+/// source surface, so the target can reproduce real finger travel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TouchContact {
     pub id: ContactId,

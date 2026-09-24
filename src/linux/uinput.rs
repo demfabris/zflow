@@ -11,7 +11,9 @@ use evdev::{
 };
 use thiserror::Error;
 
-use crate::core::{ContactId, HidUsage, MotionDelta, PointerButton, TouchContact, TouchState};
+use crate::core::{
+    ContactId, HidUsage, MotionDelta, PointerButton, SourceDimensions, TouchContact, TouchState,
+};
 
 use super::{
     MAX_TOUCHPAD_CONTACTS, MappingError, VirtualDeviceRole, ZFLOW_DEVICE_VERSION, ZFLOW_VENDOR_ID,
@@ -19,9 +21,16 @@ use super::{
 };
 
 const WHEEL_CLICK_UNITS: i64 = 120;
-const TOUCHPAD_MAX_X: i32 = 2_999;
-const TOUCHPAD_MAX_Y: i32 = 2_199;
+// 200 x 150 mm holds the largest real trackpads (a Magic Trackpad is about
+// 160 x 115 mm) with margin, so contacts are placed by millimetres, not clipped.
+const TOUCHPAD_MAX_X: i32 = 5_999;
+const TOUCHPAD_MAX_Y: i32 = 4_499;
 const TOUCHPAD_RESOLUTION: i32 = 30;
+/// Assumed for a contact that arrives without a source size: the old 100 x 73 mm pad.
+const UNSIZED_SOURCE: SourceDimensions = SourceDimensions {
+    width: 10_000,
+    height: 7_300,
+};
 
 #[derive(Debug, Error)]
 pub enum InjectionError {
@@ -502,8 +511,8 @@ fn plan_touchpad_report(
     for contact in touch.iter() {
         let target = if let Some(existing) = previous.contacts.get(&contact.id) {
             TargetContact {
-                x: scale_touch_axis(contact, true),
-                y: scale_touch_axis(contact, false),
+                x: touch_axis(contact, true),
+                y: touch_axis(contact, false),
                 ..*existing
             }
         } else {
@@ -521,8 +530,8 @@ fn plan_touchpad_report(
             TargetContact {
                 slot,
                 tracking_id,
-                x: scale_touch_axis(contact, true),
-                y: scale_touch_axis(contact, false),
+                x: touch_axis(contact, true),
+                y: touch_axis(contact, false),
             }
         };
         next.contacts.insert(contact.id, target);
@@ -586,25 +595,20 @@ fn plan_touchpad_report(
     (events, next)
 }
 
-fn scale_touch_axis(contact: &TouchContact, horizontal: bool) -> i32 {
-    let (value, maximum, source_extent) = if horizontal {
-        (
-            contact.x,
-            TOUCHPAD_MAX_X,
-            contact.source_dimensions.map(|size| size.width),
-        )
+/// Places a contact by millimetres with the source surface centered on the pad,
+/// so libinput sees the finger travel the source measured.
+fn touch_axis(contact: &TouchContact, horizontal: bool) -> i32 {
+    let source = contact.source_dimensions.unwrap_or(UNSIZED_SOURCE);
+    let (value, extent, maximum) = if horizontal {
+        (contact.x, source.width, TOUCHPAD_MAX_X)
     } else {
-        (
-            contact.y,
-            TOUCHPAD_MAX_Y,
-            contact.source_dimensions.map(|size| size.height),
-        )
+        (contact.y, source.height, TOUCHPAD_MAX_Y)
     };
-    let Some(source_extent) = source_extent.filter(|extent| *extent > 0) else {
-        return value.clamp(0, maximum);
-    };
-    let value = i64::from(value.clamp(0, i32::try_from(source_extent).unwrap_or(i32::MAX)));
-    ((value * i64::from(maximum) + i64::from(source_extent) / 2) / i64::from(source_extent)) as i32
+    // maximum / 2 + (value - extent / 2) * TOUCHPAD_RESOLUTION / 100, doubled
+    // to stay in integers, then rounded.
+    let doubled = i64::from(maximum) * 100
+        + (2 * i64::from(value) - i64::from(extent)) * i64::from(TOUCHPAD_RESOLUTION);
+    (doubled + 100).div_euclid(200).clamp(0, maximum.into()) as i32
 }
 
 fn touch_tool_key(count: usize) -> Option<KeyCode> {
@@ -729,9 +733,10 @@ mod tests {
             minor: None,
             orientation_millidegrees: None,
             tool: TouchTool::Finger,
+            // A Magic Trackpad, in hundredths of a millimetre.
             source_dimensions: Some(SourceDimensions {
-                width: 1_299,
-                height: 722,
+                width: 16_000,
+                height: 11_500,
             }),
         }
     }
@@ -854,8 +859,8 @@ mod tests {
                     12 => 214_000,
                     _ => capture + 1_000,
                 };
-                let mut contact = touch(1, (600 + sequence * 60) as i32, 1_000);
-                contact.source_dimensions = None;
+                // 2 mm per frame, ending at the middle of the trackpad.
+                let contact = touch(1, (5_000 + sequence * 200) as i32, 5_750);
                 (
                     arrival,
                     MotionFrame {
@@ -916,7 +921,7 @@ mod tests {
         // 24mm (>20mm jump threshold); preserved capture timing gives 1.5mm.
         assert_eq!(2.0 * 12_000.0 / (tenth.1 - ninth.1) as f64, 24.0);
         assert_eq!(2.0 * 12_000.0 / (tenth.2 - ninth.2).as_micros() as f64, 1.5);
-        assert_eq!(state.contacts[&ContactId(1)].x, 1_500);
+        assert_eq!(state.contacts[&ContactId(1)].x, 3_000);
     }
 
     #[test]
@@ -950,15 +955,62 @@ mod tests {
     }
 
     #[test]
-    fn touchpad_plan_scales_source_dimensions_and_emits_final_lift() {
-        let initial = TouchState::new([touch(1, 1_299, 722)]).unwrap();
+    fn touch_moves_the_same_millimetres_on_the_pad_centered_and_clamped() {
+        let at = |x, y| {
+            let contact = touch(1, x, y);
+            (touch_axis(&contact, true), touch_axis(&contact, false))
+        };
+        let millimetre = TOUCHPAD_RESOLUTION;
+        // The middle of the trackpad lands in the middle of the pad.
+        assert_eq!(at(8_000, 5_750), (3_000, 2_250));
+        // 20 mm across and 10 mm down stay 20 mm and 10 mm: no stretch.
+        let (x0, y0) = at(4_000, 3_000);
+        let (x1, y1) = at(6_000, 4_000);
+        assert_eq!((x1 - x0, y1 - y0), (20 * millimetre, 10 * millimetre));
+        // The whole 160 x 115 mm surface fits, with equal margins.
+        assert_eq!(at(0, 0), (600, 525));
+        assert_eq!(at(16_000, 11_500), (5_400, 3_975));
+        assert_eq!(at(-100_000, i32::MIN), (0, 0));
+        assert_eq!(at(i32::MAX, 100_000), (TOUCHPAD_MAX_X, TOUCHPAD_MAX_Y));
+
+        // A smaller Linux pad is centered too.
+        let mut small = touch(1, 5_000, 3_000);
+        small.source_dimensions = Some(SourceDimensions {
+            width: 10_000,
+            height: 6_000,
+        });
+        assert_eq!(touch_axis(&small, true), 3_000);
+        assert_eq!(touch_axis(&small, false), 2_250);
+    }
+
+    #[test]
+    fn touch_without_source_size_uses_a_centered_100_by_73_mm_area() {
+        let at = |x, y| {
+            let mut contact = touch(1, x, y);
+            contact.source_dimensions = None;
+            (touch_axis(&contact, true), touch_axis(&contact, false))
+        };
+        assert_eq!(at(5_000, 3_650), (3_000, 2_250));
+        assert_eq!(at(0, 0), (1_500, 1_155));
+        assert_eq!(at(10_000, 7_300), (4_500, 3_345));
+    }
+
+    #[test]
+    fn touchpad_plan_places_contacts_by_millimetres_and_emits_final_lift() {
+        let initial = TouchState::new([touch(1, 16_000, 11_500)]).unwrap();
         let (landing, state) = one_touchpad_report(&TouchpadState::default(), &initial);
-        assert!(landing.iter().any(|event| {
-            event.code() == AbsoluteAxisCode::ABS_MT_POSITION_X.0 && event.value() == TOUCHPAD_MAX_X
-        }));
-        assert!(landing.iter().any(|event| {
-            event.code() == AbsoluteAxisCode::ABS_MT_POSITION_Y.0 && event.value() == TOUCHPAD_MAX_Y
-        }));
+        for (axis, value) in [
+            (AbsoluteAxisCode::ABS_MT_POSITION_X, 5_400),
+            (AbsoluteAxisCode::ABS_MT_POSITION_Y, 3_975),
+            (AbsoluteAxisCode::ABS_X, 5_400),
+            (AbsoluteAxisCode::ABS_Y, 3_975),
+        ] {
+            assert!(
+                landing
+                    .iter()
+                    .any(|event| event.code() == axis.0 && event.value() == value)
+            );
+        }
 
         let (lift, empty) = one_touchpad_report(&state, &TouchState::default());
         assert!(empty.contacts.is_empty());
