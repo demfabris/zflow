@@ -170,11 +170,13 @@ Use `--purge` only when you also want to delete those files and the account.
 `scripts/build-macos-app.sh [--debug] [--sign IDENTITY]` builds the Rust static
 library and Swift package, then assembles `target/{debug,release}/zflow.app`.
 The app requires macOS 26 and Swift 6.2 or newer. It uses SwiftUI Settings and
-MenuBarExtra with no Dock icon. The bundle contains the AWDL client, daemon,
-and SMAppService launchd plist. All executables use hardened runtime signatures.
+MenuBarExtra with no Dock icon. The bundle contains the AWDL daemon and its
+SMAppService launchd plist. All executables use hardened runtime signatures.
 
 Use an Apple-issued signing identity to install the privileged helper through
-the app. XPC requires matching teams and exact client/daemon identifiers. Ad hoc
+the app. The app talks to the daemon over XPC directly; each side requires the
+same team and the other's exact identifier (`io.zflow.zflow` and
+`io.zflow.awdl-daemon`). Ad hoc
 builds leave AWDL installation unavailable and can still run input sharing.
 The build script does not install services, launch the app, or notarize it.
 
@@ -196,8 +198,8 @@ Its preferences and the standalone app use the same GTK4/libadwaita controls.
 Install GJS, GTK 4.12+ and libadwaita 1.5+ for the window. The service and agent
 remain usable without the GTK runtime.
 
-The agent reconnects to the system service, serves desktop requests,
-and advertises display dimensions without opening a window. It obtains public
+The agent reconnects to the system service and serves desktop requests
+without opening a window. It obtains public
 peer/discovery settings through the credential-checked desktop API. It does not
 read the protected system configuration directly. For a foreground agent, run
 `zflow desktop-agent` and stop it with Ctrl+C.

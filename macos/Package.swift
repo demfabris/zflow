@@ -12,7 +12,6 @@ let package = Package(
   platforms: [.macOS(.v26)],
   products: [
     .executable(name: "zflow-app", targets: ["ZflowApp"]),
-    .executable(name: "zflow-awdl-client", targets: ["AWDLClient"]),
     .executable(name: "zflow-awdl-daemon", targets: ["AWDLDaemon"]),
   ],
   targets: [
@@ -26,7 +25,6 @@ let package = Package(
         .linkedFramework("ApplicationServices"), .linkedFramework("Carbon"),
         .linkedFramework("CoreFoundation"), .linkedFramework("Security"),
       ]),
-    .executableTarget(name: "AWDLClient"),
     .executableTarget(name: "AWDLDaemon", dependencies: ["AWDLGuardian"]),
   ]
 )

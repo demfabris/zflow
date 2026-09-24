@@ -8,18 +8,10 @@
 
 typedef struct {
   bool up;
-  bool locked;
   bool fail_get;
   int fail_sets;
   int sets;
 } Fake;
-
-static int fake_lock(void *context) {
-  Fake *fake = context;
-  if (fake->locked) return -1;
-  fake->locked = true;
-  return 0;
-}
 
 static int fake_get(void *context, bool *up) {
   Fake *fake = context;
@@ -40,7 +32,7 @@ static int fake_set(void *context, bool up) {
 }
 
 static Backend backend(Fake *fake) {
-  return (Backend){fake, fake_lock, fake_get, fake_set};
+  return (Backend){fake, fake_get, fake_set};
 }
 
 static void state_machine_tests(void) {
@@ -85,9 +77,6 @@ static void state_machine_tests(void) {
   fake = (Fake){.up = true};
   guardian = guardian_new(backend(&fake), 0);
   assert(guardian_step(&guardian, 'A', 1) == ACTIVE_REPLY);
-  Guardian second = guardian_new(backend(&fake), 0);
-  assert(guardian_step(&second, 'A', 2) == FAILED_REPLY);
-  assert(!second.restore_needed);
   assert(!fake.up);
   fake.fail_sets = 1;
   assert(guardian_step(&guardian, 'R', 3) == FAILED_REPLY);
@@ -128,7 +117,7 @@ static void process_test(int ending) {
     close(output[0]);
     assert(fcntl(input[0], F_SETFL, O_NONBLOCK) == 0);
     assert(fcntl(output[1], F_SETFL, O_NONBLOCK) == 0);
-    _exit(run_guardian_fds(backend(fake), -1, input[0], output[1]));
+    _exit(run_guardian_fds(backend(fake), input[0], output[1]));
   }
   close(input[0]);
   close(output[1]);

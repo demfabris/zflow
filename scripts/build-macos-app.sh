@@ -50,9 +50,15 @@ MACOSX_DEPLOYMENT_TARGET=26.0 cargo "${cargo_args[@]}"
 
 readonly output_dir="$REPO_ROOT/target/$profile"
 swift_profile="$profile"
-ZFLOW_RUST_LIB_DIR="$output_dir" swift build --package-path "$REPO_ROOT/macos" --configuration "$swift_profile"
 swift_output="$(ZFLOW_RUST_LIB_DIR="$output_dir" swift build --package-path "$REPO_ROOT/macos" --configuration "$swift_profile" --show-bin-path)"
 readonly binary="$swift_output/zflow-app"
+# SwiftPM's native build system does not track a library linked through
+# unsafeFlags, so a newer libzflow.a may not relink the app. Removing the stale
+# binary forces the link.
+if [[ "$output_dir/libzflow.a" -nt "$binary" ]]; then
+    rm -f -- "$binary"
+fi
+ZFLOW_RUST_LIB_DIR="$output_dir" swift build --package-path "$REPO_ROOT/macos" --configuration "$swift_profile"
 readonly bundle="$output_dir/zflow.app"
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || die "missing native executable: $binary"
 [[ ! -L "$bundle" ]] || die "refusing to replace a symlink: $bundle"
@@ -63,7 +69,6 @@ trap 'rm -rf -- "$temporary_dir"' EXIT
 app="$temporary_dir/zflow.app"
 install -d -m 0755 "$app/Contents/MacOS" "$app/Contents/Library/LaunchDaemons"
 install -m 0755 "$binary" "$app/Contents/MacOS/zflow-app"
-install -m 0755 "$swift_output/zflow-awdl-client" "$app/Contents/MacOS/zflow-awdl-client"
 install -m 0755 "$swift_output/zflow-awdl-daemon" "$app/Contents/MacOS/zflow-awdl-daemon"
 install -m 0644 "$REPO_ROOT/packaging/macOS/io.zflow.awdl.plist" "$app/Contents/Library/LaunchDaemons/io.zflow.awdl.plist"
 install -m 0644 "$REPO_ROOT/packaging/macOS/Info.plist" "$app/Contents/Info.plist"

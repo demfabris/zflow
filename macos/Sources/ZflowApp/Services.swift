@@ -3,6 +3,7 @@ import Foundation
 import Observation
 import Security
 import ServiceManagement
+import XPC
 
 @MainActor @Observable
 final class Services {
@@ -119,21 +120,28 @@ final class Services {
     }
   }
 
+  /// Asks the helper whether it can reach awdl0. The helper answers only this
+  /// signed app, and this side accepts only the helper from the same team.
   private nonisolated static func checkHelper() async -> Bool {
-    await Task.detached {
-      guard
-        let executable = Bundle.main.executableURL?.deletingLastPathComponent()
-          .appendingPathComponent("zflow-awdl-client")
-      else { return false }
-      let process = Process()
-      process.executableURL = executable
-      process.arguments = ["--check"]
-      process.standardOutput = FileHandle.nullDevice
-      process.standardError = FileHandle.nullDevice
-      do { try process.run() } catch { return false }
-      // The client bounds XPC startup with a three-second deadline.
-      process.waitUntilExit()
-      return process.terminationStatus == 0
-    }.value
+    guard
+      let session = try? XPCSession(
+        machService: "io.zflow.awdl", options: .privileged,
+        requirement: .isFromSameTeam(andMatchesSigningIdentifier: "io.zflow.awdl-daemon"))
+    else { return false }
+    var request = XPCDictionary()
+    request["command"] = "check"
+    // Cancelling answers a pending reply with an error, so a stuck helper
+    // cannot hold the check open.
+    DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+      session.cancel(reason: "Helper check timed out")
+    }
+    return await withCheckedContinuation { continuation in
+      session.send(message: request) { result in
+        let reply = try? result.get()
+        let ready: Bool? = reply?["ready"]
+        session.cancel(reason: "Helper checked")
+        continuation.resume(returning: ready == true)
+      }
+    }
   }
 }

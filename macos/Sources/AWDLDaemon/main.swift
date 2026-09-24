@@ -4,7 +4,9 @@ import Dispatch
 import Foundation
 import XPC
 
-// Only one guardian may own awdl0. Its dedicated worker remains alive through client exits.
+// Only one lease may own awdl0. launchd runs a single daemon, so this flag is
+// all the serialization leases need. The lease's worker outlives the app's
+// connection, so a crashed or stalled app still gets AWDL restored.
 final class Guardian: @unchecked Sendable {
   let workers = DispatchGroup()
   private let lock = NSLock()
@@ -84,12 +86,12 @@ termination.setEventHandler {
   exit(0)
 }
 termination.resume()
-let requirement = XPCPeerRequirement.isFromSameTeam(
-  andMatchesSigningIdentifier: "io.zflow.awdl-client")
-let listener = try XPCListener(service: "io.zflow.awdl", requirement: requirement) { request in
-  request.accept { (session: XPCSession) -> Peer in
-    session.setPeerRequirement(requirement)
-    return Peer(guardian)
-  }
+// Only the signed zflow app from this team may check or lease AWDL. The app
+// itself connects, so this checks the real caller.
+let listener = try XPCListener(
+  service: "io.zflow.awdl",
+  requirement: .isFromSameTeam(andMatchesSigningIdentifier: "io.zflow.zflow")
+) { request in
+  request.accept { (_: XPCSession) -> Peer in Peer(guardian) }
 }
 dispatchMain()

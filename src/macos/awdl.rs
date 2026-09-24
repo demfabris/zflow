@@ -1,9 +1,13 @@
-use std::{process::Stdio, time::Duration};
+use std::{
+    ffi::{CStr, c_char},
+    os::fd::{FromRawFd, OwnedFd},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
+    net::unix::pipe,
     sync::oneshot,
     task::JoinHandle,
     time::{Instant, MissedTickBehavior, interval_at, timeout},
@@ -12,36 +16,36 @@ use tokio::{
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const RENEW_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Owns the pipe that keeps the helper's two-second AWDL lease alive.
+unsafe extern "C" {
+    fn zflow_awdl_lease(
+        input: *mut i32,
+        output: *mut i32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> i32;
+}
+
+/// Owns the pipes that keep the helper's two-second AWDL lease alive. The
+/// helper restores AWDL when the lease is released, expires, or its pipe closes.
 pub(super) struct AwDlLease {
-    child: Child,
-    input: Option<ChildStdin>,
+    input: Option<pipe::Sender>,
+    output: pipe::Receiver,
 }
 
 impl AwDlLease {
     pub(super) async fn acquire() -> Result<Self> {
-        let executable = std::env::current_exe()?;
-        let client = executable
-            .parent()
-            .context("Missing app directory")?
-            .join("zflow-awdl-client");
-        let mut command = Command::new(client);
-        command.env_clear().current_dir("/");
-        Self::start(command, RESPONSE_TIMEOUT).await
+        // The XPC request blocks, so it runs off the async workers.
+        let (input, output) = timeout(RESPONSE_TIMEOUT, tokio::task::spawn_blocking(request))
+            .await
+            .context("AWDL helper did not answer")???;
+        Self::start(input, output, RESPONSE_TIMEOUT).await
     }
 
-    async fn start(mut command: Command, deadline: Duration) -> Result<Self> {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .process_group(0)
-            // The helper must survive sender termination long enough to restore AWDL.
-            .kill_on_drop(false)
-            .spawn()
-            .context("could not start AWDL helper")?;
-        let input = child.stdin.take();
-        let mut lease = Self { child, input };
+    async fn start(input: OwnedFd, output: OwnedFd, deadline: Duration) -> Result<Self> {
+        let mut lease = Self {
+            input: Some(pipe::Sender::from_owned_fd(input)?),
+            output: pipe::Receiver::from_owned_fd(output)?,
+        };
         timeout(deadline, async {
             lease.expect(b"READY\n").await?;
             lease.send(b'A').await?;
@@ -53,9 +57,6 @@ impl AwDlLease {
     }
 
     pub(super) async fn renew(&mut self) -> Result<()> {
-        if let Some(status) = self.child.try_wait()? {
-            bail!("AWDL helper exited during remote control: {status}");
-        }
         timeout(RENEW_INTERVAL, async {
             self.send(b'H').await?;
             self.expect(b"HELD\n").await
@@ -68,12 +69,9 @@ impl AwDlLease {
         timeout(RESPONSE_TIMEOUT, async {
             self.send(b'R').await?;
             self.input.take();
-            self.expect(b"RELEASED\n").await?;
-            let status = self.child.wait().await?;
-            if !status.success() {
-                bail!("AWDL helper could not restore its previous state: {status}");
-            }
-            Ok(())
+            self.expect(b"RELEASED\n")
+                .await
+                .context("AWDL helper could not restore its previous state")
         })
         .await
         .context("AWDL helper restoration timed out")?
@@ -90,10 +88,7 @@ impl AwDlLease {
 
     async fn expect(&mut self, expected: &[u8]) -> Result<()> {
         let mut received = vec![0; expected.len()];
-        self.child
-            .stdout
-            .as_mut()
-            .context("AWDL helper has no response pipe")?
+        self.output
             .read_exact(&mut received)
             .await
             .context("AWDL helper closed before confirming the operation")?;
@@ -104,9 +99,25 @@ impl AwDlLease {
     }
 }
 
+fn request() -> Result<(OwnedFd, OwnedFd)> {
+    let (mut input, mut output) = (-1, -1);
+    let mut error = [0 as c_char; 256];
+    // SAFETY: the bridge writes two descriptors and a NUL-terminated message
+    // into storage owned by this frame.
+    let status =
+        unsafe { zflow_awdl_lease(&mut input, &mut output, error.as_mut_ptr(), error.len()) };
+    if status != 0 {
+        // SAFETY: the bridge always terminates the message within `error`.
+        let message = unsafe { CStr::from_ptr(error.as_ptr()) };
+        bail!("AWDL helper: {}", message.to_string_lossy());
+    }
+    // SAFETY: on success both descriptors are open and owned by the caller.
+    Ok(unsafe { (OwnedFd::from_raw_fd(input), OwnedFd::from_raw_fd(output)) })
+}
+
 impl Drop for AwDlLease {
     fn drop(&mut self) {
-        // EOF restores AWDL on early returns and task cancellation, without a shell.
+        // EOF restores AWDL on early returns and task cancellation.
         self.input.take();
     }
 }
@@ -155,8 +166,11 @@ impl HeldLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+    use tokio::process::{Child, Command};
 
-    // This fake peer exercises IPC without privileges or network interfaces.
+    // This fake peer exercises the lease protocol without privileges or
+    // network interfaces.
     const PEER: &str = r#"
 printf 'READY\n'
 IFS= read -r -n 1 command || exit 1
@@ -181,31 +195,32 @@ done
 exit 4
 "#;
 
-    fn peer(script: &str) -> Command {
+    /// Runs a fake helper and returns the pipe ends the real one hands over.
+    fn peer(script: &str, argument: Option<&std::path::Path>) -> (Child, OwnedFd, OwnedFd) {
         let mut command = Command::new("/bin/bash");
         command.args(["-c", script, "awdl-test"]);
-        command
+        command.args(argument);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap().into_owned_fd().unwrap();
+        let output = child.stdout.take().unwrap().into_owned_fd().unwrap();
+        (child, input, output)
     }
 
-    #[tokio::test]
-    async fn lease_acquires_renews_and_releases() {
-        let mut lease = AwDlLease::start(peer(PEER), RESPONSE_TIMEOUT)
+    async fn lease(script: &str, argument: Option<&std::path::Path>) -> (Child, AwDlLease) {
+        let (child, input, output) = peer(script, argument);
+        let lease = AwDlLease::start(input, output, RESPONSE_TIMEOUT)
             .await
             .unwrap();
-        lease.renew().await.unwrap();
-        lease.release().await.unwrap();
+        (child, lease)
     }
 
-    #[tokio::test]
-    async fn dropping_lease_closes_the_pipe_for_recovery() {
-        let directory = tempfile::tempdir().unwrap();
-        let restored = directory.path().join("restored");
-        let mut command = peer(PEER);
-        command.arg(&restored);
-        let lease = AwDlLease::start(command, RESPONSE_TIMEOUT).await.unwrap();
-        drop(lease);
+    async fn restored(marker: &std::path::Path) {
         timeout(RESPONSE_TIMEOUT, async {
-            while !restored.exists() {
+            while !marker.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -214,16 +229,33 @@ exit 4
     }
 
     #[tokio::test]
+    async fn lease_acquires_renews_and_releases() {
+        let (_child, mut lease) = lease(PEER, None).await;
+        lease.renew().await.unwrap();
+        lease.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_lease_closes_the_pipe_for_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("restored");
+        let (_child, lease) = lease(PEER, Some(&marker)).await;
+        drop(lease);
+        restored(&marker).await;
+    }
+
+    #[tokio::test]
     async fn unresponsive_helper_has_a_bounded_startup() {
-        let result =
-            AwDlLease::start(peer("IFS= read -r -n 1 command"), Duration::from_millis(30)).await;
+        let (_child, input, output) = peer("IFS= read -r -n 1 command", None);
+        let result = AwDlLease::start(input, output, Duration::from_millis(30)).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn helper_failure_is_not_reported_as_active() {
+        let (_child, input, output) = peer("printf 'READY\n'; exit 1", None);
         assert!(
-            AwDlLease::start(peer("printf 'READY\n'; exit 1"), RESPONSE_TIMEOUT)
+            AwDlLease::start(input, output, RESPONSE_TIMEOUT)
                 .await
                 .is_err()
         );
@@ -231,13 +263,9 @@ exit 4
 
     #[tokio::test]
     async fn helper_exit_during_remote_control_ends_renewal() {
-        let mut lease = AwDlLease::start(
-            peer("printf 'READY\n'; IFS= read -r -n 1 command; printf 'ACTIVE\n'; exit 1"),
-            RESPONSE_TIMEOUT,
-        )
-        .await
-        .unwrap();
-        lease.child.wait().await.unwrap();
+        let script = "printf 'READY\n'; IFS= read -r -n 1 command; printf 'ACTIVE\n'; exit 1";
+        let (mut child, mut lease) = lease(script, None).await;
+        child.wait().await.unwrap();
         assert!(lease.renew().await.is_err());
         assert!(lease.release().await.is_err());
     }
@@ -245,21 +273,15 @@ exit 4
     #[tokio::test]
     async fn a_live_helper_must_acknowledge_renewal() {
         let script = PEER.replace("H) printf 'HELD\\n'", "H) :");
-        let mut lease = AwDlLease::start(peer(&script), RESPONSE_TIMEOUT)
-            .await
-            .unwrap();
+        let (_child, mut lease) = lease(&script, None).await;
         assert!(lease.renew().await.is_err());
     }
 
     #[tokio::test]
     async fn held_lease_outlives_waits_longer_than_the_lease() {
-        let idle = AwDlLease::start(peer(EXPIRING_PEER), RESPONSE_TIMEOUT)
-            .await
-            .unwrap();
-        let held = AwDlLease::start(peer(EXPIRING_PEER), RESPONSE_TIMEOUT)
-            .await
-            .unwrap()
-            .hold();
+        let (_idle_child, idle) = lease(EXPIRING_PEER, None).await;
+        let (_held_child, held) = lease(EXPIRING_PEER, None).await;
+        let held = held.hold();
         // Longer than the fake lease, like a slow Prepare or cleanup.
         tokio::time::sleep(Duration::from_millis(1600)).await;
         assert!(idle.release().await.is_err());
@@ -268,42 +290,25 @@ exit 4
 
     #[tokio::test]
     async fn held_lease_reports_a_helper_that_exits() {
-        let mut held = AwDlLease::start(
-            peer("printf 'READY\n'; IFS= read -r -n 1 command; printf 'ACTIVE\n'; exit 1"),
-            RESPONSE_TIMEOUT,
-        )
-        .await
-        .unwrap()
-        .hold();
+        let script = "printf 'READY\n'; IFS= read -r -n 1 command; printf 'ACTIVE\n'; exit 1";
+        let (_child, lease) = lease(script, None).await;
+        let mut held = lease.hold();
         timeout(RESPONSE_TIMEOUT, held.failed()).await.unwrap();
     }
 
     #[tokio::test]
     async fn dropping_a_held_lease_releases_it() {
         let directory = tempfile::tempdir().unwrap();
-        let restored = directory.path().join("restored");
-        let mut command = peer(PEER);
-        command.arg(&restored);
-        let held = AwDlLease::start(command, RESPONSE_TIMEOUT)
-            .await
-            .unwrap()
-            .hold();
-        drop(held);
-        timeout(RESPONSE_TIMEOUT, async {
-            while !restored.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        let marker = directory.path().join("restored");
+        let (_child, lease) = lease(PEER, Some(&marker)).await;
+        drop(lease.hold());
+        restored(&marker).await;
     }
 
     #[tokio::test]
     async fn restoration_failure_is_reported() {
         let script = PEER.replace("printf 'RELEASED\\n'", "exit 1");
-        let lease = AwDlLease::start(peer(&script), RESPONSE_TIMEOUT)
-            .await
-            .unwrap();
+        let (_child, lease) = lease(&script, None).await;
         assert!(lease.release().await.is_err());
     }
 }
