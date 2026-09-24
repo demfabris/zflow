@@ -8,7 +8,7 @@ let snapshot = {daemon: {sharing: true, peers: {Mac: {}}, connected: [], receivi
 const context = {
     GLib: {
         Variant: class { constructor(_type, value) { this.value = value; } },
-        VariantType: class {}, PRIORITY_DEFAULT: 0, SOURCE_CONTINUE: true,
+        VariantType: class {}, Error: class extends Error {}, PRIORITY_DEFAULT: 0, SOURCE_CONTINUE: true,
         timeout_add(_priority, _interval, callback) { const id = timers.size + 1; timers.set(id, callback); return id; },
         Source: {remove(id) { timers.delete(id); }},
     },

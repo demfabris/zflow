@@ -71,6 +71,7 @@ app.connect('activate', () => {
         settings._sharing.active = true;
         await waitFor(() => !settings._busy && settings._errorGroup.visible);
         assert(!settings._sharing.active, 'rejected toggle rolls back');
+        assert(settings._error.subtitle === 'Test: service refused the change', 'service errors hide the D-Bus error name');
         failSharing = false;
         settings._login.active = false;
         await waitFor(() => !snapshot.autostart && !settings._busy);

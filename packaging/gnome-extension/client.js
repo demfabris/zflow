@@ -34,7 +34,11 @@ export class Client {
                 new GLib.VariantType('(s)'), flags, 7000, this._cancel,
                 (connection, result) => {
                     try { resolve(JSON.parse(connection.call_finish(result).deep_unpack()[0])); }
-                    catch (error) { reject(error); }
+                    catch (error) {
+                        // Users see this message, so drop the "GDBus.Error:<name>: " prefix.
+                        if (error instanceof GLib.Error) Gio.DBusError.strip_remote_error(error);
+                        reject(error);
+                    }
                 });
         });
     }
