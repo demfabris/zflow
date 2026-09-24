@@ -16,7 +16,7 @@ override_dh_auto_install:
 	install -D -m 0644 packaging/udev/70-zflow.rules debian/zflow/usr/lib/udev/rules.d/70-zflow.rules
 	install -D -m 0644 packaging/udev/71-zflow-capture.rules debian/zflow/usr/share/zflow/71-zflow-capture.rules
 	install -D -m 0644 packaging/config/zflow.toml debian/zflow/usr/share/zflow/zflow.toml
-	install -D -m 0644 packaging/linux/account.sh debian/zflow/usr/lib/zflow/account.sh
+	install -D -m 0755 packaging/linux/host-setup.sh debian/zflow/usr/lib/zflow/host-setup.sh
 	install -D -m 0644 packaging/linux/io.zflow.zflow.desktop debian/zflow/usr/share/applications/io.zflow.zflow.desktop
 	install -D -m 0644 packaging/linux/io.zflow.Desktop.service debian/zflow/usr/share/dbus-1/services/io.zflow.Desktop.service
 	install -d debian/zflow/usr/share/gnome-shell/extensions/zflow@demfabris

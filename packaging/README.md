@@ -107,7 +107,9 @@ The `.deb` rejects a remaining `/usr/local` installation before unpacking.
 
 For development, `scripts/install.sh` builds both headless binaries and installs them under
 `/usr/local/bin`. It creates a locked `zflow` account, loads `uinput`, installs
-the service, udev rules, and a system-sleep hook, then starts `zflowd`.
+the service, udev rules, and a system-sleep hook, then starts `zflowd`. The
+account, configuration, capture-rule, and uinput steps live in
+`packaging/linux/host-setup.sh`, which the Debian package's postinst also runs.
 
 Binary archives contain the same installer and Linux service assets alongside
 `bin/zflow` and `bin/zflowd`. Their installer runs with `--install-built` and

@@ -6,12 +6,7 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly SCRIPT_DIR REPO_ROOT
-readonly SERVICE_USER="zflow"
-readonly SERVICE_GROUP="zflow"
 readonly BIN_DIR="/usr/local/bin"
-readonly CONFIG_DIR="/etc/zflow"
-readonly CONFIG_FILE="$CONFIG_DIR/zflow.toml"
-readonly STATE_DIR="/var/lib/zflow"
 readonly UNIT_FILE="/etc/systemd/system/zflowd.service"
 readonly DROPIN_DIR="/etc/systemd/system/zflowd.service.d"
 # Older installs ordered zflowd before the display manager on every boot.
@@ -60,7 +55,7 @@ done
 [[ "$(uname -s)" == "Linux" ]] || die "Linux is required"
 
 for source in \
-    "$REPO_ROOT/packaging/linux/account.sh" \
+    "$REPO_ROOT/packaging/linux/host-setup.sh" \
     "$REPO_ROOT/packaging/config/zflow.toml" \
     "$REPO_ROOT/packaging/modules-load.d/zflow.conf" \
     "$REPO_ROOT/packaging/system-sleep/zflow" \
@@ -69,10 +64,6 @@ for source in \
     "$REPO_ROOT/packaging/udev/71-zflow-capture.rules"; do
     require_regular_source "$source"
 done
-
-# shellcheck source-path=SCRIPTDIR
-# shellcheck source=../packaging/linux/account.sh
-source "$REPO_ROOT/packaging/linux/account.sh"
 
 if [[ "$EUID" -ne 0 ]]; then
     [[ "$install_built" == false ]] || die "--install-built requires root"
@@ -87,7 +78,7 @@ if [[ "$install_built" == false ]]; then
     build_binaries
 fi
 
-for command in awk cut getent grep groupadd install modprobe runuser systemctl systemd-analyze udevadm useradd; do
+for command in install systemctl systemd-analyze; do
     require_command "$command"
 done
 
@@ -101,20 +92,13 @@ if command -v dpkg-query >/dev/null 2>&1 && [[ "$(dpkg-query -W -f='${Status}' z
     die 'zflow is managed by dpkg. Install the release .deb instead of an archive/source build.'
 fi
 
-ensure_service_account
-
-refuse_symlink "$CONFIG_DIR"
-refuse_symlink "$CONFIG_FILE"
-refuse_symlink "$STATE_DIR"
 refuse_symlink "$UNIT_FILE"
 refuse_symlink "$VIRTUAL_RULE_FILE"
-refuse_symlink "$CAPTURE_RULE_FILE"
 refuse_symlink "$MODULE_FILE"
 refuse_symlink "$SLEEP_HOOK_FILE"
 
 install -d -o root -g root -m 0755 \
     "$BIN_DIR" "$UDEV_RULE_DIR" /etc/modules-load.d /usr/lib/systemd/system-sleep
-install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$CONFIG_DIR" "$STATE_DIR"
 install -o root -g root -m 0755 "$binary_dir/zflow" "$BIN_DIR/zflow"
 install -o root -g root -m 0755 "$binary_dir/zflowd" "$BIN_DIR/zflowd"
 # Retire the old desktop launcher when upgrading an existing installation.
@@ -127,50 +111,11 @@ install -o root -g root -m 0644 "$REPO_ROOT/packaging/udev/70-zflow.rules" "$VIR
 install -o root -g root -m 0644 "$REPO_ROOT/packaging/modules-load.d/zflow.conf" "$MODULE_FILE"
 install -o root -g root -m 0755 "$REPO_ROOT/packaging/system-sleep/zflow" "$SLEEP_HOOK_FILE"
 
-if [[ -e "$CONFIG_FILE" ]]; then
-    [[ -f "$CONFIG_FILE" ]] || die "configuration is not a regular file: $CONFIG_FILE"
-    chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"
-    chmod 0600 "$CONFIG_FILE"
-    printf 'Kept existing configuration: %s\n' "$CONFIG_FILE"
-else
-    install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 \
-        "$REPO_ROOT/packaging/config/zflow.toml" "$CONFIG_FILE"
-    printf 'Installed default configuration: %s\n' "$CONFIG_FILE"
-fi
-
-if [[ -e "$CAPTURE_RULE_FILE" ]]; then
-    [[ -f "$CAPTURE_RULE_FILE" ]] || die "capture rules are not a regular file: $CAPTURE_RULE_FILE"
-    chown root:root "$CAPTURE_RULE_FILE"
-    chmod 0644 "$CAPTURE_RULE_FILE"
-    printf 'Kept existing capture rules: %s\n' "$CAPTURE_RULE_FILE"
-else
-    install -o root -g root -m 0644 \
-        "$REPO_ROOT/packaging/udev/71-zflow-capture.rules" "$CAPTURE_RULE_FILE"
-fi
+# Run through bash so a noexec temporary directory still works.
+bash "$REPO_ROOT/packaging/linux/host-setup.sh" "$REPO_ROOT/packaging/config/zflow.toml" \
+    "$REPO_ROOT/packaging/udev/71-zflow-capture.rules" "$VIRTUAL_RULE_FILE"
 
 systemd-analyze verify "$UNIT_FILE"
-udevadm verify "$VIRTUAL_RULE_FILE" "$CAPTURE_RULE_FILE"
-
-modprobe uinput
-udevadm control --reload-rules
-udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput
-udevadm trigger --action=change --subsystem-match=input
-udevadm settle
-[[ -c /dev/uinput ]] || die "uinput loaded but /dev/uinput is missing"
-# Check what the udev rules produce, so a later rule that overrides the group
-# fails here instead of after the next reboot.
-runuser -u "$SERVICE_USER" -- /usr/bin/test -w /dev/uinput \
-    || die "$SERVICE_USER cannot write /dev/uinput after applying udev rules"
-
-shopt -s nullglob
-for event_node in /dev/input/event*; do
-    if udevadm info --query=property --name="$event_node" | grep -qx 'ZFLOW_CAPTURE=1'; then
-        runuser -u "$SERVICE_USER" -- /usr/bin/test -r "$event_node" \
-            || die "$SERVICE_USER cannot read selected device $event_node"
-    fi
-done
-shopt -u nullglob
-
 systemctl daemon-reload
 systemctl enable zflowd.service
 systemctl restart zflowd.service
