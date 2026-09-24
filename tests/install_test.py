@@ -97,7 +97,7 @@ class InstallerTest(unittest.TestCase):
             (tools / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "$LOG"\n')
         # The root step stages under /tmp; keep that inside the test directory.
         (tools / "mktemp").write_text(
-            '#!/bin/sh\ncase "$2" in /tmp/*) set -- "$1" "$TEST_ROOT/root/${2#/tmp/}";; esac\n'
+            '#!/bin/sh\ncase "$2" in /tmp/zflow-install.*) set -- "$1" "$TEST_ROOT/root/${2#/tmp/}";; esac\n'
             'exec /usr/bin/mktemp "$@"\n')
         for tool in tools.iterdir():
             tool.chmod(0o755)
