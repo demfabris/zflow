@@ -342,6 +342,10 @@ just test-package            # Debian lifecycle tests in Docker (build a .deb fi
 just check                   # Formatting, Clippy, Rust, GNOME, installer tests
 ```
 
+CI (`.github/workflows/ci.yml`) runs these checks plus ShellCheck on Linux, and
+Clippy, Rust tests, the C harnesses, and Swift bridge tests on macOS, for every
+pull request and push to `main`.
+
 Linux settings require GJS, GTK 4.12 or newer, and libadwaita 1.5 or newer.
 On Ubuntu, install `gjs gir1.2-gtk-4.0 gir1.2-adw-1`; on Arch, install
 `gjs gtk4 libadwaita`. The GNOME extension supplies the panel/tray icon, without

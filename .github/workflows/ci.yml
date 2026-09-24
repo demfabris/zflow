@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_TOOLCHAIN: 1.97.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust build toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      - name: Rust
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+      - name: GNOME extension
+        run: |
+          node tests/gnome_desktop_test.mjs
+          node tests/gnome_panel_test.mjs
+      - name: Installer
+        run: python3 tests/install_test.py
+      - name: Shell scripts
+        run: |
+          shellcheck -x install.sh scripts/*.sh packaging/linux/*.sh packaging/system-sleep/zflow \
+            debian/zflow.postinst debian/zflow.postrm debian/zflow.preinst tests/deb_lifecycle.sh
+
+  macos:
+    name: macOS
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust build toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+      - name: Rust
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+      - name: C harnesses
+        run: |
+          sdk=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p target/debug
+          xcrun --sdk macosx clang -isysroot "$sdk" -std=c11 -O2 -Wall -Wextra -Werror \
+            tests/macos_awdl_helper_test.c -o target/debug/macos-awdl-helper-test
+          ./target/debug/macos-awdl-helper-test
+          xcrun --sdk macosx clang -isysroot "$sdk" -std=c11 -O2 -Wall -Wextra -Werror \
+            tests/macos_capture_test.c -framework ApplicationServices -framework CoreFoundation \
+            -o target/debug/macos-capture-test
+          ./target/debug/macos-capture-test
+      - name: Swift bridge
+        run: |
+          MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --locked --lib
+          swift test --package-path macos
