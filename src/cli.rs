@@ -87,7 +87,15 @@ struct SetupOptions {
     udev_rules: Option<PathBuf>,
     allow_prelogin: Option<bool>,
     experimental_touchpad: Option<bool>,
+    /// Where `--prelogin` installs or removes the boot ordering drop-in.
+    prelogin_dropin: Option<PathBuf>,
 }
+
+/// Orders zflowd before the display manager so input works at the greeter.
+/// It stays installed only while pre-login input is on: with Type=notify, a
+/// zflowd that never becomes ready would otherwise delay every boot.
+const PRELOGIN_DROPIN: &str = "/etc/systemd/system/zflowd.service.d/zflowd-prelogin.conf";
+const PRELOGIN_ORDERING: &str = include_str!("../packaging/systemd/zflowd-prelogin.conf");
 
 pub fn run(path: PathBuf, command: Command) -> Result<()> {
     match command {
@@ -130,6 +138,7 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
                 udev_rules,
                 allow_prelogin,
                 experimental_touchpad,
+                prelogin_dropin: cfg!(target_os = "linux").then(|| PRELOGIN_DROPIN.into()),
             },
         ),
         Command::Status { json } => status(path, json),
@@ -181,6 +190,7 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
         udev_rules,
         allow_prelogin,
         experimental_touchpad,
+        prelogin_dropin,
     } = options;
     let existed = path.exists();
     let mut config = if existed {
@@ -230,10 +240,27 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
         .as_ref()
         .map(|(rules_path, _)| FileSnapshot::capture(rules_path))
         .transpose()?;
+    let prelogin_ordering = match prelogin_dropin.zip(allow_prelogin) {
+        Some((dropin, enabled)) => {
+            let previous = FileSnapshot::capture(&dropin)?;
+            let wanted = enabled.then(|| PRELOGIN_ORDERING.as_bytes().to_vec());
+            (previous.contents != wanted).then_some((dropin, previous, wanted))
+        }
+        None => None,
+    };
     let commit: Result<()> = (|| {
         config.save(&path)?;
         if let Some((rules_path, rules)) = &rendered_rules {
             write_atomic_bytes(rules_path, rules.as_bytes(), 0o644)?;
+        }
+        if let Some((dropin, _, wanted)) = &prelogin_ordering {
+            // Restoring a snapshot of the wanted state writes or removes the file.
+            FileSnapshot {
+                contents: wanted.clone(),
+            }
+            .restore(dropin, 0o644)
+            .with_context(|| format!("could not update {}", dropin.display()))?;
+            systemd_daemon_reload()?;
         }
         if restart_required.is_empty() {
             reload_running_daemon(&config)?;
@@ -250,16 +277,25 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
         {
             rollback_failures.push(format!("udev rules: {rollback}"));
         }
+        if let Some((dropin, previous, _)) = prelogin_ordering
+            && let Err(rollback) = previous.restore(&dropin, 0o644)
+        {
+            rollback_failures.push(format!("pre-login boot ordering: {rollback}"));
+        }
         if rollback_failures.is_empty() {
-            bail!("setup failed and changes were rolled back: {error}");
+            bail!("setup failed and changes were rolled back: {error:#}");
         }
         bail!(
-            "setup failed: {error}; rollback also failed: {}",
+            "setup failed: {error:#}; rollback also failed: {}",
             rollback_failures.join("; ")
         );
     }
     if let Some((rules_path, _)) = &rendered_rules {
         println!("wrote capture permissions: {}", rules_path.display());
+    }
+    if let Some((dropin, _, wanted)) = &prelogin_ordering {
+        let action = if wanted.is_some() { "wrote" } else { "removed" };
+        println!("{action} pre-login boot ordering: {}", dropin.display());
     }
     println!(
         "{} private configuration: {}",
@@ -774,6 +810,31 @@ fn doctor_prelogin_ordering(failed: &mut bool) {
             println!("fail pre-login boot ordering: {error}");
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_daemon_reload() -> Result<()> {
+    let mut command = ProcessCommand::new("/usr/bin/systemctl");
+    command
+        .arg("daemon-reload")
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    let output = bounded_command_output(&mut command, Duration::from_secs(30), 64 * 1024)
+        .context("could not run systemctl daemon-reload")?;
+    if !output.status.success() {
+        bail!(
+            "systemctl daemon-reload exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn systemd_daemon_reload() -> Result<()> {
+    bail!("pre-login boot ordering is managed only on Linux")
 }
 
 #[cfg(target_os = "linux")]
@@ -1605,6 +1666,7 @@ mod tests {
                 udev_rules: None,
                 allow_prelogin: Some(false),
                 experimental_touchpad: None,
+                prelogin_dropin: None,
             },
         )
         .unwrap();
@@ -1631,6 +1693,7 @@ mod tests {
                 udev_rules: None,
                 allow_prelogin: None,
                 experimental_touchpad: Some(true),
+                prelogin_dropin: None,
             },
         )
         .unwrap();
@@ -1663,6 +1726,7 @@ mod tests {
                 udev_rules: None,
                 allow_prelogin: None,
                 experimental_touchpad: None,
+                prelogin_dropin: None,
             },
         )
         .unwrap();
@@ -1703,6 +1767,7 @@ mod tests {
                 udev_rules: None,
                 allow_prelogin: None,
                 experimental_touchpad: None,
+                prelogin_dropin: None,
             },
         )
         .unwrap();
@@ -1718,6 +1783,7 @@ mod tests {
                 udev_rules: None,
                 allow_prelogin: Some(false),
                 experimental_touchpad: None,
+                prelogin_dropin: None,
             },
         );
 
@@ -1752,6 +1818,7 @@ mod tests {
                 udev_rules: None,
                 allow_prelogin: Some(false),
                 experimental_touchpad: None,
+                prelogin_dropin: None,
             },
         );
 
@@ -1780,6 +1847,7 @@ mod tests {
                 udev_rules: None,
                 allow_prelogin: None,
                 experimental_touchpad: None,
+                prelogin_dropin: None,
             },
         );
 
@@ -1817,6 +1885,7 @@ mod tests {
                 udev_rules: Some(rules_path.clone()),
                 allow_prelogin: None,
                 experimental_touchpad: None,
+                prelogin_dropin: None,
             },
         );
 
