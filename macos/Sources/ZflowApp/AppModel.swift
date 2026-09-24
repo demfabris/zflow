@@ -14,6 +14,7 @@ final class AppModel {
   let showSettingsAtLaunch: Bool
   private let core: CoreBridge
   private var poller: Task<Void, Never>?
+  @ObservationIgnored private var activity: (any NSObjectProtocol)?
 
   init() {
     let arguments = ProcessInfo.processInfo.arguments
@@ -56,12 +57,25 @@ final class AppModel {
       let result = try await core.request(request)
       if !quiet || snapshot == nil { error = nil }
       snapshot = result
+      holdActivity(result.sharing)
       if snapshot?.pairing.state == "paired", showingPairing {
         showingPairing = false
         send(CoreRequest(command: "pair_cancel"))
         send(CoreRequest(command: "reload"))
       }
     } catch { if !quiet || snapshot == nil { self.error = error.localizedDescription } }
+  }
+  // The engine polls input on 1 to 12 ms timers. App Nap and timer coalescing
+  // would stutter the pointer and delay crossings, so opt out while sharing.
+  private func holdActivity(_ sharing: Bool) {
+    if sharing, activity == nil {
+      activity = ProcessInfo.processInfo.beginActivity(
+        options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+        reason: "Sharing input with another computer")
+    } else if !sharing, let activity {
+      ProcessInfo.processInfo.endActivity(activity)
+      self.activity = nil
+    }
   }
   func openConfig() { NSWorkspace.shared.open(URL(fileURLWithPath: configPath)) }
   func openAccessibility() {
