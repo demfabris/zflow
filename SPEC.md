@@ -252,7 +252,7 @@ The receiver:
 
 The receiver advertises its held-state lease duration during authenticated session negotiation and repeats it in TakeoverAccepted. The duration MUST be at most one second. Applying a valid transition or authoritative snapshot that leaves state held sets the deadline from the receiver's monotonic clock. Sender timestamps never set it. On expiry, suspend, or resume, the receiver releases all owned state, closes the activation, and rejects later messages for that activation. Only a new activation may inject again.
 
-The sender renews held state before one third of the lease duration and requires SnapshotAck. If it receives no acknowledgement before the advertised deadline, it exits Remote ownership. A peer may renew through valid snapshots but cannot increase the receiver-configured duration.
+The sender renews held state before one third of the lease duration. Every snapshot, including one with neutral state, requires SnapshotAck within the lease duration. If the acknowledgement misses that deadline, the sender exits Remote ownership; this also covers a receiver that closed the activation on its own. A peer may renew through valid snapshots but cannot increase the receiver-configured duration.
 
 ### Cumulative motion datagrams
 

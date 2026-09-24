@@ -103,8 +103,9 @@ pub enum SenderError {
 #[derive(Debug, Clone)]
 struct PendingSnapshot {
     snapshot: StateSnapshot,
-    /// Only held-state renewals can force the sender out of Remote.
-    ack_deadline: Option<MonotonicTimeMicros>,
+    /// Neutral snapshots need acks too: a receiver that closed the activation
+    /// on its own sends nothing else.
+    ack_deadline: MonotonicTimeMicros,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -385,13 +386,11 @@ impl Sender {
             motion_anchor: self.anchor(now, AnchorKind::Checkpoint),
         };
         let message = self.control(ReliableControl::StateSnapshot(snapshot.clone()))?;
-        let ack_deadline =
-            (!snapshot.held.is_neutral()).then(|| add_duration(now, self.config.receiver_lease));
         self.pending_snapshots.insert(
             message.sequence,
             PendingSnapshot {
                 snapshot,
-                ack_deadline,
+                ack_deadline: add_duration(now, self.config.receiver_lease),
             },
         );
         self.last_snapshot_at = now;
@@ -417,7 +416,7 @@ impl Sender {
         let ack_timeout = self
             .pending_snapshots
             .values()
-            .filter_map(|pending| pending.ack_deadline)
+            .map(|pending| pending.ack_deadline)
             .min();
         [Some(periodic), dirty, renewal, ack_timeout]
             .into_iter()
@@ -431,8 +430,7 @@ impl Sender {
         if self
             .pending_snapshots
             .values()
-            .filter_map(|pending| pending.ack_deadline)
-            .any(|deadline| deadline <= now)
+            .any(|pending| pending.ack_deadline <= now)
         {
             self.remote = false;
             self.held.release_all();

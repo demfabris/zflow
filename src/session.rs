@@ -3386,6 +3386,112 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sender_returns_when_a_receiver_stops_acking_neutral_state() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut config = Config::default();
+            config.transport.lease_ms = 90;
+            config.transport.checkpoint_ms = 30;
+            let options = SessionOptions::from_config(&config).unwrap();
+            let (channels, mut peer, _client, _server) = input_channel_pair().await;
+            let (commands, command_rx) = mpsc::channel(8);
+            let (events, mut event_rx) = mpsc::channel(16);
+            let (ready, receipt) = oneshot::channel();
+            let actor = tokio::spawn(run_session(
+                1,
+                "silent-receiver".into(),
+                channels,
+                command_rx,
+                options.clone(),
+                events,
+                Arc::new(Mutex::new(SessionMetrics::default())),
+                ready,
+            ));
+            let negotiated = negotiate(&mut peer, &options.offer).await.unwrap();
+            peer.datagrams
+                .configure_maximum(negotiated.maximum_datagram_size)
+                .unwrap();
+            receipt.await.unwrap().unwrap();
+            let key = |state| {
+                SessionCommand::Capture(CapturedDeviceFrame {
+                    device_path: "fake".into(),
+                    captured_at: Instant::now(),
+                    frame: CaptureFrame {
+                        transitions: vec![CaptureTransition::Key {
+                            usage: HidUsage::keyboard(4),
+                            state,
+                        }],
+                        ..CaptureFrame::default()
+                    },
+                })
+            };
+            let mut response = ControlSequence(0);
+            // Ack every held-state snapshot, up to and including `until`.
+            let mut ack_until =
+                async |peer: &mut InputChannels, until: fn(&ReliableControl) -> bool| loop {
+                    let InputControlMessage::Reliable(message) =
+                        peer.control_receive.receive().await.unwrap()
+                    else {
+                        panic!("expected reliable control");
+                    };
+                    if matches!(message.payload, ReliableControl::StateSnapshot(_)) {
+                        response.0 += 1;
+                        let ack = ReliableControlMessage {
+                            session: message.session,
+                            sequence: response,
+                            payload: ReliableControl::SnapshotAck(SnapshotAck {
+                                snapshot_sequence: message.sequence,
+                                accepted_generation: message.session.transport_generation,
+                            }),
+                        };
+                        peer.control_send.send_control(&ack).await.unwrap();
+                    }
+                    if until(&message.payload) {
+                        break;
+                    }
+                };
+
+            commands
+                .send(SessionCommand::BeginOutbound(context()))
+                .await
+                .unwrap();
+            commands.send(key(KeyState::Pressed)).await.unwrap();
+            ack_until(&mut peer, |payload| {
+                matches!(payload, ReliableControl::StateSnapshot(_))
+            })
+            .await;
+            commands.send(key(KeyState::Released)).await.unwrap();
+            ack_until(&mut peer, |payload| {
+                matches!(payload, ReliableControl::KeyUp { .. })
+            })
+            .await;
+
+            // The receiver closed the activation during a stall, so neutral
+            // checkpoints go unanswered from here on.
+            let released = Instant::now();
+            loop {
+                match event_rx.recv().await.unwrap().kind {
+                    SessionEventKind::OutboundEnded => break,
+                    SessionEventKind::Closed { reason } => panic!("session failed: {reason}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                released.elapsed() < Duration::from_millis(500),
+                "sender stayed remote for {:?}",
+                released.elapsed()
+            );
+            assert!(!actor.is_finished(), "returning must not end the session");
+            commands
+                .send(SessionCommand::Close(SessionCloseReason::LocalRelease))
+                .await
+                .unwrap();
+            actor.await.unwrap().unwrap();
+        })
+        .await
+        .expect("silent receiver regression timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn touch_capture_times_survive_datagrams_and_checkpoint_recovery() {
         use crate::core::{ContactId, SourceDimensions, TouchContact, TouchTool};
 
