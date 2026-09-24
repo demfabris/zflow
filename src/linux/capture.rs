@@ -38,11 +38,17 @@ impl CaptureNode {
         ))
     }
 
+    /// mio registers descriptors edge-triggered, and one fetch reads only a
+    /// batch. Drain until the kernel buffer is empty so a trailing key-up or
+    /// finger lift is not left behind until the device reports again.
     fn fetch_events(&mut self) -> io::Result<Vec<InputEvent>> {
-        match self.device.fetch_events() {
-            Ok(events) => Ok(events.collect()),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(Vec::new()),
-            Err(error) => Err(error),
+        let mut events = Vec::new();
+        loop {
+            match self.device.fetch_events() {
+                Ok(batch) => events.extend(batch),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(events),
+                Err(error) => return Err(error),
+            }
         }
     }
 }
