@@ -18,6 +18,8 @@ Mac apps include Developer ID signatures and Apple's notarization ticket.
 You can install the optional AWDL helper from the app with administrator approval.
 
 Updates preserve configuration and pairing identities. Restarting the Linux
-service interrupts active sharing. Log out and back in after updating the
+service interrupts active sharing. Reboot Linux hosts once after updating from
+v0.1.0: its udev rule let logind give the desktop user write access to
+`/dev/uinput`, and that access lasts until the next boot. Log out and back in after updating the
 GNOME extension. Debian packages include the application launcher and extension;
 enable zflow in GNOME Extensions and use Start at Login in Settings if desired.
