@@ -150,10 +150,11 @@ Light-mode appearance and mouse-drag interactions still need live inspection.
 
 Automated regressions cover these boundaries:
 
-- Unsupported Linux HID usages and pointer buttons are rejected before backend
-  injection, including checkpoint and takeover state. A loopback test holds a
-  key, sends button 9, and verifies peer cleanup releases the key without sending
-  the unsupported button to the backend.
+- Unsupported Linux HID usages and pointer buttons are dropped and counted
+  before backend injection, including checkpoint and takeover state. A loopback
+  test presses and releases button 9 while a key is held and verifies the key
+  still round-trips, the button never reaches the backend and the peer stays
+  connected.
 - The Mac edge observer runs independently of rendering. Worker tests exercise
   polling with no UI calls, stop notification, cleanup and joined shutdown.
 - Quiet sessions wait for checkpoint, lease, playout and probe deadlines instead

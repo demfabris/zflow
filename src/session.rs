@@ -971,9 +971,8 @@ fn validate_negotiated_control(
         ReliableControl::KeyDown { key } | ReliableControl::KeyUp { key } => {
             validate_negotiated_usage(*key, negotiated)?;
         }
-        ReliableControl::ButtonDown { button, anchor }
-        | ReliableControl::ButtonUp { button, anchor } => {
-            validate_negotiated_button(*button, negotiated)?;
+        ReliableControl::ButtonDown { anchor, .. } | ReliableControl::ButtonUp { anchor, .. } => {
+            require_capability(negotiated, InputCapability::Pointer, "pointer button")?;
             validate_negotiated_anchor(anchor, negotiated)?;
         }
         ReliableControl::ScrollBegin { scroll } => {
@@ -1039,23 +1038,7 @@ fn validate_negotiated_usage(usage: HidUsage, negotiated: &NegotiatedSession) ->
         HidUsagePage::CONSUMER => InputCapability::ConsumerControls,
         _ => bail!("peer sent a key from an unsupported HID usage page"),
     };
-    require_capability(negotiated, capability, "key usage")?;
-    // Reject unsupported input before it can become a backend injection failure.
-    #[cfg(target_os = "linux")]
-    crate::linux::hid_to_evdev_key(usage)?;
-    Ok(())
-}
-
-fn validate_negotiated_button(
-    button: crate::core::PointerButton,
-    negotiated: &NegotiatedSession,
-) -> Result<()> {
-    require_capability(negotiated, InputCapability::Pointer, "pointer button")?;
-    #[cfg(target_os = "linux")]
-    crate::linux::pointer_button_to_evdev(button)?;
-    #[cfg(not(target_os = "linux"))]
-    let _ = button;
-    Ok(())
+    require_capability(negotiated, capability, "key usage")
 }
 
 fn validate_negotiated_held(state: &HeldState, negotiated: &NegotiatedSession) -> Result<()> {
@@ -1065,8 +1048,8 @@ fn validate_negotiated_held(state: &HeldState, negotiated: &NegotiatedSession) -
     if !state.modifiers.is_empty() {
         require_capability(negotiated, InputCapability::Keyboard, "modifier state")?;
     }
-    for button in &state.pressed_buttons {
-        validate_negotiated_button(*button, negotiated)?;
+    if !state.pressed_buttons.is_empty() {
+        require_capability(negotiated, InputCapability::Pointer, "pointer button")?;
     }
     if let Some(scroll) = state.active_scroll {
         validate_negotiated_scroll(scroll, negotiated)?;
@@ -1781,6 +1764,11 @@ async fn emit_receiver_effects(
                     bail!("peer sent an invalid input state transition");
                 }
             }
+            effect if !backend_supports(&effect) => {
+                let mut metrics = lock_metrics(metrics);
+                metrics.unsupported_inputs_dropped =
+                    metrics.unsupported_inputs_dropped.saturating_add(1);
+            }
             effect => backend.push(effect),
         }
     }
@@ -1831,6 +1819,25 @@ async fn emit_receiver_effects(
             .await?;
     }
     Ok(())
+}
+
+/// The receiver keeps tracking keys and buttons the local backend cannot
+/// inject, so held state and control sequences stay in step with the sender.
+/// Only their injection is dropped.
+#[cfg(target_os = "linux")]
+fn backend_supports(effect: &ReceiverEffect) -> bool {
+    match effect {
+        ReceiverEffect::Key { key, .. } => crate::linux::hid_to_evdev_key(*key).is_ok(),
+        ReceiverEffect::Button { button, .. } => {
+            crate::linux::pointer_button_to_evdev(*button).is_ok()
+        }
+        _ => true,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn backend_supports(_: &ReceiverEffect) -> bool {
+    true
 }
 
 fn emit_event(sender: &mpsc::Sender<SessionEvent>, event: SessionEvent) -> Result<()> {
@@ -2122,45 +2129,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn unsupported_linux_input_is_rejected_in_controls_and_authoritative_state() {
-        let selected = select_negotiation(&options().offer, &options().offer).unwrap();
-        for key in [
-            Some(HidUsage::keyboard(0xffff)),
-            Some(HidUsage::consumer(0xffff)),
-            None,
-        ] {
-            let mut sender = Sender::new(
-                SenderConfig::new(Duration::from_millis(250), Duration::from_millis(900)).unwrap(),
-                context(),
-                MonotonicTimeMicros(0),
-            )
-            .unwrap();
-            sender.enter(MonotonicTimeMicros(0)).unwrap();
-            let down = match key {
-                Some(key) => sender.key_down(key, MonotonicTimeMicros(1)).unwrap(),
-                None => sender
-                    .button_down(PointerButton(9), MonotonicTimeMicros(1))
-                    .unwrap(),
-            };
-            assert!(validate_negotiated_control(&down.payload, &selected).is_err());
-            let snapshot = sender.snapshot(MonotonicTimeMicros(2)).unwrap();
-            assert!(validate_negotiated_control(&snapshot.payload, &selected).is_err());
-            let takeover = sender
-                .propose_takeover(
-                    TransportGeneration(2),
-                    crate::core::TakeoverNonce([3; 16]),
-                    MonotonicTimeMicros(3),
-                )
-                .unwrap();
-            assert!(validate_negotiated_control(&takeover.payload, &selected).is_err());
-        }
-        validate_negotiated_usage(HidUsage::keyboard(4), &selected).unwrap();
-        validate_negotiated_usage(HidUsage::consumer(0xe9), &selected).unwrap();
-        validate_negotiated_button(PointerButton(8), &selected).unwrap();
     }
 
     #[test]
@@ -2906,84 +2874,66 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn unsupported_button_closes_peer_and_releases_keys_without_reaching_backend() {
+    async fn unsupported_button_is_dropped_without_closing_the_peer() {
         let (left, right, mut events, _client, _server) = desktop_test_pair().await;
         left.begin_outbound(context()).unwrap();
-        let capture = |transition| CapturedDeviceFrame {
-            device_path: "fake".into(),
-            captured_at: Instant::now(),
-            frame: CaptureFrame {
-                transitions: vec![transition],
-                ..CaptureFrame::default()
-            },
-        };
-        left.capture(capture(CaptureTransition::Key {
+        let key = |state| CaptureTransition::Key {
             usage: HidUsage::keyboard(4),
-            state: KeyState::Pressed,
-        }))
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let SessionEventKind::ReceiverEffects {
-                    effects, applied, ..
-                } = events.recv().await.unwrap().kind
-                {
-                    let pressed = effects
-                        .iter()
-                        .any(|effect| matches!(effect, ReceiverEffect::Key { pressed: true, .. }));
-                    applied.send(Ok(())).unwrap();
-                    if pressed {
-                        break;
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap();
-        left.capture(capture(CaptureTransition::Button {
+            state,
+        };
+        // The Mac bridge reports buttons up to 32; Linux injects 1 through 8.
+        let button = |state| CaptureTransition::Button {
             button: PointerButton(9),
-            state: KeyState::Pressed,
-        }))
-        .unwrap();
+            state,
+        };
+        for transition in [
+            key(KeyState::Pressed),
+            button(KeyState::Pressed),
+            button(KeyState::Released),
+            key(KeyState::Released),
+        ] {
+            left.capture(CapturedDeviceFrame {
+                device_path: "fake".into(),
+                captured_at: Instant::now(),
+                frame: CaptureFrame {
+                    transitions: vec![transition],
+                    ..CaptureFrame::default()
+                },
+            })
+            .unwrap();
+        }
+        let mut keys = Vec::new();
         tokio::time::timeout(Duration::from_secs(2), async {
-            let mut released = false;
-            loop {
-                if let SessionEventKind::ReceiverEffects {
+            while keys.len() < 2 {
+                let SessionEventKind::ReceiverEffects {
                     effects, applied, ..
                 } = events.recv().await.unwrap().kind
-                {
-                    assert!(!effects.iter().any(|effect| matches!(
-                        effect,
-                        ReceiverEffect::Button {
-                            button: PointerButton(9),
-                            ..
+                else {
+                    continue;
+                };
+                for effect in effects {
+                    match effect {
+                        ReceiverEffect::Key {
+                            pressed, synthetic, ..
+                        } => keys.push((pressed, synthetic)),
+                        ReceiverEffect::Button { .. } => {
+                            panic!("unsupported button reached the backend")
                         }
-                    )));
-                    released |= effects.iter().any(|effect| {
-                        matches!(
-                            effect,
-                            ReceiverEffect::Key {
-                                pressed: false,
-                                synthetic: true,
-                                ..
-                            }
-                        )
-                    });
-                    let closed = effects
-                        .iter()
-                        .any(|effect| matches!(effect, ReceiverEffect::ActivationClosed { .. }));
-                    applied.send(Ok(())).unwrap();
-                    if closed {
-                        assert!(released);
-                        break;
+                        ReceiverEffect::ActivationClosed { .. } => {
+                            panic!("unsupported button closed the activation")
+                        }
+                        _ => {}
                     }
                 }
+                applied.send(Ok(())).unwrap();
             }
-            right.connection.closed().await;
         })
         .await
         .unwrap();
+        assert_eq!(keys, [(true, false), (false, false)]);
+        assert_eq!(right.metrics_snapshot().unsupported_inputs_dropped, 2);
         left.close(SessionCloseReason::LocalRelease);
+        right.close(SessionCloseReason::LocalRelease);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
