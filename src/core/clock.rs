@@ -83,7 +83,6 @@ pub struct ProbeExchange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockResetReason {
     Suspend,
-    SessionEpochTransition,
     MonotonicDiscontinuity,
     Manual,
 }
@@ -282,10 +281,6 @@ impl ClockMapper {
 
     pub fn on_suspend(&mut self) {
         self.reset(ClockResetReason::Suspend);
-    }
-
-    pub fn on_session_epoch_transition(&mut self) {
-        self.reset(ClockResetReason::SessionEpochTransition);
     }
 
     pub fn on_monotonic_discontinuity(&mut self) {
@@ -558,10 +553,9 @@ mod tests {
         mapper
             .ingest_sample(ClockSample::exact(time(3), time(4)))
             .unwrap();
-        mapper.on_session_epoch_transition();
         mapper.on_monotonic_discontinuity();
         assert_eq!(mapper.stats().accepted_sample_count, 2);
-        assert_eq!(mapper.stats().reset_count, 3);
+        assert_eq!(mapper.stats().reset_count, 2);
         assert!(matches!(mapper.map(time(5)), Err(ClockError::NotReady)));
     }
 

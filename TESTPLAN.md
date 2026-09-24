@@ -151,7 +151,7 @@ Light-mode appearance and mouse-drag interactions still need live inspection.
 Automated regressions cover these boundaries:
 
 - Unsupported Linux HID usages and pointer buttons are dropped and counted
-  before backend injection, including checkpoint and takeover state. A loopback
+  before backend injection, including checkpoint state. A loopback
   test presses and releases button 9 while a key is held and verifies the key
   still round-trips, the button never reaches the backend and the peer stays
   connected.

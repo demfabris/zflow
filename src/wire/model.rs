@@ -269,46 +269,11 @@ impl TryFrom<WireStateSnapshot> for StateSnapshot {
     }
 }
 
+/// A retired message slot. It has no values, so decoding one always fails.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WireSessionTakeover {
-    prior_generation: TransportGeneration,
-    proposed_generation: TransportGeneration,
-    proposal_nonce: TakeoverNonce,
-    last_control_sequence: ControlSequence,
-    final_motion_anchor: WireMotionAnchor,
-    authoritative_held_state: WireHeldState,
-}
+pub(crate) enum Retired {}
 
-impl TryFrom<&SessionTakeover> for WireSessionTakeover {
-    type Error = BoundError;
-
-    fn try_from(value: &SessionTakeover) -> Result<Self, Self::Error> {
-        Ok(Self {
-            prior_generation: value.prior_generation,
-            proposed_generation: value.proposed_generation,
-            proposal_nonce: value.proposal_nonce,
-            last_control_sequence: value.last_control_sequence,
-            final_motion_anchor: WireMotionAnchor::try_from(&value.final_motion_anchor)?,
-            authoritative_held_state: WireHeldState::try_from(&value.authoritative_held_state)?,
-        })
-    }
-}
-
-impl TryFrom<WireSessionTakeover> for SessionTakeover {
-    type Error = BoundError;
-
-    fn try_from(value: WireSessionTakeover) -> Result<Self, Self::Error> {
-        Ok(Self {
-            prior_generation: value.prior_generation,
-            proposed_generation: value.proposed_generation,
-            proposal_nonce: value.proposal_nonce,
-            last_control_sequence: value.last_control_sequence,
-            final_motion_anchor: value.final_motion_anchor.try_into()?,
-            authoritative_held_state: value.authoritative_held_state.try_into()?,
-        })
-    }
-}
-
+// Postcard encodes the variant index, so retired variants keep their slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum WireReliableControl {
     Enter,
@@ -351,8 +316,8 @@ pub(crate) enum WireReliableControl {
     },
     StateSnapshot(WireStateSnapshot),
     SnapshotAck(SnapshotAck),
-    SessionTakeover(WireSessionTakeover),
-    TakeoverAccepted(TakeoverAccepted),
+    SessionTakeover(Retired),
+    TakeoverAccepted(Retired),
     SessionClose {
         reason: SessionCloseReason,
         final_anchor: Option<WireMotionAnchor>,
@@ -398,10 +363,6 @@ impl TryFrom<&ReliableControl> for WireReliableControl {
             },
             ReliableControl::StateSnapshot(snapshot) => Self::StateSnapshot(snapshot.try_into()?),
             ReliableControl::SnapshotAck(ack) => Self::SnapshotAck(*ack),
-            ReliableControl::SessionTakeover(takeover) => {
-                Self::SessionTakeover(takeover.try_into()?)
-            }
-            ReliableControl::TakeoverAccepted(accepted) => Self::TakeoverAccepted(*accepted),
             ReliableControl::SessionClose {
                 reason,
                 final_anchor,
@@ -454,10 +415,8 @@ impl TryFrom<WireReliableControl> for ReliableControl {
                 Self::StateSnapshot(snapshot.try_into()?)
             }
             WireReliableControl::SnapshotAck(ack) => Self::SnapshotAck(ack),
-            WireReliableControl::SessionTakeover(takeover) => {
-                Self::SessionTakeover(takeover.try_into()?)
-            }
-            WireReliableControl::TakeoverAccepted(accepted) => Self::TakeoverAccepted(accepted),
+            WireReliableControl::SessionTakeover(retired)
+            | WireReliableControl::TakeoverAccepted(retired) => match retired {},
             WireReliableControl::SessionClose {
                 reason,
                 final_anchor,
@@ -486,8 +445,7 @@ impl WireReliableControl {
             Self::TouchCancel { .. } => 12,
             Self::StateSnapshot(_) => 13,
             Self::SnapshotAck(_) => 14,
-            Self::SessionTakeover(_) => 15,
-            Self::TakeoverAccepted(_) => 16,
+            Self::SessionTakeover(retired) | Self::TakeoverAccepted(retired) => match *retired {},
             Self::SessionClose { .. } => 17,
         }
     }

@@ -197,7 +197,7 @@ Authenticated session negotiation selects one protocol version, maximum datagram
 
 A paired peer owns a long-term public identity key. A new process session creates a random 128-bit session epoch. A security-boundary transition such as a macOS console-session change also creates a new epoch and releases prior state. Each accepted transport within an epoch has a strictly increasing generation. Each transition from local to remote input creates a monotonic activation identifier within that epoch.
 
-The receiver MUST release state from the prior epoch before accepting a new epoch. It keeps one accepted transport generation per live session and rejects traffic from older generations. It MUST ignore messages for a closed activation even if those messages pass QUIC authentication.
+The receiver MUST release state from the prior epoch before accepting a new epoch. Each input connection has its own receiver, bound to the epoch and generation of its first control message; a message for another epoch or generation ends that connection. The receiver MUST ignore messages for a closed activation even if those messages pass QUIC authentication.
 
 ### Channel split
 
@@ -223,7 +223,7 @@ The input-control stream carries:
 - TouchBegin, TouchEnd, and TouchCancel;
 - StateSnapshot;
 - SnapshotAck;
-- SessionTakeover and SessionClose.
+- SessionClose.
 
 Each transition carries a control sequence. Pointer-sensitive transitions, including button events and Leave, also carry a MotionAnchor:
 
@@ -248,10 +248,10 @@ The receiver:
 
 1. Applies control events in stream order.
 2. Reconciles each authoritative snapshot by difference and leaves matching held inputs unchanged.
-3. Releases all owned state on SessionClose, stream reset, connection loss, lease expiry, backend teardown, or epoch replacement.
+3. Releases all owned state on SessionClose, stream reset, connection loss, lease expiry, or backend teardown.
 4. Performs release through its local backend. It does not depend on a “release-all” packet crossing a dead network.
 
-The receiver advertises its held-state lease duration during authenticated session negotiation and repeats it in TakeoverAccepted. The duration MUST be at most one second. Applying a valid transition or authoritative snapshot that leaves state held sets the deadline from the receiver's monotonic clock. Sender timestamps never set it. On expiry, suspend, or resume, the receiver releases all owned state, closes the activation, and rejects later messages for that activation. Only a new activation may inject again.
+The receiver advertises its held-state lease duration during authenticated session negotiation. The duration MUST be at most one second. Applying a valid transition or authoritative snapshot that leaves state held sets the deadline from the receiver's monotonic clock. Sender timestamps never set it. On expiry, suspend, or resume, the receiver releases all owned state, closes the activation, and rejects later messages for that activation. Only a new activation may inject again.
 
 The sender renews held state before one third of the lease duration. Every snapshot, including one with neutral state, requires SnapshotAck within the lease duration. If the acknowledgement misses that deadline, the sender exits Remote ownership; this also covers a receiver that closed the activation on its own. A peer may renew through valid snapshots but cannot increase the receiver-configured duration.
 
@@ -363,6 +363,8 @@ zflow v1 uses application-level candidate racing:
 4. The peers select one input connection and may retain established alternatives for authenticated health probes.
 5. A better or surviving connection proposes SessionTakeover within the same epoch and activation using the next transport generation.
 6. The old connection closes after the receiver accepts the takeover.
+
+The prototype implements neither candidate racing nor SessionTakeover yet. A new input connection starts a new session.
 
 Endpoint::rebind does not implement simultaneous racing because it replaces an endpoint's socket for all connections.
 
@@ -669,7 +671,7 @@ Each session records bounded local metrics:
 - RTT, delay variation, loss, reordering, and datagram queue drops;
 - clock offset, skew, and residual error;
 - playout delay, scheduler lateness, and catch-up amount;
-- input lease renewals, snapshot acknowledgements, synthetic releases, epoch/generation changes, and rejected stale events;
+- input lease renewals, snapshot acknowledgements, synthetic releases, and rejected stale events;
 - arming-to-grab time and switch-time leakage events;
 - path changes, service class, probe cadence, CPU wakeups, and energy data where the platform exposes them.
 

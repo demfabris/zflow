@@ -135,8 +135,6 @@ pub struct SessionMetrics {
     pub synthetic_releases: u64,
     pub stale_events_rejected: u64,
     pub unsupported_inputs_dropped: u64,
-    pub epoch_changes: u64,
-    pub generation_changes: u64,
     highest_motion_sequence: u64,
     recent_motion_sequences: BTreeSet<u64>,
     last_packet_delay_us: Option<u64>,
@@ -183,8 +181,6 @@ pub struct SessionMetricsSnapshot {
     pub stale_events_rejected: u64,
     /// Keys and buttons the local input backend cannot inject.
     pub unsupported_inputs_dropped: u64,
-    pub epoch_changes: u64,
-    pub generation_changes: u64,
 }
 
 impl SessionMetrics {
@@ -283,8 +279,6 @@ impl SessionMetrics {
                 synthetic_releases: self.synthetic_releases,
                 stale_events_rejected: self.stale_events_rejected,
                 unsupported_inputs_dropped: self.unsupported_inputs_dropped,
-                epoch_changes: self.epoch_changes,
-                generation_changes: self.generation_changes,
             },
         }
     }

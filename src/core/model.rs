@@ -529,26 +529,6 @@ pub struct SnapshotAck {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TakeoverNonce(pub [u8; 16]);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionTakeover {
-    pub prior_generation: TransportGeneration,
-    pub proposed_generation: TransportGeneration,
-    pub proposal_nonce: TakeoverNonce,
-    pub last_control_sequence: ControlSequence,
-    pub final_motion_anchor: MotionAnchor,
-    pub authoritative_held_state: HeldState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TakeoverAccepted {
-    pub accepted_generation: TransportGeneration,
-    pub proposal_nonce: TakeoverNonce,
-    pub receiver_lease_ms: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionCloseReason {
     LocalRelease,
     LeaseExpired,
@@ -603,8 +583,6 @@ pub enum ReliableControl {
     },
     StateSnapshot(StateSnapshot),
     SnapshotAck(SnapshotAck),
-    SessionTakeover(SessionTakeover),
-    TakeoverAccepted(TakeoverAccepted),
     SessionClose {
         reason: SessionCloseReason,
         final_anchor: Option<MotionAnchor>,
@@ -622,7 +600,6 @@ impl ReliableControl {
             | Self::TouchEnd { anchor }
             | Self::TouchCancel { anchor } => Some(anchor),
             Self::StateSnapshot(snapshot) => Some(&snapshot.motion_anchor),
-            Self::SessionTakeover(takeover) => Some(&takeover.final_motion_anchor),
             Self::SessionClose {
                 final_anchor: Some(anchor),
                 ..

@@ -1,8 +1,8 @@
 //! Pure receiver-side ordering, reconciliation, and failure recovery.
 //!
-//! Authentication and playout scheduling live outside this type. The caller
-//! explicitly authorizes epochs and supplies monotonic time; the receiver only
-//! emits backend-neutral effects.
+//! Authentication and playout scheduling live outside this type. Each input
+//! connection gets its own receiver. The caller supplies monotonic time; the
+//! receiver only emits backend-neutral effects.
 
 use std::{collections::BTreeSet, time::Duration};
 
@@ -11,8 +11,8 @@ use thiserror::Error;
 use super::{
     ActivationId, ActiveScroll, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage,
     Modifier, MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionSequence, PlayoutStep,
-    PointerButton, ReliableControl, ReliableControlMessage, ScrollId, SessionCloseReason,
-    SessionContext, SessionEpoch, SnapshotAck, TakeoverAccepted, TouchState, TransportGeneration,
+    PointerButton, ProtocolVersion, ReliableControl, ReliableControlMessage, ScrollId,
+    SessionCloseReason, SessionContext, SessionEpoch, SnapshotAck, TouchState, TransportGeneration,
 };
 
 const MAX_HELD_STATE_LEASE: Duration = Duration::from_secs(1);
@@ -53,10 +53,6 @@ impl ReceiverLifecycle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionReason {
-    NoAuthorizedSession,
-    StaleEpoch,
-    StaleGeneration,
-    FutureGeneration,
     ClosedActivation,
     StaleActivation,
     NoOpenActivation,
@@ -66,7 +62,6 @@ pub enum RejectionReason {
     AnchorActivationMismatch,
     AnchorMovedBackwards,
     InvalidTransition,
-    InvalidTakeover,
     WrongDirection,
 }
 
@@ -106,10 +101,6 @@ pub enum ReceiverEffect {
         session: SessionContext,
         ack: SnapshotAck,
     },
-    TakeoverAccepted {
-        session: SessionContext,
-        accepted: TakeoverAccepted,
-    },
     ActivationClosed {
         session: SessionContext,
         reason: SessionCloseReason,
@@ -142,12 +133,8 @@ pub enum ReceiverError {
     InvalidLease,
     #[error("receiver monotonic time moved backwards")]
     ClockMovedBackwards,
-    #[error("a generation change for an open activation requires SessionTakeover")]
-    TakeoverRequired,
-    #[error("accepted transport generations must increase exactly by one")]
-    InvalidGenerationAdvance,
-    #[error("the protocol version cannot change within one session epoch")]
-    ProtocolChangedWithinEpoch,
+    #[error("the peer changed protocol, epoch, or generation within one connection")]
+    ContextChanged,
 }
 
 #[derive(Debug, Clone)]
@@ -176,13 +163,11 @@ impl ActivationState {
 #[derive(Debug, Clone)]
 pub struct Receiver {
     config: ReceiverConfig,
-    accepted_protocol: Option<super::ProtocolVersion>,
-    accepted_epoch: Option<SessionEpoch>,
-    accepted_generation: Option<TransportGeneration>,
+    /// Taken from the first control message. One connection carries one.
+    context: Option<(ProtocolVersion, SessionEpoch, TransportGeneration)>,
     highest_activation: Option<ActivationId>,
     activation: Option<ActivationState>,
-    closed_activations: BTreeSet<(SessionEpoch, ActivationId)>,
-    accepted_takeovers: BTreeSet<(SessionEpoch, TransportGeneration)>,
+    closed_activations: BTreeSet<ActivationId>,
     last_observed_time: MonotonicTimeMicros,
 }
 
@@ -191,64 +176,12 @@ impl Receiver {
         let config = ReceiverConfig::new(config.held_state_lease)?;
         Ok(Self {
             config,
-            accepted_protocol: None,
-            accepted_epoch: None,
-            accepted_generation: None,
+            context: None,
             highest_activation: None,
             activation: None,
             closed_activations: BTreeSet::new(),
-            accepted_takeovers: BTreeSet::new(),
             last_observed_time: now,
         })
-    }
-
-    /// Authorizes an authenticated session boundary.
-    ///
-    /// Epoch bytes are random identifiers, not counters. Consequently a packet
-    /// can never replace an epoch by comparing byte values; only this explicit
-    /// lifecycle input can do so.
-    pub fn authorize_session(
-        &mut self,
-        session: SessionContext,
-        now: MonotonicTimeMicros,
-    ) -> Result<Vec<ReceiverEffect>, ReceiverError> {
-        self.observe_time(now)?;
-        let mut effects = Vec::new();
-        match self.accepted_epoch {
-            None => {
-                self.accepted_protocol = Some(session.protocol_version);
-                self.accepted_epoch = Some(session.session_epoch);
-                self.accepted_generation = Some(session.transport_generation);
-                self.highest_activation = None;
-            }
-            Some(epoch) if epoch != session.session_epoch => {
-                self.close_activation(SessionCloseReason::Superseded, &mut effects);
-                self.closed_activations.clear();
-                self.accepted_takeovers.clear();
-                self.accepted_protocol = Some(session.protocol_version);
-                self.accepted_epoch = Some(session.session_epoch);
-                self.accepted_generation = Some(session.transport_generation);
-                self.highest_activation = None;
-            }
-            Some(_) => {
-                if self.accepted_protocol != Some(session.protocol_version) {
-                    return Err(ReceiverError::ProtocolChangedWithinEpoch);
-                }
-                let accepted = self.accepted_generation.expect("epoch has a generation");
-                if self.activation.is_some() && session.transport_generation != accepted {
-                    return Err(ReceiverError::TakeoverRequired);
-                }
-                if session.transport_generation != accepted {
-                    let expected = accepted.0.checked_add(1);
-                    if expected != Some(session.transport_generation.0) {
-                        return Err(ReceiverError::InvalidGenerationAdvance);
-                    }
-                    self.accepted_generation = Some(session.transport_generation);
-                }
-                self.accepted_protocol = Some(session.protocol_version);
-            }
-        }
-        Ok(effects)
     }
 
     pub fn active_context(&self) -> Option<SessionContext> {
@@ -269,27 +202,17 @@ impl Receiver {
             .and_then(|state| state.lease_deadline)
     }
 
-    pub fn is_closed(&self, epoch: SessionEpoch, activation: ActivationId) -> bool {
-        self.closed_activations.contains(&(epoch, activation))
-    }
-
     pub fn receive_control(
         &mut self,
         message: ReliableControlMessage,
         now: MonotonicTimeMicros,
     ) -> Result<Vec<ReceiverEffect>, ReceiverError> {
         self.observe_time(now)?;
+        // Checked before the lease: an error must leave held state for the
+        // caller's connection-loss cleanup.
+        self.check_context(message.session)?;
         let mut effects = Vec::new();
         self.expire_lease(now, &mut effects);
-        if matches!(message.payload, ReliableControl::SessionTakeover(_)) {
-            effects.extend(self.receive_takeover(message, now));
-            return Ok(effects);
-        }
-
-        if let Some(reason) = self.session_rejection(message.session, false) {
-            effects.push(rejected(message.session, reason));
-            return Ok(effects);
-        }
 
         if matches!(message.payload, ReliableControl::Enter) {
             self.receive_enter(message, now, &mut effects);
@@ -298,7 +221,7 @@ impl Receiver {
 
         if self
             .closed_activations
-            .contains(&(message.session.session_epoch, message.session.activation_id))
+            .contains(&message.session.activation_id)
         {
             effects.push(rejected(message.session, RejectionReason::ClosedActivation));
             return Ok(effects);
@@ -309,15 +232,7 @@ impl Receiver {
             return Ok(effects);
         };
         if state.session.activation_id != message.session.activation_id {
-            let reason = if self
-                .closed_activations
-                .contains(&(message.session.session_epoch, message.session.activation_id))
-            {
-                RejectionReason::ClosedActivation
-            } else {
-                RejectionReason::StaleActivation
-            };
-            effects.push(rejected(message.session, reason));
+            effects.push(rejected(message.session, RejectionReason::StaleActivation));
             return Ok(effects);
         }
         if let Some(reason) = sequence_rejection(state.last_control_sequence, message.sequence) {
@@ -436,11 +351,11 @@ impl Receiver {
                     });
                 }
                 ReliableControl::SessionClose { reason, .. } => close = Some(*reason),
-                ReliableControl::SnapshotAck(_) | ReliableControl::TakeoverAccepted(_) => {
+                ReliableControl::SnapshotAck(_) => {
                     effects.push(rejected(message.session, RejectionReason::WrongDirection));
                     return Ok(effects);
                 }
-                ReliableControl::Enter | ReliableControl::SessionTakeover(_) => unreachable!(),
+                ReliableControl::Enter => unreachable!(),
             }
 
             state.last_control_sequence = message.sequence;
@@ -465,14 +380,7 @@ impl Receiver {
         self.observe_time(now)?;
         let mut effects = Vec::new();
         self.expire_lease(now, &mut effects);
-        if let Some(reason) = self.session_rejection(session, false) {
-            effects.push(rejected(session, reason));
-            return Ok(effects);
-        }
-        if self
-            .closed_activations
-            .contains(&(session.session_epoch, session.activation_id))
-        {
+        if self.closed_activations.contains(&session.activation_id) {
             effects.push(rejected(session, RejectionReason::ClosedActivation));
             return Ok(effects);
         }
@@ -480,7 +388,7 @@ impl Receiver {
             effects.push(rejected(session, RejectionReason::NoOpenActivation));
             return Ok(effects);
         };
-        if state.session.activation_id != session.activation_id {
+        if state.session != session {
             effects.push(rejected(session, RejectionReason::StaleActivation));
             return Ok(effects);
         }
@@ -566,7 +474,7 @@ impl Receiver {
     ) {
         if self
             .closed_activations
-            .contains(&(message.session.session_epoch, message.session.activation_id))
+            .contains(&message.session.activation_id)
         {
             effects.push(rejected(message.session, RejectionReason::ClosedActivation));
             return;
@@ -591,74 +499,6 @@ impl Receiver {
         self.highest_activation = Some(message.session.activation_id);
         self.activation = Some(state);
         effects.push(ReceiverEffect::ActivationOpened(message.session));
-    }
-
-    fn receive_takeover(
-        &mut self,
-        message: ReliableControlMessage,
-        now: MonotonicTimeMicros,
-    ) -> Vec<ReceiverEffect> {
-        let mut effects = Vec::new();
-        let ReliableControl::SessionTakeover(takeover) = &message.payload else {
-            unreachable!();
-        };
-        let Some(state) = self.activation.as_ref() else {
-            effects.push(rejected(message.session, RejectionReason::NoOpenActivation));
-            return effects;
-        };
-        let next_generation = state.session.transport_generation.0.checked_add(1);
-        let valid = message.session.protocol_version == state.session.protocol_version
-            && message.session.session_epoch == state.session.session_epoch
-            && message.session.activation_id == state.session.activation_id
-            && takeover.prior_generation == state.session.transport_generation
-            && takeover.proposed_generation == message.session.transport_generation
-            && next_generation == Some(takeover.proposed_generation.0)
-            && takeover.last_control_sequence == state.last_control_sequence
-            && message.sequence.0 == state.last_control_sequence.0.saturating_add(1)
-            && takeover.final_motion_anchor.kind == AnchorKind::Checkpoint
-            && takeover.final_motion_anchor.final_touch_state
-                == takeover.authoritative_held_state.active_touch
-            && !self
-                .accepted_takeovers
-                .contains(&(message.session.session_epoch, takeover.proposed_generation));
-        if !valid {
-            effects.push(rejected(message.session, RejectionReason::InvalidTakeover));
-            return effects;
-        }
-        let anchor_delta = match validate_anchor(state, &takeover.final_motion_anchor) {
-            Ok(delta) => delta,
-            Err(AnchorFailure::Rejected(reason)) => {
-                effects.push(rejected(message.session, reason));
-                return effects;
-            }
-            Err(AnchorFailure::MotionOverflow) => {
-                self.close_activation(SessionCloseReason::MotionOverflow, &mut effects);
-                return effects;
-            }
-        };
-        let state = self.activation.as_mut().expect("validated above");
-        apply_anchor(
-            state,
-            &takeover.final_motion_anchor,
-            anchor_delta,
-            &mut effects,
-        );
-        reconcile_held(state, &takeover.authoritative_held_state, &mut effects);
-        state.session.transport_generation = takeover.proposed_generation;
-        state.last_control_sequence = message.sequence;
-        refresh_lease(state, now, self.config.held_state_lease);
-        self.accepted_generation = Some(takeover.proposed_generation);
-        self.accepted_takeovers
-            .insert((message.session.session_epoch, takeover.proposed_generation));
-        effects.push(ReceiverEffect::TakeoverAccepted {
-            session: state.session,
-            accepted: TakeoverAccepted {
-                accepted_generation: takeover.proposed_generation,
-                proposal_nonce: takeover.proposal_nonce,
-                receiver_lease_ms: self.config.held_state_lease.as_millis() as u32,
-            },
-        });
-        effects
     }
 
     fn validate_transition(&self, payload: &ReliableControl) -> bool {
@@ -698,38 +538,22 @@ impl Receiver {
             ReliableControl::SessionClose { final_anchor, .. } => final_anchor
                 .as_ref()
                 .is_none_or(|anchor| anchor.kind == AnchorKind::Terminal),
-            ReliableControl::Enter
-            | ReliableControl::SnapshotAck(_)
-            | ReliableControl::SessionTakeover(_)
-            | ReliableControl::TakeoverAccepted(_) => false,
+            ReliableControl::Enter | ReliableControl::SnapshotAck(_) => false,
         }
     }
 
-    fn session_rejection(
-        &self,
-        session: SessionContext,
-        allow_next_generation: bool,
-    ) -> Option<RejectionReason> {
-        let Some(epoch) = self.accepted_epoch else {
-            return Some(RejectionReason::NoAuthorizedSession);
-        };
-        if session.session_epoch != epoch {
-            return Some(RejectionReason::StaleEpoch);
+    fn check_context(&mut self, session: SessionContext) -> Result<(), ReceiverError> {
+        let context = (
+            session.protocol_version,
+            session.session_epoch,
+            session.transport_generation,
+        );
+        match self.context {
+            None => self.context = Some(context),
+            Some(pinned) if pinned != context => return Err(ReceiverError::ContextChanged),
+            Some(_) => {}
         }
-        if self.accepted_protocol != Some(session.protocol_version) {
-            return Some(RejectionReason::StaleEpoch);
-        }
-        let generation = self.accepted_generation.expect("epoch has generation");
-        if session.transport_generation < generation {
-            return Some(RejectionReason::StaleGeneration);
-        }
-        if session.transport_generation > generation
-            && !(allow_next_generation
-                && generation.0.checked_add(1) == Some(session.transport_generation.0))
-        {
-            return Some(RejectionReason::FutureGeneration);
-        }
-        None
+        Ok(())
     }
 
     fn close_activation(&mut self, reason: SessionCloseReason, effects: &mut Vec<ReceiverEffect>) {
@@ -737,8 +561,7 @@ impl Receiver {
             return;
         };
         release_all(&mut state, effects);
-        self.closed_activations
-            .insert((state.session.session_epoch, state.session.activation_id));
+        self.closed_activations.insert(state.session.activation_id);
         effects.push(ReceiverEffect::ActivationClosed {
             session: state.session,
             reason,
@@ -950,10 +773,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::core::{
-        ProtocolVersion, Sender, SenderConfig, SenderTick, SessionEpoch, SessionTakeover,
-        StateSnapshot, TakeoverNonce,
-    };
+    use crate::core::{Sender, SenderConfig, SenderTick, StateSnapshot};
 
     fn context(epoch: u8, generation: u64, activation: u64) -> SessionContext {
         SessionContext {
@@ -973,9 +793,6 @@ mod tests {
     }
 
     fn enter(receiver: &mut Receiver, session: SessionContext, at: u64) {
-        receiver
-            .authorize_session(session, MonotonicTimeMicros(at))
-            .unwrap();
         let effects = receiver
             .receive_control(
                 ReliableControlMessage {
@@ -1032,10 +849,11 @@ mod tests {
             ));
             prop_assert!(released_key);
             prop_assert!(receiver.active_context().is_none());
-            prop_assert!(receiver.is_closed(session.session_epoch, session.activation_id));
+            prop_assert!(receiver.closed_activations.contains(&session.activation_id));
         }
 
-        /// Required property: stale epoch, generation, and activation traffic never injects.
+        /// Required property: a closed activation never injects again, and a
+        /// connection cannot switch epoch or generation.
         #[test]
         fn epoch_generation_activation_ordering_rejects_stale(
             epochs in (any::<u8>(), any::<u8>()).prop_filter(
@@ -1045,23 +863,53 @@ mod tests {
             generation in 1_u64..u64::MAX,
             activation in 1_u64..u64::MAX,
         ) {
-            let (old_epoch, new_epoch) = epochs;
-            let old = context(old_epoch, generation, activation);
-            let new = context(new_epoch, generation + 1, activation + 1);
+            let (epoch, other_epoch) = epochs;
+            let old = context(epoch, generation, activation);
+            let new = SessionContext { activation_id: ActivationId(activation + 1), ..old };
             let mut receiver = receiver(900);
             enter(&mut receiver, old, 0);
-            receiver.authorize_session(new, MonotonicTimeMicros(1)).unwrap();
+            receiver.receive_control(
+                ReliableControlMessage {
+                    session: old,
+                    sequence: ControlSequence(2),
+                    payload: ReliableControl::SessionClose {
+                        reason: SessionCloseReason::LocalRelease,
+                        final_anchor: None,
+                    },
+                },
+                MonotonicTimeMicros(1),
+            ).unwrap();
             enter(&mut receiver, new, 1);
 
-            for stale in [
-                old,
-                SessionContext { transport_generation: TransportGeneration(generation), ..new },
-                SessionContext { activation_id: ActivationId(activation), ..new },
+            let effects = receiver
+                .receive_playout_step(old, step(1, 99), MonotonicTimeMicros(2))
+                .unwrap();
+            prop_assert!(!effects.iter().any(ReceiverEffect::is_injection));
+            let effects = receiver.receive_control(
+                ReliableControlMessage {
+                    session: old,
+                    sequence: ControlSequence(3),
+                    payload: ReliableControl::KeyDown { key: HidUsage::keyboard(4) },
+                },
+                MonotonicTimeMicros(2),
+            ).unwrap();
+            prop_assert!(!effects.iter().any(ReceiverEffect::is_injection));
+
+            for changed in [
+                SessionContext { session_epoch: SessionEpoch([other_epoch; 16]), ..new },
+                SessionContext { transport_generation: TransportGeneration(generation - 1), ..new },
+                SessionContext { transport_generation: TransportGeneration(generation + 1), ..new },
             ] {
-                let effects = receiver
-                    .receive_playout_step(stale, step(1, 99), MonotonicTimeMicros(2))
-                    .unwrap();
-                prop_assert!(!effects.iter().any(ReceiverEffect::is_injection));
+                let result = receiver.receive_control(
+                    ReliableControlMessage {
+                        session: changed,
+                        sequence: ControlSequence(2),
+                        payload: ReliableControl::KeyDown { key: HidUsage::keyboard(4) },
+                    },
+                    MonotonicTimeMicros(3),
+                );
+                prop_assert_eq!(result, Err(ReceiverError::ContextChanged));
+                prop_assert_eq!(receiver.active_context(), Some(new));
             }
         }
 
@@ -1191,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn authorization_error_at_deadline_preserves_state_for_cleanup() {
+    fn context_error_at_deadline_preserves_state_for_cleanup() {
         let session = context(1, 1, 1);
         let key = HidUsage::keyboard(4);
         let mut receiver = receiver(10);
@@ -1213,9 +1061,16 @@ mod tests {
         };
         assert_eq!(
             receiver
-                .authorize_session(invalid, MonotonicTimeMicros(10_000))
+                .receive_control(
+                    ReliableControlMessage {
+                        session: invalid,
+                        sequence: ControlSequence(3),
+                        payload: ReliableControl::KeyUp { key },
+                    },
+                    MonotonicTimeMicros(10_000),
+                )
                 .unwrap_err(),
-            ReceiverError::ProtocolChangedWithinEpoch
+            ReceiverError::ContextChanged
         );
         assert_eq!(receiver.active_context(), Some(session));
         assert!(receiver.held_state().unwrap().pressed_keys.contains(&key));
@@ -1260,36 +1115,6 @@ mod tests {
             }
         )));
         assert!(receiver.active_context().is_none());
-    }
-
-    #[test]
-    fn replacing_an_epoch_discards_old_epoch_tombstones() {
-        let mut receiver = receiver(900);
-
-        for epoch in 1..=200 {
-            let session = context(epoch, u64::from(epoch), 1);
-            enter(&mut receiver, session, u64::from(epoch));
-            receiver
-                .accepted_takeovers
-                .insert((session.session_epoch, session.transport_generation));
-            receiver
-                .receive_control(
-                    ReliableControlMessage {
-                        session,
-                        sequence: ControlSequence(2),
-                        payload: ReliableControl::SessionClose {
-                            reason: SessionCloseReason::LocalRelease,
-                            final_anchor: None,
-                        },
-                    },
-                    MonotonicTimeMicros(u64::from(epoch)),
-                )
-                .unwrap();
-
-            assert_eq!(receiver.closed_activations.len(), 1);
-            assert_eq!(receiver.accepted_takeovers.len(), 1);
-            assert!(receiver.is_closed(session.session_epoch, session.activation_id));
-        }
     }
 
     #[test]
@@ -1543,43 +1368,6 @@ mod tests {
             source_dimensions: None,
         }])
         .unwrap()
-    }
-
-    #[test]
-    fn takeover_accepts_exact_next_generation_and_rejects_old_transport() {
-        let session = context(1, 1, 1);
-        let mut receiver = receiver(900);
-        enter(&mut receiver, session, 0);
-        let next = SessionContext {
-            transport_generation: TransportGeneration(2),
-            ..session
-        };
-        let effects = receiver
-            .receive_control(
-                ReliableControlMessage {
-                    session: next,
-                    sequence: ControlSequence(2),
-                    payload: ReliableControl::SessionTakeover(SessionTakeover {
-                        prior_generation: TransportGeneration(1),
-                        proposed_generation: TransportGeneration(2),
-                        proposal_nonce: TakeoverNonce([7; 16]),
-                        last_control_sequence: ControlSequence(1),
-                        final_motion_anchor: anchor(session, 0, 0),
-                        authoritative_held_state: HeldState::default(),
-                    }),
-                },
-                MonotonicTimeMicros(1),
-            )
-            .unwrap();
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, ReceiverEffect::TakeoverAccepted { .. }))
-        );
-        let stale = receiver
-            .receive_playout_step(session, step(1, 1), MonotonicTimeMicros(2))
-            .unwrap();
-        assert!(!stale.iter().any(ReceiverEffect::is_injection));
     }
 
     fn step(through: u64, dx: i64) -> PlayoutStep {

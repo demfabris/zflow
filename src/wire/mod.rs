@@ -70,7 +70,7 @@ impl Family {
     fn valid_message_type(self, message_type: u8) -> bool {
         match self {
             Self::Negotiation => matches!(message_type, 1 | 2),
-            Self::ReliableControl => (1..=17).contains(&message_type),
+            Self::ReliableControl => matches!(message_type, 1..=14 | 17),
             Self::Motion | Self::Discovery | Self::Pairing | Self::Desktop => message_type == 1,
             Self::Probe => matches!(message_type, 1 | 2),
         }
@@ -907,6 +907,144 @@ mod tests {
             let decoded = decode(&bytes).unwrap();
             assert_eq!(decoded.message, message);
             assert!(decoded.optional_fields.is_empty());
+        }
+    }
+
+    /// Payload bytes recorded before takeover, Leave and scroll phases were
+    /// retired. Every message still sent must keep its exact encoding.
+    #[test]
+    fn retired_messages_leave_live_encodings_unchanged() {
+        let anchor = |kind| MotionAnchor {
+            activation_id: session().activation_id,
+            through_motion_sequence: MotionSequence(3),
+            sender_capture_time: MonotonicTimeMicros(1_000),
+            totals: CumulativeMotion::new(5, -2, 0, 7),
+            final_touch_state: TouchState::default(),
+            kind,
+        };
+        let held = HeldState {
+            pressed_keys: BTreeSet::from([HidUsage::keyboard(4)]),
+            pressed_buttons: BTreeSet::from([PointerButton::PRIMARY]),
+            modifiers: BTreeSet::new(),
+            active_scroll: None,
+            active_touch: TouchState::default(),
+        };
+        let checkpoint = anchor(AnchorKind::Checkpoint);
+        let cases = [
+            (ReliableControl::Enter, 1, "00"),
+            (
+                ReliableControl::KeyDown {
+                    key: HidUsage::keyboard(4),
+                },
+                3,
+                "020704",
+            ),
+            (
+                ReliableControl::KeyUp {
+                    key: HidUsage::consumer(0xe9),
+                },
+                4,
+                "030ce901",
+            ),
+            (
+                ReliableControl::ButtonDown {
+                    button: PointerButton::PRIMARY,
+                    anchor: checkpoint.clone(),
+                },
+                5,
+                "04010903e8070a03000e0000",
+            ),
+            (
+                ReliableControl::ButtonUp {
+                    button: PointerButton::SECONDARY,
+                    anchor: checkpoint.clone(),
+                },
+                6,
+                "05020903e8070a03000e0000",
+            ),
+            (
+                ReliableControl::TouchBegin {
+                    initial_state: touch_state(),
+                },
+                10,
+                "090201c80190030180040108010601b8170001800fb80802d804a006000000000000",
+            ),
+            (
+                ReliableControl::TouchEnd {
+                    anchor: checkpoint.clone(),
+                },
+                11,
+                "0a0903e8070a03000e0000",
+            ),
+            (
+                ReliableControl::TouchCancel {
+                    anchor: checkpoint.clone(),
+                },
+                12,
+                "0b0903e8070a03000e0000",
+            ),
+            (
+                ReliableControl::StateSnapshot(StateSnapshot {
+                    held,
+                    motion_anchor: checkpoint,
+                }),
+                13,
+                "0c01070401010000000903e8070a03000e0000",
+            ),
+            (
+                ReliableControl::SnapshotAck(SnapshotAck {
+                    snapshot_sequence: ControlSequence(4),
+                    accepted_generation: TransportGeneration(7),
+                }),
+                14,
+                "0d0407",
+            ),
+            (
+                ReliableControl::SessionClose {
+                    reason: SessionCloseReason::LocalRelease,
+                    final_anchor: Some(anchor(AnchorKind::Terminal)),
+                },
+                17,
+                "1000010903e8070a03000e0001",
+            ),
+            (
+                ReliableControl::SessionClose {
+                    reason: SessionCloseReason::PermissionRevoked,
+                    final_anchor: None,
+                },
+                17,
+                "100300",
+            ),
+        ];
+        let payload_start = FIXED_HEADER_BYTES + 32 + 8;
+        for (payload, message_type, expected) in cases {
+            let message = WireMessage::ReliableControl(ReliableControlMessage {
+                session: session(),
+                sequence: ControlSequence(5),
+                payload,
+            });
+            let bytes = encode(&message).unwrap();
+            let hex: String = bytes[payload_start..]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!((bytes[5], hex.as_str()), (message_type, expected));
+            assert_eq!(decode(&bytes).unwrap().message, message);
+        }
+    }
+
+    #[test]
+    fn retired_control_types_are_rejected() {
+        let mut bytes = encode(&corpus().remove(2)).unwrap();
+        for retired in [15, 16] {
+            bytes[5] = retired;
+            assert_eq!(
+                decode(&bytes),
+                Err(WireError::UnknownMessageType {
+                    family: Family::ReliableControl,
+                    message_type: retired,
+                })
+            );
         }
     }
 

@@ -1264,7 +1264,6 @@ fn apply_receiver_effect(
         | ReceiverEffect::ScrollBegan(_)
         | ReceiverEffect::ScrollEnded { .. }
         | ReceiverEffect::SnapshotAck { .. }
-        | ReceiverEffect::TakeoverAccepted { .. }
         | ReceiverEffect::Rejected { .. } => Ok(()),
     };
     result.map_err(|error| injection_diagnostic(&error))

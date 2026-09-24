@@ -12,8 +12,7 @@ use super::{
     ActiveScroll, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage, Modifier,
     MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionFrame, MotionOverflow, MotionSequence,
     PointerButton, ReliableControl, ReliableControlMessage, ScrollId, SessionCloseReason,
-    SessionContext, SessionTakeover, SnapshotAck, StateSnapshot, TakeoverAccepted, TakeoverNonce,
-    TouchState, TransportGeneration,
+    SessionContext, SnapshotAck, StateSnapshot, TouchState,
 };
 
 const MAX_PENDING_SNAPSHOTS: usize = 64;
@@ -90,12 +89,6 @@ pub enum SenderError {
     UnknownSnapshotAck,
     #[error("too many checkpoints are awaiting acknowledgement")]
     PendingSnapshotLimit,
-    #[error("transport generation must advance exactly by one")]
-    InvalidGenerationAdvance,
-    #[error("takeover acknowledgement did not match the pending proposal")]
-    UnexpectedTakeoverAcceptance,
-    #[error("capture is paused until the pending takeover is accepted or abandoned")]
-    TakeoverPending,
     #[error(transparent)]
     MotionOverflow(#[from] MotionOverflow),
 }
@@ -106,13 +99,6 @@ struct PendingSnapshot {
     /// Neutral snapshots need acks too: a receiver that closed the activation
     /// on its own sends nothing else.
     ack_deadline: MonotonicTimeMicros,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PendingTakeover {
-    generation: TransportGeneration,
-    nonce: TakeoverNonce,
-    proposed_at: MonotonicTimeMicros,
 }
 
 /// Sender state for one activation.
@@ -131,7 +117,6 @@ pub struct Sender {
     dirty_since: Option<MonotonicTimeMicros>,
     pending_snapshots: BTreeMap<ControlSequence, PendingSnapshot>,
     last_acknowledged: Option<(ControlSequence, StateSnapshot)>,
-    pending_takeover: Option<PendingTakeover>,
 }
 
 impl Sender {
@@ -155,7 +140,6 @@ impl Sender {
             dirty_since: None,
             pending_snapshots: BTreeMap::new(),
             last_acknowledged: None,
-            pending_takeover: None,
         })
     }
 
@@ -222,7 +206,7 @@ impl Sender {
         touch_snapshot: Option<TouchState>,
         now: MonotonicTimeMicros,
     ) -> Result<MotionFrame, SenderError> {
-        self.require_capture_ready()?;
+        self.require_remote()?;
         self.observe_time(now)?;
         let next_totals = match self.totals.checked_add(delta) {
             Ok(totals) => totals,
@@ -381,7 +365,7 @@ impl Sender {
         &mut self,
         now: MonotonicTimeMicros,
     ) -> Result<ReliableControlMessage, SenderError> {
-        self.require_capture_ready()?;
+        self.require_remote()?;
         self.observe_time(now)?;
         if self.pending_snapshots.len() >= MAX_PENDING_SNAPSHOTS {
             return Err(SenderError::PendingSnapshotLimit);
@@ -482,62 +466,6 @@ impl Sender {
         Ok(())
     }
 
-    pub fn propose_takeover(
-        &mut self,
-        generation: TransportGeneration,
-        nonce: TakeoverNonce,
-        now: MonotonicTimeMicros,
-    ) -> Result<ReliableControlMessage, SenderError> {
-        self.before_control(now)?;
-        if self.session.transport_generation.0.checked_add(1) != Some(generation.0)
-            || self.pending_takeover.is_some()
-        {
-            return Err(SenderError::InvalidGenerationAdvance);
-        }
-        let prior_control_sequence = self.last_control_sequence;
-        let sequence = self.next_control_sequence()?;
-        self.last_control_sequence = sequence;
-        self.pending_takeover = Some(PendingTakeover {
-            generation,
-            nonce,
-            proposed_at: now,
-        });
-        Ok(ReliableControlMessage {
-            session: SessionContext {
-                transport_generation: generation,
-                ..self.session
-            },
-            sequence,
-            payload: ReliableControl::SessionTakeover(SessionTakeover {
-                prior_generation: self.session.transport_generation,
-                proposed_generation: generation,
-                proposal_nonce: nonce,
-                last_control_sequence: prior_control_sequence,
-                final_motion_anchor: self.anchor(now, AnchorKind::Checkpoint),
-                authoritative_held_state: self.held.clone(),
-            }),
-        })
-    }
-
-    pub fn accept_takeover(&mut self, accepted: TakeoverAccepted) -> Result<(), SenderError> {
-        let Some(pending) = self.pending_takeover else {
-            return Err(SenderError::UnexpectedTakeoverAcceptance);
-        };
-        if pending.generation != accepted.accepted_generation
-            || pending.nonce != accepted.proposal_nonce
-            || u128::from(accepted.receiver_lease_ms) * 1_000
-                != self.config.receiver_lease.as_micros()
-        {
-            return Err(SenderError::UnexpectedTakeoverAcceptance);
-        }
-        self.session.transport_generation = accepted.accepted_generation;
-        self.last_snapshot_at = pending.proposed_at;
-        self.dirty_since = None;
-        self.pending_takeover = None;
-        self.pending_snapshots.clear();
-        Ok(())
-    }
-
     pub fn leave(
         &mut self,
         reason: SessionCloseReason,
@@ -552,12 +480,11 @@ impl Sender {
         self.remote = false;
         self.held.release_all();
         self.pending_snapshots.clear();
-        self.pending_takeover = None;
         Ok(message)
     }
 
     fn before_control(&mut self, now: MonotonicTimeMicros) -> Result<(), SenderError> {
-        self.require_capture_ready()?;
+        self.require_remote()?;
         self.observe_time(now)
     }
 
@@ -602,14 +529,6 @@ impl Sender {
         self.remote.then_some(()).ok_or(SenderError::NotRemote)
     }
 
-    fn require_capture_ready(&self) -> Result<(), SenderError> {
-        self.require_remote()?;
-        if self.pending_takeover.is_some() {
-            return Err(SenderError::TakeoverPending);
-        }
-        Ok(())
-    }
-
     fn observe_time(&mut self, now: MonotonicTimeMicros) -> Result<(), SenderError> {
         if now < self.last_observed_time {
             return Err(SenderError::ClockMovedBackwards);
@@ -637,7 +556,7 @@ fn one_third_rounded_down(duration: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{ActivationId, ProtocolVersion, SessionEpoch};
+    use crate::core::{ActivationId, ProtocolVersion, SessionEpoch, TransportGeneration};
 
     fn context() -> SessionContext {
         SessionContext {
@@ -816,42 +735,6 @@ mod tests {
         assert_eq!(
             sender.enter(MonotonicTimeMicros(3)).unwrap_err(),
             SenderError::ClosedActivation
-        );
-    }
-
-    #[test]
-    fn takeover_consumes_one_control_sequence_and_requires_matching_acceptance() {
-        let mut sender = sender();
-        sender.enter(MonotonicTimeMicros(0)).unwrap();
-        let takeover = sender
-            .propose_takeover(
-                TransportGeneration(2),
-                TakeoverNonce([8; 16]),
-                MonotonicTimeMicros(1),
-            )
-            .unwrap();
-        assert_eq!(takeover.sequence, ControlSequence(2));
-        assert_eq!(
-            takeover.session.transport_generation,
-            TransportGeneration(2)
-        );
-        sender
-            .accept_takeover(TakeoverAccepted {
-                accepted_generation: TransportGeneration(2),
-                proposal_nonce: TakeoverNonce([8; 16]),
-                receiver_lease_ms: 900,
-            })
-            .unwrap();
-        assert_eq!(
-            sender.session().transport_generation,
-            TransportGeneration(2)
-        );
-        assert_eq!(
-            sender
-                .key_down(HidUsage::keyboard(4), MonotonicTimeMicros(2))
-                .unwrap()
-                .sequence,
-            ControlSequence(3)
         );
     }
 }

@@ -15,10 +15,10 @@ use crate::{
         ActiveScroll, ClockConfig, ClockMapper, ControlSequence, HeldState, HidUsage, HidUsagePage,
         InputCapabilities, InputCapability, MonotonicTimeMicros, MotionAnchor, MotionSequence,
         NegotiatedSession, NegotiationOffer, PlayoutConfig, PlayoutDelayMode, ProbeExchange,
-        ProbeMessage, ProbePayload, ProbeSequence, ProtocolVersion, Receiver, ReceiverConfig,
-        ReceiverEffect, ReceiverLifecycle, ReceiverPlayout, RejectionReason, ReliableControl,
+        ProbeMessage, ProbePayload, ProbeSequence, Receiver, ReceiverConfig, ReceiverEffect,
+        ReceiverLifecycle, ReceiverPlayout, RejectionReason, ReliableControl,
         ReliableControlMessage, ScrollUnit, Sender, SenderConfig, SenderTick, SessionCloseReason,
-        SessionContext, SessionEpoch, TouchState, TransportGeneration,
+        SessionContext, TouchState, TransportGeneration,
     },
     metrics::{SessionMetrics, SessionMetricsSnapshot},
     transport::{InputChannels, InputConnection, InputControlMessage, InputDatagram},
@@ -481,7 +481,6 @@ async fn run_session(
     let mut sender = None;
     let mut capture_merge = CaptureMerger::default();
     let mut receiver = Receiver::new(receiver_config, clock.now())?;
-    let mut authorized = None;
     let mut clock_mapper = ClockMapper::new(ClockConfig::default())?;
     let mut playout = None;
     let mut response_sequence = ControlSequence(0);
@@ -663,12 +662,6 @@ async fn run_session(
                                 metrics.snapshot_acknowledgements =
                                     metrics.snapshot_acknowledgements.saturating_add(1);
                             }
-                            ReliableControl::TakeoverAccepted(accepted) => {
-                                let Some(active) = sender.as_mut() else {
-                                    bail!("takeover acknowledgement arrived without an outbound activation");
-                                };
-                                active.accept_takeover(accepted)?;
-                            }
                             _ => {
                                 let now = clock.now();
                                 enqueue_pending_control(
@@ -682,7 +675,6 @@ async fn run_session(
                                     &mut pending_controls,
                                     &mut channels,
                                     &mut receiver,
-                                    &mut authorized,
                                     &mut playout,
                                     &mut clock_mapper,
                                     &mut response_sequence,
@@ -792,7 +784,6 @@ async fn run_session(
                     &mut pending_controls,
                     &mut channels,
                     &mut receiver,
-                    &mut authorized,
                     &mut playout,
                     &mut clock_mapper,
                     &mut response_sequence,
@@ -990,9 +981,7 @@ fn validate_negotiated_control(
     negotiated: &NegotiatedSession,
 ) -> Result<()> {
     match payload {
-        ReliableControl::Enter
-        | ReliableControl::SnapshotAck(_)
-        | ReliableControl::TakeoverAccepted(_) => {}
+        ReliableControl::Enter | ReliableControl::SnapshotAck(_) => {}
         ReliableControl::Leave { anchor } => validate_negotiated_anchor(anchor, negotiated)?,
         ReliableControl::KeyDown { key } | ReliableControl::KeyUp { key } => {
             validate_negotiated_usage(*key, negotiated)?;
@@ -1023,10 +1012,6 @@ fn validate_negotiated_control(
         ReliableControl::StateSnapshot(snapshot) => {
             validate_negotiated_held(&snapshot.held, negotiated)?;
             validate_negotiated_anchor(&snapshot.motion_anchor, negotiated)?;
-        }
-        ReliableControl::SessionTakeover(takeover) => {
-            validate_negotiated_held(&takeover.authoritative_held_state, negotiated)?;
-            validate_negotiated_anchor(&takeover.final_motion_anchor, negotiated)?;
         }
         ReliableControl::SessionClose { final_anchor, .. } => {
             if let Some(anchor) = final_anchor {
@@ -1304,41 +1289,8 @@ fn enqueue_pending_control(
     Ok(())
 }
 
-fn anchor_targets_active_context(message: &ReliableControlMessage, active: SessionContext) -> bool {
-    let Some(anchor) = message.payload.motion_anchor() else {
-        return false;
-    };
-    if anchor.activation_id != active.activation_id
-        || message.session.protocol_version != active.protocol_version
-        || message.session.session_epoch != active.session_epoch
-    {
-        return false;
-    }
-    match &message.payload {
-        ReliableControl::SessionTakeover(takeover) => {
-            takeover.prior_generation == active.transport_generation
-                && takeover.proposed_generation == message.session.transport_generation
-        }
-        _ => message.session == active,
-    }
-}
-
-fn message_belongs_to_context(message: &ReliableControlMessage, context: SessionContext) -> bool {
-    if message.session == context {
-        return true;
-    }
-    matches!(
-        &message.payload,
-        ReliableControl::SessionTakeover(takeover)
-            if message.session.protocol_version == context.protocol_version
-                && message.session.session_epoch == context.session_epoch
-                && message.session.activation_id == context.activation_id
-                && takeover.prior_generation == context.transport_generation
-    )
-}
-
 fn discard_pending_context(pending: &mut VecDeque<PendingControl>, context: SessionContext) {
-    pending.retain(|item| !message_belongs_to_context(&item.message, context));
+    pending.retain(|item| item.message.session != context);
 }
 
 fn pending_control_is_ready(
@@ -1355,7 +1307,7 @@ fn pending_control_is_ready(
     let Some(active) = receiver.active_context() else {
         return Ok(true);
     };
-    if !anchor_targets_active_context(&pending.message, active) {
+    if pending.message.session != active {
         return Ok(true);
     }
     let delay = playout
@@ -1376,7 +1328,6 @@ async fn drain_pending_controls(
     pending: &mut VecDeque<PendingControl>,
     channels: &mut InputChannels,
     receiver: &mut Receiver,
-    authorized: &mut Option<(ProtocolVersion, SessionEpoch, TransportGeneration)>,
     playout: &mut Option<ReceiverPlayout>,
     clock_mapper: &mut ClockMapper,
     response_sequence: &mut ControlSequence,
@@ -1399,7 +1350,6 @@ async fn drain_pending_controls(
         apply_control(
             channels,
             receiver,
-            authorized,
             playout,
             clock_mapper,
             response_sequence,
@@ -1427,7 +1377,6 @@ async fn drain_pending_controls(
 async fn apply_control(
     channels: &mut InputChannels,
     receiver: &mut Receiver,
-    authorized: &mut Option<(ProtocolVersion, SessionEpoch, TransportGeneration)>,
     playout: &mut Option<ReceiverPlayout>,
     clock_mapper: &mut ClockMapper,
     response_sequence: &mut ControlSequence,
@@ -1441,40 +1390,6 @@ async fn apply_control(
     received_at: Instant,
     motion_received_at: &mut BTreeMap<MotionSequence, Instant>,
 ) -> Result<()> {
-    let boundary = (
-        message.session.protocol_version,
-        message.session.session_epoch,
-        message.session.transport_generation,
-    );
-    let takeover = matches!(message.payload, ReliableControl::SessionTakeover(_));
-    if *authorized != Some(boundary) && !takeover {
-        let effects = receiver.authorize_session(message.session, now)?;
-        if authorized.is_some_and(|(_, epoch, _)| epoch != message.session.session_epoch) {
-            clock_mapper.on_session_epoch_transition();
-            let mut metrics = lock_metrics(metrics);
-            metrics.epoch_changes = metrics.epoch_changes.saturating_add(1);
-            update_clock_metrics(&mut metrics, clock_mapper);
-        } else if authorized
-            .is_some_and(|(_, _, generation)| generation != message.session.transport_generation)
-        {
-            let mut metrics = lock_metrics(metrics);
-            metrics.generation_changes = metrics.generation_changes.saturating_add(1);
-        }
-        *authorized = Some(boundary);
-        emit_receiver_effects(
-            channels,
-            effects,
-            response_sequence,
-            events,
-            session_id,
-            peer,
-            metrics,
-            received_at,
-            None,
-        )
-        .await?;
-    }
-
     let anchor = message.payload.motion_anchor().cloned();
     let touch_captured_at = anchor
         .as_ref()
@@ -1484,23 +1399,6 @@ async fn apply_control(
         .map(|capture| capture_instant(capture, now));
     let sequence = message.sequence;
     let effects = receiver.receive_control(message, now)?;
-    let takeover_accepted = takeover
-        && effects
-            .iter()
-            .any(|effect| matches!(effect, ReceiverEffect::TakeoverAccepted { .. }));
-    if takeover_accepted {
-        if authorized.is_some_and(|(_, _, generation)| generation != boundary.2) {
-            let mut metrics = lock_metrics(metrics);
-            metrics.generation_changes = metrics.generation_changes.saturating_add(1);
-        }
-        *authorized = Some(boundary);
-        *playout = Some(ReceiverPlayout::new(
-            options.playout,
-            receiver
-                .active_context()
-                .expect("takeover kept activation open"),
-        )?);
-    }
     let rejected = effects
         .iter()
         .any(|effect| matches!(effect, ReceiverEffect::Rejected { .. }));
@@ -1759,9 +1657,6 @@ async fn emit_receiver_effects(
             ReceiverEffect::SnapshotAck { session, ack } => {
                 responses.push((session, ReliableControl::SnapshotAck(ack)));
             }
-            ReceiverEffect::TakeoverAccepted { session, accepted } => {
-                responses.push((session, ReliableControl::TakeoverAccepted(accepted)));
-            }
             ReceiverEffect::Rejected { reason, .. } => {
                 let mut metrics = lock_metrics(metrics);
                 metrics.stale_events_rejected = metrics.stale_events_rejected.saturating_add(1);
@@ -1769,7 +1664,6 @@ async fn emit_receiver_effects(
                     reason,
                     RejectionReason::ControlGap
                         | RejectionReason::InvalidTransition
-                        | RejectionReason::InvalidTakeover
                         | RejectionReason::AnchorActivationMismatch
                         | RejectionReason::AnchorMovedBackwards
                         | RejectionReason::WrongDirection
@@ -1973,7 +1867,7 @@ mod tests {
         capture::CaptureFrame,
         core::{
             ActivationId, AnchorKind, CumulativeMotion, HidUsage, MotionDelta, PointerButton,
-            SnapshotAck,
+            ProtocolVersion, SessionEpoch, SnapshotAck,
         },
         identity::Identity,
         transport::{
@@ -2004,9 +1898,6 @@ mod tests {
         let context = context();
         let mut receiver =
             Receiver::new(ReceiverConfig::new(lease).unwrap(), MonotonicTimeMicros(0)).unwrap();
-        receiver
-            .authorize_session(context, MonotonicTimeMicros(0))
-            .unwrap();
         receiver
             .receive_control(
                 ReliableControlMessage {
