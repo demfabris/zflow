@@ -549,8 +549,11 @@ async fn run_session(
                         sender = Some(next);
                     }
                     SessionCommand::Capture(frame) => {
+                        // Frames queued before the activation ended are stale.
                         let Some(active) = sender.as_mut() else {
-                            bail!("capture arrived without an outbound activation");
+                            let mut metrics = lock_metrics(&metrics);
+                            metrics.stale_events_rejected = metrics.stale_events_rejected.saturating_add(1);
+                            continue;
                         };
                         let captured_at = frame.captured_at;
                         let frame = capture_merge.merge(frame);
@@ -630,12 +633,15 @@ async fn run_session(
                         validate_negotiated_control(&message.payload, &negotiated)?;
                         match message.payload {
                             ReliableControl::SnapshotAck(ack) => {
-                                let Some(active) = sender.as_mut() else {
-                                    bail!("snapshot acknowledgement arrived without an outbound activation");
+                                // An ack can trail a return or a quick re-entry.
+                                let Some(active) = sender
+                                    .as_mut()
+                                    .filter(|active| active.session() == message.session)
+                                else {
+                                    let mut metrics = lock_metrics(&metrics);
+                                    metrics.stale_events_rejected = metrics.stale_events_rejected.saturating_add(1);
+                                    continue;
                                 };
-                                if message.session != active.session() {
-                                    bail!("snapshot acknowledgement named the wrong activation");
-                                }
                                 active.acknowledge_snapshot(ack)?;
                                 let mut metrics = lock_metrics(&metrics);
                                 metrics.snapshot_acknowledgements =
@@ -3278,6 +3284,105 @@ mod tests {
             error.contains("request queue unavailable: channel closed"),
             "{error}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acks_and_captures_that_trail_a_return_are_stale_not_fatal() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (channels, mut peer, _client, _server) = input_channel_pair().await;
+            let (commands, command_rx) = mpsc::channel(8);
+            let (events, _event_rx) = mpsc::channel(16);
+            let (ready, receipt) = oneshot::channel();
+            let metrics = Arc::new(Mutex::new(SessionMetrics::default()));
+            let actor = tokio::spawn(run_session(
+                1,
+                "late-ack-peer".into(),
+                channels,
+                command_rx,
+                options(),
+                events,
+                metrics.clone(),
+                ready,
+            ));
+            let negotiated = negotiate(&mut peer, &options().offer).await.unwrap();
+            peer.datagrams
+                .configure_maximum(negotiated.maximum_datagram_size)
+                .unwrap();
+            receipt.await.unwrap().unwrap();
+
+            let first = context();
+            let second = SessionContext {
+                activation_id: ActivationId(2),
+                ..first
+            };
+            let late_ack = ReliableControlMessage {
+                session: first,
+                sequence: ControlSequence(1),
+                payload: ReliableControl::SnapshotAck(SnapshotAck {
+                    snapshot_sequence: ControlSequence(2),
+                    accepted_generation: first.transport_generation,
+                }),
+            };
+            let stale = |count| {
+                let metrics = metrics.clone();
+                async move {
+                    while lock_metrics(&metrics).stale_events_rejected < count {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            };
+            let end_outbound = || async {
+                let (sent, done) = oneshot::channel();
+                commands
+                    .send(SessionCommand::EndOutbound {
+                        reason: SessionCloseReason::LocalRelease,
+                        sent,
+                    })
+                    .await
+                    .unwrap();
+                done.await.unwrap().unwrap();
+            };
+
+            commands
+                .send(SessionCommand::BeginOutbound(first))
+                .await
+                .unwrap();
+            end_outbound().await;
+            // The checkpoint ack and a queued capture land after the return.
+            peer.control_send.send_control(&late_ack).await.unwrap();
+            commands
+                .send(SessionCommand::Capture(CapturedDeviceFrame {
+                    device_path: "fake".into(),
+                    captured_at: Instant::now(),
+                    frame: CaptureFrame {
+                        motion: MotionDelta {
+                            dx: 4,
+                            ..MotionDelta::default()
+                        },
+                        ..CaptureFrame::default()
+                    },
+                }))
+                .await
+                .unwrap();
+            stale(2).await;
+
+            // A quick re-entry must also survive the old activation's ack.
+            commands
+                .send(SessionCommand::BeginOutbound(second))
+                .await
+                .unwrap();
+            peer.control_send.send_control(&late_ack).await.unwrap();
+            stale(3).await;
+            end_outbound().await;
+            assert!(!actor.is_finished(), "a stale event closed the session");
+            commands
+                .send(SessionCommand::Close(SessionCloseReason::LocalRelease))
+                .await
+                .unwrap();
+            actor.await.unwrap().unwrap();
+        })
+        .await
+        .expect("stale ack regression timed out");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
