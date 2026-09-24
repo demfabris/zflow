@@ -1,34 +1,34 @@
 //! User-session connection between the daemon and GNOME's desktop integration.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Default)]
 struct State {
-    active: bool,
     ready: bool,
     message: String,
 }
 
+fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A task on the agent's runtime, which outlives anything zbus spawns for it.
+/// The agent runs on one thread, so an aborted task never writes state again.
 #[derive(Default)]
 pub struct DesktopReceiver {
     state: Arc<Mutex<State>>,
-    cancel: Option<tokio::sync::oneshot::Sender<()>>,
-    generation: Arc<std::sync::atomic::AtomicU64>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DesktopReceiver {
     pub fn is_active(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).active
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
     }
     pub fn is_ready(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).ready
+        lock(&self.state).ready
     }
     pub fn status(&self) -> String {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .message
-            .clone()
+        lock(&self.state).message.clone()
     }
     /// `connection` must own the agent's bus name; the extension answers no
     /// other caller.
@@ -36,59 +36,33 @@ impl DesktopReceiver {
         if self.is_active() {
             return;
         }
-        self.stop();
+        tracing::debug!("starting desktop agent");
         let connection = connection.clone();
-        let generation = self
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let generation_ref = self.generation.clone();
-        tracing::debug!(generation, "starting desktop agent");
         let state = self.state.clone();
-
-        let (cancel, receipt) = tokio::sync::oneshot::channel();
-        self.cancel = Some(cancel);
-        *state.lock().unwrap_or_else(|e| e.into_inner()) = State {
-            active: true,
+        *lock(&state) = State {
             ready: false,
             message: "Connecting to the local GNOME desktop…".into(),
         };
-        std::thread::spawn(move || {
-            let result = (|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(async {
-                        tokio::select! {
-                            result=run(&connection,&state,&generation_ref,generation) => result,
-                            _=receipt => Ok(()),
-                        }
-                    })
-            })();
-            if generation_ref.load(std::sync::atomic::Ordering::SeqCst) == generation {
-                if let Err(error) = &result {
-                    tracing::warn!(generation, error = %format_args!("{error:#}"), "desktop agent stopped");
-                }
-                *state.lock().unwrap_or_else(|e| e.into_inner()) = State {
-                    active: false,
-                    ready: false,
-                    message: match result {
-                        Ok(()) => "Receiving stopped".into(),
-                        Err(error) => format!("{error:#}"),
-                    },
-                };
+        self.task = Some(tokio::spawn(async move {
+            let result = run(&connection, &state).await;
+            if let Err(error) = &result {
+                tracing::warn!(error = %format_args!("{error:#}"), "desktop agent stopped");
             }
-        });
+            *lock(&state) = State {
+                ready: false,
+                message: match result {
+                    Ok(()) => "Receiving stopped".into(),
+                    Err(error) => format!("{error:#}"),
+                },
+            };
+        }));
     }
     pub fn stop(&mut self) {
         tracing::debug!("stopping desktop agent");
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(());
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State {
-            active: false,
+        *lock(&self.state) = State {
             ready: false,
             message: "Receiving stopped".into(),
         };
@@ -102,12 +76,7 @@ impl Drop for DesktopReceiver {
 }
 
 #[cfg(target_os = "linux")]
-async fn run(
-    connection: &zbus::Connection,
-    state: &Arc<Mutex<State>>,
-    generation: &std::sync::atomic::AtomicU64,
-    expected: u64,
-) -> anyhow::Result<()> {
+async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Result<()> {
     use crate::desktop::{DesktopRequest, DesktopResponse};
     use anyhow::{Context, ensure};
     const ENABLE: &str = "Enable the zflow GNOME integration; a newly installed extension may require logging out and back in";
@@ -123,7 +92,7 @@ async fn run(
             Ok(owner) => break owner,
             Err(zbus::fdo::Error::NameHasNoOwner(_)) if !waiting => {
                 tracing::debug!("waiting for the zflow GNOME extension");
-                state.lock().unwrap_or_else(|e| e.into_inner()).message = ENABLE.into();
+                lock(state).message = ENABLE.into();
                 waiting = true;
             }
             Err(zbus::fdo::Error::NameHasNoOwner(_)) => {}
@@ -176,13 +145,11 @@ async fn run(
         matches!(ready, DesktopResponse::Finished),
         "The service denied the desktop connection"
     );
-    if generation.load(std::sync::atomic::Ordering::SeqCst) != expected {
-        return Ok(());
-    }
-    state.lock().unwrap_or_else(|e| e.into_inner()).message =
-        "Ready to receive through the GNOME desktop".into();
-    state.lock().unwrap_or_else(|e| e.into_inner()).ready = true;
-    tracing::info!(generation = expected, "desktop agent ready");
+    *lock(state) = State {
+        ready: true,
+        message: "Ready to receive through the GNOME desktop".into(),
+    };
+    tracing::info!("desktop agent ready");
 
     loop {
         let request: DesktopRequest = crate::control::read_message(&mut stream).await?;
@@ -341,28 +308,34 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
+    async fn receiver_runs_as_a_task_that_stop_ends() {
+        let agent = zbus::Connection::session().await.unwrap();
+        let mut receiver = DesktopReceiver::default();
+        receiver.start(&agent);
+        assert!(receiver.is_active());
+        assert!(!receiver.is_ready());
+        receiver.stop();
+        assert!(!receiver.is_active());
+        tokio::task::yield_now().await;
+        assert_eq!(receiver.status(), "Receiving stopped");
+        receiver.start(&agent);
+        assert!(receiver.is_active());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
     async fn receiver_waits_for_gnome_shell_and_calls_from_its_own_connection() {
         use crate::desktop::{BUS_NAME, OBJECT_PATH};
-        let state = Arc::new(Mutex::new(State::default()));
-        let generation = std::sync::atomic::AtomicU64::new(1);
+        let state = Mutex::new(State::default());
         let agent = zbus::Connection::session().await.unwrap();
         // Login can start the agent before Shell enables the extension.
-        let early = tokio::time::timeout(
-            std::time::Duration::from_millis(700),
-            run(&agent, &state, &generation, 1),
-        )
-        .await;
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(700), run(&agent, &state)).await;
         assert!(
             early.is_err(),
             "the receiver keeps waiting for the extension"
         );
-        assert!(
-            state
-                .lock()
-                .unwrap()
-                .message
-                .starts_with("Enable the zflow")
-        );
+        assert!(lock(&state).message.starts_with("Enable the zflow"));
         let shell = zbus::connection::Builder::session()
             .unwrap()
             .name("org.gnome.Shell")
@@ -372,7 +345,7 @@ mod tests {
             .unwrap();
         let impostor = zbus::Connection::session().await.unwrap();
         impostor.request_name(BUS_NAME).await.unwrap();
-        let error = run(&agent, &state, &generation, 1).await.unwrap_err();
+        let error = run(&agent, &state).await.unwrap_err();
         assert!(format!("{error:#}").contains("Another program owns"));
         impostor.release_name(BUS_NAME).await.unwrap();
 
@@ -383,7 +356,7 @@ mod tests {
             .await
             .unwrap();
         shell.request_name(BUS_NAME).await.unwrap();
-        let error = run(&agent, &state, &generation, 1).await.unwrap_err();
+        let error = run(&agent, &state).await.unwrap_err();
         assert_eq!(format!("{error:#}"), "fake shell");
         assert_eq!(
             *callers.lock().unwrap(),
