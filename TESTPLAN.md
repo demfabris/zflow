@@ -380,10 +380,10 @@ qualify this test; allow access through the normal system UI and retry.
 
 The Linux desktop agent uses `/run/zflow-gui/peers.sock`, a separate desktop
 endpoint. The original control socket and private config/state paths retain
-their permissions. The endpoint accepts Snapshot, user-confirmed pairing and
+their permissions. The endpoint accepts Status, user-confirmed pairing and
 an explicitly enabled desktop broker. It checks Unix credentials
-against the service/root/active desktop UID, and returns public peer records
-plus the discovery flag. It has a separate eight-client limit and three-second
+against the service/root/active desktop UID, and Status returns sharing state,
+public peer records and the discovery flag. It has a separate eight-client limit and three-second
 initial-request timeout; pairing has its own bounded confirmation window and
 the desktop broker rechecks authorization during its connection. The agent also
 checks the server UID; it cannot edit service configuration.

@@ -11,7 +11,6 @@ pub const SOCKET_PATH: &str = "/run/zflow-gui/peers.sock";
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Snapshot {},
     Status {},
     SetSharing {
         enabled: bool,
@@ -60,13 +59,8 @@ pub async fn connect_service() -> anyhow::Result<tokio::net::UnixStream> {
     Ok(stream)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Snapshot {
-    pub peers: BTreeMap<String, PeerConfig>,
-    pub discovery: bool,
-}
-
+/// What desktop users may see: sharing state and public peer records, never
+/// private paths or keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopStatus {
@@ -76,6 +70,19 @@ pub struct DesktopStatus {
     pub connected: Vec<String>,
     pub peers: BTreeMap<String, PeerConfig>,
     pub discovery: bool,
+}
+
+impl DesktopStatus {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            sharing: config.daemon.sharing,
+            receiving_from: None,
+            sending_to: None,
+            connected: Vec::new(),
+            peers: config.peers.clone(),
+            discovery: config.transport.discovery,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,37 +106,12 @@ pub async fn request(request: &Request) -> anyhow::Result<DesktopReply> {
     }).await.context("The desktop API did not respond within five seconds")?
 }
 
-impl Snapshot {
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            peers: config.peers.clone(),
-            discovery: config.transport.discovery,
-        }
-    }
-
-    pub fn into_display_config(self) -> Config {
-        Config {
-            peers: self.peers,
-            transport: crate::config::TransportConfig {
-                discovery: self.discovery,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
-pub async fn fetch() -> anyhow::Result<Snapshot> {
-    use anyhow::Context;
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        let mut stream = connect_service().await?;
-        crate::control::write_message(&mut stream, &Request::Snapshot {}).await?;
-        let snapshot: Snapshot = crate::control::read_message(&mut stream).await
-            .context("The service denied access or returned an invalid response. Use the active local desktop session")?;
-        snapshot.clone().into_display_config().validate()?;
-        Ok(snapshot)
-    }).await.context("The desktop API did not respond within three seconds")?
+pub async fn status() -> anyhow::Result<DesktopStatus> {
+    match request(&Request::Status {}).await? {
+        DesktopReply::Status(status) => Ok(status),
+        _ => anyhow::bail!("Unexpected response; update the zflow service"),
+    }
 }
 
 #[cfg(test)]
@@ -144,7 +126,8 @@ mod tests {
             r#"{"command":"activate","peer":"desk"}"#,
             r#"{"command":"local"}"#,
             r#"{"command":"reload_config"}"#,
-            r#"{"command":"snapshot","path":"/etc/zflow"}"#,
+            r#"{"command":"status","path":"/etc/zflow"}"#,
+            r#"{"command":"snapshot"}"#,
             r#"{"command":"pair","remote":null,"identity":"attacker"}"#,
             r#"{"command":"pair_confirm","name":"desk","authentication_code":"123456","permissions":{"inject_prelogin":true}}"#,
         ] {
@@ -153,12 +136,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_contains_only_peer_metadata_and_discovery() {
+    fn status_carries_discovery_but_no_private_configuration() {
         let mut config = Config::default();
         config.daemon.state_dir = "/private/identity-location".into();
-        let value = serde_json::to_value(Snapshot::from_config(&config)).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 2);
+        config.transport.discovery = false;
+        let value = serde_json::to_value(DesktopStatus::from_config(&config)).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 6);
         assert!(value.get("peers").is_some());
+        assert_eq!(value["discovery"], false);
         assert!(!value.to_string().contains("identity-location"));
     }
 }

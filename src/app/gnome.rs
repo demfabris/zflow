@@ -61,18 +61,14 @@ impl Service {
     async fn dispatch(&self, json: &str) -> Result<serde_json::Value> {
         ensure!(json.len() <= 4096, "Desktop request exceeds limit");
         let request: Request = serde_json::from_str(json)?;
-        use crate::peer_view::{DesktopReply, Request as DaemonRequest};
+        use crate::peer_view::Request as DaemonRequest;
         match request {
             Request::Snapshot => {
-                let daemon = crate::peer_view::request(&DaemonRequest::Status {}).await;
+                let daemon = crate::peer_view::status().await;
                 let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
                 let nearby = state.nearby.snapshot();
                 let (daemon, error) = match daemon {
-                    Ok(DesktopReply::Status(value)) => (Some(value), None),
-                    Ok(_) => (
-                        None,
-                        Some("Unexpected response; update the zflow service".to_owned()),
-                    ),
+                    Ok(value) => (Some(value), None),
                     Err(error) => (None, Some(format!("{error:#}"))),
                 };
                 return Ok(serde_json::json!({

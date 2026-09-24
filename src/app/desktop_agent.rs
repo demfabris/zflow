@@ -37,7 +37,7 @@ pub fn run(install: bool) -> Result<()> {
                     };
                     if status!=previous { tracing::info!(%status,"desktop agent"); previous=status; }
                     detector.refresh();
-                    match crate::peer_view::fetch().await {
+                    match crate::peer_view::status().await {
                         Ok(snapshot) => {
                             discovery.update(detector.snapshot().0,snapshot.discovery);
                             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());

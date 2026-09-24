@@ -38,17 +38,6 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
                         crate::peer_view::Request::Desktop {} => {
                             super::desktop::serve(shared.clone(), stream, daemon_uid).await?;
                         }
-                        crate::peer_view::Request::Snapshot {} => {
-                            let snapshot = crate::peer_view::Snapshot::from_config(
-                                &*shared.config.read().await,
-                            );
-                            authorize_peer(&stream, daemon_uid, shared.active_uid())?;
-                            tokio::time::timeout(
-                                Duration::from_secs(3),
-                                write_message(&mut stream, &snapshot),
-                            )
-                            .await??;
-                        }
                         crate::peer_view::Request::Pair { remote } => {
                             let result = async {
                                 let _slot = pairing_slot
@@ -107,29 +96,22 @@ async fn desktop_command(
     authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();
     match request {
-        Request::Status {} => {
-            let receiving_from = shared
+        Request::Status {} => Ok(DesktopReply::Status(DesktopStatus {
+            receiving_from: shared
                 .inbound_owner
                 .lock()
                 .await
                 .as_ref()
-                .map(|(peer, _)| peer.clone());
-            let sending_to = shared
+                .map(|(peer, _)| peer.clone()),
+            sending_to: shared
                 .active_outbound
                 .lock()
                 .await
                 .as_ref()
-                .map(|active| active.peer.clone());
-            let connected = shared.sessions.lock().await.keys().cloned().collect();
-            Ok(DesktopReply::Status(DesktopStatus {
-                sharing: config.daemon.sharing,
-                receiving_from,
-                sending_to,
-                connected,
-                peers: config.peers,
-                discovery: config.transport.discovery,
-            }))
-        }
+                .map(|active| active.peer.clone()),
+            connected: shared.sessions.lock().await.keys().cloned().collect(),
+            ..DesktopStatus::from_config(&config)
+        })),
         Request::SetSharing { enabled } => {
             config.daemon.sharing = enabled;
             shared.apply_config_locked(config, true).await?;
