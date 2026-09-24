@@ -1,8 +1,15 @@
 use super::*;
+use crate::control::ControlError;
 use crate::desktop::{DesktopRequest, DesktopResponse};
+use crate::linux::SeatState;
 use crate::session::{desktop_operation, desktop_response_kind};
 use anyhow::ensure;
 use tokio::net::UnixStream;
+
+/// Logind answers Unknown when a query is slow or races a property change.
+/// The agent keeps its last definite seat state for this long, so one slow
+/// answer does not disconnect it and end a live crossing.
+const SEAT_UNKNOWN_GRACE: Duration = Duration::from_secs(1);
 
 struct Job {
     request: DesktopRequest,
@@ -141,6 +148,26 @@ impl Hub {
     }
 }
 
+/// The seat state a connected desktop agent is judged by.
+struct AgentSeat {
+    state: SeatState,
+    definite_at: Option<Instant>,
+}
+
+impl AgentSeat {
+    fn observe(&mut self, next: SeatState, now: Instant) {
+        if !matches!(next, SeatState::Unknown { .. }) {
+            self.state = next;
+            self.definite_at = Some(now);
+        } else if self
+            .definite_at
+            .is_none_or(|at| now.duration_since(at) >= SEAT_UNKNOWN_GRACE)
+        {
+            self.state = next;
+        }
+    }
+}
+
 pub(super) async fn request(
     shared: Arc<Shared>,
     peer: String,
@@ -261,10 +288,16 @@ pub(super) async fn serve(
         ensure!(broker.is_none(), "A desktop receiver is already connected");
         *broker = Some((id, sender));
     }
-    tracing::info!(broker_id = id, "desktop desktop agent connected");
+    tracing::info!(broker_id = id, "desktop agent connected");
+    let mut seat = AgentSeat {
+        state: SeatState::Unknown {
+            reason: "not queried yet".into(),
+        },
+        definite_at: None,
+    };
     let result=async {
         write_message(&mut stream,&DesktopResponse::Finished).await?;
-        let mut seat=tokio::task::spawn_blocking(query_primary_seat).await?;
+        seat.observe(tokio::task::spawn_blocking(query_primary_seat).await?, Instant::now());
         let mut interval=tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {
@@ -285,18 +318,18 @@ pub(super) async fn serve(
                     let seat_before_ms = if operation == "poll" {
                         0
                     } else {
-                        seat=tokio::task::spawn_blocking(query_primary_seat).await?;
+                        seat.observe(tokio::task::spawn_blocking(query_primary_seat).await?, Instant::now());
                         seat_started.elapsed().as_millis() as u64
                     };
                     if seat_before_ms >= 150 {
                         tracing::debug!(broker_id = id, %peer, ?session_id, operation, seat_before_ms, "slow desktop seat check before operation");
                     }
                     tracing::trace!(broker_id = id, %peer, ?session_id, operation, queue_ms, seat_before_ms, "desktop broker seat checked before operation");
-                    authorize_peer(&stream,daemon_uid,seat.active_authenticated_uid())?;
+                    authorize_peer(&stream,daemon_uid,seat.state.active_authenticated_uid())?;
                     if let Some((peer, session_id)) = &job.origin {
                         let _policy = shared.policy.lock().await;
                         let config = shared.config.read().await;
-                        let gate = seat.injection_gate();
+                        let gate = seat.state.injection_gate();
                         let current_session = shared.sessions.lock().await.get(peer).is_some_and(|s|s.id()==*session_id);
                         let current = matches!(gate,InjectionGate::Normal{..})
                             && receiver_authorized(&config,peer,gate)
@@ -320,10 +353,10 @@ pub(super) async fn serve(
                     let seat_after_ms = if operation == "poll" {
                         0
                     } else {
-                        seat=tokio::task::spawn_blocking(query_primary_seat).await?;
+                        seat.observe(tokio::task::spawn_blocking(query_primary_seat).await?, Instant::now());
                         seat_started.elapsed().as_millis() as u64
                     };
-                    authorize_peer(&stream,daemon_uid,seat.active_authenticated_uid())?;
+                    authorize_peer(&stream,daemon_uid,seat.state.active_authenticated_uid())?;
                     let elapsed_ms = job.queued_at.elapsed().as_millis() as u64;
                     if operation != "poll" || elapsed_ms >= crate::desktop::POLL_HOLD_MS + 150 || outcome != "active" {
                         tracing::debug!(broker_id = id, %peer, ?session_id, operation, outcome, queue_ms, seat_before_ms, compositor_ms, seat_after_ms, elapsed_ms, "desktop broker operation completed");
@@ -338,8 +371,8 @@ pub(super) async fn serve(
                     }
                 }
                 _=interval.tick() => {
-                    seat=tokio::task::spawn_blocking(query_primary_seat).await?;
-                    authorize_peer(&stream,daemon_uid,seat.active_authenticated_uid())?;
+                    seat.observe(tokio::task::spawn_blocking(query_primary_seat).await?, Instant::now());
+                    authorize_peer(&stream,daemon_uid,seat.state.active_authenticated_uid())?;
                     let expired={
                         let mut lease=shared.desktop.lease.lock().await;
                         if lease.as_ref().is_some_and(|l|l.renewed.elapsed() >= Duration::from_millis(crate::desktop::LEASE_MS)) {lease.take()} else {None}
@@ -354,7 +387,7 @@ pub(super) async fn serve(
                     // another reader that could consume a response frame.
                     let mut byte=[0u8;1];
                     match stream.try_read(&mut byte) {
-                        Ok(0)=>bail!("Desktop window disconnected"),
+                        Ok(0)=>break,
                         Ok(_)=>bail!("Unexpected desktop bridge data"),
                         Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{},
                         Err(error)=>return Err(error.into()),
@@ -364,10 +397,20 @@ pub(super) async fn serve(
         }
         Ok(())
     }.await;
-    if let Err(error) = &result {
-        tracing::warn!(broker_id = id, error = %format_args!("{error:#}"), "desktop desktop agent stopped");
-    } else {
-        tracing::info!(broker_id = id, "desktop desktop agent stopped");
+    match &result {
+        Ok(()) => tracing::info!(broker_id = id, "desktop agent stopped"),
+        // Logout and user switches hand the seat to a greeter or another uid.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<ControlError>(),
+                Some(ControlError::Unauthorized(_))
+            ) && !matches!(seat.state, SeatState::Unknown { .. }) =>
+        {
+            tracing::info!(broker_id = id, error = %format_args!("{error:#}"), "desktop agent stopped after the seat changed hands");
+        }
+        Err(error) => {
+            tracing::warn!(broker_id = id, error = %format_args!("{error:#}"), "desktop agent stopped");
+        }
     }
     shared.desktop.disconnected(id, &shared.sessions).await;
     result
@@ -431,6 +474,43 @@ mod tests {
                 .permits("mac", 5, 9)
         );
         assert!(!hub.allows_session("mac", 4).await);
+    }
+
+    #[test]
+    fn agent_seat_tolerates_a_short_unknown_but_not_a_definite_change() {
+        use crate::linux::{AuthenticatedSession, AuthenticatedSessionKind, RestrictedSeatState};
+        let unlocked = SeatState::Unlocked(AuthenticatedSession {
+            id: "2".into(),
+            uid: 1000,
+            kind: AuthenticatedSessionKind::Wayland,
+        });
+        let unknown = || SeatState::Unknown {
+            reason: "slow".into(),
+        };
+        let start = Instant::now();
+        let mut seat = AgentSeat {
+            state: unknown(),
+            definite_at: None,
+        };
+        seat.observe(unlocked.clone(), start);
+        seat.observe(unknown(), start + Duration::from_millis(900));
+        assert_eq!(seat.state, unlocked);
+        seat.observe(unknown(), start + SEAT_UNKNOWN_GRACE);
+        assert_eq!(seat.state.active_authenticated_uid(), None);
+
+        seat.observe(unlocked.clone(), start + Duration::from_secs(2));
+        let greeter = SeatState::Restricted(RestrictedSeatState::Greeter {
+            session_id: "c1".into(),
+        });
+        seat.observe(greeter.clone(), start + Duration::from_millis(2_100));
+        assert_eq!(seat.state, greeter);
+
+        let mut fresh = AgentSeat {
+            state: unlocked,
+            definite_at: None,
+        };
+        fresh.observe(unknown(), start);
+        assert_eq!(fresh.state.active_authenticated_uid(), None);
     }
 
     #[test]
