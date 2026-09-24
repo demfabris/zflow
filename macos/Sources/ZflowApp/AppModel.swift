@@ -15,6 +15,7 @@ final class AppModel {
   private let core: CoreBridge
   private var poller: Task<Void, Never>?
   @ObservationIgnored private var activity: (any NSObjectProtocol)?
+  @ObservationIgnored private var wake: (any NSObjectProtocol)?
 
   init() {
     let arguments = ProcessInfo.processInfo.arguments
@@ -42,6 +43,13 @@ final class AppModel {
         ticks += 1
         try? await Task.sleep(for: .milliseconds(500))
       }
+    }
+    // A receiver can drop the session while the Mac sleeps, and the link would
+    // still look ready until its next keep-alive. Recheck it on wake.
+    wake = NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated { self?.send(CoreRequest(command: "retry")) }
     }
   }
 
