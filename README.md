@@ -248,7 +248,8 @@ The experimental Mac source uses an active HID-level event tap. During remote
 control it hides the Mac cursor and disconnects cursor position from physical
 movement, while forwarding relative deltas and raw trackpad contacts. It does
 not warp the cursor back to screen center. On exit it reconnects and shows the
-cursor; if macOS disables the event tap, it ends forwarding and runs cleanup.
+cursor. If macOS disables the event tap after a callback timeout, it re-enables
+the tap; if user input disables it, it ends forwarding and runs cleanup.
 It handles Ctrl+Cmd+Backspace, SIGINT, SIGTERM, and SIGHUP.
 
 For background cursor visibility, the CLI resolves the private
