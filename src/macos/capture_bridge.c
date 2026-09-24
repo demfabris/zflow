@@ -341,15 +341,14 @@ static int contact_callback(MTDeviceRef device, MTTouch *touches, int count,
 
     float x = touches[i].normalized.pos.x;
     float y = touches[i].normalized.pos.y;
-    if (!isfinite(x) || !isfinite(y) || x < 0.0f || x > 1.0f || y < 0.0f ||
-        y > 1.0f) {
-      return 0;
-    }
+    if (!isfinite(x) || !isfinite(y)) return 0;
 
+    // Contacts at the pad edge report slightly outside [0, 1]. Dropping the
+    // whole frame would freeze the gesture there, so clamp instead.
     ZFlowMacContact *contact = &event.contacts[event.contact_count++];
     contact->id = touches[i].identifier;
-    contact->x = x;
-    contact->y = y;
+    contact->x = fminf(fmaxf(x, 0.0f), 1.0f);
+    contact->y = fminf(fmaxf(y, 0.0f), 1.0f);
   }
   atomic_store(&g_raw_contact_active, event.contact_count > 0);
   enqueue(&event);

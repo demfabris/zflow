@@ -436,6 +436,27 @@ static void cursor_lifecycle_tests(void) {
   }
 }
 
+static void touch_tests(void) {
+  reset();
+  MTTouch touches[2] = {0};
+  touches[0].state = 4;
+  touches[0].identifier = 1;
+  touches[0].normalized.pos = (MTPoint){1.02f, -0.01f};
+  touches[1].state = 4;
+  touches[1].identifier = 2;
+  touches[1].normalized.pos = (MTPoint){0.5f, 0.25f};
+  // A contact just past the pad edge keeps the frame, clamped.
+  contact_callback(NULL, touches, 2, 0, 0);
+  ZFlowMacEvent captured;
+  assert(zflow_mac_capture_poll(&captured) && captured.kind == ZFLOW_EVENT_TOUCH);
+  assert(captured.contact_count == 2);
+  assert(captured.contacts[0].x == 1.0f && captured.contacts[0].y == 0.0f);
+  assert(captured.contacts[1].x == 0.5f && captured.contacts[1].y == 0.25f);
+  touches[0].normalized.pos.x = NAN;
+  contact_callback(NULL, touches, 2, 0, 0);
+  assert(!zflow_mac_capture_poll(&captured));
+}
+
 static void event_tests(void) {
   reset();
   CGEventRef event = CGEventCreateMouseEvent(
@@ -528,6 +549,7 @@ int main(void) {
   cursor_lifecycle_tests();
   lost_stop_tests();
   return_cursor_tests();
+  touch_tests();
   event_tests();
   reset();
   tap_available = false;
