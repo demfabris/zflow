@@ -16,8 +16,6 @@ pub enum TransportError {
     ControlWriteTimedOut,
     #[error("critical control stream read failed: {0}")]
     ControlRead(#[from] quinn::ReadExactError),
-    #[error("datagram send failed: {0}")]
-    DatagramSend(#[from] quinn::SendDatagramError),
     #[error("datagram sender is closed")]
     DatagramQueueClosed,
     #[error("wire message is invalid: {0}")]
