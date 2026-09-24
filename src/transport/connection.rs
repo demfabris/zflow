@@ -413,7 +413,8 @@ impl DatagramChannel {
 
     pub async fn receive(&self) -> Result<InputDatagram, TransportError> {
         let bytes = self.connection.read_datagram().await?;
-        if let Err(error) = self.check_size(bytes.len()) {
+        // Our own path MTU says nothing about what the peer may send us.
+        if let Err(error) = self.check_negotiated(bytes.len()) {
             close_protocol(&self.connection, b"datagram exceeded negotiated maximum");
             return Err(error);
         }
@@ -442,13 +443,18 @@ impl DatagramChannel {
         self.connection.closed().await
     }
 
-    fn check_size(&self, actual: usize) -> Result<(), TransportError> {
+    fn check_negotiated(&self, actual: usize) -> Result<(), TransportError> {
         let negotiated = self
             .negotiated_maximum()
             .ok_or(TransportError::DatagramSizeNotNegotiated)?;
         if actual > negotiated {
             return Err(TransportError::DatagramTooLarge { actual, negotiated });
         }
+        Ok(())
+    }
+
+    fn check_size(&self, actual: usize) -> Result<(), TransportError> {
+        self.check_negotiated(actual)?;
         let path_maximum = self.connection.max_datagram_size();
         if path_maximum.is_none_or(|path| actual > path) {
             return Err(TransportError::InvalidDatagramSize {

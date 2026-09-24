@@ -34,7 +34,10 @@ const MAX_PENDING_PROBES: usize = 64;
 const CLOSE_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 const MAX_CONTROL_MESSAGES_PER_SECOND: u32 = 20_000;
 const MAX_DATAGRAMS_PER_SECOND: u32 = 50_000;
-const OFFER_DATAGRAM_SIZE: u32 = 1_200;
+// QUIC only guarantees 1200-byte packets, which leave Quinn about 1162 bytes
+// of datagram payload until an MTU probe succeeds. The largest real frame (five
+// touch contacts) is about 330 bytes.
+const OFFER_DATAGRAM_SIZE: u32 = 1_024;
 
 struct PendingControl {
     message: ReliableControlMessage,
@@ -425,20 +428,25 @@ async fn run_session(
     metrics: Arc<Mutex<SessionMetrics>>,
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<()> {
-    let negotiated = match negotiate(&mut channels, &options.offer).await {
-        Ok(negotiated) => negotiated,
+    let setup = async {
+        let negotiated = negotiate(&mut channels, &options.offer).await?;
+        channels
+            .datagrams
+            .configure_maximum(negotiated.maximum_datagram_size)?;
+        let lease = Duration::from_millis(u64::from(negotiated.receiver_lease_ms));
+        let checkpoint = Duration::from_millis(u64::from(negotiated.checkpoint_bound_ms));
+        let sender_config = SenderConfig::new(checkpoint, lease)?;
+        let receiver_config = ReceiverConfig::new(lease)?;
+        Ok::<_, anyhow::Error>((negotiated, sender_config, receiver_config))
+    }
+    .await;
+    let (negotiated, sender_config, receiver_config) = match setup {
+        Ok(setup) => setup,
         Err(error) => {
             let _ = ready.send(Err(error.to_string()));
             return Err(error);
         }
     };
-    channels
-        .datagrams
-        .configure_maximum(negotiated.maximum_datagram_size)?;
-    let negotiated_lease = Duration::from_millis(u64::from(negotiated.receiver_lease_ms));
-    let negotiated_checkpoint = Duration::from_millis(u64::from(negotiated.checkpoint_bound_ms));
-    let sender_config = SenderConfig::new(negotiated_checkpoint, negotiated_lease)?;
-    let receiver_config = ReceiverConfig::new(negotiated_lease)?;
     let _ = ready.send(Ok(()));
 
     let clock = MonotonicClock::new();
@@ -2772,6 +2780,69 @@ mod tests {
         left.close(SessionCloseReason::LocalRelease);
         client_endpoint.wait_idle().await;
         server_endpoint.wait_idle().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn negotiated_datagram_size_fits_before_mtu_discovery() {
+        let (_left_directory, left_identity) = identity();
+        let (_right_directory, right_identity) = identity();
+        let client = input_client_config(&left_identity, right_identity.spki()).unwrap();
+        let server = input_server_config(&right_identity, left_identity.spki()).unwrap();
+        // A lost MTU probe leaves the path at QUIC's 1200-byte floor.
+        let mut transport = quinn::TransportConfig::default();
+        transport.mtu_discovery_config(None);
+        let mut floor = server.quinn_config();
+        floor.transport_config(Arc::new(transport));
+        let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server_endpoint = quinn::Endpoint::server(floor, listen).unwrap();
+        let client_endpoint = quinn::Endpoint::client(listen).unwrap();
+        let address = server_endpoint.local_addr().unwrap();
+        let (events, _event_rx) = mpsc::channel(64);
+        let mut oversized = options();
+        oversized.offer.maximum_datagram_size = 1_200;
+
+        for (options, fits) in [(oversized, false), (options(), true)] {
+            let accept_endpoint = server_endpoint.clone();
+            let accept_config = server.clone();
+            let accepted = tokio::spawn(async move {
+                let incoming = accept_endpoint.accept().await.unwrap();
+                accept_input(incoming, &accept_config).await.unwrap()
+            });
+            let left = connect_input(&client_endpoint, address, &client)
+                .await
+                .unwrap();
+            let right = accepted.await.unwrap();
+            let (left, right) = tokio::join!(
+                start_session(
+                    left,
+                    "right".into(),
+                    TransportGeneration(1),
+                    options.clone(),
+                    events.clone(),
+                ),
+                start_session(
+                    right,
+                    "left".into(),
+                    TransportGeneration(1),
+                    options,
+                    events.clone(),
+                )
+            );
+            match right {
+                Ok(right) => {
+                    assert!(fits, "a 1200-byte offer cannot fit the QUIC floor");
+                    right.close(SessionCloseReason::LocalRelease);
+                }
+                Err(error) => {
+                    assert!(!fits, "default offer failed at the QUIC floor: {error}");
+                    // The real cause reaches the caller instead of a generic stop.
+                    assert!(error.to_string().contains("path maximum"), "{error}");
+                }
+            }
+            if let Ok(left) = left {
+                left.close(SessionCloseReason::LocalRelease);
+            }
+        }
     }
 
     #[test]
