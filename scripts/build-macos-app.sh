@@ -72,10 +72,7 @@ version="$(cargo metadata --no-deps --format-version 1 --manifest-path "$REPO_RO
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 if command -v codesign >/dev/null 2>&1; then
-    codesign --force --options runtime --identifier io.zflow.awdl-client --sign "$sign_identity" "$app/Contents/MacOS/zflow-awdl-client"
-    codesign --force --options runtime --identifier io.zflow.awdl-daemon --sign "$sign_identity" "$app/Contents/MacOS/zflow-awdl-daemon"
-    codesign --force --options runtime --sign "$sign_identity" "$app"
-    codesign --verify --strict --deep "$app"
+    "$SCRIPT_DIR/sign-macos-app.sh" "$sign_identity" "$app"
 fi
 
 rm -rf -- "$bundle"

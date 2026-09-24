@@ -29,8 +29,9 @@ downloads; they rely on the same GitHub/HTTPS trust as the artifacts.
 
 To build without publishing, dispatch the **Release** workflow with `publish`
 left off. To publish, update Cargo.toml/Cargo.lock to the intended version,
-commit and push, then either push its matching `vVERSION` tag or dispatch with
-`publish=true`. Manual publication creates the tag at the workflow's commit.
+commit and push, then either push its matching `vVERSION` tag or dispatch from
+`main` with `publish=true`. A dispatch from another branch builds but never
+publishes. Manual publication creates the tag at the workflow's commit.
 Prerelease version suffixes produce GitHub prereleases, which users select
 with `--version`; the default `latest` selects a normal published release.
 
@@ -51,9 +52,11 @@ Configure these GitHub Actions repository secrets before running the workflow:
 | `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password generated for that account |
 | `APPLE_TEAM_ID` | Developer team ID matching the certificate |
 
-Each Mac job imports the certificate into a temporary keychain and deletes it
-after packaging or failure. Credentials stay in GitHub secrets and the runner's
-temporary keychain. Notarization JSON results remain in separate workflow
+Each Mac job builds and tests the app with an ad-hoc signature first, so no
+build script runs while the certificate is available. It then imports the
+certificate into a temporary keychain, signs with `scripts/sign-macos-app.sh`,
+notarizes, and deletes the keychain before packaging, also on failure.
+Credentials stay in GitHub secrets and the runner's temporary keychain. Notarization JSON results remain in separate workflow
 artifacts for seven days; they do not enter the published release.
 
 For a local signed and notarized build:
