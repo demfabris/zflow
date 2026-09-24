@@ -167,23 +167,6 @@ fn read_hex_u16(path: PathBuf) -> Option<u16> {
     u16::from_str_radix(value.trim(), 16).ok()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReadinessPaths {
-    pub input_dir: PathBuf,
-    pub sys_class_input_dir: PathBuf,
-    pub udev_database_dir: PathBuf,
-}
-
-impl Default for ReadinessPaths {
-    fn default() -> Self {
-        Self {
-            input_dir: PathBuf::from("/dev/input"),
-            sys_class_input_dir: PathBuf::from("/sys/class/input"),
-            udev_database_dir: PathBuf::from("/run/udev/data"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use evdev::BusType;

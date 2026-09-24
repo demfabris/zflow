@@ -173,15 +173,8 @@ impl SourceOwnership {
         Ok(())
     }
 
-    pub fn suspend(&mut self) -> OwnershipEffect {
-        self.force_release()
-    }
-
-    pub fn device_removed(&mut self) -> OwnershipEffect {
-        self.force_release()
-    }
-
-    fn force_release(&mut self) -> OwnershipEffect {
+    /// Ends ownership now, without waiting for a terminal or a frame boundary.
+    pub fn force_release(&mut self) -> OwnershipEffect {
         match self.phase {
             OwnershipPhase::Idle => OwnershipEffect::None,
             OwnershipPhase::Arming => {
@@ -235,18 +228,6 @@ impl AggregateInputState {
         self.devices.remove(path).is_some()
     }
 
-    pub fn replace_held(
-        &mut self,
-        path: &std::path::Path,
-        held: impl IntoIterator<Item = KeyCode>,
-    ) -> bool {
-        let Some(device) = self.devices.get_mut(path) else {
-            return false;
-        };
-        device.held = held.into_iter().collect();
-        true
-    }
-
     pub fn observe(&mut self, path: &std::path::Path, event: InputEvent) -> bool {
         let Some(device) = self.devices.get_mut(path) else {
             return false;
@@ -287,14 +268,6 @@ impl AggregateInputState {
 
     pub fn boundary_generation(&self) -> u64 {
         self.boundary_generation
-    }
-
-    pub fn held_on(&self, path: &std::path::Path) -> Option<&BTreeSet<KeyCode>> {
-        self.devices.get(path).map(|device| &device.held)
-    }
-
-    pub fn len(&self) -> usize {
-        self.devices.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -431,22 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn suspend_and_removal_force_remote_release() {
+    fn forced_release_closes_remote_and_cancels_arming() {
         let mut ownership = SourceOwnership {
             phase: OwnershipPhase::Remote,
             ..SourceOwnership::default()
         };
         assert_eq!(
-            ownership.suspend(),
+            ownership.force_release(),
             OwnershipEffect::CloseActivationAndReleaseGrabs
         );
         ownership.release_completed().unwrap();
         assert_eq!(ownership.phase(), OwnershipPhase::Idle);
 
         ownership.request_activation().unwrap();
-        assert_eq!(
-            ownership.device_removed(),
-            OwnershipEffect::CancelActivation
-        );
+        assert_eq!(ownership.force_release(), OwnershipEffect::CancelActivation);
     }
 }

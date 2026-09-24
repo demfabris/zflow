@@ -813,9 +813,7 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
         RuntimeEvent::ReceiverStateReleased(reason) => {
             if matches!(
                 reason,
-                RuntimeCloseReason::BackendFault
-                    | RuntimeCloseReason::Suspend
-                    | RuntimeCloseReason::Stop
+                RuntimeCloseReason::BackendFault | RuntimeCloseReason::Stop
             ) {
                 shared.close_all(runtime_close_reason(reason)).await;
             }
@@ -1052,7 +1050,6 @@ fn remove_session_if_current(
 fn runtime_close_reason(reason: RuntimeCloseReason) -> SessionCloseReason {
     match reason {
         RuntimeCloseReason::LocalRelease => SessionCloseReason::LocalRelease,
-        RuntimeCloseReason::Suspend => SessionCloseReason::Suspend,
         RuntimeCloseReason::TransportLost => SessionCloseReason::LeaseExpired,
         RuntimeCloseReason::DeviceRemoved
         | RuntimeCloseReason::CaptureFault

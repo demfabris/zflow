@@ -27,8 +27,6 @@ const TOUCHPAD_RESOLUTION: i32 = 30;
 pub enum InjectionError {
     #[error(transparent)]
     Unsupported(#[from] MappingError),
-    #[error("cannot repeat USB HID usage {usage:?} because it is not held")]
-    RepeatOfReleasedKey { usage: HidUsage },
     #[error("failed to create {role:?} virtual device: {source}")]
     Create {
         role: VirtualDeviceRole,
@@ -127,14 +125,6 @@ impl VirtualKeyboard {
             self.held.remove(&usage);
         }
         Ok(())
-    }
-
-    pub fn repeat_key(&mut self, usage: HidUsage) -> Result<(), InjectionError> {
-        if !self.held.contains(&usage) {
-            return Err(InjectionError::RepeatOfReleasedKey { usage });
-        }
-        let key = hid_to_evdev_key(usage)?;
-        self.emit(&[InputEvent::new(EventType::KEY.0, key.code(), 2)])
     }
 
     pub fn held(&self) -> &BTreeSet<HidUsage> {
@@ -696,14 +686,6 @@ impl VirtualInput {
         } else {
             Err(ReleaseAllError::new(failures))
         }
-    }
-
-    pub fn suspend(&mut self) -> Result<(), ReleaseAllError> {
-        self.release_all()
-    }
-
-    pub fn device_removed(&mut self) -> Result<(), ReleaseAllError> {
-        self.release_all()
     }
 }
 

@@ -29,12 +29,17 @@ use crate::{
     },
 };
 
-use super::{ReadinessPaths, VirtualDeviceReadiness, probe_virtual_device_readiness_in};
+use super::probe_virtual_device_readiness;
 
 const WAKE_TOKEN: Token = Token(0);
 const FIRST_DEVICE_TOKEN: usize = 1;
 const MAX_COMMANDS_PER_TICK: usize = 256;
 const MAX_IDLE_POLL: Duration = Duration::from_secs(2);
+const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+const READINESS_PROBE_INTERVAL: Duration = Duration::from_millis(25);
+const COMMAND_CAPACITY: usize = 256;
+const EVENT_CAPACITY: usize = 256;
+const CAPTURE_CAPACITY: usize = 1_024;
 
 #[derive(Debug, Clone)]
 pub struct LinuxRuntimeConfig {
@@ -42,12 +47,6 @@ pub struct LinuxRuntimeConfig {
     pub activation_chord: Vec<String>,
     pub escape_chord: Vec<String>,
     pub experimental_touchpad: bool,
-    pub rescan_interval: Duration,
-    pub readiness_probe_interval: Duration,
-    pub command_capacity: usize,
-    pub event_capacity: usize,
-    pub capture_capacity: usize,
-    pub readiness_paths: ReadinessPaths,
 }
 
 impl LinuxRuntimeConfig {
@@ -57,54 +56,13 @@ impl LinuxRuntimeConfig {
             activation_chord: config.input.activation_chord.clone(),
             escape_chord: config.input.escape_chord.clone(),
             experimental_touchpad: config.input.experimental_touchpad,
-            ..Self::default()
         }
     }
 
     pub fn validate(&self) -> Result<(), LinuxRuntimeError> {
-        if self.rescan_interval.is_zero() {
-            return Err(LinuxRuntimeError::InvalidConfig(
-                "device rescan interval must be non-zero",
-            ));
-        }
-        if self.readiness_probe_interval.is_zero() {
-            return Err(LinuxRuntimeError::InvalidConfig(
-                "readiness probe interval must be non-zero",
-            ));
-        }
-        if self.command_capacity == 0 || self.event_capacity == 0 || self.capture_capacity == 0 {
-            return Err(LinuxRuntimeError::InvalidConfig(
-                "runtime channel capacities must be non-zero",
-            ));
-        }
-        ConfiguredChord::parse(&self.activation_chord, ChordPurpose::Activation)?;
-        ConfiguredChord::parse(&self.escape_chord, ChordPurpose::Escape)?;
+        ConfiguredChord::parse(&self.activation_chord)?;
+        ConfiguredChord::parse(&self.escape_chord)?;
         Ok(())
-    }
-}
-
-impl Default for LinuxRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            capture_devices: Vec::new(),
-            activation_chord: vec![
-                "KEY_LEFTCTRL".into(),
-                "KEY_LEFTMETA".into(),
-                "KEY_F12".into(),
-            ],
-            escape_chord: vec![
-                "KEY_LEFTCTRL".into(),
-                "KEY_LEFTMETA".into(),
-                "KEY_BACKSPACE".into(),
-            ],
-            experimental_touchpad: false,
-            rescan_interval: Duration::from_secs(2),
-            readiness_probe_interval: Duration::from_millis(25),
-            command_capacity: 256,
-            event_capacity: 256,
-            capture_capacity: 1024,
-            readiness_paths: ReadinessPaths::default(),
-        }
     }
 }
 
@@ -127,8 +85,6 @@ pub enum RuntimeCommand {
         /// Sent only after every effect reaches the uinput backend.
         applied: Option<tokio::sync::oneshot::Sender<Instant>>,
     },
-    Suspend,
-    Resume,
     Reload {
         config: LinuxRuntimeConfig,
         applied: tokio::sync::oneshot::Sender<Result<(), LinuxRuntimeError>>,
@@ -144,7 +100,6 @@ pub enum RuntimeCloseReason {
     CaptureFault,
     BackendFault,
     Backpressure,
-    Suspend,
     Stop,
 }
 
@@ -161,7 +116,6 @@ pub enum RuntimeDiagnostic {
     InjectionRejected,
     ReadinessProbeFailed,
     ServiceNotificationFailed,
-    EventQueueFull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,27 +137,11 @@ pub enum RuntimeEvent {
     Stopped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeDeviceStatus {
-    pub path: PathBuf,
-    pub grabbed: bool,
-}
-
+/// What the daemon reads back from the input thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxRuntimeStatus {
-    pub running: bool,
-    pub suspended: bool,
-    pub ready: bool,
-    pub virtual_devices: VirtualDeviceReadiness,
     pub ownership: OwnershipPhase,
     pub selected_peer: Option<String>,
-    pub capture_devices: Vec<RuntimeDeviceStatus>,
-    pub capture_selection_complete: bool,
-    pub unmatched_selectors: usize,
-    pub ambiguous_selectors: usize,
-    pub dropped_events: u64,
-    pub dropped_capture_frames: u64,
-    pub last_diagnostic: Option<RuntimeDiagnostic>,
 }
 
 /// Read-only capture resolution used by setup diagnostics.
@@ -248,19 +186,8 @@ pub fn diagnose_capture_selection(
 impl Default for LinuxRuntimeStatus {
     fn default() -> Self {
         Self {
-            running: false,
-            suspended: false,
-            ready: false,
-            virtual_devices: VirtualDeviceReadiness::default(),
             ownership: OwnershipPhase::Idle,
             selected_peer: None,
-            capture_devices: Vec::new(),
-            capture_selection_complete: false,
-            unmatched_selectors: 0,
-            ambiguous_selectors: 0,
-            dropped_events: 0,
-            dropped_capture_frames: 0,
-            last_diagnostic: None,
         }
     }
 }
@@ -376,9 +303,9 @@ impl LinuxRuntime {
         let poll = Poll::new().map_err(LinuxRuntimeError::Poll)?;
         let waker =
             Arc::new(Waker::new(poll.registry(), WAKE_TOKEN).map_err(LinuxRuntimeError::Poll)?);
-        let (command_tx, command_rx) = mpsc::sync_channel(config.command_capacity);
-        let (event_tx, event_rx) = mpsc::sync_channel(config.event_capacity);
-        let (capture_tx, capture_rx) = mpsc::sync_channel(config.capture_capacity);
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+        let (capture_tx, capture_rx) = mpsc::sync_channel(CAPTURE_CAPACITY);
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let status = Arc::new(Mutex::new(LinuxRuntimeStatus::default()));
         let alive = Arc::new(AtomicBool::new(true));
@@ -394,7 +321,7 @@ impl LinuxRuntime {
                     command_rx,
                     event_tx,
                     capture_tx,
-                    thread_status.clone(),
+                    thread_status,
                 ) {
                     Ok(mut runtime) => {
                         let _ = startup_tx.send(Ok(()));
@@ -405,9 +332,6 @@ impl LinuxRuntime {
                     }
                 }
                 thread_alive.store(false, Ordering::Release);
-                let mut status = lock_status(&thread_status);
-                status.running = false;
-                status.ready = false;
             })
             .map_err(LinuxRuntimeError::Spawn)?;
 
@@ -479,17 +403,11 @@ enum ChordMember {
     Button(PointerButton),
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ChordPurpose {
-    Activation,
-    Escape,
-}
-
 #[derive(Debug, Clone)]
 struct ConfiguredChord(BTreeSet<ChordMember>);
 
 impl ConfiguredChord {
-    fn parse(names: &[String], _purpose: ChordPurpose) -> Result<Self, LinuxRuntimeError> {
+    fn parse(names: &[String]) -> Result<Self, LinuxRuntimeError> {
         if names.is_empty() {
             return Err(LinuxRuntimeError::InvalidConfig(
                 "input chords must not be empty",
@@ -573,11 +491,6 @@ impl ChordTracker {
                 .any(|held| held.contains(member))
         });
     }
-
-    fn clear(&mut self) {
-        self.held_by_device.clear();
-        self.latched = false;
-    }
 }
 
 #[derive(Debug)]
@@ -610,7 +523,7 @@ struct RuntimeLoop {
     next_watchdog: Option<Instant>,
     watchdog_period: Option<Duration>,
     ready_notified: bool,
-    suspended: bool,
+    commands_pending: bool,
     stopping: bool,
 }
 
@@ -625,14 +538,14 @@ impl RuntimeLoop {
     ) -> Result<Self, RuntimeStartupError> {
         let virtual_input = VirtualInput::create(config.experimental_touchpad)?;
         let activation_chord = ChordTracker::new(
-            ConfiguredChord::parse(&config.activation_chord, ChordPurpose::Activation)
+            ConfiguredChord::parse(&config.activation_chord)
                 .expect("runtime configuration was validated before thread startup"),
         );
         let escape_chord = ChordTracker::new(
-            ConfiguredChord::parse(&config.escape_chord, ChordPurpose::Escape)
+            ConfiguredChord::parse(&config.escape_chord)
                 .expect("runtime configuration was validated before thread startup"),
         );
-        let mut scanner = PeriodicDeviceScanner::new(config.rescan_interval);
+        let mut scanner = PeriodicDeviceScanner::new(RESCAN_INTERVAL);
         scanner.refresh().map_err(RuntimeStartupError::DeviceScan)?;
         let selection = select_configured(&config.capture_devices, scanner.known());
         let capture = if selection.capture_set().is_empty() {
@@ -666,18 +579,10 @@ impl RuntimeLoop {
             next_watchdog: watchdog_period.map(|period| now + period),
             watchdog_period,
             ready_notified: false,
-            suspended: false,
+            commands_pending: false,
             stopping: false,
         };
         runtime.register_capture_descriptors()?;
-        {
-            let mut status = lock_status(&runtime.status);
-            status.running = true;
-            status.capture_selection_complete = selection.is_complete();
-            status.unmatched_selectors = selection.unmatched;
-            status.ambiguous_selectors = selection.ambiguous;
-        }
-        runtime.refresh_status();
         if let Some(diagnostic) = capture_selection_diagnostic(None, selection.is_complete()) {
             runtime.diagnostic(diagnostic);
         }
@@ -736,21 +641,21 @@ impl RuntimeLoop {
             }
             self.next_watchdog = self.watchdog_period.map(|period| now + period);
         }
-        if !self.suspended && now >= self.next_rescan {
+        if now >= self.next_rescan {
             self.rescan();
-            self.next_rescan = now + self.config.rescan_interval;
+            self.next_rescan = now + RESCAN_INTERVAL;
         }
         if !self.ready_notified && now >= self.next_readiness_probe {
             self.probe_readiness();
-            self.next_readiness_probe = now + self.config.readiness_probe_interval;
+            self.next_readiness_probe = now + READINESS_PROBE_INTERVAL;
         }
     }
 
     fn poll_timeout(&self, now: Instant) -> Duration {
-        let mut next = now + MAX_IDLE_POLL;
-        if !self.suspended {
-            next = next.min(self.next_rescan);
+        if self.commands_pending {
+            return Duration::ZERO;
         }
+        let mut next = (now + MAX_IDLE_POLL).min(self.next_rescan);
         if !self.ready_notified {
             next = next.min(self.next_readiness_probe);
         }
@@ -761,18 +666,11 @@ impl RuntimeLoop {
     }
 
     fn probe_readiness(&mut self) {
-        let paths = &self.config.readiness_paths;
-        match probe_virtual_device_readiness_in(
-            &paths.input_dir,
-            &paths.sys_class_input_dir,
-            &paths.udev_database_dir,
-        ) {
+        match probe_virtual_device_readiness() {
             Ok(readiness) => {
-                lock_status(&self.status).virtual_devices = readiness;
                 if readiness.is_ready_for(self.config.experimental_touchpad) {
                     if sd_notify::notify(&[NotifyState::Ready]).is_ok() {
                         self.ready_notified = true;
-                        lock_status(&self.status).ready = true;
                         self.emit(RuntimeEvent::Ready);
                     } else {
                         self.diagnostic(RuntimeDiagnostic::ServiceNotificationFailed);
@@ -784,6 +682,7 @@ impl RuntimeLoop {
     }
 
     fn drain_commands(&mut self) {
+        self.commands_pending = false;
         for index in 0..MAX_COMMANDS_PER_TICK {
             match self.commands.try_recv() {
                 Ok(command) => self.handle_command(command),
@@ -799,56 +698,31 @@ impl RuntimeLoop {
             if index + 1 == MAX_COMMANDS_PER_TICK {
                 // Do not let a permanently busy producer starve descriptor
                 // reads or the watchdog. The next zero-time poll handles more.
-                self.next_rescan = self.next_rescan.min(Instant::now());
+                self.commands_pending = true;
             }
         }
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) {
-        match route_command(self.suspended, &command) {
-            CommandRoute::IgnoreWhileSuspended => {}
-            CommandRoute::Activate => {
-                let RuntimeCommand::Activate { peer } = command else {
-                    unreachable!()
-                };
-                self.activate(peer);
-            }
-            CommandRoute::Release => {
-                let RuntimeCommand::Release { transport_live } = command else {
-                    unreachable!()
-                };
-                self.release(transport_live);
-            }
-            CommandRoute::TerminalSent => {
-                let RuntimeCommand::TerminalSent { transport_live } = command else {
-                    unreachable!()
-                };
-                self.terminal_sent(transport_live);
-            }
-            CommandRoute::Inject => {
-                let RuntimeCommand::ReceiverEffects {
-                    effects,
-                    touch_captured_at,
-                    applied,
-                } = command
-                else {
-                    unreachable!()
-                };
+        match command {
+            RuntimeCommand::Activate { peer } => self.activate(peer),
+            RuntimeCommand::Release { transport_live } => self.release(transport_live),
+            RuntimeCommand::TerminalSent { transport_live } => self.terminal_sent(transport_live),
+            RuntimeCommand::ReceiverEffects {
+                effects,
+                touch_captured_at,
+                applied,
+            } => {
                 if self.inject(effects, touch_captured_at)
                     && let Some(applied) = applied
                 {
                     let _ = applied.send(Instant::now());
                 }
             }
-            CommandRoute::Suspend => self.suspend(),
-            CommandRoute::Resume => self.resume(),
-            CommandRoute::Reload => {
-                let RuntimeCommand::Reload { config, applied } = command else {
-                    unreachable!()
-                };
+            RuntimeCommand::Reload { config, applied } => {
                 let _ = applied.send(self.reload(config));
             }
-            CommandRoute::Stop => self.stopping = true,
+            RuntimeCommand::Stop => self.stopping = true,
         }
     }
 
@@ -922,50 +796,17 @@ impl RuntimeLoop {
         true
     }
 
-    fn suspend(&mut self) {
-        if self.suspended {
-            return;
-        }
-        self.force_source_release(RuntimeCloseReason::Suspend);
-        self.deregister_capture_descriptors();
-        let failures = self.capture.suspend();
-        if !failures.is_empty() {
-            self.diagnostic(RuntimeDiagnostic::UngrabRequiredDescriptorClose);
-        }
-        self.release_receiver_state(RuntimeCloseReason::Suspend);
-        self.activation_chord.clear();
-        self.escape_chord.clear();
-        self.suspended = true;
-        self.refresh_status();
-    }
-
-    fn resume(&mut self) {
-        if !self.suspended {
-            return;
-        }
-        if self.virtual_input.release_all().is_err() {
-            self.diagnostic(RuntimeDiagnostic::InjectionFailed);
-            self.stopping = true;
-            return;
-        }
-        self.suspended = false;
-        self.next_rescan = Instant::now();
-        self.next_readiness_probe = Instant::now();
-        self.rescan();
-        self.refresh_status();
-    }
-
     fn reload(&mut self, config: LinuxRuntimeConfig) -> Result<(), LinuxRuntimeError> {
         config.validate()?;
         if self.ownership.phase() != OwnershipPhase::Idle {
             self.force_source_release(RuntimeCloseReason::LocalRelease);
         }
         self.activation_chord = ChordTracker::new(
-            ConfiguredChord::parse(&config.activation_chord, ChordPurpose::Activation)
+            ConfiguredChord::parse(&config.activation_chord)
                 .expect("reloaded runtime configuration was validated"),
         );
         self.escape_chord = ChordTracker::new(
-            ConfiguredChord::parse(&config.escape_chord, ChordPurpose::Escape)
+            ConfiguredChord::parse(&config.escape_chord)
                 .expect("reloaded runtime configuration was validated"),
         );
         if config.experimental_touchpad != self.config.experimental_touchpad {
@@ -975,16 +816,10 @@ impl RuntimeLoop {
             self.virtual_input = replacement;
             self.ready_notified = false;
             self.next_readiness_probe = Instant::now();
-            let mut status = lock_status(&self.status);
-            status.ready = false;
-            status.virtual_devices = VirtualDeviceReadiness::default();
         }
-        self.scanner = PeriodicDeviceScanner::new(config.rescan_interval);
+        self.scanner = PeriodicDeviceScanner::new(RESCAN_INTERVAL);
         self.config = config;
-        self.next_rescan = Instant::now();
-        if !self.suspended {
-            self.rescan();
-        }
+        self.rescan();
         Ok(())
     }
 
@@ -1001,12 +836,6 @@ impl RuntimeLoop {
         let selection = select_configured(&self.config.capture_devices, self.scanner.known());
         let previous_selection_complete = self.capture_selection_complete;
         self.capture_selection_complete = selection.is_complete();
-        {
-            let mut status = lock_status(&self.status);
-            status.capture_selection_complete = selection.is_complete();
-            status.unmatched_selectors = selection.unmatched;
-            status.ambiguous_selectors = selection.ambiguous;
-        }
         if let Some(diagnostic) =
             capture_selection_diagnostic(Some(previous_selection_complete), selection.is_complete())
         {
@@ -1044,7 +873,6 @@ impl RuntimeLoop {
             self.force_source_release(RuntimeCloseReason::CaptureFault);
             self.capture.suspend();
         }
-        self.refresh_status();
     }
 
     fn read_capture_path(&mut self, path: &Path) {
@@ -1076,7 +904,6 @@ impl RuntimeLoop {
                 self.next_rescan = Instant::now();
             }
         }
-        self.refresh_status();
     }
 
     fn handle_captured_frame(&mut self, captured: CapturedDeviceFrame) {
@@ -1109,11 +936,6 @@ impl RuntimeLoop {
             OwnershipPhase::Remote => match self.capture_tx.try_send(captured) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
-                    {
-                        let mut status = lock_status(&self.status);
-                        status.dropped_capture_frames =
-                            status.dropped_capture_frames.saturating_add(1);
-                    }
                     self.diagnostic(RuntimeDiagnostic::CapturedFrameQueueFull);
                     self.force_source_release(RuntimeCloseReason::Backpressure);
                 }
@@ -1180,11 +1002,10 @@ impl RuntimeLoop {
             }
             _ => {}
         }
-        self.refresh_status();
     }
 
     fn force_source_release(&mut self, reason: RuntimeCloseReason) {
-        let effect = self.ownership.device_removed();
+        let effect = self.ownership.force_release();
         match effect {
             OwnershipEffect::CloseActivationAndReleaseGrabs => {
                 let failures = self.capture.ungrab_all();
@@ -1206,7 +1027,6 @@ impl RuntimeLoop {
             OwnershipEffect::None => {}
             _ => unreachable!("forced ownership release has a closed effect set"),
         }
-        self.refresh_status();
     }
 
     fn stop_all(&mut self) {
@@ -1241,7 +1061,6 @@ impl RuntimeLoop {
             let Some(fd) = self.capture.raw_fd(&path) else {
                 continue;
             };
-            ensure_close_on_exec(fd).map_err(RuntimeStartupError::Register)?;
             let token = Token(self.next_device_token);
             self.next_device_token = self.next_device_token.saturating_add(1);
             let mut source = SourceFd(&fd);
@@ -1262,14 +1081,20 @@ impl RuntimeLoop {
         }
     }
 
+    /// Every ownership or peer change goes through here, so the shared status
+    /// is updated before the daemon hears about it.
     fn emit_ownership(&mut self) {
+        let phase = self.ownership.phase();
+        *lock_status(&self.status) = LinuxRuntimeStatus {
+            ownership: phase,
+            selected_peer: self.selected_peer.clone(),
+        };
         self.emit(RuntimeEvent::OwnershipChanged {
-            phase: self.ownership.phase(),
+            phase,
             selected_peer: self.selected_peer.clone(),
             changed_at: Instant::now(),
             arming_leakage_events: self.arming_leakage_events,
         });
-        self.refresh_status();
     }
 
     fn queue_terminal_or_fail_closed(&mut self) {
@@ -1281,42 +1106,18 @@ impl RuntimeLoop {
     }
 
     fn diagnostic(&mut self, diagnostic: RuntimeDiagnostic) {
-        lock_status(&self.status).last_diagnostic = Some(diagnostic);
         self.emit(RuntimeEvent::Diagnostic(diagnostic));
     }
 
     fn emit(&mut self, event: RuntimeEvent) -> bool {
         match self.event_tx.try_send(event) {
             Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                let mut status = lock_status(&self.status);
-                status.dropped_events = status.dropped_events.saturating_add(1);
-                status.last_diagnostic = Some(RuntimeDiagnostic::EventQueueFull);
-                false
-            }
+            Err(TrySendError::Full(_)) => false,
             Err(TrySendError::Disconnected(_)) => {
                 self.stopping = true;
                 false
             }
         }
-    }
-
-    fn refresh_status(&self) {
-        let grabbed = self.capture.is_grabbed();
-        let mut status = lock_status(&self.status);
-        status.running = true;
-        status.suspended = self.suspended;
-        status.ownership = self.ownership.phase();
-        status.selected_peer = self.selected_peer.clone();
-        status.capture_selection_complete = self.capture_selection_complete;
-        status.capture_devices = self
-            .capture
-            .paths()
-            .map(|path| RuntimeDeviceStatus {
-                path: path.to_owned(),
-                grabbed,
-            })
-            .collect();
     }
 }
 
@@ -1457,22 +1258,6 @@ fn selection_loss_closes_activation(phase: OwnershipPhase, selection_complete: b
     !selection_complete && phase != OwnershipPhase::Idle
 }
 
-fn ensure_close_on_exec(fd: RawFd) -> io::Result<()> {
-    // SAFETY: F_GETFD and F_SETFD do not dereference pointers. `fd` is owned
-    // by the live CaptureSet for the duration of both calls.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if flags & libc::FD_CLOEXEC == 0 {
-        let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
 fn apply_receiver_effect(
     virtual_input: &mut VirtualInput,
     effect: ReceiverEffect,
@@ -1542,36 +1327,6 @@ pub fn watchdog_tick_interval(watchdog_timeout: Option<Duration>) -> Option<Dura
             half
         }
     })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandRoute {
-    Activate,
-    Release,
-    TerminalSent,
-    Inject,
-    Suspend,
-    Resume,
-    Reload,
-    Stop,
-    IgnoreWhileSuspended,
-}
-
-fn route_command(suspended: bool, command: &RuntimeCommand) -> CommandRoute {
-    match command {
-        RuntimeCommand::Stop => CommandRoute::Stop,
-        RuntimeCommand::Resume => CommandRoute::Resume,
-        RuntimeCommand::Reload { .. } => CommandRoute::Reload,
-        RuntimeCommand::Suspend => CommandRoute::Suspend,
-        RuntimeCommand::Activate { .. } if suspended => CommandRoute::IgnoreWhileSuspended,
-        RuntimeCommand::ReceiverEffects { .. } if suspended => CommandRoute::IgnoreWhileSuspended,
-        RuntimeCommand::Release { .. } if suspended => CommandRoute::IgnoreWhileSuspended,
-        RuntimeCommand::TerminalSent { .. } if suspended => CommandRoute::IgnoreWhileSuspended,
-        RuntimeCommand::Activate { .. } => CommandRoute::Activate,
-        RuntimeCommand::Release { .. } => CommandRoute::Release,
-        RuntimeCommand::TerminalSent { .. } => CommandRoute::TerminalSent,
-        RuntimeCommand::ReceiverEffects { .. } => CommandRoute::Inject,
-    }
 }
 
 fn lock_status(
@@ -1664,11 +1419,7 @@ mod tests {
 
     #[test]
     fn chord_is_aggregate_edge_triggered_across_devices() {
-        let chord = ConfiguredChord::parse(
-            &["KEY_LEFTCTRL".into(), "KEY_F12".into()],
-            ChordPurpose::Activation,
-        )
-        .unwrap();
+        let chord = ConfiguredChord::parse(&["KEY_LEFTCTRL".into(), "KEY_F12".into()]).unwrap();
         let mut tracker = ChordTracker::new(chord);
         assert!(!tracker.observe(Path::new("one"), &frame(&[(KeyCode::KEY_LEFTCTRL, 1)])));
         assert!(tracker.observe(Path::new("two"), &frame(&[(KeyCode::KEY_F12, 1)])));
@@ -1679,11 +1430,7 @@ mod tests {
 
     #[test]
     fn removal_clears_composite_chord_state() {
-        let chord = ConfiguredChord::parse(
-            &["KEY_LEFTCTRL".into(), "KEY_F12".into()],
-            ChordPurpose::Activation,
-        )
-        .unwrap();
+        let chord = ConfiguredChord::parse(&["KEY_LEFTCTRL".into(), "KEY_F12".into()]).unwrap();
         let mut tracker = ChordTracker::new(chord);
         tracker.observe(Path::new("one"), &frame(&[(KeyCode::KEY_LEFTCTRL, 1)]));
         tracker.remove_device(Path::new("one"));
@@ -1896,40 +1643,8 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_commands_route_safely_while_suspended() {
-        assert_eq!(
-            route_command(
-                true,
-                &RuntimeCommand::Activate {
-                    peer: "desk".into()
-                }
-            ),
-            CommandRoute::IgnoreWhileSuspended
-        );
-        assert_eq!(
-            route_command(
-                true,
-                &RuntimeCommand::ReceiverEffects {
-                    effects: Vec::new(),
-                    touch_captured_at: None,
-                    applied: None,
-                }
-            ),
-            CommandRoute::IgnoreWhileSuspended
-        );
-        assert_eq!(
-            route_command(true, &RuntimeCommand::Resume),
-            CommandRoute::Resume
-        );
-        assert_eq!(
-            route_command(true, &RuntimeCommand::Stop),
-            CommandRoute::Stop
-        );
-    }
-
-    #[test]
     fn runtime_defaults_do_not_claim_the_linux_vt_switch_chord() {
-        let config = LinuxRuntimeConfig::default();
+        let config = LinuxRuntimeConfig::from_config(&Config::default());
         assert_eq!(
             config.activation_chord,
             ["KEY_LEFTCTRL", "KEY_LEFTMETA", "KEY_F12"]
@@ -1989,7 +1704,8 @@ mod tests {
     #[test]
     #[ignore = "requires root-equivalent access to /dev/uinput and selected evdev nodes"]
     fn privileged_runtime_smoke() {
-        let runtime = LinuxRuntime::spawn(LinuxRuntimeConfig::default()).unwrap();
+        let runtime =
+            LinuxRuntime::spawn(LinuxRuntimeConfig::from_config(&Config::default())).unwrap();
         runtime.shutdown().unwrap();
     }
 }

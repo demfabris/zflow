@@ -408,9 +408,9 @@ impl CaptureSet {
         })
     }
 
-    /// Suspend is fail-safe: try explicit ungrabs, then close all descriptors.
-    /// Closing guarantees kernel grab release even if an ioctl failed. Resume
-    /// reconstructs the set from the next periodic scan.
+    /// Fail-safe teardown: try explicit ungrabs, then close all descriptors.
+    /// Closing guarantees kernel grab release even if an ioctl failed. The
+    /// next periodic scan reopens the set.
     pub fn suspend(&mut self) -> Vec<UngrabFailure> {
         let failures = self.ungrab_all();
         self.nodes.clear();

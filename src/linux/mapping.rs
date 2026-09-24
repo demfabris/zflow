@@ -344,10 +344,9 @@ impl FrameAccumulator {
                         state,
                     }
                 } else {
-                    let usage = match evdev_key_to_hid(key) {
-                        Ok(usage) => usage,
-                        Err(MappingError::UnsupportedEvdevCode(_)) => return Ok(None),
-                        Err(error) => return Err(error),
+                    // Capture ignores keys without an unambiguous HID usage.
+                    let Ok(usage) = evdev_key_to_hid(key) else {
+                        return Ok(None);
                     };
                     CaptureTransition::Key { usage, state }
                 };
