@@ -1158,9 +1158,13 @@ fn render_capture_rules(devices: &[crate::config::DeviceSelector]) -> Result<Str
         let mut matches = format!(
             "ACTION==\"add|change\", SUBSYSTEM==\"input\", KERNEL==\"event*\", ENV{{ZFLOW_CAPTURE_EXCLUDE}}!=\"1\", ATTRS{{id/vendor}}==\"{vendor:04x}\", ATTRS{{id/product}}==\"{product:04x}\""
         );
-        let physical_path = device.phys.as_deref().context(
-            "selected device has no stable physical path; refusing to grant every identical device",
-        )?;
+        let physical_path = device
+            .phys
+            .as_deref()
+            .filter(|physical_path| !physical_path.is_empty())
+            .context(
+                "selected device has no stable physical path; refusing to grant every identical device",
+            )?;
         matches.push_str(&format!(
             ", ATTRS{{phys}}==\"{}\"",
             escape_udev_value(physical_path)?
@@ -1230,11 +1234,19 @@ fn write_atomic_bytes(path: &Path, contents: &[u8], create_mode: u32) -> Result<
     Ok(())
 }
 
+/// udev(7) match values are glob patterns with no escape for `* ? [ ] |`, and
+/// only `\"` is unescaped inside quotes. A value containing one of those or a
+/// backslash would match other devices or none, so it is refused.
 fn escape_udev_value(value: &str) -> Result<String> {
-    if value.chars().any(char::is_control) {
-        bail!("udev match values cannot contain control characters");
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '*' | '?' | '[' | ']' | '|' | '\\'))
+    {
+        bail!(
+            "udev cannot match {value:?} literally; it contains a control character, a backslash, or one of * ? [ ] |"
+        );
     }
-    Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
+    Ok(value.replace('"', "\\\""))
 }
 
 fn peers(path: PathBuf) -> Result<()> {
@@ -1535,12 +1547,22 @@ mod tests {
     }
 
     #[test]
-    fn udev_values_escape_quotes_and_backslashes() {
+    fn udev_values_escape_quotes_and_refuse_what_udev_cannot_match_literally() {
         assert_eq!(
-            escape_udev_value("board \\\"left\"").unwrap(),
-            "board \\\\\\\"left\\\""
+            escape_udev_value("board \"left\"").unwrap(),
+            "board \\\"left\\\""
         );
-        assert!(escape_udev_value("line\nbreak").is_err());
+        for value in [
+            "line\nbreak",
+            "back\\slash",
+            "usb-*",
+            "usb-?/input0",
+            "usb-[01]",
+            "usb-]",
+            "a|b",
+        ] {
+            assert!(escape_udev_value(value).is_err(), "{value:?}");
+        }
     }
 
     #[test]
@@ -1569,20 +1591,24 @@ mod tests {
     fn capture_rule_refuses_a_device_without_a_stable_physical_path() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("71-zflow-capture.rules");
-        let error = write_capture_rules(
-            &path,
-            &[crate::config::DeviceSelector {
-                path: "/dev/input/event7".into(),
-                name: Some("Indistinguishable Keyboard".into()),
-                phys: None,
-                vendor: Some(0x1234),
-                product: Some(0xabcd),
-            }],
-        )
-        .unwrap_err();
+        // An empty phys would render ATTRS{phys}=="" and grant every device
+        // with the same vendor and product.
+        for phys in [None, Some(String::new())] {
+            let error = write_capture_rules(
+                &path,
+                &[crate::config::DeviceSelector {
+                    path: "/dev/input/event7".into(),
+                    name: Some("Indistinguishable Keyboard".into()),
+                    phys,
+                    vendor: Some(0x1234),
+                    product: Some(0xabcd),
+                }],
+            )
+            .unwrap_err();
 
-        assert!(error.to_string().contains("no stable physical path"));
-        assert!(!path.exists());
+            assert!(error.to_string().contains("no stable physical path"));
+            assert!(!path.exists());
+        }
     }
 
     #[test]
