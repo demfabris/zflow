@@ -30,6 +30,8 @@ jobs:
       - name: Rust
         run: |
           cargo fmt --all --check
+          # Without dev-dependencies, so their features can't hide a missing one.
+          cargo build --locked
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked --all-targets
       - name: GNOME extension
