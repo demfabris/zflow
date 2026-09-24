@@ -30,11 +30,14 @@ impl DesktopReceiver {
             .message
             .clone()
     }
-    pub fn start(&mut self) {
+    /// `connection` must own the agent's bus name; the extension answers no
+    /// other caller.
+    pub fn start(&mut self, connection: &zbus::Connection) {
         if self.is_active() {
             return;
         }
         self.stop();
+        let connection = connection.clone();
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -57,7 +60,7 @@ impl DesktopReceiver {
                     .build()?
                     .block_on(async {
                         tokio::select! {
-                            result=run(&state,&generation_ref,generation) => result,
+                            result=run(&connection,&state,&generation_ref,generation) => result,
                             _=receipt => Ok(()),
                         }
                     })
@@ -100,16 +103,27 @@ impl Drop for DesktopReceiver {
 
 #[cfg(target_os = "linux")]
 async fn run(
+    connection: &zbus::Connection,
     state: &Arc<Mutex<State>>,
     generation: &std::sync::atomic::AtomicU64,
     expected: u64,
 ) -> anyhow::Result<()> {
     use crate::desktop::{DesktopRequest, DesktopResponse};
     use anyhow::{Context, ensure};
-    let connection = zbus::Connection::session().await?;
+    let bus = zbus::fdo::DBusProxy::new(connection).await?;
+    let owner = bus
+        .get_name_owner(crate::desktop::BUS_NAME.try_into()?)
+        .await
+        .context("Enable the zflow GNOME integration; a newly installed extension may require logging out and back in")?;
+    // Trust replies only from GNOME Shell, and keep talking to that connection
+    // even if another program takes the name later.
+    ensure!(
+        owner == bus.get_name_owner("org.gnome.Shell".try_into()?).await?,
+        "Another program owns the zflow GNOME integration name"
+    );
     let proxy = zbus::Proxy::new(
-        &connection,
-        crate::desktop::BUS_NAME,
+        connection,
+        owner.clone(),
         crate::desktop::OBJECT_PATH,
         crate::desktop::BUS_NAME,
     )
@@ -159,6 +173,11 @@ async fn run(
         let response = match call(&proxy, &request).await {
             Ok(response) => response,
             Err(error) => {
+                // A restarted Shell has a new unique name; start over to find and check it.
+                ensure!(
+                    bus.name_has_owner((&owner).into()).await?,
+                    "GNOME Shell restarted"
+                );
                 DesktopResponse::unavailable(format!("GNOME integration unavailable: {error}"))
             }
         };
@@ -223,15 +242,6 @@ async fn call(
     result
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn run(
-    _state: &Arc<Mutex<State>>,
-    _generation: &std::sync::atomic::AtomicU64,
-    _expected: u64,
-) -> anyhow::Result<()> {
-    anyhow::bail!("Desktop receiving currently requires Linux with GNOME")
-}
-
 /// Called only by the explicit Install GNOME integration action.
 pub fn install_extension() -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
@@ -294,5 +304,56 @@ pub fn install_extension() -> anyhow::Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Shell(Arc<Mutex<Vec<String>>>);
+
+    #[zbus::interface(name = "org.gnome.Shell.Extensions.Zflow")]
+    impl Shell {
+        fn call(&self, #[zbus(header)] header: zbus::message::Header<'_>, _json: &str) -> String {
+            let sender = header.sender().map(|sender| sender.to_string());
+            self.0.lock().unwrap().extend(sender);
+            r#"{"status":"unavailable","reason":"fake shell"}"#.into()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
+    async fn receiver_trusts_only_gnome_shell_and_calls_from_its_own_connection() {
+        use crate::desktop::{BUS_NAME, OBJECT_PATH};
+        let state = Arc::new(Mutex::new(State::default()));
+        let generation = std::sync::atomic::AtomicU64::new(1);
+        let agent = zbus::Connection::session().await.unwrap();
+        let shell = zbus::connection::Builder::session()
+            .unwrap()
+            .name("org.gnome.Shell")
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let impostor = zbus::Connection::session().await.unwrap();
+        impostor.request_name(BUS_NAME).await.unwrap();
+        let error = run(&agent, &state, &generation, 1).await.unwrap_err();
+        assert!(format!("{error:#}").contains("Another program owns"));
+        impostor.release_name(BUS_NAME).await.unwrap();
+
+        let callers = Arc::new(Mutex::new(Vec::new()));
+        shell
+            .object_server()
+            .at(OBJECT_PATH, Shell(callers.clone()))
+            .await
+            .unwrap();
+        shell.request_name(BUS_NAME).await.unwrap();
+        let error = run(&agent, &state, &generation, 1).await.unwrap_err();
+        assert_eq!(format!("{error:#}"), "fake shell");
+        assert_eq!(
+            *callers.lock().unwrap(),
+            [agent.unique_name().unwrap().to_string()]
+        );
     }
 }

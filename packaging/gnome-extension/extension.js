@@ -8,6 +8,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const BUS = 'org.gnome.Shell.Extensions.Zflow';
 const PATH = '/org/gnome/Shell/Extensions/Zflow';
+// src/app/gnome.rs owns this name on the connection that calls us.
+const AGENT = 'io.zflow.Desktop';
 const MAX = 1000000;
 const LEASE_US = 2000000;
 // src/desktop.rs mirrors this hold duration.
@@ -19,6 +21,11 @@ export default class ZflowExtension extends Extension {
         this._indicator = new Indicator();
         this._lease = null;
         this._barriers = [];
+        // Only the desktop agent may read the pointer or move it. This skips GNOME's
+        // DBusSenderChecker, whose destroy() passes array indexes to unwatch_name.
+        this._agent = null;
+        this._agentWatch = Gio.bus_watch_name_on_connection(Gio.DBus.session, AGENT, Gio.BusNameWatcherFlags.NONE,
+            (_connection, _name, owner) => { this._agent = owner; }, () => { this._agent = null; });
         this._object = Gio.DBusExportedObject.wrapJSObject(XML, this);
         this._object.export(Gio.DBus.session, PATH);
         this._busId = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS, Gio.BusNameOwnerFlags.NONE, null, null);
@@ -40,7 +47,8 @@ export default class ZflowExtension extends Extension {
         this._object?.unexport();
         this._object = null;
         if (this._busId) Gio.bus_unown_name(this._busId);
-        this._busId = 0;
+        if (this._agentWatch) Gio.bus_unwatch_name(this._agentWatch);
+        this._busId = this._agentWatch = 0;
     }
 
     _available() {
@@ -64,6 +72,10 @@ export default class ZflowExtension extends Extension {
     }
 
     async CallAsync([json], invocation) {
+        if (invocation.get_sender() !== this._agent) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied', 'Only the zflow desktop agent may call this');
+            return;
+        }
         let response;
         try {
             if (json.length > 4096) throw new Error('Desktop request exceeds limit');

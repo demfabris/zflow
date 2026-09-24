@@ -16,6 +16,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     const sessionMode = {isLocked: false, isGreeter: false};
     const seat = {warp_pointer(x, y) {pointer = {x, y};}};
     const backend = {get_default_seat: () => seat};
+    const watch = {};
     // GNOME 51 reaches the backend only through the stage context.
     const context = {
         Extension: class {},
@@ -29,9 +30,17 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
             timeout_add(_priority, interval, fn) {const id = next++; timers.set(id, {fn, interval, due: now + interval * 1000}); return id;},
             idle_add(_priority, fn) {queueMicrotask(fn); return next++;},
             Source: {remove(id) {timers.delete(id);}},
+            Variant: class { constructor(_type, value) {this.value = value;} },
         },
         Gio: {DBus: {session: {}}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},
-            BusNameOwnerFlags: {NONE: 0}, bus_own_name_on_connection: () => 1, bus_unown_name() {}},
+            BusNameOwnerFlags: {NONE: 0}, bus_own_name_on_connection: () => 1, bus_unown_name() {},
+            // The desktop agent is already running as :1.7.
+            BusNameWatcherFlags: {NONE: 0}, bus_unwatch_name(id) {watch.removed = id;},
+            bus_watch_name_on_connection(_connection, name, _flags, appeared, vanished) {
+                Object.assign(watch, {name, vanished});
+                appeared(null, name, ':1.7');
+                return 2;
+            }},
         Clutter: {},
         Meta: {
             BackendCapabilities: {BARRIERS: 1},
@@ -46,7 +55,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     vm.runInNewContext(source, context);
     const extension = new context.TestExtension();
     extension.enable();
-    return {extension, barriers, context, seat, backend, sessionMode, handlers, timers, advance(ms) {
+    return {extension, barriers, context, seat, backend, watch, sessionMode, handlers, timers, advance(ms) {
         now += ms * 1000;
         for (const [id, timer] of timers) {
             if (timer.due > now) continue;
@@ -211,4 +220,26 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     assert.equal((await replacement).status, 'prepared');
     d.extension.disable();
 }
-console.log('GNOME desktop entry, return, geometry, stale requests, lease, lock and placement checks passed');
+{
+    // Other session programs must not read the pointer, move it or hold the lease.
+    const d = desktop();
+    const replies = [];
+    const call = (sender, request) => d.extension.CallAsync([JSON.stringify(request)], {
+        get_sender: () => sender,
+        return_dbus_error: name => replies.push(name),
+        return_value: variant => replies.push(JSON.parse(variant.value[0]).status),
+    });
+    assert.equal(d.watch.name, 'io.zflow.Desktop');
+    await call(':1.99', prepare());
+    await call(':1.99', {command: 'snapshot'});
+    assert.equal(d.extension._lease, null);
+    assert.equal(d.barriers.length, 0);
+    await call(':1.7', {command: 'snapshot'});
+    d.watch.vanished();
+    await call(':1.7', {command: 'snapshot'});
+    const denied = 'org.freedesktop.DBus.Error.AccessDenied';
+    assert.deepEqual(replies, [denied, denied, 'snapshot', denied]);
+    d.extension.disable();
+    assert.equal(d.watch.removed, 2);
+}
+console.log('GNOME desktop entry, return, geometry, stale requests, lease, lock, placement and caller checks passed');

@@ -18,7 +18,7 @@ pub fn run(install: bool) -> Result<()> {
         .try_init();
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
         let state = Arc::new(Mutex::new(super::gnome::State::default()));
-        let _connection = super::gnome::connect(state.clone()).await?;
+        let connection = super::gnome::connect(state.clone()).await?;
         let mut detector=DesktopDetector::default();
         let mut discovery=DisplayDiscovery::default();
         let mut timer=tokio::time::interval(Duration::from_secs(2));
@@ -32,7 +32,7 @@ pub fn run(install: bool) -> Result<()> {
                 _=timer.tick() => {
                     let status = {
                         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-                        if !state.receiver.is_active() { state.receiver.start(); }
+                        if !state.receiver.is_active() { state.receiver.start(&connection); }
                         state.receiver.status()
                     };
                     if status!=previous { tracing::info!(%status,"desktop agent"); previous=status; }
