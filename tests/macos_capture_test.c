@@ -208,6 +208,21 @@ static void startup_release_tests(void) {
   assert(enqueue(&pre_capture));
   assert(zflow_mac_capture_poll(&captured));
   assert(captured.kind == ZFLOW_EVENT_TOUCH && captured.contact_count == 1);
+
+  // Each Caps Lock toggle is one flagsChanged with no release report.
+  CGEventRef caps = CGEventCreateKeyboardEvent(NULL, ZFLOW_CAPS_LOCK, true);
+  assert(caps);
+  CGEventSetIntegerValueField(caps, kCGKeyboardEventKeycode, ZFLOW_CAPS_LOCK);
+  for (int toggle = 0; toggle < 2; toggle++) {
+    CGEventSetFlags(caps, toggle ? 0 : kCGEventFlagMaskAlphaShift);
+    assert(event_callback(NULL, kCGEventFlagsChanged, caps, NULL) == NULL);
+    assert(zflow_mac_capture_poll(&captured) && captured.pressed);
+    assert(captured.kind == ZFLOW_EVENT_KEY && captured.code == ZFLOW_CAPS_LOCK);
+    assert(zflow_mac_capture_poll(&captured) && !captured.pressed);
+    assert(captured.kind == ZFLOW_EVENT_KEY && captured.code == ZFLOW_CAPS_LOCK);
+  }
+  assert(!zflow_mac_capture_poll(&captured));
+  CFRelease(caps);
   g_check_entry = false;
 }
 

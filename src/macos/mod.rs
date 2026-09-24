@@ -1246,8 +1246,6 @@ impl Drop for MacCapture {
 mod tests {
     use super::*;
 
-    const ALPHA_SHIFT: u64 = 0x0001_0000;
-
     #[tokio::test]
     async fn source_worker_shutdown_notifies_peer_before_its_runtime_exits() {
         use crate::transport::{accept_input, input_server_config};
@@ -1562,12 +1560,6 @@ mod tests {
             assert!(modifier_pressed(left_keycode, right_released));
             assert!(!modifier_pressed(right_keycode, right_released));
         }
-    }
-
-    #[test]
-    fn caps_lock_uses_the_aggregate_flag() {
-        assert!(modifier_pressed(57, ALPHA_SHIFT));
-        assert!(!modifier_pressed(57, 0));
     }
 
     #[test]

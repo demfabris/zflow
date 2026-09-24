@@ -12,6 +12,7 @@
 #define ZFLOW_QUEUE_CAPACITY 1024
 #define ZFLOW_MAX_CONTACTS 5
 #define ZFLOW_MAX_DISPLAYS 64
+#define ZFLOW_CAPS_LOCK 57
 
 typedef struct { double x, y; } ZFlowMacPosition;
 typedef struct { double x, y, width, height; } ZFlowMacRect;
@@ -392,7 +393,6 @@ uint8_t zflow_mac_modifier_pressed(uint16_t keycode, uint64_t raw_flags) {
     case 62: return side_modifier_pressed(
         flags, kCGEventFlagMaskControl, NX_DEVICERCTLKEYMASK,
         NX_DEVICELCTLKEYMASK, NX_DEVICERCTLKEYMASK);
-    case 57: return (flags & kCGEventFlagMaskAlphaShift) != 0;
     default: return 0;
   }
 }
@@ -463,6 +463,14 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
       }
       captured.kind = ZFLOW_EVENT_KEY;
       captured.code = keycode;
+      if (type == kCGEventFlagsChanged && keycode == ZFLOW_CAPS_LOCK) {
+        // macOS reports one flagsChanged per Caps Lock toggle and nothing on
+        // release, so each report is a full press.
+        captured.pressed = 1;
+        forward(&captured);
+        captured.pressed = 0;
+        return forward(&captured);
+      }
       captured.pressed = type == kCGEventFlagsChanged
           ? zflow_mac_modifier_pressed(keycode, flags)
           : type == kCGEventKeyDown;
