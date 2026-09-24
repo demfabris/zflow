@@ -923,6 +923,11 @@ fn claim_inbound(
 }
 
 fn is_safety_release(effect: &ReceiverEffect) -> bool {
+    // A synthetic touch replacement can carry peer-supplied contacts; only a
+    // replacement with no contacts is a release.
+    if let ReceiverEffect::TouchReplaced { state, synthetic } = effect {
+        return *synthetic && state.is_empty();
+    }
     matches!(
         effect,
         ReceiverEffect::Key {
@@ -938,9 +943,6 @@ fn is_safety_release(effect: &ReceiverEffect) -> bool {
             synthetic: true,
             ..
         } | ReceiverEffect::ScrollEnded {
-            synthetic: true,
-            ..
-        } | ReceiverEffect::TouchReplaced {
             synthetic: true,
             ..
         } | ReceiverEffect::ActivationClosed { .. }
@@ -1667,6 +1669,39 @@ mod tests {
             "peer",
             InjectionGate::PreLogin
         ));
+    }
+
+    #[test]
+    fn only_an_empty_synthetic_touch_replacement_is_a_safety_release() {
+        use crate::core::{ContactId, TouchContact, TouchState, TouchTool};
+        let contact = TouchContact {
+            id: ContactId(1),
+            x: 10,
+            y: 20,
+            pressure: None,
+            major: None,
+            minor: None,
+            orientation_millidegrees: None,
+            tool: TouchTool::Finger,
+            source_dimensions: None,
+        };
+        let touching = TouchState::new([contact]).unwrap();
+        assert!(is_safety_release(&ReceiverEffect::TouchReplaced {
+            state: TouchState::default(),
+            synthetic: true,
+        }));
+        assert!(!is_safety_release(&ReceiverEffect::TouchReplaced {
+            state: touching.clone(),
+            synthetic: true,
+        }));
+        assert!(!is_safety_release(&ReceiverEffect::TouchReplaced {
+            state: TouchState::default(),
+            synthetic: false,
+        }));
+        assert!(!is_safety_release(&ReceiverEffect::TouchReplaced {
+            state: touching,
+            synthetic: false,
+        }));
     }
 
     #[test]
