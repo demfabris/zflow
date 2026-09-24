@@ -45,6 +45,10 @@ fetch() {
         --location --retry 3 --connect-timeout 20 --max-time 600 --output "$2" "$1" </dev/null
 }
 
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'
+}
+
 cleanup() {
     local status=$?
     trap - EXIT
@@ -62,25 +66,57 @@ cleanup() {
     exit "$status"
 }
 
+# Runtime packages the root step installs before an archive.
 linux_dependencies() {
-    local packages=()
     if command -v apt-get >/dev/null 2>&1; then
+        manager=apt-get
         packages=(kmod udev passwd util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gir1.2-gtk-4.0 gir1.2-adw-1); fi
-        as_root apt-get update
-        as_root apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
+        manager=dnf
         packages=(kmod systemd-udev shadow-utils util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita); fi
-        as_root dnf install -y "${packages[@]}"
     elif command -v pacman >/dev/null 2>&1; then
+        manager=pacman
         packages=(kmod systemd shadow util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita); fi
-        # Do not refresh the package database without upgrading the whole system.
-        as_root pacman -S --needed --noconfirm "${packages[@]}"
     else
         die 'Automatic dependency installation supports apt, dnf, and pacman. Install the runtime dependencies and use the installation script inside the release archive.'
     fi
+}
+
+# Every Linux system change, run as root in a shell of its own (see install_linux).
+# It works on a root-owned copy of the download and checks the checksum again, so
+# a process running as the user cannot swap files while the password prompt is open.
+# Arguments: DOWNLOAD SHA256, then apt options for a .deb, or the package manager
+# and runtime packages for an archive.
+root_install() {
+    local source=$1 checksum=$2 asset=${1##*/} manager
+    shift 2
+    root_stage=$(mktemp -d /tmp/zflow-install.XXXXXXXX)
+    trap 'rm -rf -- "$root_stage"' EXIT
+    cp -- "$source" "$root_stage/$asset"
+    [[ "$(sha256_of "$root_stage/$asset")" == "$checksum" ]] || die "Checksum mismatch for $asset; nothing was installed."
+    if [[ "$asset" == *.deb ]]; then
+        # apt reads local packages as the unprivileged _apt user.
+        chmod 0755 "$root_stage"
+        chmod 0644 "$root_stage/$asset"
+        apt-get update
+        apt-get install -y "$@" "$root_stage/$asset"
+        return
+    fi
+    manager=$1
+    shift
+    case "$manager" in
+        apt-get) apt-get update; apt-get install -y "$@" ;;
+        dnf) dnf install -y "$@" ;;
+        # Do not refresh the package database without upgrading the whole system.
+        pacman) pacman -S --needed --noconfirm "$@" ;;
+        *) die "Unsupported package manager: $manager" ;;
+    esac
+    mkdir "$root_stage/payload"
+    tar -xzf "$root_stage/$asset" --no-same-owner --strip-components=1 -C "$root_stage/payload"
+    bash "$root_stage/payload/scripts/install.sh" --install-built
 }
 
 # Runs before anything changes. Tools such as groupadd live in /usr/sbin, which is not
@@ -122,16 +158,10 @@ latest_version() {
 }
 
 verify_download() {
-    local expected actual
-    expected=$(awk -v name="$asset" '$2 == name && NF == 2 {hash=$1; count++} END {if (count == 1) print hash; else exit 1}' "$work_dir/SHA256SUMS") \
+    checksum=$(awk -v name="$asset" '$2 == name && NF == 2 {hash=$1; count++} END {if (count == 1) print hash; else exit 1}' "$work_dir/SHA256SUMS") \
         || die "The release has no unique checksum for $asset."
-    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die 'Invalid release checksum.'
-    if command -v sha256sum >/dev/null 2>&1; then
-        actual=$(sha256sum "$work_dir/$asset" | awk '{print $1}')
-    else
-        actual=$(shasum -a 256 "$work_dir/$asset" | awk '{print $1}')
-    fi
-    [[ "$actual" == "$expected" ]] || die "Checksum mismatch for $asset; nothing was installed."
+    [[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || die 'Invalid release checksum.'
+    [[ "$(sha256_of "$work_dir/$asset")" == "$checksum" ]] || die "Checksum mismatch for $asset; nothing was installed."
 }
 
 archive_install_present() {
@@ -176,19 +206,19 @@ select_artifact() {
 
 install_linux() {
     say 'Installing the service. An existing zflow connection will disconnect during its restart.'
+    local root_args=("$work_dir/$asset" "$checksum")
     if [[ "$use_deb" == true ]]; then
-        # apt drops privileges to _apt while reading the verified local package.
-        chmod 0755 "$work_dir"
-        chmod 0644 "$work_dir/$asset"
-        as_root apt-get update
-        if [[ "$desktop" == true ]]; then as_root apt-get install -y "$work_dir/$asset";
-        else as_root apt-get install -y --no-install-recommends "$work_dir/$asset"; fi
+        if [[ "$desktop" == false ]]; then root_args+=(--no-install-recommends); fi
         installed_cli=/usr/bin/zflow
     else
         linux_dependencies
-        as_root bash "$payload_dir/scripts/install.sh" --install-built
+        root_args+=("$manager" "${packages[@]}")
         installed_cli=/usr/local/bin/zflow
     fi
+    # One elevated shell makes every system change: one password prompt, and
+    # cancelling it leaves nothing half installed.
+    as_root bash -c "set -euo pipefail; $(declare -f die sha256_of root_install); root_install \"\$@\"" \
+        zflow-install "${root_args[@]}"
     if [[ "$desktop" == true ]]; then
         say 'Installing GNOME integration for your desktop account…'
         local output
@@ -311,6 +341,7 @@ main() {
         mkdir "$payload_dir"
         tar -xzf "$work_dir/$asset" --strip-components=1 -C "$payload_dir"
         if [[ "$platform" == Linux ]]; then
+            # Only a check before asking for a password; the root step extracts its own copy.
             [[ -x "$payload_dir/bin/zflow" && -x "$payload_dir/bin/zflowd" && -f "$payload_dir/scripts/install.sh" ]] \
                 || die 'The release archive is missing the Linux binaries or installer.'
         fi

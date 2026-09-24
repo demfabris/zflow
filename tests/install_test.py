@@ -27,7 +27,10 @@ command() {
     fi
     builtin command "$@"
 }
-as_root() { record "root $*"; }
+# The single elevated step really runs as bash -c CODE NAME ARGS, without root.
+as_root() {
+    if [[ "$1 $2" == "bash -c" ]]; then record "root bash -c ${*:4}"; "$@"; else record "root $*"; fi
+}
 fetch() { record "fetch $1"; cp "$RELEASE/${1##*/}" "$2"; }
 curl() { record latest; echo "${LATEST_URL:-https://github.com/demfabris/zflow/releases/tag/v0.1.0}"; }
 archive_install_present() { [[ "$LEGACY" == true ]]; }
@@ -65,7 +68,7 @@ class InstallerTest(unittest.TestCase):
         self.source = self.root / "payload with spaces"
         (self.source / "scripts").mkdir(parents=True)
         (self.source / "bin").mkdir()
-        (self.source / "scripts/install.sh").write_text("exit 99\n")
+        (self.source / "scripts/install.sh").write_text('printf \'setup %s %s\\n\' "$0" "$*" >> "$LOG"\n')
         for name in ("zflow", "zflowd"):
             binary = self.source / "bin" / name
             # TMPDIR can be noexec, so the installer must never run downloaded files.
@@ -86,9 +89,22 @@ class InstallerTest(unittest.TestCase):
         self.log = self.root / "calls"
         (self.root / "home").mkdir()
         (self.root / "tmp").mkdir()
+        (self.root / "root").mkdir()
+        # Commands the elevated shell runs; it cannot see this shell's functions.
+        tools = self.root / "bin"
+        tools.mkdir()
+        for name in ("apt-get", "dnf", "pacman"):
+            (tools / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "$LOG"\n')
+        # The root step stages under /tmp; keep that inside the test directory.
+        (tools / "mktemp").write_text(
+            '#!/bin/sh\ncase "$2" in /tmp/*) set -- "$1" "$TEST_ROOT/root/${2#/tmp/}";; esac\n'
+            'exec /usr/bin/mktemp "$@"\n')
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
         self.env = {
             **os.environ,
             "HOME": str(self.root / "home"), "TMPDIR": str(self.root / "tmp"),
+            "PATH": f"{self.root / 'bin'}:{os.environ['PATH']}",
             "LOG": str(self.log), "FIXTURE": str(self.source),
             "RELEASE": str(self.release), "TEST_ROOT": str(self.root),
             "PLATFORM": "Linux", "ARCH": "x86_64", "MANAGER": "apt-get", "LEGACY": "true",
@@ -118,15 +134,25 @@ class InstallerTest(unittest.TestCase):
     def calls(self):
         return self.log.read_text() if self.log.exists() else ""
 
+    def elevations(self):
+        return [line for line in self.calls().splitlines() if line.startswith("root ")]
+
+    def assert_temporary_files_removed(self):
+        self.assertEqual(list((self.root / "tmp").iterdir()), [])
+        self.assertEqual(list((self.root / "root").iterdir()), [])
+
     def test_linux_archive_install_never_builds(self):
         self.run_shell("main --yes --no-launch")
         calls = self.calls()
-        self.assertIn("root apt-get install -y kmod", calls)
+        self.assertEqual(len(self.elevations()), 1)
+        self.assertIn("\napt-get install -y kmod", calls)
         self.assertIn("gir1.2-adw-1", calls)
+        # Root runs the installer from its own extracted copy, not the user's download.
+        self.assertIn(f"setup {self.root}/root/zflow-install.", calls)
         self.assertIn("/payload/scripts/install.sh --install-built", calls)
         self.assertIn("user installed-zflow desktop-agent --install", calls)
         self.assertNotIn("executed-download", calls)
-        self.assertEqual(list((self.root / "tmp").iterdir()), [])
+        self.assert_temporary_files_removed()
         for package in ("build-essential", "gcc", "base-devel", "pkg-config"):
             self.assertNotIn(package, calls)
 
@@ -135,18 +161,34 @@ class InstallerTest(unittest.TestCase):
             with self.subTest(manager=manager):
                 self.log.write_text("")
                 self.run_shell("main --yes --headless", env={"MANAGER": manager})
-                self.assertIn(f"root {manager} ", self.calls())
+                self.assertEqual(len(self.elevations()), 1)
+                self.assertIn(f"\n{manager} ", self.calls())
+                self.assertIn("--install-built", self.calls())
                 self.assertNotIn("gjs", self.calls())
                 self.assertNotIn("installed-zflow", self.calls())
                 self.assertNotIn("pacman -Sy", self.calls())
 
     def test_debian_uses_package_manager_and_global_desktop_assets(self):
         self.run_shell("main --yes --no-launch", env={"LEGACY": "false"})
-        self.assertIn("zflow_0.1.0_amd64.deb", self.calls())
-        self.assertIn("root apt-get install -y", self.calls())
+        self.assertEqual(len(self.elevations()), 1)
+        self.assertIn(f"apt-get install -y {self.root}/root/zflow-install.", self.calls())
+        self.assertIn("/zflow_0.1.0_amd64.deb", self.calls())
         self.assertIn("extension enable zflow@demfabris", self.calls())
         self.assertNotIn("desktop-agent --install", self.calls())
-        self.assertNotIn("/scripts/install.sh", self.calls())
+        self.assertNotIn("setup ", self.calls())
+        self.assert_temporary_files_removed()
+
+    def test_root_step_rejects_a_download_swapped_after_verification(self):
+        # Simulate a process running as the user replacing the file during the password prompt.
+        swap = 'eval "original_$(declare -f as_root)"\nas_root() { printf swapped > "$5"; original_as_root "$@"; }'
+        for legacy in ("false", "true"):
+            with self.subTest(legacy=legacy):
+                self.log.write_text("")
+                output = self.run_shell("main --yes --no-launch", before=swap, env={"LEGACY": legacy}, ok=False)
+                self.assertIn("Checksum mismatch", output)
+                self.assertEqual(len(self.elevations()), 1)
+                self.assertFalse([line for line in self.calls().splitlines() if line.startswith(("apt-get", "setup "))])
+                self.assert_temporary_files_removed()
 
     def test_debian_package_follows_dpkg_architecture(self):
         self.run_shell("main --yes --headless", env={"LEGACY": "false", "ARCH": "x86_64", "DPKG_ARCH": "arm64"})

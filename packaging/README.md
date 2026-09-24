@@ -5,6 +5,9 @@ verifies the selected file against that release's `SHA256SUMS`, and installs it.
 It resolves `latest` to a specific tag before downloading either file. Use
 `--version v0.1.0` to select a release. A failed download, missing checksum, or
 unsupported platform stops installation before requesting administrator access.
+On Linux, every system change then runs in one elevated shell. It copies the
+download to a root-owned directory and checks the checksum again before
+installing, so no process running as the user can swap files mid-install.
 
 ## Release artifacts
 

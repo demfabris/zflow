@@ -24,8 +24,8 @@ On Ubuntu/Debian, a fresh installation uses the `.deb` package. On other
 supported Linux distributions, or when updating an existing `/usr/local`
 installation, it uses the binary archive. Linux runtime dependencies come from
 apt, dnf, or pacman. GNOME settings need GJS, GTK 4.12+, and libadwaita 1.5+.
-System changes request administrator access through GNOME's password dialog
-when available, or `sudo` in the terminal.
+System changes request administrator access once, through GNOME's password
+dialog when available, or `sudo` in the terminal.
 
 On macOS, the installer places `zflow.app` in `/Applications`. The release
 workflow signs Mac apps with Developer ID and includes Apple's notarization
