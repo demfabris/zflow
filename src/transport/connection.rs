@@ -33,7 +33,7 @@ const SERVER_NAME_PLACEHOLDER: &str = "zflow.invalid";
 const CONTROL_STREAM_PREFACE: &[u8] = b"zflow-control-v1\0";
 const PAIRING_STREAM_PREFACE: &[u8] = b"zflow-pair-v2\0";
 const PAIRING_COMMITMENT_LABEL: &[u8] = b"zflow pairing commitment v2\0";
-const MAX_CONTROL_FRAME_BYTES: usize = MAX_RELIABLE_PAYLOAD_BYTES + 1_024 + 64;
+const MAX_CONTROL_FRAME_BYTES: usize = MAX_RELIABLE_PAYLOAD_BYTES + 64;
 const MAX_PAIRING_FRAME_BYTES: usize = MAX_PAIRING_PAYLOAD_BYTES + 64;
 const CRITICAL_STREAM_ERROR: VarInt = VarInt::from_u32(0x100);
 const PROTOCOL_ERROR: VarInt = VarInt::from_u32(0x101);
@@ -291,7 +291,7 @@ impl ControlReceiver {
                 return Err(error.into());
             }
         };
-        match decoded.message {
+        match decoded {
             WireMessage::NegotiationOffer(offer) => {
                 Ok(InputControlMessage::NegotiationOffer(offer))
             }
@@ -402,7 +402,7 @@ impl DatagramChannel {
                 return Err(error.into());
             }
         };
-        match decoded.message {
+        match decoded {
             WireMessage::Motion(frame) => Ok(InputDatagram::Motion(frame)),
             WireMessage::Probe(probe) => Ok(InputDatagram::Probe(probe)),
             _ => {
@@ -723,7 +723,7 @@ impl PairingConnection {
 
     fn decode_offer(&self, frame: &[u8]) -> Result<PairingOffer, TransportError> {
         // Only the pairing decoder is reachable before trust exists.
-        match decode_family(frame, Family::Pairing)?.message {
+        match decode_family(frame, Family::Pairing)? {
             WireMessage::Pairing(offer) => Ok(offer),
             _ => {
                 close_protocol(&self.connection, b"message on pairing-only stream");
@@ -940,13 +940,11 @@ mod pairing_tests {
     use crate::{
         identity::Identity,
         transport::{pairing_client_config, pairing_server_config},
-        wire::PairingMethod,
     };
 
     fn offer(label: &str) -> PairingOffer {
         PairingOffer {
             handshake_nonce: [0x11; 32],
-            method: PairingMethod::ShortAuthenticationString,
             device_label: Some(label.into()),
             input_port: 43119,
             input_candidates: Vec::new(),

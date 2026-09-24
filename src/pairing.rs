@@ -11,7 +11,7 @@ use crate::{
         PairingConnection, TransportError, accept_pairing, connect_pairing, pairing_client_config,
         pairing_server_config,
     },
-    wire::{PairingMethod, PairingOffer, WireMessage, encode as encode_wire},
+    wire::{PairingOffer, WireMessage, encode as encode_wire},
 };
 
 pub const DEFAULT_PAIRING_PORT: u16 = 43120;
@@ -66,7 +66,6 @@ pub fn make_offer(
         .map_err(|error| anyhow::anyhow!("could not generate the pairing nonce: {error}"))?;
     Ok(PairingOffer {
         handshake_nonce,
-        method: PairingMethod::ShortAuthenticationString,
         device_label,
         input_port,
         input_candidates: input_candidates
@@ -245,9 +244,6 @@ async fn complete(
     local_offer: &PairingOffer,
     connection: &mut PairingConnection,
 ) -> Result<PairingObservation> {
-    if local_offer.method != PairingMethod::ShortAuthenticationString {
-        bail!("the CLI supports only short authentication string pairing");
-    }
     let peer_spki = connection.peer_spki().to_vec();
     if peer_spki == identity.spki() {
         bail!("refusing to pair an identity with itself");
@@ -255,9 +251,6 @@ async fn complete(
     let binding = connection.transcript_binding()?;
     let remote_address = connection.remote_address();
     let peer_offer = connection.exchange_offer(local_offer).await?;
-    if peer_offer.method != PairingMethod::ShortAuthenticationString {
-        bail!("peer selected an unsupported pairing method");
-    }
     if peer_offer.input_port == 0 {
         bail!("peer advertised an invalid input port");
     }

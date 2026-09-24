@@ -1,41 +1,35 @@
 //! Bounded, self-describing framing for the protocol domain model.
 //!
 //! The envelope is codec-independent and is parsed before serde sees a byte:
-//! magic, framing version, codec, family/type, flags, required-feature bits,
-//! optional-field length, payload length, protocol version, then (for session
-//! traffic) epoch/generation/activation and channel sequences. Unknown data is
-//! accepted only inside the explicit optional-field TLV area.
+//! magic, framing version, codec, family/type, required-feature bits, payload
+//! length, protocol version, then (for session traffic) epoch/generation/
+//! activation and channel sequences.
 
 mod bounds;
 mod codec;
 mod error;
 mod model;
 
-use std::collections::BTreeSet;
-
 use crate::core::*;
 
-use bounds::{BoundError, MAX_OPTIONAL_BYTES, MAX_OPTIONAL_FIELD_BYTES, MAX_OPTIONAL_FIELDS};
+use bounds::BoundError;
 pub use error::WireError;
-pub use model::{DiscoveryAnnouncement, PairingMethod, PairingOffer};
+pub use model::PairingOffer;
 use model::{
-    WireDiscoveryAnnouncement, WireMotionBody, WireNegotiatedSession, WireNegotiationOffer,
-    WirePairingOffer, WireReliableControl,
+    WireMotionBody, WireNegotiatedSession, WireNegotiationOffer, WirePairingOffer,
+    WireReliableControl,
 };
 
 const MAGIC: [u8; 2] = *b"ZF";
 const FRAMING_VERSION: u8 = 1;
 const POSTCARD_CODEC: u8 = 1;
-const FLAG_SESSION_CONTEXT: u8 = 1 << 0;
-const KNOWN_FLAGS: u8 = FLAG_SESSION_CONTEXT;
-const FIXED_HEADER_BYTES: usize = 17;
+const FIXED_HEADER_BYTES: usize = 14;
 
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
 pub const MAX_NEGOTIATION_PAYLOAD_BYTES: usize = 4 * 1_024;
 pub const MAX_RELIABLE_PAYLOAD_BYTES: usize = 32 * 1_024;
 pub const MAX_MOTION_PAYLOAD_BYTES: usize = 8 * 1_024;
 pub const MAX_PROBE_PAYLOAD_BYTES: usize = 128;
-pub const MAX_DISCOVERY_PAYLOAD_BYTES: usize = 8 * 1_024;
 pub const MAX_PAIRING_PAYLOAD_BYTES: usize = 2 * 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +39,8 @@ pub enum Family {
     ReliableControl = 2,
     Motion = 3,
     Probe = 4,
-    Discovery = 5,
-    Pairing = 6,
-    Desktop = 7,
+    Pairing = 5,
+    Desktop = 6,
 }
 
 impl Family {
@@ -57,7 +50,6 @@ impl Family {
             Self::ReliableControl => MAX_RELIABLE_PAYLOAD_BYTES,
             Self::Motion => MAX_MOTION_PAYLOAD_BYTES,
             Self::Probe => MAX_PROBE_PAYLOAD_BYTES,
-            Self::Discovery => MAX_DISCOVERY_PAYLOAD_BYTES,
             Self::Pairing => MAX_PAIRING_PAYLOAD_BYTES,
             Self::Desktop => crate::desktop::MAX_MESSAGE_BYTES + 8,
         }
@@ -70,8 +62,8 @@ impl Family {
     fn valid_message_type(self, message_type: u8) -> bool {
         match self {
             Self::Negotiation => matches!(message_type, 1 | 2),
-            Self::ReliableControl => matches!(message_type, 1 | 3..=6 | 10..=14 | 17),
-            Self::Motion | Self::Discovery | Self::Pairing | Self::Desktop => message_type == 1,
+            Self::ReliableControl => (1..=11).contains(&message_type),
+            Self::Motion | Self::Pairing | Self::Desktop => message_type == 1,
             Self::Probe => matches!(message_type, 1 | 2),
         }
     }
@@ -86,9 +78,8 @@ impl TryFrom<u8> for Family {
             2 => Ok(Self::ReliableControl),
             3 => Ok(Self::Motion),
             4 => Ok(Self::Probe),
-            5 => Ok(Self::Discovery),
-            6 => Ok(Self::Pairing),
-            7 => Ok(Self::Desktop),
+            5 => Ok(Self::Pairing),
+            6 => Ok(Self::Desktop),
             other => Err(WireError::UnknownFamily(other)),
         }
     }
@@ -101,7 +92,6 @@ pub enum WireMessage {
     ReliableControl(ReliableControlMessage),
     Motion(MotionFrame),
     Probe(ProbeMessage),
-    Discovery(DiscoveryAnnouncement),
     Pairing(PairingOffer),
     Desktop(crate::desktop::DesktopMessage),
 }
@@ -113,37 +103,14 @@ impl WireMessage {
             Self::ReliableControl(_) => Family::ReliableControl,
             Self::Motion(_) => Family::Motion,
             Self::Probe(_) => Family::Probe,
-            Self::Discovery(_) => Family::Discovery,
             Self::Pairing(_) => Family::Pairing,
             Self::Desktop(_) => Family::Desktop,
         }
     }
 }
 
-/// An envelope extension. IDs are application-defined; unknown IDs are
-/// preserved and ignored by the core decoder, while duplicate IDs are invalid.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OptionalField {
-    pub id: u16,
-    pub value: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedMessage {
-    pub message: WireMessage,
-    pub optional_fields: Vec<OptionalField>,
-}
-
 pub fn encode(message: &WireMessage) -> Result<Vec<u8>, WireError> {
-    encode_with_options(message, &[])
-}
-
-pub fn encode_with_options(
-    message: &WireMessage,
-    optional_fields: &[OptionalField],
-) -> Result<Vec<u8>, WireError> {
     let encoded = prepare_payload(message)?;
-    let optional = encode_optional_fields(optional_fields)?;
     if encoded.payload.len() > encoded.family.maximum_payload_bytes() {
         return Err(WireError::SizeLimit {
             what: "payload",
@@ -158,17 +125,11 @@ pub fn encode_with_options(
             actual: encoded.payload.len(),
             maximum: u32::MAX as usize,
         })?;
-    let optional_length = u16::try_from(optional.len()).map_err(|_| WireError::SizeLimit {
-        what: "optional fields",
-        actual: optional.len(),
-        maximum: u16::MAX as usize,
-    })?;
 
     let mut bytes = Vec::with_capacity(
         FIXED_HEADER_BYTES
             + encoded.session.map_or(0, |_| 32)
             + encoded.channel.encoded_len()
-            + optional.len()
             + encoded.payload.len(),
     );
     bytes.extend_from_slice(&MAGIC);
@@ -176,13 +137,7 @@ pub fn encode_with_options(
     bytes.push(POSTCARD_CODEC);
     bytes.push(encoded.family as u8);
     bytes.push(encoded.message_type);
-    bytes.push(if encoded.session.is_some() {
-        FLAG_SESSION_CONTEXT
-    } else {
-        0
-    });
     bytes.extend_from_slice(&0_u16.to_le_bytes()); // no required feature bits in v1
-    bytes.extend_from_slice(&optional_length.to_le_bytes());
     bytes.extend_from_slice(&payload_length.to_le_bytes());
     bytes.extend_from_slice(&encoded.protocol_version.0.to_le_bytes());
 
@@ -192,38 +147,31 @@ pub fn encode_with_options(
         bytes.extend_from_slice(&session.activation_id.0.to_le_bytes());
     }
     encoded.channel.encode(&mut bytes);
-    bytes.extend_from_slice(&optional);
     bytes.extend_from_slice(&encoded.payload);
     Ok(bytes)
 }
 
-pub fn decode(bytes: &[u8]) -> Result<DecodedMessage, WireError> {
+pub fn decode(bytes: &[u8]) -> Result<WireMessage, WireError> {
     decode_inner(bytes, None)
 }
 
 /// Decodes only one family, rejecting a mismatch immediately after the bounded
 /// header parse. Fuzz targets use this to keep each decoder family independent.
-pub fn decode_family(bytes: &[u8], expected: Family) -> Result<DecodedMessage, WireError> {
+pub fn decode_family(bytes: &[u8], expected: Family) -> Result<WireMessage, WireError> {
     decode_inner(bytes, Some(expected))
 }
 
-fn decode_inner(bytes: &[u8], expected: Option<Family>) -> Result<DecodedMessage, WireError> {
-    let parsed = parse_envelope(bytes)?;
+fn decode_inner(bytes: &[u8], expected: Option<Family>) -> Result<WireMessage, WireError> {
+    let (header, payload) = parse_envelope(bytes)?;
     if let Some(expected) = expected
-        && parsed.header.family != expected
+        && header.family != expected
     {
         return Err(WireError::FamilyMismatch {
             expected,
-            actual: parsed.header.family,
+            actual: header.family,
         });
     }
-
-    let optional_fields = decode_optional_fields(parsed.optional)?;
-    let message = decode_payload(&parsed.header, parsed.payload)?;
-    Ok(DecodedMessage {
-        message,
-        optional_fields,
-    })
+    decode_payload(&header, payload)
 }
 
 struct EncodedPayload {
@@ -305,17 +253,6 @@ fn prepare_payload(message: &WireMessage) -> Result<EncodedPayload, WireError> {
                 payload: codec::encode(&message.payload)?,
             }
         }
-        WireMessage::Discovery(announcement) => {
-            let value = WireDiscoveryAnnouncement::try_from(announcement).map_err(bounds)?;
-            EncodedPayload {
-                family: Family::Discovery,
-                message_type: 1,
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                session: None,
-                channel: ChannelFields::None,
-                payload: codec::encode(&value)?,
-            }
-        }
         WireMessage::Desktop(message) => {
             message
                 .validate()
@@ -392,13 +329,7 @@ struct Header {
     channel: ChannelFields,
 }
 
-struct ParsedEnvelope<'a> {
-    header: Header,
-    optional: &'a [u8],
-    payload: &'a [u8],
-}
-
-fn parse_envelope(bytes: &[u8]) -> Result<ParsedEnvelope<'_>, WireError> {
+fn parse_envelope(bytes: &[u8]) -> Result<(Header, &[u8]), WireError> {
     if bytes.len() < FIXED_HEADER_BYTES {
         return Err(WireError::TooShort);
     }
@@ -422,21 +353,9 @@ fn parse_envelope(bytes: &[u8]) -> Result<ParsedEnvelope<'_>, WireError> {
             message_type,
         });
     }
-    let flags = cursor.u8()?;
-    if flags & !KNOWN_FLAGS != 0 {
-        return Err(WireError::InvalidFlags(flags));
-    }
     let required_features = cursor.u16()?;
     if required_features != 0 {
         return Err(WireError::UnknownRequiredFeatures(required_features));
-    }
-    let optional_length = usize::from(cursor.u16()?);
-    if optional_length > MAX_OPTIONAL_BYTES {
-        return Err(WireError::SizeLimit {
-            what: "optional fields",
-            actual: optional_length,
-            maximum: MAX_OPTIONAL_BYTES,
-        });
     }
     let payload_length = usize::try_from(cursor.u32()?).map_err(|_| WireError::SizeLimit {
         what: "payload",
@@ -453,13 +372,7 @@ fn parse_envelope(bytes: &[u8]) -> Result<ParsedEnvelope<'_>, WireError> {
     let protocol_version = ProtocolVersion(cursor.u16()?);
     check_protocol_version(protocol_version)?;
 
-    let has_session = flags & FLAG_SESSION_CONTEXT != 0;
-    if has_session != family.requires_session() {
-        return Err(WireError::InvalidEnvelope(
-            "session context presence does not match the family",
-        ));
-    }
-    let session = if has_session {
+    let session = if family.requires_session() {
         let mut epoch = [0_u8; 16];
         epoch.copy_from_slice(cursor.take(16)?);
         Some(SessionContext {
@@ -481,25 +394,17 @@ fn parse_envelope(bytes: &[u8]) -> Result<ParsedEnvelope<'_>, WireError> {
         _ => ChannelFields::None,
     };
 
-    let remaining_length = optional_length
-        .checked_add(payload_length)
-        .ok_or(WireError::LengthMismatch)?;
-    if cursor.remaining() != remaining_length {
+    if cursor.remaining() != payload_length {
         return Err(WireError::LengthMismatch);
     }
-    let optional = cursor.take(optional_length)?;
-    let payload = cursor.take(payload_length)?;
-    Ok(ParsedEnvelope {
-        header: Header {
-            family,
-            message_type,
-            protocol_version,
-            session,
-            channel,
-        },
-        optional,
-        payload,
-    })
+    let header = Header {
+        family,
+        message_type,
+        protocol_version,
+        session,
+        channel,
+    };
+    Ok((header, cursor.take(payload_length)?))
 }
 
 fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireError> {
@@ -578,10 +483,6 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
                 payload: value,
             }))
         }
-        Family::Discovery => {
-            let value: WireDiscoveryAnnouncement = codec::decode(payload)?;
-            Ok(WireMessage::Discovery(value.try_into().map_err(bounds)?))
-        }
         Family::Desktop => {
             let value: bounds::BoundedString<{ crate::desktop::MAX_MESSAGE_BYTES }> =
                 codec::decode(payload)?;
@@ -621,84 +522,6 @@ fn validate_reliable_context(
         ));
     }
     Ok(())
-}
-
-fn encode_optional_fields(fields: &[OptionalField]) -> Result<Vec<u8>, WireError> {
-    if fields.len() > MAX_OPTIONAL_FIELDS {
-        return Err(WireError::SizeLimit {
-            what: "optional field count",
-            actual: fields.len(),
-            maximum: MAX_OPTIONAL_FIELDS,
-        });
-    }
-    let mut ids = BTreeSet::new();
-    let mut encoded = Vec::new();
-    for field in fields {
-        if field.id == 0 {
-            return Err(WireError::InvalidEnvelope(
-                "optional field id zero is reserved",
-            ));
-        }
-        if !ids.insert(field.id) {
-            return Err(WireError::DuplicateOptionalField(field.id));
-        }
-        if field.value.len() > MAX_OPTIONAL_FIELD_BYTES {
-            return Err(WireError::SizeLimit {
-                what: "optional field",
-                actual: field.value.len(),
-                maximum: MAX_OPTIONAL_FIELD_BYTES,
-            });
-        }
-        let length = u16::try_from(field.value.len()).expect("field cap fits u16");
-        encoded.extend_from_slice(&field.id.to_le_bytes());
-        encoded.extend_from_slice(&length.to_le_bytes());
-        encoded.extend_from_slice(&field.value);
-    }
-    if encoded.len() > MAX_OPTIONAL_BYTES {
-        return Err(WireError::SizeLimit {
-            what: "optional fields",
-            actual: encoded.len(),
-            maximum: MAX_OPTIONAL_BYTES,
-        });
-    }
-    Ok(encoded)
-}
-
-fn decode_optional_fields(bytes: &[u8]) -> Result<Vec<OptionalField>, WireError> {
-    let mut cursor = Cursor::new(bytes);
-    let mut ids = BTreeSet::new();
-    let mut fields = Vec::new();
-    while cursor.remaining() != 0 {
-        if fields.len() == MAX_OPTIONAL_FIELDS {
-            return Err(WireError::SizeLimit {
-                what: "optional field count",
-                actual: fields.len() + 1,
-                maximum: MAX_OPTIONAL_FIELDS,
-            });
-        }
-        let id = cursor.u16()?;
-        if id == 0 {
-            return Err(WireError::InvalidEnvelope(
-                "optional field id zero is reserved",
-            ));
-        }
-        if !ids.insert(id) {
-            return Err(WireError::DuplicateOptionalField(id));
-        }
-        let length = usize::from(cursor.u16()?);
-        if length > MAX_OPTIONAL_FIELD_BYTES {
-            return Err(WireError::SizeLimit {
-                what: "optional field",
-                actual: length,
-                maximum: MAX_OPTIONAL_FIELD_BYTES,
-            });
-        }
-        fields.push(OptionalField {
-            id,
-            value: cursor.take(length)?.to_vec(),
-        });
-    }
-    Ok(fields)
 }
 
 struct Cursor<'a> {
@@ -753,6 +576,8 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     fn session() -> SessionContext {
@@ -878,19 +703,8 @@ mod tests {
                     echoed_at: MonotonicTimeMicros(111),
                 },
             }),
-            WireMessage::Discovery(DiscoveryAnnouncement {
-                ephemeral_instance_id: "ephemeral-7f31".into(),
-                protocol_versions: vec![CURRENT_PROTOCOL_VERSION],
-                capability_summary: InputCapabilities::from([
-                    InputCapability::Keyboard,
-                    InputCapability::Pointer,
-                ]),
-                candidates: vec!["192.0.2.1:43122".into(), "[2001:db8::1]:43122".into()],
-                rotating_token: Some([0x77; 16]),
-            }),
             WireMessage::Pairing(PairingOffer {
                 handshake_nonce: [0x33; 32],
-                method: PairingMethod::ShortAuthenticationString,
                 device_label: Some("workstation".into()),
                 input_port: 43119,
                 input_candidates: vec!["192.0.2.1:43119".into()],
@@ -902,16 +716,12 @@ mod tests {
     fn every_family_round_trips() {
         for message in corpus() {
             let bytes = encode(&message).unwrap();
-            let decoded = decode(&bytes).unwrap();
-            assert_eq!(decoded.message, message);
-            assert!(decoded.optional_fields.is_empty());
+            assert_eq!(decode(&bytes).unwrap(), message);
         }
     }
 
-    /// Payload bytes recorded before takeover, Leave and scroll phases were
-    /// retired. Every message still sent must keep its exact encoding.
     #[test]
-    fn retired_messages_leave_live_encodings_unchanged() {
+    fn every_control_message_round_trips_under_its_own_type() {
         let anchor = |kind| MotionAnchor {
             activation_id: session().activation_id,
             through_motion_sequence: MotionSequence(3),
@@ -927,150 +737,67 @@ mod tests {
         };
         let checkpoint = anchor(AnchorKind::Checkpoint);
         let cases = [
-            (ReliableControl::Enter, 1, "00"),
-            (
-                ReliableControl::KeyDown {
-                    key: HidUsage::keyboard(4),
-                },
-                3,
-                "020704",
-            ),
-            (
-                ReliableControl::KeyUp {
-                    key: HidUsage::consumer(0xe9),
-                },
-                4,
-                "030ce901",
-            ),
-            (
-                ReliableControl::ButtonDown {
-                    button: PointerButton::PRIMARY,
-                    anchor: checkpoint.clone(),
-                },
-                5,
-                "04010903e8070a03000e0000",
-            ),
-            (
-                ReliableControl::ButtonUp {
-                    button: PointerButton::SECONDARY,
-                    anchor: checkpoint.clone(),
-                },
-                6,
-                "05020903e8070a03000e0000",
-            ),
-            (
-                ReliableControl::TouchBegin {
-                    initial_state: touch_state(),
-                },
-                10,
-                "090201c80190030180040108010601b8170001800fb80802d804a006000000000000",
-            ),
-            (
-                ReliableControl::TouchEnd {
-                    anchor: checkpoint.clone(),
-                },
-                11,
-                "0a0903e8070a03000e0000",
-            ),
-            (
-                ReliableControl::TouchCancel {
-                    anchor: checkpoint.clone(),
-                },
-                12,
-                "0b0903e8070a03000e0000",
-            ),
-            (
-                ReliableControl::StateSnapshot(StateSnapshot {
-                    held,
-                    motion_anchor: checkpoint,
-                }),
-                13,
-                "0c01070401010000000903e8070a03000e0000",
-            ),
-            (
-                ReliableControl::SnapshotAck(SnapshotAck {
-                    snapshot_sequence: ControlSequence(4),
-                    accepted_generation: TransportGeneration(7),
-                }),
-                14,
-                "0d0407",
-            ),
-            (
-                ReliableControl::SessionClose {
-                    reason: SessionCloseReason::LocalRelease,
-                    final_anchor: Some(anchor(AnchorKind::Terminal)),
-                },
-                17,
-                "1000010903e8070a03000e0001",
-            ),
-            (
-                ReliableControl::SessionClose {
-                    reason: SessionCloseReason::PermissionRevoked,
-                    final_anchor: None,
-                },
-                17,
-                "100300",
-            ),
+            ReliableControl::Enter,
+            ReliableControl::KeyDown {
+                key: HidUsage::keyboard(4),
+            },
+            ReliableControl::KeyUp {
+                key: HidUsage::consumer(0xe9),
+            },
+            ReliableControl::ButtonDown {
+                button: PointerButton::PRIMARY,
+                anchor: checkpoint.clone(),
+            },
+            ReliableControl::ButtonUp {
+                button: PointerButton::SECONDARY,
+                anchor: checkpoint.clone(),
+            },
+            ReliableControl::TouchBegin {
+                initial_state: touch_state(),
+            },
+            ReliableControl::TouchEnd {
+                anchor: checkpoint.clone(),
+            },
+            ReliableControl::TouchCancel {
+                anchor: checkpoint.clone(),
+            },
+            ReliableControl::StateSnapshot(StateSnapshot {
+                held,
+                motion_anchor: checkpoint,
+            }),
+            ReliableControl::SnapshotAck(SnapshotAck {
+                snapshot_sequence: ControlSequence(4),
+                accepted_generation: TransportGeneration(7),
+            }),
+            ReliableControl::SessionClose {
+                reason: SessionCloseReason::LocalRelease,
+                final_anchor: Some(anchor(AnchorKind::Terminal)),
+            },
         ];
-        let payload_start = FIXED_HEADER_BYTES + 32 + 8;
-        for (payload, message_type, expected) in cases {
+        for (message_type, payload) in (1..).zip(cases) {
             let message = WireMessage::ReliableControl(ReliableControlMessage {
                 session: session(),
                 sequence: ControlSequence(5),
                 payload,
             });
             let bytes = encode(&message).unwrap();
-            let hex: String = bytes[payload_start..]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            assert_eq!((bytes[5], hex.as_str()), (message_type, expected));
-            assert_eq!(decode(&bytes).unwrap().message, message);
+            assert_eq!(bytes[5], message_type);
+            assert_eq!(decode(&bytes).unwrap(), message);
         }
     }
 
     #[test]
-    fn retired_control_types_are_rejected() {
+    fn unknown_control_types_are_rejected() {
         let mut bytes = encode(&corpus().remove(2)).unwrap();
-        for retired in [2, 7, 8, 9, 15, 16] {
-            bytes[5] = retired;
+        for unknown in [0, 12, 255] {
+            bytes[5] = unknown;
             assert_eq!(
                 decode(&bytes),
                 Err(WireError::UnknownMessageType {
                     family: Family::ReliableControl,
-                    message_type: retired,
+                    message_type: unknown,
                 })
             );
-        }
-    }
-
-    #[test]
-    fn retired_held_state_slots_must_stay_empty() {
-        let held = ReliableControl::StateSnapshot(StateSnapshot {
-            held: HeldState {
-                pressed_keys: BTreeSet::from([HidUsage::keyboard(4)]),
-                pressed_buttons: BTreeSet::from([PointerButton::PRIMARY]),
-                active_touch: TouchState::default(),
-            },
-            motion_anchor: MotionAnchor {
-                final_touch_state: TouchState::default(),
-                ..anchor()
-            },
-        });
-        let bytes = encode(&WireMessage::ReliableControl(ReliableControlMessage {
-            session: session(),
-            sequence: ControlSequence(1),
-            payload: held,
-        }))
-        .unwrap();
-        // Payload: variant, one key, one button, then the modifier count and
-        // the scroll option.
-        let payload = FIXED_HEADER_BYTES + 32 + 8;
-        for slot in [payload + 6, payload + 7] {
-            assert_eq!(bytes[slot], 0);
-            let mut filled = bytes.clone();
-            filled[slot] = 1;
-            assert!(matches!(decode(&filled), Err(WireError::Codec(_))));
         }
     }
 
@@ -1079,25 +806,6 @@ mod tests {
         let mut bytes = encode(&corpus().remove(4)).unwrap();
         bytes[3] = 2;
         assert_eq!(decode(&bytes), Err(WireError::UnknownCodec(2)));
-    }
-
-    #[test]
-    fn unknown_explicit_optional_fields_are_preserved() {
-        let message = corpus().remove(4);
-        let options = [
-            OptionalField {
-                id: 41,
-                value: vec![1, 2, 3],
-            },
-            OptionalField {
-                id: 900,
-                value: vec![4, 5],
-            },
-        ];
-        let bytes = encode_with_options(&message, &options).unwrap();
-        let decoded = decode(&bytes).unwrap();
-        assert_eq!(decoded.message, message);
-        assert_eq!(decoded.optional_fields, options);
     }
 
     #[test]
@@ -1126,7 +834,7 @@ mod tests {
     #[test]
     fn declared_oversize_payload_is_rejected_before_length_or_codec_work() {
         let mut bytes = encode(&corpus().remove(4)).unwrap();
-        bytes[11..15].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
             decode(&bytes),
             Err(WireError::SizeLimit {
@@ -1146,31 +854,14 @@ mod tests {
     }
 
     #[test]
-    fn strings_and_duplicate_optional_ids_are_bounded() {
+    fn strings_are_bounded() {
         let message = WireMessage::Pairing(PairingOffer {
             handshake_nonce: [0; 32],
-            method: PairingMethod::QrTranscript,
             device_label: Some("x".repeat(bounds::MAX_STRING_BYTES + 1)),
             input_port: 43119,
             input_candidates: Vec::new(),
         });
         assert!(matches!(encode(&message), Err(WireError::Bounds(_))));
-
-        let probe = corpus().remove(4);
-        let duplicate = [
-            OptionalField {
-                id: 7,
-                value: vec![],
-            },
-            OptionalField {
-                id: 7,
-                value: vec![],
-            },
-        ];
-        assert_eq!(
-            encode_with_options(&probe, &duplicate),
-            Err(WireError::DuplicateOptionalField(7))
-        );
     }
 
     #[test]
@@ -1215,7 +906,7 @@ mod tests {
             },
         });
         let bytes = encode(&message).unwrap();
-        assert_eq!(decode(&bytes).unwrap().message, message);
+        assert_eq!(decode(&bytes).unwrap(), message);
         let mut invalid = bytes;
         // Unknown families fail before metadata is interpreted.
         invalid[4] = 255;

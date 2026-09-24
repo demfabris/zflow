@@ -16,7 +16,7 @@ use zflow::{
         connect_input, connect_pairing, input_client_config, input_server_config,
         input_server_config_for_peers, pairing_client_config, pairing_server_config,
     },
-    wire::{CURRENT_PROTOCOL_VERSION, PairingMethod, PairingOffer, WireMessage, encode},
+    wire::{CURRENT_PROTOCOL_VERSION, PairingOffer, WireMessage, encode},
 };
 
 const LOOPBACK: SocketAddr =
@@ -420,14 +420,12 @@ async fn pairing_proves_rpk_possession_and_exports_the_same_transcript_binding()
     );
     let client_offer = PairingOffer {
         handshake_nonce: [0x11; 32],
-        method: PairingMethod::ShortAuthenticationString,
         device_label: Some("client".into()),
         input_port: 43119,
         input_candidates: vec!["127.0.0.1:43119".into()],
     };
     let server_offer = PairingOffer {
         handshake_nonce: [0x22; 32],
-        method: PairingMethod::ShortAuthenticationString,
         device_label: Some("server".into()),
         input_port: 43120,
         input_candidates: vec!["127.0.0.1:43120".into()],

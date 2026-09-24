@@ -186,7 +186,6 @@ The decoder MUST:
 - reject unknown required features;
 - cap message, collection, contact, and string lengths before allocation;
 - reject duplicate identifiers and invalid state transitions;
-- tolerate unknown optional fields;
 - expose a fuzz target for every message family.
 
 Payloads use postcard inside the bounded envelope; the decoder accepts no other codec. The logical model below is fixed for the first prototype.

@@ -155,17 +155,10 @@ impl TryFrom<WireTouchState> for TouchState {
     }
 }
 
-/// A retired wire slot. It has no values, so decoding one always fails.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Retired {}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WireHeldState {
     pressed_keys: BoundedVec<HidUsage, MAX_HELD_KEYS>,
     pressed_buttons: BoundedVec<PointerButton, MAX_HELD_BUTTONS>,
-    // Retired modifier and scroll slots, always empty.
-    modifiers: BoundedVec<Retired, MAX_MODIFIERS>,
-    active_scroll: Option<Retired>,
     active_touch: WireTouchState,
 }
 
@@ -182,8 +175,6 @@ impl TryFrom<&HeldState> for WireHeldState {
                 value.pressed_buttons.iter().copied().collect(),
                 "pressed_buttons",
             )?,
-            modifiers: BoundedVec::try_from_vec(Vec::new(), "modifiers")?,
-            active_scroll: None,
             active_touch: WireTouchState::try_from(&value.active_touch)?,
         })
     }
@@ -193,12 +184,6 @@ impl TryFrom<WireHeldState> for HeldState {
     type Error = BoundError;
 
     fn try_from(value: WireHeldState) -> Result<Self, Self::Error> {
-        if let Some(retired) = value.modifiers.as_slice().first() {
-            match *retired {}
-        }
-        if let Some(retired) = value.active_scroll {
-            match retired {}
-        }
         Ok(Self {
             pressed_keys: unique_set(value.pressed_keys, "pressed_keys")?,
             pressed_buttons: unique_set(value.pressed_buttons, "pressed_buttons")?,
@@ -275,11 +260,9 @@ impl TryFrom<WireStateSnapshot> for StateSnapshot {
     }
 }
 
-// Postcard encodes the variant index, so retired variants keep their slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum WireReliableControl {
     Enter,
-    Leave(Retired),
     KeyDown {
         key: HidUsage,
     },
@@ -294,9 +277,6 @@ pub(crate) enum WireReliableControl {
         button: PointerButton,
         anchor: WireMotionAnchor,
     },
-    ScrollBegin(Retired),
-    ScrollEnd(Retired),
-    ScrollCancel(Retired),
     TouchBegin {
         initial_state: WireTouchState,
     },
@@ -308,8 +288,6 @@ pub(crate) enum WireReliableControl {
     },
     StateSnapshot(WireStateSnapshot),
     SnapshotAck(SnapshotAck),
-    SessionTakeover(Retired),
-    TakeoverAccepted(Retired),
     SessionClose {
         reason: SessionCloseReason,
         final_anchor: Option<WireMotionAnchor>,
@@ -383,12 +361,6 @@ impl TryFrom<WireReliableControl> for ReliableControl {
                 Self::StateSnapshot(snapshot.try_into()?)
             }
             WireReliableControl::SnapshotAck(ack) => Self::SnapshotAck(ack),
-            WireReliableControl::Leave(retired)
-            | WireReliableControl::ScrollBegin(retired)
-            | WireReliableControl::ScrollEnd(retired)
-            | WireReliableControl::ScrollCancel(retired)
-            | WireReliableControl::SessionTakeover(retired)
-            | WireReliableControl::TakeoverAccepted(retired) => match retired {},
             WireReliableControl::SessionClose {
                 reason,
                 final_anchor,
@@ -404,22 +376,16 @@ impl WireReliableControl {
     pub(crate) fn message_type(&self) -> u8 {
         match self {
             Self::Enter => 1,
-            Self::KeyDown { .. } => 3,
-            Self::KeyUp { .. } => 4,
-            Self::ButtonDown { .. } => 5,
-            Self::ButtonUp { .. } => 6,
-            Self::TouchBegin { .. } => 10,
-            Self::TouchEnd { .. } => 11,
-            Self::TouchCancel { .. } => 12,
-            Self::StateSnapshot(_) => 13,
-            Self::SnapshotAck(_) => 14,
-            Self::Leave(retired)
-            | Self::ScrollBegin(retired)
-            | Self::ScrollEnd(retired)
-            | Self::ScrollCancel(retired)
-            | Self::SessionTakeover(retired)
-            | Self::TakeoverAccepted(retired) => match *retired {},
-            Self::SessionClose { .. } => 17,
+            Self::KeyDown { .. } => 2,
+            Self::KeyUp { .. } => 3,
+            Self::ButtonDown { .. } => 4,
+            Self::ButtonUp { .. } => 5,
+            Self::TouchBegin { .. } => 6,
+            Self::TouchEnd { .. } => 7,
+            Self::TouchCancel { .. } => 8,
+            Self::StateSnapshot(_) => 9,
+            Self::SnapshotAck(_) => 10,
+            Self::SessionClose { .. } => 11,
         }
     }
 }
@@ -465,18 +431,10 @@ impl WireMotionBody {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PairingMethod {
-    ShortAuthenticationString,
-    QrTranscript,
-    Spake2,
-}
-
 /// Metadata exchanged only after the pairing-only TLS handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingOffer {
     pub handshake_nonce: [u8; 32],
-    pub method: PairingMethod,
     pub device_label: Option<String>,
     pub input_port: u16,
     pub input_candidates: Vec<String>,
@@ -485,7 +443,6 @@ pub struct PairingOffer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WirePairingOffer {
     handshake_nonce: [u8; 32],
-    method: PairingMethod,
     device_label: Option<BoundedString<MAX_STRING_BYTES>>,
     input_port: u16,
     input_candidates: BoundedVec<BoundedString<MAX_STRING_BYTES>, MAX_DISCOVERY_CANDIDATES>,
@@ -497,7 +454,6 @@ impl TryFrom<&PairingOffer> for WirePairingOffer {
     fn try_from(value: &PairingOffer) -> Result<Self, Self::Error> {
         Ok(Self {
             handshake_nonce: value.handshake_nonce,
-            method: value.method,
             device_label: value
                 .device_label
                 .clone()
@@ -523,84 +479,12 @@ impl TryFrom<WirePairingOffer> for PairingOffer {
     fn try_from(value: WirePairingOffer) -> Result<Self, Self::Error> {
         Ok(Self {
             handshake_nonce: value.handshake_nonce,
-            method: value.method,
             device_label: value.device_label.map(BoundedString::into_string),
             input_port: value.input_port,
             input_candidates: unique_vec(value.input_candidates, "input_candidates")?
                 .into_iter()
                 .map(BoundedString::into_string)
                 .collect(),
-        })
-    }
-}
-
-/// Privacy-preserving discovery data. Candidate strings are transport addresses,
-/// not trusted identities.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveryAnnouncement {
-    pub ephemeral_instance_id: String,
-    pub protocol_versions: Vec<ProtocolVersion>,
-    pub capability_summary: InputCapabilities,
-    pub candidates: Vec<String>,
-    pub rotating_token: Option<[u8; 16]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WireDiscoveryAnnouncement {
-    ephemeral_instance_id: BoundedString<MAX_STRING_BYTES>,
-    protocol_versions: BoundedVec<ProtocolVersion, MAX_PROTOCOL_VERSIONS>,
-    capability_summary: BoundedVec<InputCapability, MAX_CAPABILITIES>,
-    candidates: BoundedVec<BoundedString<MAX_STRING_BYTES>, MAX_DISCOVERY_CANDIDATES>,
-    rotating_token: Option<[u8; 16]>,
-}
-
-impl TryFrom<&DiscoveryAnnouncement> for WireDiscoveryAnnouncement {
-    type Error = BoundError;
-
-    fn try_from(value: &DiscoveryAnnouncement) -> Result<Self, Self::Error> {
-        Ok(Self {
-            ephemeral_instance_id: BoundedString::try_from_string(
-                value.ephemeral_instance_id.clone(),
-                "ephemeral_instance_id",
-            )?,
-            protocol_versions: BoundedVec::try_from_vec(
-                value.protocol_versions.clone(),
-                "protocol_versions",
-            )?,
-            capability_summary: BoundedVec::try_from_vec(
-                value.capability_summary.iter().collect(),
-                "capability_summary",
-            )?,
-            candidates: BoundedVec::try_from_vec(
-                value
-                    .candidates
-                    .iter()
-                    .cloned()
-                    .map(|candidate| BoundedString::try_from_string(candidate, "candidate"))
-                    .collect::<Result<_, _>>()?,
-                "candidates",
-            )?,
-            rotating_token: value.rotating_token,
-        })
-    }
-}
-
-impl TryFrom<WireDiscoveryAnnouncement> for DiscoveryAnnouncement {
-    type Error = BoundError;
-
-    fn try_from(value: WireDiscoveryAnnouncement) -> Result<Self, Self::Error> {
-        Ok(Self {
-            ephemeral_instance_id: value.ephemeral_instance_id.into_string(),
-            protocol_versions: unique_vec(value.protocol_versions, "protocol_versions")?,
-            capability_summary: InputCapabilities::new(unique_vec(
-                value.capability_summary,
-                "capability_summary",
-            )?),
-            candidates: unique_vec(value.candidates, "candidates")?
-                .into_iter()
-                .map(BoundedString::into_string)
-                .collect(),
-            rotating_token: value.rotating_token,
         })
     }
 }
