@@ -1,5 +1,7 @@
 # Give the locked zflow service account access to the uinput control node.
-ACTION=="add|change", SUBSYSTEM=="misc", KERNEL=="uinput", TAG-="uaccess", GROUP="zflow", MODE="0660", OPTIONS+="static_node=uinput"
+# Leave the uaccess tag alone: udev's static-node pass ignores TAG-= and adds
+# the tag instead, which lets logind grant the desktop user access.
+ACTION=="add|change", SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="zflow", MODE="0660", OPTIONS+="static_node=uinput"
 
 # Stable roles for zflow's virtual devices. The capture backend also
 # checks the kernel identifiers, but these properties let setup and future

@@ -35,7 +35,7 @@ systemctl() { echo "${SYSTEMD_VERSION-259}"; }
 udevadm() { echo verify; }
 gjs() { echo "${GTK_VERSIONS:-4.12 1.5}"; }
 gnome-extensions() { record "extension $*"; }
-for tool in getent groupadd useradd runuser setfacl modprobe systemd-analyze; do
+for tool in getent groupadd useradd runuser modprobe systemd-analyze; do
     eval "$tool() { :; }"
 done
 for tool in cargo rustup rustc swift xcrun xcode-select cc make; do
@@ -120,7 +120,7 @@ class InstallerTest(unittest.TestCase):
     def test_linux_archive_install_never_builds(self):
         self.run_shell("main --yes --no-launch")
         calls = self.calls()
-        self.assertIn("root apt-get install -y acl", calls)
+        self.assertIn("root apt-get install -y kmod", calls)
         self.assertIn("gir1.2-adw-1", calls)
         self.assertIn("/payload/scripts/install.sh --install-built", calls)
         self.assertIn("user installed-zflow desktop-agent --install", calls)

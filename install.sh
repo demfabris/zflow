@@ -65,16 +65,16 @@ cleanup() {
 linux_dependencies() {
     local packages=()
     if command -v apt-get >/dev/null 2>&1; then
-        packages=(acl kmod udev passwd util-linux)
+        packages=(kmod udev passwd util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gir1.2-gtk-4.0 gir1.2-adw-1); fi
         as_root apt-get update
         as_root apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
-        packages=(acl kmod systemd-udev shadow-utils util-linux)
+        packages=(kmod systemd-udev shadow-utils util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita); fi
         as_root dnf install -y "${packages[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        packages=(acl kmod systemd shadow util-linux)
+        packages=(kmod systemd shadow util-linux)
         if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita); fi
         # Do not refresh the package database without upgrading the whole system.
         as_root pacman -S --needed --noconfirm "${packages[@]}"
@@ -87,7 +87,7 @@ check_linux() {
     require systemctl
     [[ -n "$(systemctl show --property=Version --value 2>/dev/null)" ]] || die 'Linux installation requires a running systemd system manager.'
     local command
-    for command in getent groupadd useradd runuser setfacl modprobe systemd-analyze udevadm; do require "$command"; done
+    for command in getent groupadd useradd runuser modprobe systemd-analyze udevadm; do require "$command"; done
     udevadm --help | grep 'verify' >/dev/null || die 'udevadm verify is required (systemd 254 or newer).'
     if [[ "$desktop" == true ]]; then
         require gjs

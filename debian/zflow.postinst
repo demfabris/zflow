@@ -38,9 +38,6 @@ if [[ "$1" == configure ]]; then
         udevadm trigger --action=change --subsystem-match=input
         udevadm settle
         [[ -c /dev/uinput ]] || die 'uinput is unavailable'
-        setfacl --remove-all /dev/uinput
-        chown root:zflow /dev/uinput
-        chmod 0660 /dev/uinput
         runuser -u zflow -- /usr/bin/test -w /dev/uinput
     fi
 fi

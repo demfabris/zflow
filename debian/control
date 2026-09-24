@@ -9,7 +9,7 @@ Rules-Requires-Root: no
 
 Package: zflow
 Architecture: amd64 arm64
-Depends: ${shlibs:Depends}, ${misc:Depends}, passwd, acl, kmod, udev (>= 254), systemd (>= 254)
+Depends: ${shlibs:Depends}, ${misc:Depends}, passwd, kmod, udev (>= 254), systemd (>= 254)
 Recommends: gjs, gir1.2-gtk-4.0 (>= 4.12), gir1.2-adw-1 (>= 1.5)
 Description: Keyboard, pointer and trackpad sharing for GNOME and macOS
  Shares input with paired computers over authenticated QUIC.
