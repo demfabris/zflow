@@ -1,6 +1,6 @@
 # zflow test plan
 
-> Release gates for beta and 1.0. The prototype gates (property tests, simulator, fuzz targets) live in SPEC.md under Validation. Snapshot 2026-08-31; refresh version claims before running a matrix.
+> Release gates for beta and 1.0. The prototype gates (property tests, deterministic protocol tests, fuzz targets) live in SPEC.md under Validation. Snapshot 2026-08-31; refresh version claims before running a matrix.
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 

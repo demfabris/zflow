@@ -84,8 +84,6 @@ enum Command {
         #[arg(long)]
         percentile: Option<f64>,
     },
-    /// Run the deterministic protocol failure simulator.
-    Simulate,
 }
 
 #[derive(Debug, Subcommand)]
@@ -234,7 +232,6 @@ impl From<Command> for zflow::cli::Command {
                 maximum_delay_ms,
                 percentile,
             },
-            Command::Simulate => Self::Simulate,
         }
     }
 }

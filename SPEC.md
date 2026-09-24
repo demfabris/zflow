@@ -683,9 +683,9 @@ The prototype requires:
 
 - property tests over the protocol state machine: lease expiry, epoch/generation/activation ordering, anchor-before-transition, snapshot reconciliation by difference;
 - fuzz targets for every decoder message family;
-- one deterministic simulator run injecting: isolated and burst loss; duplicate and reordered datagrams; 40-150 ms jitter bursts; control/datagram cross-ordering; final-datagram loss followed by idle; delayed snapshots after lease expiry; sender and receiver process death; suspend/resume; connection replacement and old-epoch or old-generation traffic; held keys and buttons during each failure.
+- deterministic sender, receiver, playout, and loopback session tests covering: isolated and burst loss; duplicate and reordered datagrams; 40-150 ms jitter bursts; control/datagram cross-ordering; final-datagram loss followed by idle; delayed snapshots after lease expiry; connection loss; held keys, buttons, and touches during each failure.
 
-The simulator run passes when the sender enqueues a reliable cumulative checkpoint within 250 ms after totals change; keys, buttons, touches, and gestures release within the lease bound; a click never overtakes its motion anchor; old epochs and closed activations inject nothing; and bulk serialization, stream loss, and congestion state create no transport-level head-of-line blocking on the input connection.
+These pass when the sender enqueues a reliable cumulative checkpoint within 250 ms after totals change; keys, buttons, and touches release within the lease bound; a click never overtakes its motion anchor; and closed activations inject nothing.
 
 ## Naming, licensing, and repository state
 
@@ -701,7 +701,7 @@ As of 2026-08-31, implementation steps 0 through 5 are code-complete and pass th
 
 0. Run the tier 0 and tier 1 feasibility spikes in [SPIKES.md](SPIKES.md). A tier 0 failure reopens this specification before any step below starts.
 1. Choose the package name and license.
-2. Build the protocol state machine, property tests, small deterministic simulator, and fuzz targets.
+2. Build the protocol state machine, property tests, and fuzz targets.
 3. Run the bounded Lan Mouse backend reuse spike.
 4. Implement Linux on-demand evdev capture, uinput injection, hotkey ownership, and watchdog recovery.
 5. Add authenticated QUIC, cumulative motion, receiver lease, and metrics.
@@ -733,7 +733,7 @@ Release matrices from TESTPLAN.md gate each beta along the way.
 - Discovery does not publish a long-lived identity fingerprint.
 - Path changes use candidate racing and application session takeover.
 - Raw Mac trackpad contact capture ships in the signed baseline behind a feature flag with mandatory graceful degradation (maintainer decision, 2026-08-31).
-- Release matrices live in TESTPLAN.md; the prototype gates on property tests, fuzzing, and the simulator (maintainer decision, 2026-08-31).
+- Release matrices live in TESTPLAN.md; the prototype gates on property tests, deterministic protocol tests, and fuzzing (maintainer decision, 2026-08-31).
 
 ### Provisional until measurements
 

@@ -1,4 +1,4 @@
-//! Pure domain types shared by protocol, simulator, and platform adapters.
+//! Pure domain types shared by protocol and platform adapters.
 //!
 //! This module deliberately models semantics rather than a wire encoding. The
 //! encoding is still an open protocol decision, while the channel split and

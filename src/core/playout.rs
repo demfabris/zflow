@@ -1080,6 +1080,49 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_frames_repair_loss_and_play_repeats_once() {
+        fn drain(playout: &mut ReceiverPlayout, now: u64) -> i64 {
+            let mut dx = 0;
+            while let Some(step) = playout.poll(time(now)).unwrap() {
+                dx += step.delta.dx;
+            }
+            dx
+        }
+        let clock = identity_clock();
+        let mut playout = ReceiverPlayout::new(unbounded_test_config(), session(1)).unwrap();
+
+        // Frame 1 is lost, frame 3 overtakes frame 2, and frame 3 arrives twice.
+        playout
+            .ingest_frame(frame(3, 3_000, 30, 0), time(4_000), &clock)
+            .unwrap();
+        playout
+            .ingest_frame(frame(2, 2_000, 20, 0), time(4_500), &clock)
+            .unwrap();
+        assert_eq!(
+            playout
+                .ingest_frame(frame(3, 3_000, 30, 0), time(4_600), &clock)
+                .unwrap(),
+            EnqueueOutcome::Duplicate
+        );
+        assert_eq!(drain(&mut playout, 50_000), 30);
+
+        // Frames 4 and 5 are lost as a burst; frame 6 carries their totals.
+        playout
+            .ingest_frame(frame(6, 6_000, 60, 0), time(51_000), &clock)
+            .unwrap();
+        assert_eq!(drain(&mut playout, 100_000), 30);
+
+        // Late and repeated frames are already covered by the newer target.
+        for late in [frame(2, 2_000, 20, 0), frame(6, 6_000, 60, 0)] {
+            assert_eq!(
+                playout.ingest_frame(late, time(100_000), &clock).unwrap(),
+                EnqueueOutcome::RetiredByCumulativeTarget
+            );
+        }
+        assert_eq!(drain(&mut playout, 100_000), 0);
+    }
+
+    #[test]
     fn jitter_burst_grows_fast_counts_late_frames_and_conserves_final_totals() {
         let clock = identity_clock();
         let mut playout = ReceiverPlayout::new(PlayoutConfig::default(), session(1)).unwrap();

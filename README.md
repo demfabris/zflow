@@ -369,7 +369,6 @@ with `journalctl -u zflowd -o short-iso-precise --since "10 minutes ago"`.
 ```sh
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
-cargo run --bin zflow -- simulate
 cargo check --manifest-path fuzz/Cargo.toml --bins
 ```
 

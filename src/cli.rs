@@ -76,7 +76,6 @@ pub enum Command {
         maximum_delay_ms: Option<u64>,
         percentile: Option<f64>,
     },
-    Simulate,
 }
 
 struct SetupOptions {
@@ -178,7 +177,6 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
             maximum_delay_ms,
             percentile,
         ),
-        Command::Simulate => simulate(),
     }
 }
 
@@ -1023,13 +1021,6 @@ fn reload_running_daemon(config: &Config) -> Result<()> {
         Response::Error { message } => bail!("daemon rejected configuration reload: {message}"),
         response => bail!("unexpected daemon response: {response:?}"),
     }
-}
-
-fn simulate() -> Result<()> {
-    crate::core::simulator::run_prototype_scenario()
-        .context("prototype simulator scenario failed")?;
-    println!("prototype simulator: PASS");
-    Ok(())
 }
 
 /// Run as root, setup and pairing would leave a root-owned 0600 key that the

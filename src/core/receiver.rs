@@ -1136,7 +1136,8 @@ mod tests {
 
     use super::*;
     use crate::core::{
-        ProtocolVersion, SessionEpoch, SessionTakeover, StateSnapshot, TakeoverNonce,
+        ProtocolVersion, Sender, SenderConfig, SenderTick, SessionEpoch, SessionTakeover,
+        StateSnapshot, TakeoverNonce,
     };
 
     fn context(epoch: u8, generation: u64, activation: u64) -> SessionContext {
@@ -1740,6 +1741,124 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn lease_expiry_releases_keys_buttons_and_touch() {
+        let session = context(1, 1, 1);
+        let mut receiver = receiver(100);
+        enter(&mut receiver, session, 0);
+        for (sequence, payload) in [
+            (
+                2,
+                ReliableControl::KeyDown {
+                    key: HidUsage::keyboard(5),
+                },
+            ),
+            (
+                3,
+                ReliableControl::ButtonDown {
+                    button: PointerButton::SECONDARY,
+                    anchor: anchor(session, 0, 0),
+                },
+            ),
+            (
+                4,
+                ReliableControl::TouchBegin {
+                    initial_state: one_finger(),
+                },
+            ),
+        ] {
+            receiver
+                .receive_control(
+                    ReliableControlMessage {
+                        session,
+                        sequence: ControlSequence(sequence),
+                        payload,
+                    },
+                    MonotonicTimeMicros(0),
+                )
+                .unwrap();
+        }
+
+        let effects = receiver.tick(MonotonicTimeMicros(100_000)).unwrap();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ReceiverEffect::Key {
+                pressed: false,
+                synthetic: true,
+                ..
+            }
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ReceiverEffect::Button {
+                pressed: false,
+                synthetic: true,
+                ..
+            }
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ReceiverEffect::TouchReplaced { state, synthetic: true } if state.is_empty()
+        )));
+        assert!(receiver.active_context().is_none());
+    }
+
+    #[test]
+    fn idle_checkpoint_repairs_a_lost_final_datagram() {
+        let session = context(1, 1, 1);
+        let mut sender = Sender::new(
+            SenderConfig::new(Duration::from_millis(250), Duration::from_millis(900)).unwrap(),
+            session,
+            MonotonicTimeMicros(0),
+        )
+        .unwrap();
+        let mut receiver = receiver(900);
+        enter(&mut receiver, session, 0);
+        sender.enter(MonotonicTimeMicros(0)).unwrap();
+
+        // The only datagram is lost and the source goes idle.
+        let captured_at = MonotonicTimeMicros(1_000);
+        sender
+            .capture_motion(
+                MotionDelta {
+                    dx: 7,
+                    ..MotionDelta::default()
+                },
+                None,
+                captured_at,
+            )
+            .unwrap();
+        let checkpoint_at = sender.next_deadline().unwrap();
+        assert!(checkpoint_at.0 - captured_at.0 <= 250_000);
+        let SenderTick::Checkpoint(checkpoint) = sender.tick(checkpoint_at).unwrap() else {
+            panic!("idle loss did not enqueue a checkpoint");
+        };
+
+        let effects = receiver
+            .receive_control(*checkpoint, checkpoint_at)
+            .unwrap();
+        assert_eq!(motion_dx(&effects), 7);
+        assert_eq!(
+            receiver.activation.as_ref().unwrap().injected_totals,
+            CumulativeMotion::new(7, 0, 0, 0)
+        );
+    }
+
+    fn one_finger() -> TouchState {
+        TouchState::new([crate::core::TouchContact {
+            id: crate::core::ContactId(1),
+            x: 0,
+            y: 0,
+            pressure: None,
+            major: None,
+            minor: None,
+            orientation_millidegrees: None,
+            tool: crate::core::TouchTool::Finger,
+            source_dimensions: None,
+        }])
+        .unwrap()
     }
 
     #[test]

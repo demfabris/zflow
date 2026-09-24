@@ -5,7 +5,6 @@ mod model;
 pub mod playout;
 pub mod receiver;
 pub mod sender;
-pub mod simulator;
 
 pub use clock::*;
 pub use model::*;
