@@ -1,7 +1,7 @@
 use super::displays::Desktop;
 use crate::config::Config;
 use anyhow::Result;
-use std::{collections::BTreeMap, sync::mpsc, thread::JoinHandle};
+use std::{collections::BTreeMap, net::SocketAddr, sync::mpsc, thread::JoinHandle};
 
 #[derive(Default)]
 pub(super) struct ProbeResult {
@@ -14,7 +14,7 @@ pub(super) struct Probe {
     result: mpsc::Receiver<Result<ProbeResult>>,
 }
 impl Probe {
-    pub fn start(config: Config) -> Result<Self> {
+    pub fn start(config: Config, nearby: Vec<SocketAddr>) -> Result<Self> {
         let (sender, result) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("zflow-receiver-check".into())
@@ -26,7 +26,7 @@ impl Probe {
                         .block_on(async {
                             let mut result = ProbeResult::default();
                             for name in config.peers.keys() {
-                                match crate::macos::receiver_snapshot(&config, name)
+                                match crate::macos::receiver_snapshot(&config, name, &nearby)
                                     .await
                                     .and_then(|g| g.bounds())
                                 {

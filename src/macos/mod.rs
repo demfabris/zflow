@@ -3,6 +3,7 @@
 mod awdl;
 
 use std::{
+    collections::BTreeSet,
     ffi::CStr,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::raw::c_char,
@@ -28,7 +29,7 @@ use crate::{
     desktop::{DesktopRequest, DesktopResponse, Edge},
     identity::Identity,
     session::{SessionEventKind, SessionOptions, start_session},
-    transport::{InputClientConfig, connect_input, input_client_config},
+    transport::{InputClientConfig, InputConnection, connect_input, input_client_config},
     wire::CURRENT_PROTOCOL_VERSION,
 };
 
@@ -41,6 +42,8 @@ const SECURE_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const SECURE_INPUT_RETURNED: &str = "Secure keyboard entry turned on in a Mac app, so typing \
     could not be shared. Input returned to the Mac";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// A working pinned address wins before other hosts on the network are tried.
+const NEARBY_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Debug)]
 pub struct SourceOptions {
@@ -48,6 +51,8 @@ pub struct SourceOptions {
     pub config: Option<Config>,
     pub peer: String,
     pub address: Option<SocketAddr>,
+    /// Discovered receiver addresses, tried after the peer's own addresses.
+    pub nearby: Vec<SocketAddr>,
     pub raw_touch: bool,
     pub reduce_wifi_latency: bool,
     pub handoff: Option<HandoffOptions>,
@@ -312,6 +317,7 @@ impl Drop for SourceEndpoint {
 pub(crate) async fn receiver_snapshot(
     config: &Config,
     name: &str,
+    nearby: &[SocketAddr],
 ) -> Result<crate::desktop::Geometry> {
     let _guard = SourceGuard::acquire()?;
     let peer = config.peers.get(name).context("Unknown paired computer")?;
@@ -332,11 +338,7 @@ pub(crate) async fn receiver_snapshot(
     let endpoint = SourceEndpoint(Endpoint::client(bind)?);
     let (events, _received) = mpsc::channel(128);
     let result = async {
-        let connection = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            connect_input(&endpoint.0, address, &client),
-        )
-        .await??;
+        let (_, connection) = connect_peer(&endpoint.0, &client, &peer.addresses, nearby).await?;
         let session = start_session(
             connection,
             name.to_owned(),
@@ -398,9 +400,11 @@ async fn run_source(
     }
     config.input.experimental_touchpad = raw_available;
 
-    let address = options
+    let pinned = options
         .address
-        .or_else(|| peer.addresses.first().copied())
+        .map_or_else(|| peer.addresses.clone(), |address| vec![address]);
+    let address = *pinned
+        .first()
         .with_context(|| format!("peer {} has no input address", options.peer))?;
     let identity = Identity::load_or_create(&config.daemon.state_dir)?;
     let client_config = input_client_config(&identity, &peer.spki_der()?)?;
@@ -412,7 +416,7 @@ async fn run_source(
     run_endpoint(
         &endpoint,
         &client_config,
-        address,
+        pinned,
         config,
         options,
         stop,
@@ -424,7 +428,7 @@ async fn run_source(
 async fn run_endpoint(
     endpoint: &SourceEndpoint,
     client_config: &InputClientConfig,
-    address: SocketAddr,
+    pinned: Vec<SocketAddr>,
     config: Config,
     mut options: SourceOptions,
     stop: &mut watch::Receiver<bool>,
@@ -434,15 +438,14 @@ async fn run_endpoint(
     let result = async {
     let raw_available = config.input.experimental_touchpad;
     let connecting = Instant::now();
-    tracing::info!(peer = %options.peer, %address, "input connection starting");
-    println!("connecting to {} at {address}", options.peer);
+    tracing::info!(peer = %options.peer, ?pinned, nearby = options.nearby.len(), "input connection starting");
+    println!("connecting to {} at {pinned:?}", options.peer);
     let (session_events, mut events) = mpsc::channel(128);
     let session = {
         let setup = async {
-            let connection = tokio::time::timeout(
-                CONNECT_TIMEOUT, connect_input(&endpoint.0, address, client_config),
-            ).await.context("input connection timed out")??;
-            tracing::info!(elapsed_ms = connecting.elapsed().as_millis() as u64,
+            let (address, connection) =
+                connect_peer(&endpoint.0, client_config, &pinned, &options.nearby).await?;
+            tracing::info!(%address, elapsed_ms = connecting.elapsed().as_millis() as u64,
                 "QUIC connection established");
             let negotiating = Instant::now();
             let session = start_session(connection, options.peer.clone(), TransportGeneration(1),
@@ -887,6 +890,54 @@ fn validate_finished(response: Result<DesktopResponse>) -> Result<()> {
         }
         _ => bail!("receiver did not confirm desktop handoff cleanup"),
     }
+}
+
+/// Race the peer's pinned addresses, then discovered receivers after a short
+/// delay, all within one timeout. SPKI pinning rejects every host that is not
+/// this peer, so unverified addresses are safe to try.
+async fn connect_peer(
+    endpoint: &Endpoint,
+    client: &InputClientConfig,
+    pinned: &[SocketAddr],
+    nearby: &[SocketAddr],
+) -> Result<(SocketAddr, InputConnection)> {
+    let ipv4 = pinned
+        .first()
+        .context("Computer has no input address")?
+        .is_ipv4();
+    let mut tried = BTreeSet::new();
+    let mut attempts = tokio::task::JoinSet::new();
+    let candidates = pinned.iter().map(|address| (*address, Duration::ZERO));
+    let candidates = candidates.chain(nearby.iter().map(|address| (*address, NEARBY_DELAY)));
+    // The endpoint is bound to the family of the first pinned address.
+    for (address, delay) in candidates.filter(|(address, _)| address.is_ipv4() == ipv4) {
+        if !tried.insert(address) {
+            continue;
+        }
+        let (endpoint, client) = (endpoint.clone(), client.clone());
+        attempts.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let connection = connect_input(&endpoint, address, &client)
+                .await
+                .with_context(|| format!("could not connect to {address}"))?;
+            Ok::<_, anyhow::Error>((address, connection))
+        });
+    }
+    tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let mut failure = anyhow!("no input address to try");
+        while let Some(attempt) = attempts.join_next().await {
+            match attempt
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+            {
+                Ok(connected) => return Ok(connected),
+                Err(error) => failure = error,
+            }
+        }
+        Err(failure)
+    })
+    .await
+    .context("input connection timed out")?
 }
 
 /// Resolves only when a held AWDL lease fails to renew.
@@ -1340,6 +1391,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_finds_a_moved_peer_and_rejects_other_receivers() {
+        use crate::transport::{accept_input, input_server_config};
+
+        let directories = [(); 3].map(|_| tempfile::tempdir().unwrap());
+        let [mac, linux, stranger] =
+            [0, 1, 2].map(|index| Identity::load_or_create(directories[index].path()).unwrap());
+        let client = input_client_config(&mac, linux.spki()).unwrap();
+        let mut servers = Vec::new();
+        for identity in [&stranger, &linux] {
+            let config = input_server_config(identity, mac.spki()).unwrap();
+            let server =
+                Endpoint::server(config.quinn_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+            let accepting = server.clone();
+            tokio::spawn(async move {
+                let mut accepted = Vec::new();
+                while let Some(incoming) = accepting.accept().await {
+                    accepted.push(accept_input(incoming, &config).await);
+                }
+            });
+            servers.push(server);
+        }
+        let [stranger, linux] = [&servers[0], &servers[1]].map(|s| s.local_addr().unwrap());
+        // The pinned address stopped answering, as after a DHCP change.
+        let stale = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (address, _connection) = connect_peer(
+            &endpoint,
+            &client,
+            &[stale.local_addr().unwrap()],
+            &[stranger, linux],
+        )
+        .await
+        .unwrap();
+        assert_eq!(address, linux);
+        assert!(
+            connect_peer(&endpoint, &client, &[stranger], &[])
+                .await
+                .is_err()
+        );
+        endpoint.close(0_u32.into(), b"test finished");
+        for server in servers {
+            server.close(0_u32.into(), b"test finished");
+        }
+    }
+
+    #[tokio::test]
     async fn raw_touch_needs_a_receiver_that_negotiates_touch() {
         use crate::transport::{accept_input, input_server_config};
 
@@ -1600,6 +1697,7 @@ mod tests {
                     config_path: PathBuf::from("/nonexistent-zflow-test-config"),
                     peer: "unused".into(),
                     address: None,
+                    nearby: Vec::new(),
                     raw_touch: false,
                     reduce_wifi_latency: false,
                     handoff: None,

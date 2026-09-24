@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         config: None,
         peer: args.peer,
         address: args.address,
+        nearby: Vec::new(),
         raw_touch: !args.no_touch,
         reduce_wifi_latency: args.reduce_wifi_latency,
         handoff: None,

@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     thread::JoinHandle,
     time::Instant,
@@ -42,6 +43,7 @@ pub(super) struct Observer {
     previous: Option<Point>,
     pub notice: String,
     pub reduce_wifi_latency: bool,
+    pub nearby: Vec<SocketAddr>,
     pub pause_requested: bool,
 }
 
@@ -56,6 +58,7 @@ impl Default for Observer {
             previous: None,
             notice: "Sharing is off.".into(),
             reduce_wifi_latency: false,
+            nearby: Vec::new(),
             pause_requested: false,
         }
     }
@@ -286,6 +289,7 @@ impl Observer {
             config: self.config.clone(),
             peer: handoff.peer.clone(),
             address: None,
+            nearby: self.nearby.clone(),
             raw_touch: true,
             reduce_wifi_latency: self.reduce_wifi_latency,
             handoff: Some(macos::HandoffOptions {

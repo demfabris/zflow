@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    net::SocketAddr,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -247,6 +248,7 @@ impl NativeApp {
             } else {
                 self.nearby.stop();
             }
+            self.observer.nearby = self.nearby_addresses();
             if let Err(error) = self.sync_layout() {
                 self.layout_error = Some(format!("{error:#}"));
             }
@@ -291,7 +293,7 @@ impl NativeApp {
             return;
         }
         if !self.checked && !self.observer.is_enabled() && Instant::now() >= self.retry_at {
-            match Probe::start(config.clone()) {
+            match Probe::start(config.clone(), self.nearby_addresses()) {
                 Ok(probe) => self.probe = Some(probe),
                 Err(error) => {
                     self.receiver_error = Some(error.to_string());
@@ -317,6 +319,16 @@ impl NativeApp {
                 }
             }
         }
+    }
+
+    /// Discovered receivers let a connection find a peer whose address changed.
+    /// Each connection still pins the peer's key, so other hosts are rejected.
+    fn nearby_addresses(&self) -> Vec<SocketAddr> {
+        let records = self.nearby.snapshot().records.into_values();
+        records
+            .filter(|record| record.compatible)
+            .flat_map(|record| record.addresses)
+            .collect()
     }
 
     fn sync_layout(&mut self) -> Result<()> {
