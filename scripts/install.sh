@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 readonly SCRIPT_DIR REPO_ROOT
 readonly BIN_DIR="/usr/local/bin"
+readonly LIB_DIR="/usr/local/lib/zflow"
+readonly UNINSTALLER="$LIB_DIR/uninstall.sh"
 readonly UNIT_FILE="/etc/systemd/system/zflowd.service"
 readonly DROPIN_DIR="/etc/systemd/system/zflowd.service.d"
 # Older installs ordered zflowd before the display manager on every boot.
@@ -55,6 +57,7 @@ done
 [[ "$(uname -s)" == "Linux" ]] || die "Linux is required"
 
 for source in \
+    "$SCRIPT_DIR/uninstall.sh" \
     "$REPO_ROOT/packaging/linux/host-setup.sh" \
     "$REPO_ROOT/packaging/config/zflow.toml" \
     "$REPO_ROOT/packaging/modules-load.d/zflow.conf" \
@@ -96,11 +99,15 @@ refuse_symlink "$UNIT_FILE"
 refuse_symlink "$VIRTUAL_RULE_FILE"
 refuse_symlink "$MODULE_FILE"
 refuse_symlink "$SLEEP_HOOK_FILE"
+refuse_symlink "$LIB_DIR"
+refuse_symlink "$UNINSTALLER"
 
 install -d -o root -g root -m 0755 \
-    "$BIN_DIR" "$UDEV_RULE_DIR" /etc/modules-load.d /usr/lib/systemd/system-sleep
+    "$BIN_DIR" "$LIB_DIR" "$UDEV_RULE_DIR" /etc/modules-load.d /usr/lib/systemd/system-sleep
 install -o root -g root -m 0755 "$binary_dir/zflow" "$BIN_DIR/zflow"
 install -o root -g root -m 0755 "$binary_dir/zflowd" "$BIN_DIR/zflowd"
+# Release archives are extracted to a temporary directory, so keep a copy of the uninstaller.
+install -o root -g root -m 0755 "$SCRIPT_DIR/uninstall.sh" "$UNINSTALLER"
 # Retire the old desktop launcher when upgrading an existing installation.
 rm -f -- "$BIN_DIR/zflow-gui" /usr/local/share/applications/io.zflow.zflow.desktop
 # zflow setup --prelogin on installs its own drop-in when pre-login input is wanted.
@@ -133,6 +140,7 @@ printf '     sudo udevadm trigger --action=change --subsystem-match=input\n'
 printf '  4. Check the host:\n'
 printf '     sudo %s/zflow doctor\n' "$BIN_DIR"
 printf 'Inspect logs with: journalctl -u zflowd.service -f\n'
+printf 'Remove zflow with: sudo %s\n' "$UNINSTALLER"
 printf 'Pre-login input stays disabled until you grant it during setup.\n'
 
 printf 'For GNOME handoff, run as your desktop user (without sudo):\n'

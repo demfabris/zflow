@@ -148,11 +148,12 @@ the uninstaller with `--purge` deletes the drop-in. The sleep hook stops an
 active daemon before suspend and starts a fresh process after resume. This
 releases every evdev grab and discards stale sessions and clock state.
 
-The normal uninstaller keeps configuration, identity state, and the service
-account. It removes the capture rule to revoke event-device access:
+The installer copies the uninstaller to `/usr/local/lib/zflow/uninstall.sh`.
+It keeps configuration, identity state, and the service account, and removes
+the capture rule to revoke event-device access:
 
 ```sh
-sudo ./scripts/uninstall.sh
+sudo /usr/local/lib/zflow/uninstall.sh
 ```
 
 Use `--purge` only when you also want to delete those files and the account.

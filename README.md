@@ -53,6 +53,12 @@ and install it with `sudo apt install ./zflow_0.1.0_amd64.deb` (use `arm64` on A
 See [packaging/README.md](packaging/README.md) for migration from a source/archive
 installation, package removal, and building releases.
 
+To remove zflow from Linux, run `sudo apt remove zflow` on a `.deb` install
+(`apt purge zflow` also deletes the configuration and device selections). An
+archive install keeps its uninstaller at `/usr/local/lib/zflow/uninstall.sh`;
+run it with `sudo`, adding `--purge` to also delete the configuration, paired
+identities, and the service account.
+
 ## Mac → Ubuntu setup
 
 Install zflow on both computers using the command above. Open zflow from

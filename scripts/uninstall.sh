@@ -20,6 +20,7 @@ readonly SLEEP_HOOK_FILE="/usr/lib/systemd/system-sleep/zflow"
 readonly SLEEP_MARKER="/run/zflowd-resume-after-sleep"
 readonly ZFLOW_BIN="/usr/local/bin/zflow"
 readonly ZFLOWD_BIN="/usr/local/bin/zflowd"
+readonly LIB_DIR="/usr/local/lib/zflow"
 readonly ZFLOW_GUI_BIN="/usr/local/bin/zflow-gui"
 readonly DESKTOP_FILE="/usr/local/share/applications/io.zflow.zflow.desktop"
 
@@ -43,7 +44,7 @@ case "${1:-}" in
     "") ;;
     --purge) purge=true ;;
     -h|--help)
-        printf 'usage: sudo ./scripts/uninstall.sh [--purge]\n'
+        printf 'usage: sudo %s [--purge]\n' "$0"
         printf 'Without --purge, configuration, identity state, and the service account remain.\n'
         exit 0
         ;;
@@ -56,7 +57,7 @@ esac
 if command -v dpkg-query >/dev/null 2>&1 && [[ "$(dpkg-query -W -f='${Status}' zflow 2>/dev/null || true)" == 'install ok installed' ]]; then
     die 'zflow is managed by dpkg. Remove it with: sudo apt remove zflow'
 fi
-[[ "$EUID" -eq 0 ]] || die "run as root: sudo ./scripts/uninstall.sh"
+[[ "$EUID" -eq 0 ]] || die "run as root: sudo $0"
 
 if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet zflowd.service; then
@@ -75,8 +76,10 @@ rm -f -- \
     "$SLEEP_MARKER" \
     "$ZFLOW_BIN" \
     "$ZFLOWD_BIN" \
+    "$LIB_DIR/uninstall.sh" \
     "$ZFLOW_GUI_BIN" \
     "$DESKTOP_FILE"
+rmdir -- "$LIB_DIR" 2>/dev/null || true
 
 if [[ "$purge" == true ]]; then
     for command in find getent groupdel userdel; do
