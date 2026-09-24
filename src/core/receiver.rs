@@ -4,7 +4,7 @@
 //! connection gets its own receiver. The caller supplies monotonic time; the
 //! receiver only emits backend-neutral effects.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -133,7 +133,6 @@ pub struct Receiver {
     context: Option<(ProtocolVersion, SessionEpoch, TransportGeneration)>,
     highest_activation: Option<ActivationId>,
     activation: Option<ActivationState>,
-    closed_activations: BTreeSet<ActivationId>,
     last_observed_time: MonotonicTimeMicros,
 }
 
@@ -145,7 +144,6 @@ impl Receiver {
             context: None,
             highest_activation: None,
             activation: None,
-            closed_activations: BTreeSet::new(),
             last_observed_time: now,
         })
     }
@@ -177,10 +175,7 @@ impl Receiver {
             return Ok(effects);
         }
 
-        if self
-            .closed_activations
-            .contains(&message.session.activation_id)
-        {
+        if self.is_closed(message.session.activation_id) {
             effects.push(rejected(message.session, RejectionReason::ClosedActivation));
             return Ok(effects);
         }
@@ -317,7 +312,7 @@ impl Receiver {
         self.observe_time(now)?;
         let mut effects = Vec::new();
         self.expire_lease(now, &mut effects);
-        if self.closed_activations.contains(&session.activation_id) {
+        if self.is_closed(session.activation_id) {
             effects.push(rejected(session, RejectionReason::ClosedActivation));
             return Ok(effects);
         }
@@ -409,10 +404,7 @@ impl Receiver {
         now: MonotonicTimeMicros,
         effects: &mut Vec<ReceiverEffect>,
     ) {
-        if self
-            .closed_activations
-            .contains(&message.session.activation_id)
-        {
+        if self.is_closed(message.session.activation_id) {
             effects.push(rejected(message.session, RejectionReason::ClosedActivation));
             return;
         }
@@ -483,12 +475,22 @@ impl Receiver {
         Ok(())
     }
 
+    /// Activation ids only grow, so every id up to the highest one seen is
+    /// closed unless it is the one still open.
+    fn is_closed(&self, activation: ActivationId) -> bool {
+        self.highest_activation
+            .is_some_and(|highest| activation <= highest)
+            && self
+                .activation
+                .as_ref()
+                .is_none_or(|open| open.session.activation_id != activation)
+    }
+
     fn close_activation(&mut self, reason: SessionCloseReason, effects: &mut Vec<ReceiverEffect>) {
         let Some(mut state) = self.activation.take() else {
             return;
         };
         release_all(&mut state, effects);
-        self.closed_activations.insert(state.session.activation_id);
         effects.push(ReceiverEffect::ActivationClosed {
             session: state.session,
             reason,
@@ -731,7 +733,7 @@ mod tests {
             ));
             prop_assert!(released_key);
             prop_assert!(receiver.active_context().is_none());
-            prop_assert!(receiver.closed_activations.contains(&session.activation_id));
+            prop_assert!(receiver.is_closed(session.activation_id));
         }
 
         /// Required property: a closed activation never injects again, and a
