@@ -30,8 +30,6 @@ pub enum Command {
         install: bool,
     },
     Setup {
-        state_dir: Option<PathBuf>,
-        control_socket: Option<PathBuf>,
         listen: Option<std::net::SocketAddr>,
         devices: Vec<PathBuf>,
         activation_chord: Vec<String>,
@@ -82,8 +80,6 @@ pub enum Command {
 }
 
 struct SetupOptions {
-    state_dir: Option<PathBuf>,
-    control_socket: Option<PathBuf>,
     listen: Option<std::net::SocketAddr>,
     devices: Vec<PathBuf>,
     activation_chord: Vec<String>,
@@ -117,8 +113,6 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
             }
         }
         Command::Setup {
-            state_dir,
-            control_socket,
             listen,
             devices,
             activation_chord,
@@ -129,8 +123,6 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
         } => setup(
             path,
             SetupOptions {
-                state_dir,
-                control_socket,
                 listen,
                 devices,
                 activation_chord,
@@ -182,8 +174,6 @@ pub fn run(path: PathBuf, command: Command) -> Result<()> {
 
 fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
     let SetupOptions {
-        state_dir,
-        control_socket,
         listen,
         devices,
         activation_chord,
@@ -199,12 +189,6 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
         Config::default()
     };
     let original_config = existed.then(|| config.clone());
-    if let Some(state_dir) = state_dir {
-        config.daemon.state_dir = state_dir;
-    }
-    if let Some(control_socket) = control_socket {
-        config.daemon.control_socket = control_socket;
-    }
     if let Some(listen) = listen {
         config.transport.listen = listen;
     }
@@ -231,14 +215,6 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
     #[cfg(target_os = "linux")]
     crate::runtime::LinuxRuntimeConfig::from_config(&config).validate()?;
     crate::session::SessionOptions::from_config(&config)?;
-    if let Some(previous) = &original_config
-        && previous.daemon.control_socket != config.daemon.control_socket
-        && previous.daemon.control_socket.exists()
-    {
-        bail!(
-            "changing daemon.control_socket while the previous socket exists is unsafe; stop zflowd, rerun setup, then start zflowd"
-        );
-    }
     let restart_required = original_config.as_ref().map_or_else(Vec::new, |previous| {
         restart_required_fields(previous, &config)
     });
@@ -247,7 +223,7 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
             render_capture_rules(&config.input.capture_devices).map(|rules| (rules_path, rules))
         })
         .transpose()?;
-    let identity = Identity::load_or_create(&config.daemon.state_dir)?;
+    let identity = load_or_create_identity(&config.daemon.state_dir)?;
 
     let previous_config = FileSnapshot::capture(&path)?;
     let previous_rules = rendered_rules
@@ -260,12 +236,7 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
             write_atomic_bytes(rules_path, rules.as_bytes(), 0o644)?;
         }
         if restart_required.is_empty() {
-            let reload_socket = original_config
-                .as_ref()
-                .map(|previous| previous.daemon.control_socket.as_path())
-                .filter(|socket| socket.exists())
-                .unwrap_or(&config.daemon.control_socket);
-            reload_running_daemon_at(reload_socket)?;
+            reload_running_daemon(&config)?;
         }
         Ok(())
     })();
@@ -326,12 +297,6 @@ fn setup(path: PathBuf, options: SetupOptions) -> Result<()> {
 
 fn restart_required_fields(previous: &Config, next: &Config) -> Vec<&'static str> {
     let mut fields = Vec::new();
-    if previous.daemon.state_dir != next.daemon.state_dir {
-        fields.push("daemon.state_dir");
-    }
-    if previous.daemon.control_socket != next.daemon.control_socket {
-        fields.push("daemon.control_socket");
-    }
     if previous.transport.listen != next.transport.listen {
         fields.push("transport.listen");
     }
@@ -984,10 +949,7 @@ fn daemon_request(socket: &std::path::Path, request: Request) -> Result<Response
 }
 
 fn reload_running_daemon(config: &Config) -> Result<()> {
-    reload_running_daemon_at(&config.daemon.control_socket)
-}
-
-fn reload_running_daemon_at(control_socket: &Path) -> Result<()> {
+    let control_socket = &config.daemon.control_socket;
     if !control_socket.exists() {
         return Ok(());
     }
@@ -1006,6 +968,42 @@ fn simulate() -> Result<()> {
         .context("prototype simulator scenario failed")?;
     println!("prototype simulator: PASS");
     Ok(())
+}
+
+/// Run as root, setup and pairing would leave a root-owned 0600 key that the
+/// zflow service account cannot read, so zflowd would fail to start. Anything
+/// created here is handed to that account instead.
+fn load_or_create_identity(state_dir: &Path) -> Result<Identity> {
+    #[cfg(target_os = "linux")]
+    {
+        let key = state_dir.join("identity.pk8");
+        let created = [state_dir, key.as_path()]
+            .into_iter()
+            .filter(|path| fs::symlink_metadata(path).is_err())
+            .collect::<Vec<_>>();
+        let owner = if nix::unistd::geteuid().is_root() && !created.is_empty() {
+            let user = nix::unistd::User::from_name("zflow")?.context(
+                "the zflow service account does not exist; install zflow before running setup or pairing as root",
+            )?;
+            Some((user.uid.as_raw(), user.gid.as_raw()))
+        } else {
+            None
+        };
+        let identity = Identity::load_or_create(state_dir)?;
+        if let Some((uid, gid)) = owner {
+            for path in created {
+                std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| {
+                    format!(
+                        "could not give {} to the zflow service account",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        Ok(identity)
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(Identity::load_or_create(state_dir)?)
 }
 
 #[cfg(target_os = "linux")]
@@ -1219,7 +1217,7 @@ fn pair_connect(
     timeout: Duration,
 ) -> Result<()> {
     let config = Config::load(&path)?;
-    let identity = Identity::load_or_create(&config.daemon.state_dir)?;
+    let identity = load_or_create_identity(&config.daemon.state_dir)?;
     let offer = crate::pairing::make_offer(
         local_device_label(),
         config.transport.listen.port(),
@@ -1247,7 +1245,7 @@ fn pair_listen(
     timeout: Duration,
 ) -> Result<()> {
     let config = Config::load(&path)?;
-    let identity = Identity::load_or_create(&config.daemon.state_dir)?;
+    let identity = load_or_create_identity(&config.daemon.state_dir)?;
     let offer = crate::pairing::make_offer(
         local_device_label(),
         config.transport.listen.port(),
@@ -1600,8 +1598,6 @@ mod tests {
         setup(
             path.clone(),
             SetupOptions {
-                state_dir: None,
-                control_socket: None,
                 listen: None,
                 devices: Vec::new(),
                 activation_chord: Vec::new(),
@@ -1628,8 +1624,6 @@ mod tests {
         setup(
             path.clone(),
             SetupOptions {
-                state_dir: None,
-                control_socket: None,
                 listen: None,
                 devices: Vec::new(),
                 activation_chord: Vec::new(),
@@ -1654,18 +1648,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("zflow.toml");
         let stale_socket = directory.path().join("stale.sock");
-        let new_state_dir = directory.path().join("new-state");
-        let new_socket = directory.path().join("new.sock");
         let new_listen = "127.0.0.1:43219".parse().unwrap();
         let mut config = Config::default();
-        config.daemon.state_dir = directory.path().join("old-state");
+        config.daemon.state_dir = directory.path().join("state");
         config.daemon.control_socket = stale_socket.clone();
         config.save(&path).unwrap();
         setup(
             path.clone(),
             SetupOptions {
-                state_dir: Some(new_state_dir.clone()),
-                control_socket: Some(new_socket.clone()),
                 listen: Some(new_listen),
                 devices: Vec::new(),
                 activation_chord: Vec::new(),
@@ -1678,57 +1668,15 @@ mod tests {
         .unwrap();
 
         let saved = Config::load(&path).unwrap();
-        assert_eq!(saved.daemon.state_dir, new_state_dir);
-        assert_eq!(saved.daemon.control_socket, new_socket);
         assert_eq!(saved.transport.listen, new_listen);
         assert_eq!(
             restart_required_fields(&config, &saved),
-            [
-                "daemon.state_dir",
-                "daemon.control_socket",
-                "transport.listen"
-            ]
+            ["transport.listen"]
         );
         assert_eq!(
             restart_required_message(&restart_required_fields(&config, &saved)),
-            "daemon restart required to apply this setup (changed: daemon.state_dir, daemon.control_socket, transport.listen)"
+            "daemon restart required to apply this setup (changed: transport.listen)"
         );
-    }
-
-    #[test]
-    fn setup_refuses_live_control_socket_migration_before_any_write() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("zflow.toml");
-        let old_socket = directory.path().join("old.sock");
-        let new_state_dir = directory.path().join("new-state");
-        let rules = directory.path().join("capture.rules");
-        let mut config = Config::default();
-        config.daemon.state_dir = directory.path().join("old-state");
-        config.daemon.control_socket = old_socket.clone();
-        config.save(&path).unwrap();
-        fs::write(old_socket, []).unwrap();
-        let before = fs::read(&path).unwrap();
-
-        let error = setup(
-            path.clone(),
-            SetupOptions {
-                state_dir: Some(new_state_dir.clone()),
-                control_socket: Some(directory.path().join("new.sock")),
-                listen: None,
-                devices: Vec::new(),
-                activation_chord: Vec::new(),
-                escape_chord: Vec::new(),
-                udev_rules: Some(rules.clone()),
-                allow_prelogin: None,
-                experimental_touchpad: None,
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("stop zflowd"));
-        assert_eq!(fs::read(path).unwrap(), before);
-        assert!(!new_state_dir.exists());
-        assert!(!rules.exists());
     }
 
     #[cfg(unix)]
@@ -1737,10 +1685,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("zflow.toml");
         let stale_socket = directory.path().join("stale.sock");
-        let new_state_dir = directory.path().join("new-state");
         let new_listen = "127.0.0.1:43219".parse().unwrap();
         let mut config = Config::default();
-        config.daemon.state_dir = directory.path().join("old-state");
+        config.daemon.state_dir = directory.path().join("state");
         config.daemon.control_socket = stale_socket.clone();
         config.input.allow_prelogin_input = true;
         config.save(&path).unwrap();
@@ -1749,8 +1696,6 @@ mod tests {
         setup(
             path.clone(),
             SetupOptions {
-                state_dir: Some(new_state_dir.clone()),
-                control_socket: None,
                 listen: Some(new_listen),
                 devices: Vec::new(),
                 activation_chord: Vec::new(),
@@ -1766,8 +1711,6 @@ mod tests {
         let result = setup(
             path.clone(),
             SetupOptions {
-                state_dir: None,
-                control_socket: None,
                 listen: None,
                 devices: Vec::new(),
                 activation_chord: Vec::new(),
@@ -1781,7 +1724,6 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fs::read(&path).unwrap(), pending);
         let saved = Config::load(&path).unwrap();
-        assert_eq!(saved.daemon.state_dir, new_state_dir);
         assert_eq!(saved.transport.listen, new_listen);
         assert!(saved.input.allow_prelogin_input);
     }
@@ -1803,8 +1745,6 @@ mod tests {
         let result = setup(
             path.clone(),
             SetupOptions {
-                state_dir: None,
-                control_socket: None,
                 listen: None,
                 devices: Vec::new(),
                 activation_chord: Vec::new(),
@@ -1833,8 +1773,6 @@ mod tests {
         let result = setup(
             path.clone(),
             SetupOptions {
-                state_dir: None,
-                control_socket: None,
                 listen: None,
                 devices: Vec::new(),
                 activation_chord: vec!["KEY_THIS_DOES_NOT_EXIST".into()],
@@ -1872,8 +1810,6 @@ mod tests {
         let result = setup(
             path.clone(),
             SetupOptions {
-                state_dir: None,
-                control_socket: None,
                 listen: None,
                 devices: Vec::new(),
                 activation_chord: Vec::new(),

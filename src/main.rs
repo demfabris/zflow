@@ -23,12 +23,6 @@ enum Command {
     },
     /// Create or update the local configuration.
     Setup {
-        /// Override the daemon state directory; changes require a daemon restart.
-        #[arg(long)]
-        state_dir: Option<std::path::PathBuf>,
-        /// Override the local daemon control socket; changes require a daemon restart.
-        #[arg(long)]
-        control_socket: Option<std::path::PathBuf>,
         /// Override the QUIC listen address; changes require a daemon restart.
         #[arg(long)]
         listen: Option<std::net::SocketAddr>,
@@ -166,8 +160,6 @@ impl From<Command> for zflow::cli::Command {
             Command::Settings => Self::Settings,
             Command::DesktopAgent { install } => Self::DesktopAgent { install },
             Command::Setup {
-                state_dir,
-                control_socket,
                 listen,
                 devices,
                 activation_chord,
@@ -176,8 +168,6 @@ impl From<Command> for zflow::cli::Command {
                 allow_prelogin,
                 experimental_touchpad,
             } => Self::Setup {
-                state_dir,
-                control_socket,
                 listen,
                 devices,
                 activation_chord,
@@ -245,6 +235,18 @@ impl From<Command> for zflow::cli::Command {
                 percentile,
             },
             Command::Simulate => Self::Simulate,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_cannot_move_paths_the_sandboxed_daemon_depends_on() {
+        for flag in ["--state-dir", "--control-socket"] {
+            assert!(Cli::try_parse_from(["zflow", "setup", flag, "/tmp/zflow"]).is_err());
         }
     }
 }
