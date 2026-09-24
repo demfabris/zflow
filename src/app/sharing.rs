@@ -257,6 +257,13 @@ impl Observer {
         else {
             return Ok(());
         };
+        // Capture would refuse anyway; skip the connection and receiver setup.
+        if macos::secure_input_enabled() {
+            self.notice = "Secure keyboard entry is on in a Mac app (a password field or \
+                Terminal's Secure Keyboard Entry). Input stays on the Mac until it turns off."
+                .into();
+            return Ok(());
+        }
         static NEXT_CROSSING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let span = tracing::info_span!("crossing",
             crossing = NEXT_CROSSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

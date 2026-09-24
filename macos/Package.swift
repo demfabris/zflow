@@ -23,8 +23,8 @@ let package = Package(
       name: "ZflowApp", dependencies: ["ZflowCore"],
       linkerSettings: [
         .unsafeFlags(["-L", rustLibrary, "-lzflow"]),
-        .linkedFramework("ApplicationServices"), .linkedFramework("CoreFoundation"),
-        .linkedFramework("Security"),
+        .linkedFramework("ApplicationServices"), .linkedFramework("Carbon"),
+        .linkedFramework("CoreFoundation"), .linkedFramework("Security"),
       ]),
     .executableTarget(name: "AWDLClient"),
     .executableTarget(name: "AWDLDaemon", dependencies: ["AWDLGuardian"]),

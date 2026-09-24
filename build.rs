@@ -11,5 +11,6 @@ fn main() {
         .warnings(true)
         .compile("zflow_macos_capture");
     println!("cargo:rustc-link-lib=framework=ApplicationServices");
+    println!("cargo:rustc-link-lib=framework=Carbon");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
 }

@@ -25,6 +25,9 @@
    CGEventMaskBit(31) | CGEventMaskBit(32) | CGEventMaskBit(33) |           \
    CGEventMaskBit(34))
 
+// From Carbon's HIToolbox; declared here instead of including all of Carbon.
+extern Boolean IsSecureEventInputEnabled(void);
+
 typedef struct { double x, y; } ZFlowMacPosition;
 typedef struct { double x, y, width, height; } ZFlowMacRect;
 
@@ -73,6 +76,10 @@ int zflow_mac_warp_cursor(ZFlowMacPosition position) {
   if (!isfinite(position.x) || !isfinite(position.y)) return -1;
   return CGWarpMouseCursorPosition(CGPointMake(position.x, position.y)) ==
                  kCGErrorSuccess ? 0 : -1;
+}
+
+int zflow_mac_secure_input_enabled(void) {
+  return IsSecureEventInputEnabled() ? 1 : 0;
 }
 
 int zflow_mac_input_is_neutral(void) {
@@ -282,6 +289,13 @@ static bool capture_cursor(void) {
 
 // Admission status: 0 allows capture, -1 fails, -2 cancels the crossing.
 static int capture_entry_allowed(void) {
+  // While any app holds Secure Event Input the tap sees no keys, so typing
+  // would reach the Mac while the pointer drives the other computer.
+  if (IsSecureEventInputEnabled()) {
+    set_error("secure keyboard entry is on in a Mac app (a password field or "
+              "Terminal's Secure Keyboard Entry); input stays on the Mac");
+    return -2;
+  }
   if (!g_check_entry) return 0;
   double right = g_entry_region.x + g_entry_region.width;
   double bottom = g_entry_region.y + g_entry_region.height;

@@ -22,6 +22,7 @@ static bool fake_key_state(CGEventSourceStateID, CGKeyCode);
 static bool fake_button_state(CGEventSourceStateID, CGMouseButton);
 static CGEventFlags fake_flags_state(CGEventSourceStateID);
 static Boolean fake_trusted(void);
+static Boolean fake_secure_input(void);
 static Boolean fake_trusted_options(CFDictionaryRef);
 static CFMachPortRef fake_tap(CGEventTapLocation, CGEventTapPlacement,
                              CGEventTapOptions, CGEventMask,
@@ -50,6 +51,7 @@ static CFRunLoopRunResult fake_run_loop(CFRunLoopMode, CFTimeInterval, Boolean);
 #define CGEventSourceFlagsState fake_flags_state
 #define AXIsProcessTrusted fake_trusted
 #define AXIsProcessTrustedWithOptions fake_trusted_options
+#define IsSecureEventInputEnabled fake_secure_input
 #include "../src/macos/capture_bridge.c"
 #undef CFRunLoopRunInMode
 
@@ -114,6 +116,9 @@ static CGEventFlags fake_flags_state(CGEventSourceStateID state) {
 }
 
 static Boolean fake_trusted(void) { return false; }
+
+static bool secure_input;
+static Boolean fake_secure_input(void) { return secure_input; }
 
 static Boolean fake_trusted_options(CFDictionaryRef options) {
   assert(CFDictionaryGetValue(options, kAXTrustedCheckOptionPrompt) == kCFBooleanTrue);
@@ -394,6 +399,23 @@ static void start_capture(void) {
   assert(g_thread_valid && strcmp(calls, "BHD") == 0);
 }
 
+static void secure_input_tests(void) {
+  // With Secure Event Input the tap sees no keys, so capture must not start.
+  reset();
+  secure_input = true;
+  assert(zflow_mac_secure_input_enabled() == 1);
+  assert(zflow_mac_capture_start(0, NULL) == -2);
+  assert(strstr(g_error, "secure keyboard entry"));
+  assert(call_count == 0 && !g_thread_valid);
+  g_check_entry = true;
+  g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
+  assert(capture_entry_allowed() == -2);
+  secure_input = false;
+  assert(capture_entry_allowed() == 0);
+  g_check_entry = false;
+  assert(zflow_mac_secure_input_enabled() == 0);
+}
+
 static void lost_stop_tests(void) {
   reset();
   lose_stop = true;
@@ -625,6 +647,7 @@ int main(void) {
   desktop_and_permission_tests();
   startup_release_tests();
   cursor_lifecycle_tests();
+  secure_input_tests();
   lost_stop_tests();
   return_cursor_tests();
   multitouch_tests();

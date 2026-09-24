@@ -37,6 +37,9 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 // overflow its 512-command queue in one burst.
 const MAX_EVENTS_PER_POLL: usize = 256;
 const TOUCH_STALE_TIMEOUT: Duration = Duration::from_millis(150);
+const SECURE_INPUT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+const SECURE_INPUT_RETURNED: &str = "Secure keyboard entry turned on in a Mac app, so typing \
+    could not be shared. Input returned to the Mac";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -200,6 +203,13 @@ pub fn warp_cursor(position: CursorPosition) -> Result<()> {
 pub fn input_is_neutral() -> bool {
     // SAFETY: this reads physical key, button and modifier state without capture.
     unsafe { zflow_mac_input_is_neutral() == 1 }
+}
+
+/// True while any app holds Secure Event Input. The event tap then sees no
+/// keys, so typing would reach the Mac while the pointer drives the peer.
+pub fn secure_input_enabled() -> bool {
+    // SAFETY: this reads a system-wide flag without capture.
+    unsafe { zflow_mac_secure_input_enabled() == 1 }
 }
 
 /// Stop by setting the watch value to true or dropping its sender, then await
@@ -573,6 +583,8 @@ async fn run_endpoint(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut awdl_renewal = tokio::time::interval(awdl::RENEW_INTERVAL);
         awdl_renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut secure_input_check = tokio::time::interval(SECURE_INPUT_CHECK_INTERVAL);
+        secure_input_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut touch_active = false;
         let mut last_touch = Instant::now();
         let mut terminal_error = None;
@@ -627,6 +639,13 @@ async fn run_endpoint(
                     if let Err(error) = awdl_lease.as_mut().expect("active AWDL lease").renew().await {
                         stop_reason = "AWDL renewal failed";
                         terminal_error = Some(error);
+                        break;
+                    }
+                }
+                _ = secure_input_check.tick() => {
+                    if secure_input_enabled() {
+                        stop_reason = "secure keyboard entry";
+                        terminal_error = Some(AdmissionCancelled(SECURE_INPUT_RETURNED.into()).into());
                         break;
                     }
                 }
@@ -1149,6 +1168,7 @@ unsafe extern "C" {
     fn zflow_mac_desktop_rectangles(rectangles: *mut DesktopRect, capacity: u32) -> i32;
     fn zflow_mac_warp_cursor(position: CursorPosition) -> i32;
     fn zflow_mac_input_is_neutral() -> i32;
+    fn zflow_mac_secure_input_enabled() -> i32;
     fn zflow_mac_raw_touch_available() -> i32;
     fn zflow_mac_capture_start(raw_touch: i32, entry: *const DesktopRect) -> i32;
     fn zflow_mac_capture_stop_at(position: *const CursorPosition) -> i32;
