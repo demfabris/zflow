@@ -69,7 +69,8 @@ class InstallerTest(unittest.TestCase):
         (self.source / "scripts/install.sh").write_text("exit 99\n")
         for name in ("zflow", "zflowd"):
             binary = self.source / "bin" / name
-            binary.write_text('#!/bin/sh\nprintf "zflow 0.1.0\\n"\n')
+            # TMPDIR can be noexec, so the installer must never run downloaded files.
+            binary.write_text('#!/bin/sh\necho executed-download >> "$LOG"\n')
             binary.chmod(0o755)
         (self.source / "zflow.app/Contents").mkdir(parents=True)
         (self.source / "zflow.app/Contents/version").write_text("new")
@@ -125,6 +126,7 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("gir1.2-adw-1", calls)
         self.assertIn("/payload/scripts/install.sh --install-built", calls)
         self.assertIn("user installed-zflow desktop-agent --install", calls)
+        self.assertNotIn("executed-download", calls)
         self.assertEqual(list((self.root / "tmp").iterdir()), [])
         for package in ("build-essential", "gcc", "base-devel", "pkg-config"):
             self.assertNotIn(package, calls)

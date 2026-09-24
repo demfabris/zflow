@@ -314,7 +314,6 @@ main() {
         if [[ "$platform" == Linux ]]; then
             [[ -x "$payload_dir/bin/zflow" && -x "$payload_dir/bin/zflowd" && -f "$payload_dir/scripts/install.sh" ]] \
                 || die 'The release archive is missing the Linux binaries or installer.'
-            "$payload_dir/bin/zflow" --version
         fi
     fi
     if [[ "$platform" == Linux ]]; then install_linux; else install_macos; fi
