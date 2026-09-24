@@ -14,10 +14,14 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     const handlers = new Map();
     let next = 1;
     const sessionMode = {isLocked: false, isGreeter: false};
+    const seat = {warp_pointer(x, y) {pointer = {x, y};}};
+    const backend = {get_default_seat: () => seat};
+    // GNOME 51 reaches the backend only through the stage context.
     const context = {
         Extension: class {},
         Indicator: class { destroy() {} },
-        global: {backend: {capabilities: 1}, get_pointer: () => [pointer.x, pointer.y]},
+        global: {backend: {capabilities: 1}, stage: {get_context: () => ({get_backend: () => backend})},
+            get_pointer: () => [pointer.x, pointer.y]},
         Main: {sessionMode, layoutManager: {monitors, connect(name, fn) {handlers.set(name, fn); return 1;}, disconnect() {}}},
         GLib: {
             PRIORITY_DEFAULT: 0, PRIORITY_DEFAULT_IDLE: 0, SOURCE_CONTINUE: true, SOURCE_REMOVE: false,
@@ -28,7 +32,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
         },
         Gio: {DBus: {session: {}}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},
             BusNameOwnerFlags: {NONE: 0}, bus_own_name_on_connection: () => 1, bus_unown_name() {}},
-        Clutter: {get_default_backend: () => ({get_default_seat: () => ({warp_pointer(x, y) {pointer = {x, y};}})})},
+        Clutter: {},
         Meta: {
             BackendCapabilities: {BARRIERS: 1},
             BarrierDirection: {POSITIVE_X: 1, NEGATIVE_X: 2, POSITIVE_Y: 4, NEGATIVE_Y: 8},
@@ -42,7 +46,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     vm.runInNewContext(source, context);
     const extension = new context.TestExtension();
     extension.enable();
-    return {extension, barriers, context, sessionMode, handlers, timers, advance(ms) {
+    return {extension, barriers, context, seat, backend, sessionMode, handlers, timers, advance(ms) {
         now += ms * 1000;
         for (const [id, timer] of timers) {
             if (timer.due > now) continue;
@@ -62,6 +66,14 @@ for (const [edge, expectedY, direction] of [['top', 3, 4], ['bottom', 1076, 8]])
     assert.equal(d.barriers[0].properties.directions, direction);
     d.barriers[0].hit(d.barriers[0], {x: 480, y: edge === 'top' ? 0 : 1080});
     assert.equal((await d.extension._request({command: 'poll', token: 7})).position, 250000);
+    d.extension.disable();
+}
+{
+    // Shells whose stage has no context fall back to Clutter.get_default_backend().
+    const d = desktop();
+    delete d.context.global.stage.get_context;
+    d.context.Clutter.get_default_backend = () => d.backend;
+    assert.equal((await d.extension._request(prepare())).status, 'prepared');
     d.extension.disable();
 }
 {
@@ -155,7 +167,7 @@ for (const [edge, expectedY, direction] of [['top', 3, 4], ['bottom', 1076, 8]])
 }
 {
     const d = desktop();
-    d.context.Clutter.get_default_backend = () => ({get_default_seat: () => ({warp_pointer() {}})});
+    d.seat.warp_pointer = () => {};
     await assert.rejects(d.extension._request(prepare()), /did not place/);
     assert.ok(d.barriers.every(b => b.destroyed));
     assert.equal(d.extension._lease, null);

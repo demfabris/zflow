@@ -141,7 +141,9 @@ export default class ZflowExtension extends Extension {
         const lease = {token: r.token, renewed: GLib.get_monotonic_time(), returned: null, polls: new Set()};
         this._lease = lease;
         try {
-            Clutter.get_default_backend().get_default_seat().warp_pointer(point.x, point.y);
+            // GNOME 51 removed Clutter.get_default_backend().
+            const backend = global.stage.get_context?.().get_backend() ?? Clutter.get_default_backend();
+            backend.get_default_seat().warp_pointer(point.x, point.y);
             const directions = {left: Meta.BarrierDirection.POSITIVE_X, right: Meta.BarrierDirection.NEGATIVE_X,
                 top: Meta.BarrierDirection.POSITIVE_Y, bottom: Meta.BarrierDirection.NEGATIVE_Y};
             for (const s of segments) {
