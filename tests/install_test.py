@@ -224,8 +224,10 @@ class InstallerTest(unittest.TestCase):
                                env={"PLATFORM": platform, "ARCH": architecture})
                 self.assertIn(f"/releases/download/v0.1.0/zflow-v0.1.0-{target}.tar.gz", self.calls())
                 self.assertNotIn("latest", self.calls())
-        self.run_shell('platform=Darwin; version=v0.1.0; select_artifact; echo "$asset"',
-                       env={"ARCH": "x86_64", "ROSETTA": "1"})
+        # An arm64 Mac running this script under Rosetta still gets the native app.
+        output = self.run_shell('platform=Darwin; version=v0.1.0; select_artifact; echo "$asset"',
+                                env={"ARCH": "x86_64", "ROSETTA": "1"})
+        self.assertIn("zflow-v0.1.0-aarch64-apple-darwin.tar.gz", output)
 
     def test_latest_resolution_is_pinned_for_all_downloads(self):
         self.run_shell("main --yes --headless")
@@ -267,9 +269,9 @@ class InstallerTest(unittest.TestCase):
         output = self.run_shell(args, env={"DESKTOP_STATUS": "1", "DESKTOP_OUTPUT": "Permission denied"}, ok=False)
         self.assertIn("desktop setup failed", output)
 
-    def test_rejects_root_and_source_build_options(self):
+    def test_rejects_root_and_invalid_options(self):
         cases = (("--yes", {"MOCK_UID": "0"}), ("--version", {}), ("--version --yes", {}),
-                 ("--version ../main", {}), ("--source .", {}), ("--ref main", {}), ("--sign Developer", {}))
+                 ("--version ../main", {}), ("--unknown", {}))
         for args, env in cases:
             with self.subTest(args=args, env=env):
                 self.run_shell(f"main {args}", env=env, ok=False)
