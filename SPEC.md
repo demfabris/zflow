@@ -16,9 +16,10 @@ Rust owns the core. Linux supports Wayland sessions and the kernel input path. z
 The experimental GNOME return path holds a Poll for up to 200 ms and responds
 when the return barrier fires. The Mac starts the next poll after the reply,
 with a 50 ms minimum start-to-start interval for receivers that reply at once.
-The desktop broker uses seat state refreshed on its 250 ms tick for Poll;
-Prepare, Finish and Snapshot refresh that state before and after the compositor
-call. Existing request timeouts and the two-second desktop lease still apply.
+The daemon follows the seat through logind signals rather than polling it. The
+desktop broker checks that state before and after every compositor call, and a
+logind answer of Unknown keeps the last definite state for up to one second.
+Existing request timeouts and the two-second desktop lease still apply.
 
 ## Reading this specification
 

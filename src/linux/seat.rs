@@ -1,14 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
+    future::Future,
+    pin::Pin,
     sync::OnceLock,
     time::Duration,
 };
 
 use thiserror::Error;
-use tokio::{runtime::Runtime, sync::Mutex, time::timeout_at};
+use tokio::{
+    runtime::Runtime,
+    sync::{Mutex, watch},
+    time::timeout_at,
+};
 use zbus::{
-    Connection,
+    Connection, MatchRule, MessageStream,
+    export::futures_core::Stream,
+    message::Type,
     zvariant::{OwnedObjectPath, OwnedValue},
 };
 
@@ -18,6 +26,13 @@ const LOGIND: &str = "org.freedesktop.login1";
 const MANAGER_PATH: &str = "/org/freedesktop/login1";
 
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
+/// Logind sends several signals for one change, such as a lock or a VT switch.
+const SIGNAL_DEBOUNCE: Duration = Duration::from_millis(25);
+const SIGNAL_QUEUE: usize = 64;
+/// No signal may follow an Unknown caused by a slow reply, so Unknown is
+/// retried on its own, backing off for a seat that stays unsupported.
+const RETRY_MIN: Duration = Duration::from_millis(100);
+const RETRY_MAX: Duration = Duration::from_secs(5);
 
 type Properties = BTreeMap<String, String>;
 
@@ -296,6 +311,146 @@ pub fn query_primary_seat() -> SeatState {
         Ok(query) => inspect_seat(query, PRIMARY_SEAT),
         Err(error) => unknown_query("runtime", error),
     }
+}
+
+/// Follows the primary seat through logind signals.
+///
+/// Every burst of logind signals triggers the same full, double-checked
+/// inspection as [`query_primary_seat`]; nothing is inferred from the signal
+/// itself. The watch starts Unknown and returns to Unknown whenever the
+/// subscription is lost, so a stale answer never outlives its source.
+pub fn watch_primary_seat() -> watch::Receiver<SeatState> {
+    let (sender, receiver) = watch::channel(SeatState::Unknown {
+        reason: "logind was not queried yet".to_owned(),
+    });
+    tokio::spawn(async move {
+        let mut retry = RETRY_MIN;
+        loop {
+            let reason = match LogindSignals::subscribe().await {
+                Ok(mut signals) => {
+                    retry = RETRY_MIN;
+                    follow_seat(&sender, &mut signals, inspect_primary_seat).await;
+                    "the logind signal subscription ended".to_owned()
+                }
+                Err(error) => format!("could not subscribe to logind signals: {error}"),
+            };
+            publish(&sender, SeatState::Unknown { reason });
+            tokio::select! {
+                () = tokio::time::sleep(retry) => {}
+                () = sender.closed() => return,
+            }
+            retry = (retry * 2).min(RETRY_MAX);
+        }
+    });
+    receiver
+}
+
+async fn inspect_primary_seat() -> SeatState {
+    tokio::task::spawn_blocking(query_primary_seat)
+        .await
+        .unwrap_or_else(|error| unknown_query("task", error))
+}
+
+fn publish(sender: &watch::Sender<SeatState>, state: SeatState) {
+    sender.send_if_modified(|current| {
+        let changed = *current != state;
+        *current = state;
+        changed
+    });
+}
+
+/// A source of change notifications. `next` resolves on any signal and
+/// returns false once the subscription is gone.
+trait SeatSignals {
+    async fn next(&mut self) -> bool;
+}
+
+/// Inspects the seat, publishes the answer, then waits for a signal, or for
+/// the retry delay while the answer is Unknown. Returns when the signals end
+/// or nobody watches anymore.
+async fn follow_seat<S, I, F>(sender: &watch::Sender<SeatState>, signals: &mut S, inspect: I)
+where
+    S: SeatSignals,
+    I: Fn() -> F,
+    F: Future<Output = SeatState>,
+{
+    let mut retry = RETRY_MIN;
+    loop {
+        let state = inspect().await;
+        let wait = if matches!(state, SeatState::Unknown { .. }) {
+            let wait = retry;
+            retry = (retry * 2).min(RETRY_MAX);
+            Some(wait)
+        } else {
+            retry = RETRY_MIN;
+            None
+        };
+        publish(sender, state);
+        tokio::select! {
+            alive = signals.next() => if !alive {
+                return;
+            },
+            () = tokio::time::sleep(wait.unwrap_or_default()), if wait.is_some() => {}
+            () = sender.closed() => return,
+        }
+        // Signals queued during the pause are covered by the next inspection.
+        tokio::time::sleep(SIGNAL_DEBOUNCE).await;
+        loop {
+            tokio::select! {
+                biased;
+                alive = signals.next() => if !alive {
+                    return;
+                },
+                () = std::future::ready(()) => break,
+            }
+        }
+    }
+}
+
+/// Every signal logind sends plus changes of its bus name owner. Seat
+/// `Sessions` has no change signal, but SessionNew and SessionRemoved cover it.
+struct LogindSignals {
+    logind: MessageStream,
+    owner: MessageStream,
+}
+
+impl LogindSignals {
+    async fn subscribe() -> zbus::Result<Self> {
+        // The system socket directly, as for queries.
+        let connection = zbus::connection::Builder::address(SYSTEM_BUS_ADDRESS)?
+            .build()
+            .await?;
+        let logind = MatchRule::builder()
+            .msg_type(Type::Signal)
+            .sender(LOGIND)?
+            .build();
+        let owner = MatchRule::builder()
+            .msg_type(Type::Signal)
+            .sender("org.freedesktop.DBus")?
+            .interface("org.freedesktop.DBus")?
+            .member("NameOwnerChanged")?
+            .arg(0, LOGIND)?
+            .build();
+        Ok(Self {
+            logind: MessageStream::for_match_rule(logind, &connection, Some(SIGNAL_QUEUE)).await?,
+            owner: MessageStream::for_match_rule(owner, &connection, Some(SIGNAL_QUEUE)).await?,
+        })
+    }
+}
+
+impl SeatSignals for LogindSignals {
+    async fn next(&mut self) -> bool {
+        let item = tokio::select! {
+            item = next_message(&mut self.logind) => item,
+            item = next_message(&mut self.owner) => item,
+        };
+        // A bus error ends the subscription; the caller reconnects.
+        matches!(item, Some(Ok(_)))
+    }
+}
+
+async fn next_message(stream: &mut MessageStream) -> Option<zbus::Result<zbus::Message>> {
+    std::future::poll_fn(|context| Pin::new(&mut *stream).poll_next(context)).await
 }
 
 pub fn inspect_seat<Q: LogindQuery>(query: &Q, seat: &str) -> SeatState {
@@ -806,6 +961,101 @@ mod tests {
             inspect_seat(&query, "seat0").injection_gate(),
             InjectionGate::Denied
         );
+    }
+
+    struct FakeSignals(tokio::sync::mpsc::UnboundedReceiver<()>);
+
+    impl SeatSignals for FakeSignals {
+        async fn next(&mut self) -> bool {
+            self.0.recv().await.is_some()
+        }
+    }
+
+    fn scripted(
+        answers: Vec<SeatState>,
+    ) -> (
+        impl Fn() -> std::future::Ready<SeatState>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let answers = std::sync::Mutex::new(VecDeque::from(answers));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let inspect = move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected seat inspection");
+            std::future::ready(next)
+        };
+        (inspect, calls)
+    }
+
+    #[tokio::test]
+    async fn signals_trigger_one_inspection_per_burst_and_unknown_is_retried() {
+        let unlocked = inspect(&[SEAT_ACTIVE, SEAT_ACTIVE], &[WAYLAND, WAYLAND]);
+        let locked_session = WAYLAND.replace("LockedHint=no", "LockedHint=yes");
+        let locked = inspect(
+            &[SEAT_ACTIVE, SEAT_ACTIVE],
+            &[&locked_session, &locked_session],
+        );
+        let (answer, calls) = scripted(vec![
+            SeatState::Unknown {
+                reason: "slow reply".into(),
+            },
+            unlocked.clone(),
+            locked.clone(),
+        ]);
+        let (sender, mut seat) = watch::channel(SeatState::Unknown {
+            reason: "not queried yet".into(),
+        });
+        let (signal, signals) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(async move {
+            follow_seat(&sender, &mut FakeSignals(signals), answer).await;
+        });
+        let within = Duration::from_secs(2);
+
+        // A slow reply is retried without waiting for a signal.
+        tokio::time::timeout(within, seat.wait_for(|state| *state == unlocked))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // A lock sends several signals; they cost one inspection.
+        for _ in 0..5 {
+            signal.send(()).unwrap();
+        }
+        tokio::time::timeout(within, seat.wait_for(|state| *state == locked))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(RETRY_MIN * 2).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // A lost subscription hands control back to the reconnect loop.
+        drop(signal);
+        tokio::time::timeout(within, follower)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[ignore = "requires a local system bus and logind seat0"]
+    async fn live_seat_watch_publishes_the_queried_seat() {
+        let mut seat = watch_primary_seat();
+        tokio::time::timeout(Duration::from_secs(2), seat.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let watched = seat.borrow().clone();
+        let queried = tokio::task::spawn_blocking(query_primary_seat)
+            .await
+            .unwrap();
+        assert!(!matches!(watched, SeatState::Unknown { .. }), "{watched:?}");
+        assert_eq!(watched, queried);
     }
 
     #[test]

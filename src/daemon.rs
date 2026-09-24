@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use quinn::Endpoint;
 use tokio::{
     net::UnixListener,
-    sync::{Mutex, RwLock, Semaphore, mpsc},
+    sync::{Mutex, RwLock, Semaphore, mpsc, watch},
 };
 
 use crate::{
@@ -30,7 +30,7 @@ use crate::{
     },
     discovery::{Advertisement, Discovery, DiscoveryError},
     identity::Identity,
-    linux::{InjectionGate, OwnershipPhase, query_primary_seat},
+    linux::{InjectionGate, OwnershipPhase, SeatState, watch_primary_seat},
     runtime::{
         LinuxRuntime, LinuxRuntimeConfig, LinuxRuntimeControl, RuntimeCloseReason, RuntimeCommand,
         RuntimeEvent,
@@ -55,8 +55,10 @@ const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_METRICS_HISTORY: usize = 128;
 const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAX_LOCAL_CLIENTS: usize = 64;
-const SEAT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const SEAT_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Logind answers Unknown when a reply is slow or races a property change.
+/// Such a short Unknown holds injection and keeps the last definite state for
+/// authorization, so it does not end a live crossing.
+const SEAT_UNKNOWN_GRACE: Duration = Duration::from_secs(1);
 
 pub fn run(config_path: PathBuf) -> Result<()> {
     tracing_subscriber::fmt()
@@ -86,6 +88,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     fs::set_permissions(&config.daemon.state_dir, fs::Permissions::from_mode(0o700))?;
     let identity = Arc::new(Identity::load_or_create(&config.daemon.state_dir)?);
     let process_epoch = random_epoch()?;
+    let mut seat = watch_primary_seat();
     let mut runtime = LinuxRuntime::spawn(LinuxRuntimeConfig::from_config(&config))?;
 
     let endpoint = Endpoint::client(config.transport.listen).with_context(|| {
@@ -106,9 +109,9 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
 
     let (session_events, mut session_event_rx) = mpsc::channel(SESSION_EVENT_CAPACITY);
     let (accepted_tx, mut accepted_rx) = mpsc::channel(ACCEPT_EVENT_CAPACITY);
-    let initial_seat = tokio::task::spawn_blocking(query_primary_seat)
-        .await
-        .context("initial active-seat query failed")?;
+    // Give the first logind answer a moment so early requests see a real seat.
+    let _ = tokio::time::timeout(SEAT_UNKNOWN_GRACE, seat.changed()).await;
+    let initial_seat = SeatGrace::new(seat.borrow().clone(), Instant::now()).gate();
     let shared = Arc::new(Shared {
         config: RwLock::new(config.clone()),
         config_mutation: Mutex::new(()),
@@ -129,8 +132,8 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         active_outbound: Mutex::new(None),
         inbound_owner: Mutex::new(None),
         desktop: desktop::Hub::default(),
-        seat_gate: RwLock::new(initial_seat.injection_gate()),
-        seat_query: Mutex::new(()),
+        seat,
+        seat_gate: RwLock::new(initial_seat),
         session_events,
     });
     if let Err(error) = peer_view::start(shared.clone()) {
@@ -302,8 +305,9 @@ struct Shared {
     active_outbound: Mutex<Option<ActiveOutbound>>,
     inbound_owner: Mutex<Option<(String, u64)>>,
     desktop: desktop::Hub,
-    seat_gate: RwLock<InjectionGate>,
-    seat_query: Mutex<()>,
+    seat: watch::Receiver<SeatState>,
+    /// The inbound injection gate, kept current by `watch_seat`.
+    seat_gate: RwLock<SeatGate>,
     session_events: mpsc::Sender<SessionEvent>,
 }
 
@@ -839,30 +843,137 @@ async fn race_connect(
     Err(last_error.unwrap_or_else(|| anyhow!("peer has no connection candidates")))
 }
 
+/// Keeps the inbound gate in step with the seat watch and ends the inbound
+/// session once the seat stops authorizing it.
 async fn watch_seat(shared: Arc<Shared>) {
-    let mut interval = tokio::time::interval(SEAT_ACTIVE_POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_query = Instant::now();
+    let mut seat = shared.seat.clone();
+    let mut grace = SeatGrace::new(seat.borrow_and_update().clone(), Instant::now());
     loop {
-        interval.tick().await;
-        let inbound_active = shared.inbound_owner.lock().await.is_some();
-        if !seat_query_due(inbound_active, last_query.elapsed()) {
-            continue;
+        shared.update_seat_gate(grace.gate()).await;
+        tokio::select! {
+            changed = seat.changed() => if changed.is_err() {
+                shared.update_seat_gate(SeatGate::DENIED).await;
+                return;
+            },
+            () = sleep_until(grace.deadline()) => {}
         }
-        shared.refresh_seat_gate().await;
-        last_query = Instant::now();
+        grace.observe(seat.borrow_and_update().clone(), Instant::now());
     }
 }
 
-fn seat_query_due(inbound_active: bool, since_last_query: Duration) -> bool {
-    inbound_active || since_last_query >= SEAT_IDLE_POLL_INTERVAL
+/// Sleeps until `deadline`, or forever without one.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
 }
 
-async fn query_seat_gate() -> InjectionGate {
-    match tokio::task::spawn_blocking(query_primary_seat).await {
-        Ok(state) => state.injection_gate(),
-        Err(_) => InjectionGate::Denied,
+/// The seat as the daemon judges it: the last definite state rides out a
+/// short Unknown, then Unknown takes over.
+struct SeatGrace {
+    state: SeatState,
+    /// Set while logind's latest answer is Unknown.
+    unknown_since: Option<Instant>,
+}
+
+impl SeatGrace {
+    fn new(current: SeatState, now: Instant) -> Self {
+        let mut grace = Self {
+            state: current.clone(),
+            unknown_since: None,
+        };
+        grace.observe(current, now);
+        grace
     }
+
+    fn observe(&mut self, next: SeatState, now: Instant) {
+        if !matches!(next, SeatState::Unknown { .. }) {
+            self.state = next;
+            self.unknown_since = None;
+            return;
+        }
+        let since = *self.unknown_since.get_or_insert(now);
+        if matches!(self.state, SeatState::Unknown { .. })
+            || now.duration_since(since) >= SEAT_UNKNOWN_GRACE
+        {
+            self.state = next;
+        }
+    }
+
+    /// When a short Unknown runs out and must be observed again.
+    fn deadline(&self) -> Option<Instant> {
+        if matches!(self.state, SeatState::Unknown { .. }) {
+            return None;
+        }
+        self.unknown_since.map(|since| since + SEAT_UNKNOWN_GRACE)
+    }
+
+    fn gate(&self) -> SeatGate {
+        SeatGate {
+            gate: self.state.injection_gate(),
+            held: self.unknown_since.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeatGate {
+    /// What the last definite seat state allows.
+    gate: InjectionGate,
+    /// Logind's latest answer is Unknown, so nothing is injected until it
+    /// clears or the grace runs out.
+    held: bool,
+}
+
+impl SeatGate {
+    const DENIED: Self = Self {
+        gate: InjectionGate::Denied,
+        held: false,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Inject,
+    /// Deliver releases and drop the rest without ending the session.
+    Hold,
+    Refuse,
+}
+
+fn admit(config: &Config, peer: &str, seat: SeatGate) -> Admission {
+    if !receiver_authorized(config, peer, seat.gate) {
+        Admission::Refuse
+    } else if seat.held {
+        Admission::Hold
+    } else {
+        Admission::Inject
+    }
+}
+
+/// Splits receiver effects into what reaches the backend and whether any
+/// were refused outright.
+fn admitted_effects(
+    effects: Vec<ReceiverEffect>,
+    admission: Admission,
+) -> (Vec<ReceiverEffect>, bool) {
+    let mut deliver = Vec::new();
+    let mut refused = false;
+    for effect in effects {
+        let admitted = !effect.is_injection()
+            || match admission {
+                Admission::Inject => true,
+                // A release can only return keys, buttons and contacts to rest.
+                Admission::Hold => is_release(&effect),
+                Admission::Refuse => is_safety_release(&effect),
+            };
+        if admitted {
+            deliver.push(effect);
+        } else {
+            refused |= admission == Admission::Refuse;
+        }
+    }
+    (deliver, refused)
 }
 
 fn receiver_authorized(config: &Config, peer: &str, gate: InjectionGate) -> bool {
@@ -899,6 +1010,17 @@ fn claim_inbound(
     }
     *owner = Some((peer.to_owned(), session_id));
     true
+}
+
+fn is_release(effect: &ReceiverEffect) -> bool {
+    match effect {
+        ReceiverEffect::Key { pressed, .. }
+        | ReceiverEffect::Button { pressed, .. }
+        | ReceiverEffect::Modifier { pressed, .. } => !pressed,
+        ReceiverEffect::TouchReplaced { state, .. } => state.is_empty(),
+        ReceiverEffect::ScrollEnded { .. } | ReceiverEffect::ActivationClosed { .. } => true,
+        _ => false,
+    }
 }
 
 fn is_safety_release(effect: &ReceiverEffect) -> bool {
@@ -1280,9 +1402,6 @@ impl Shared {
         let opens = effects
             .iter()
             .any(|effect| matches!(effect, ReceiverEffect::ActivationOpened(_)));
-        if opens {
-            self.refresh_seat_gate().await;
-        }
         let _policy = self.policy.lock().await;
         let session = self
             .sessions
@@ -1296,10 +1415,11 @@ impl Shared {
         };
 
         let gate = *self.seat_gate.read().await;
-        let permitted = {
+        let admission = {
             let config = self.config.read().await;
-            receiver_authorized(&config, peer, gate)
+            admit(&config, peer, gate)
         };
+        let permitted = admission != Admission::Refuse;
         if opens {
             if !permitted || !self.desktop.allows_session(peer, session_id).await {
                 self.close_session(peer, session_id, SessionCloseReason::PermissionRevoked)
@@ -1315,17 +1435,10 @@ impl Shared {
             }
         }
 
-        let mut deliver = Vec::new();
-        let mut rejected = false;
-        let mut closed = false;
-        for effect in effects {
-            closed |= matches!(effect, ReceiverEffect::ActivationClosed { .. });
-            if !effect.is_injection() || permitted || is_safety_release(&effect) {
-                deliver.push(effect);
-            } else {
-                rejected = true;
-            }
-        }
+        let closed = effects
+            .iter()
+            .any(|effect| matches!(effect, ReceiverEffect::ActivationClosed { .. }));
+        let (deliver, mut rejected) = admitted_effects(effects, admission);
         if !deliver.is_empty() {
             let safety_release = deliver.iter().all(is_safety_release);
             let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
@@ -1493,33 +1606,29 @@ impl Shared {
             .map_err(anyhow::Error::from)
     }
 
-    async fn update_seat_gate(&self, gate: InjectionGate) {
+    async fn update_seat_gate(&self, gate: SeatGate) {
         let _policy = self.policy.lock().await;
-        self.update_seat_gate_locked(gate).await;
-    }
-
-    async fn refresh_seat_gate(&self) {
-        let _query = self.seat_query.lock().await;
-        let gate = query_seat_gate().await;
-        self.update_seat_gate(gate).await;
-    }
-
-    async fn update_seat_gate_locked(&self, gate: InjectionGate) {
         let old = std::mem::replace(&mut *self.seat_gate.write().await, gate);
         if old == gate {
             return;
         }
         let owner = self.inbound_owner.lock().await.clone();
         if let Some((peer, session_id)) = owner {
-            let allowed = {
+            let refused = {
                 let config = self.config.read().await;
-                receiver_authorized(&config, &peer, gate)
+                admit(&config, &peer, gate) == Admission::Refuse
             };
-            if !allowed {
+            if refused {
                 self.close_session(&peer, session_id, SessionCloseReason::PermissionRevoked)
                     .await;
             }
         }
+    }
+
+    /// The active desktop user's uid for desktop API callers; none while the
+    /// seat is Unknown.
+    fn active_uid(&self) -> Option<u32> {
+        self.seat.borrow().active_authenticated_uid()
     }
 
     async fn close_all(&self, reason: SessionCloseReason) {
@@ -1677,10 +1786,140 @@ mod tests {
         }));
     }
 
+    fn unlocked() -> SeatState {
+        SeatState::Unlocked(crate::linux::AuthenticatedSession {
+            id: "2".into(),
+            uid: 1000,
+            kind: crate::linux::AuthenticatedSessionKind::Wayland,
+        })
+    }
+
+    fn unknown() -> SeatState {
+        SeatState::Unknown {
+            reason: "slow".into(),
+        }
+    }
+
+    fn sending_peer() -> Config {
+        let mut config = Config::default();
+        config.peers.insert(
+            "mac".to_owned(),
+            PeerConfig {
+                spki_der_hex: "01".to_owned(),
+                addresses: Vec::new(),
+                permissions: PeerPermissions {
+                    connect: true,
+                    send_normal: true,
+                    receive_normal: false,
+                    inject_prelogin: false,
+                },
+            },
+        );
+        config
+    }
+
     #[test]
-    fn seat_queries_back_off_without_an_inbound_activation() {
-        assert!(!seat_query_due(false, SEAT_ACTIVE_POLL_INTERVAL));
-        assert!(seat_query_due(false, SEAT_IDLE_POLL_INTERVAL));
-        assert!(seat_query_due(true, Duration::ZERO));
+    fn seat_grace_rides_out_a_short_unknown_but_not_a_definite_change() {
+        use crate::linux::RestrictedSeatState;
+        let start = Instant::now();
+        let mut seat = SeatGrace::new(unlocked(), start);
+        assert_eq!(seat.deadline(), None);
+
+        seat.observe(unknown(), start);
+        seat.observe(unknown(), start + Duration::from_millis(900));
+        assert_eq!(seat.state, unlocked());
+        assert_eq!(seat.deadline(), Some(start + SEAT_UNKNOWN_GRACE));
+        seat.observe(unknown(), start + SEAT_UNKNOWN_GRACE);
+        assert_eq!(seat.state.active_authenticated_uid(), None);
+        assert_eq!(seat.deadline(), None);
+
+        seat.observe(unlocked(), start + Duration::from_secs(2));
+        let greeter = SeatState::Restricted(RestrictedSeatState::Greeter {
+            session_id: "c1".into(),
+        });
+        seat.observe(greeter.clone(), start + Duration::from_millis(2_100));
+        assert_eq!(seat.state, greeter);
+        assert_eq!(seat.deadline(), None);
+
+        // Nothing definite to fall back on: Unknown applies at once.
+        let fresh = SeatGrace::new(unknown(), start);
+        assert_eq!(
+            fresh.gate(),
+            SeatGate {
+                gate: InjectionGate::Denied,
+                held: true
+            }
+        );
+    }
+
+    #[test]
+    fn inbound_injection_holds_through_a_short_unknown_and_closes_after_it() {
+        let config = sending_peer();
+        let start = Instant::now();
+        let mut seat = SeatGrace::new(unlocked(), start);
+        assert_eq!(admit(&config, "mac", seat.gate()), Admission::Inject);
+
+        seat.observe(unknown(), start);
+        assert_eq!(admit(&config, "mac", seat.gate()), Admission::Hold);
+        seat.observe(unknown(), start + SEAT_UNKNOWN_GRACE);
+        assert_eq!(admit(&config, "mac", seat.gate()), Admission::Refuse);
+
+        // A definite answer ends the hold either way.
+        seat.observe(unlocked(), start + Duration::from_secs(2));
+        assert_eq!(admit(&config, "mac", seat.gate()), Admission::Inject);
+        seat.observe(unknown(), start + Duration::from_secs(3));
+        let locked = SeatState::Restricted(crate::linux::RestrictedSeatState::LockScreen {
+            session_id: "c2".into(),
+        });
+        seat.observe(locked, start + Duration::from_millis(3_100));
+        assert_eq!(admit(&config, "mac", seat.gate()), Admission::Refuse);
+
+        // Base permissions still refuse during a hold.
+        let mut paused = config.clone();
+        paused.daemon.sharing = false;
+        let held = SeatGate {
+            gate: InjectionGate::Normal { uid: 1000 },
+            held: true,
+        };
+        assert_eq!(admit(&paused, "mac", held), Admission::Refuse);
+    }
+
+    #[test]
+    fn a_hold_drops_new_input_but_lets_releases_through() {
+        use crate::core::{HidUsage, MotionDelta, MotionSequence, TouchState};
+        let key = |pressed, synthetic| ReceiverEffect::Key {
+            key: HidUsage::keyboard(4),
+            pressed,
+            synthetic,
+        };
+        let effects = || {
+            vec![
+                key(true, false),
+                ReceiverEffect::Motion {
+                    delta: MotionDelta::default(),
+                    through_sequence: MotionSequence(1),
+                },
+                key(false, false),
+                key(false, true),
+                ReceiverEffect::TouchReplaced {
+                    state: TouchState::default(),
+                    synthetic: false,
+                },
+            ]
+        };
+
+        let (held, refused) = admitted_effects(effects(), Admission::Hold);
+        assert!(!refused);
+        assert_eq!(held.len(), 3);
+        assert!(held.iter().all(is_release));
+
+        let (denied, refused) = admitted_effects(effects(), Admission::Refuse);
+        assert!(refused);
+        assert_eq!(denied.len(), 1);
+        assert!(is_safety_release(&denied[0]));
+
+        let (injected, refused) = admitted_effects(effects(), Admission::Inject);
+        assert!(!refused);
+        assert_eq!(injected.len(), 5);
     }
 }

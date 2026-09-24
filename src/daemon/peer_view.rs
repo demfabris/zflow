@@ -30,8 +30,7 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
             tokio::spawn(async move {
                 let _permit = permit;
                 let result = async {
-                    let seat = tokio::task::spawn_blocking(query_primary_seat).await?;
-                    authorize_peer(&stream, daemon_uid, seat.active_authenticated_uid())?;
+                    authorize_peer(&stream, daemon_uid, shared.active_uid())?;
                     let request =
                         tokio::time::timeout(Duration::from_secs(3), read_message(&mut stream))
                             .await??;
@@ -43,8 +42,7 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
                             let snapshot = crate::peer_view::Snapshot::from_config(
                                 &*shared.config.read().await,
                             );
-                            let seat = tokio::task::spawn_blocking(query_primary_seat).await?;
-                            authorize_peer(&stream, daemon_uid, seat.active_authenticated_uid())?;
+                            authorize_peer(&stream, daemon_uid, shared.active_uid())?;
                             tokio::time::timeout(
                                 Duration::from_secs(3),
                                 write_message(&mut stream, &snapshot),
@@ -106,8 +104,7 @@ async fn desktop_command(
 ) -> Result<crate::peer_view::DesktopReply> {
     use crate::peer_view::{DesktopReply, DesktopStatus, Request};
     let _mutation = shared.config_mutation.lock().await;
-    let seat = tokio::task::spawn_blocking(query_primary_seat).await?;
-    authorize_peer(stream, daemon_uid, seat.active_authenticated_uid())?;
+    authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();
     match request {
         Request::Status {} => {
@@ -173,8 +170,7 @@ async fn pair(
     Ok::<_, anyhow::Error>((session, name, authentication_code))
     }).await.context("Pairing expired; try again")??;
     let _mutation = shared.config_mutation.lock().await;
-    let seat = tokio::task::spawn_blocking(query_primary_seat).await?;
-    authorize_peer(stream, daemon_uid, seat.active_authenticated_uid())?;
+    authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();
     crate::pairing::add_confirmed_peer(
         &mut config,

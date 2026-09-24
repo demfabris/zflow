@@ -217,10 +217,9 @@ checks do not qualify the live workflow:
 Return polling holds each GNOME request for up to 200 ms and replies on a barrier
 hit. The Node compositor checks cover hold expiry, a hit during a pending poll,
 pending-poll cancellation at Finish or lease expiry, and hold-timer removal.
-For live verification, expect about 300 poll requests per minute, `seat_before_ms`
-and `seat_after_ms` equal to zero for polls, and a return response within roughly
-one network round trip of the barrier hit. The daemon refreshes cached seat state
-on its 250 ms tick and keeps fresh seat checks around other desktop operations.
+For live verification, expect about 300 poll requests per minute and a return
+response within roughly one network round trip of the barrier hit. The daemon
+learns seat changes from logind signals, so an idle daemon makes no logind calls.
 These are targets; the two-machine measurements remain pending.
 
 For current live qualification, install matching Linux daemon/desktop-agent
@@ -330,8 +329,9 @@ builds. Use `just debug mac`, `just debug linux` and `just debug-daemon`:
 - Click during connect and overshoot the entry region. Require `crossing
   cancelled`, `enabled=true` when the worker finishes, and a successful next
   crossing after moving back inside the Mac. Stop must still disable sharing.
-- Check daemon trace logs for zero `seat_before_ms` and `seat_after_ms` on polls.
-  Seat refreshes should happen on the broker tick rather than on each poll.
+- Check that polls cause no logind calls. The daemon learns seat changes from
+  logind signals; locking the screen mid-crossing must still end a session
+  whose peer lacks pre-login permission.
 - Measure return-edge report to `edge sharing rearmed`, with Reduce Wi-Fi latency
   both off and on. Try another crossing within 150 ms and record its result.
 - Minimize the Mac window and cross, then repeat with its window on another Space.

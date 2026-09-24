@@ -6,11 +6,6 @@ use crate::session::{desktop_operation, desktop_response_kind};
 use anyhow::ensure;
 use tokio::net::UnixStream;
 
-/// Logind answers Unknown when a query is slow or races a property change.
-/// The agent keeps its last definite seat state for this long, so one slow
-/// answer does not disconnect it and end a live crossing.
-const SEAT_UNKNOWN_GRACE: Duration = Duration::from_secs(1);
-
 struct Job {
     request: DesktopRequest,
     origin: Option<(String, u64)>,
@@ -129,6 +124,15 @@ impl Hub {
         }
     }
 
+    /// When the handoff lease runs out unless a Poll renews it first.
+    async fn lease_deadline(&self) -> Option<Instant> {
+        self.lease
+            .lock()
+            .await
+            .as_ref()
+            .map(|lease| lease.renewed + Duration::from_millis(crate::desktop::LEASE_MS))
+    }
+
     pub async fn closed(&self, peer: &str, session_id: u64) {
         let token = {
             let mut lease = self.lease.lock().await;
@@ -148,26 +152,6 @@ impl Hub {
     }
 }
 
-/// The seat state a connected desktop agent is judged by.
-struct AgentSeat {
-    state: SeatState,
-    definite_at: Option<Instant>,
-}
-
-impl AgentSeat {
-    fn observe(&mut self, next: SeatState, now: Instant) {
-        if !matches!(next, SeatState::Unknown { .. }) {
-            self.state = next;
-            self.definite_at = Some(now);
-        } else if self
-            .definite_at
-            .is_none_or(|at| now.duration_since(at) >= SEAT_UNKNOWN_GRACE)
-        {
-            self.state = next;
-        }
-    }
-}
-
 pub(super) async fn request(
     shared: Arc<Shared>,
     peer: String,
@@ -183,7 +167,7 @@ pub(super) async fn request(
     {
         let _policy = shared.policy.lock().await;
         let config = shared.config.read().await;
-        let gate = *shared.seat_gate.read().await;
+        let gate = shared.seat_gate.read().await.gate;
         if !matches!(gate, InjectionGate::Normal { .. })
             || !receiver_authorized(&config, &peer, gate)
             || !shared
@@ -273,9 +257,8 @@ pub(super) async fn request(
 }
 
 /// A desktop agent opts in by keeping this credential-checked stream open.
-/// Polls use the active seat refreshed on the idle interval; other RPCs recheck it.
-/// The compositor barrier and daemon reservation both expire after two seconds
-/// without a source Poll.
+/// Every seat change rechecks it. The compositor barrier and daemon
+/// reservation both expire after two seconds without a source Poll.
 pub(super) async fn serve(
     shared: Arc<Shared>,
     mut stream: UnixStream,
@@ -289,114 +272,68 @@ pub(super) async fn serve(
         *broker = Some((id, sender));
     }
     tracing::info!(broker_id = id, "desktop agent connected");
-    let mut seat = AgentSeat {
-        state: SeatState::Unknown {
-            reason: "not queried yet".into(),
-        },
-        definite_at: None,
-    };
-    let result=async {
-        write_message(&mut stream,&DesktopResponse::Finished).await?;
-        seat.observe(tokio::task::spawn_blocking(query_primary_seat).await?, Instant::now());
-        let mut interval=tokio::time::interval(Duration::from_millis(250));
+    let mut latest = shared.seat.clone();
+    let mut seat = SeatGrace::new(latest.borrow_and_update().clone(), Instant::now());
+    let result = async {
+        write_message(&mut stream, &DesktopResponse::Finished).await?;
         loop {
+            authorize_peer(&stream, daemon_uid, seat.state.active_authenticated_uid())?;
+            let lease_deadline = shared.desktop.lease_deadline().await;
             tokio::select! {
-                job=jobs.recv() => {
-                    let Some(job)=job else {break;};
-                    let operation = desktop_operation(&job.request);
-                    let peer = job.origin.as_ref().map(|(peer,_)|peer.as_str()).unwrap_or("local_cleanup");
-                    let session_id = job.origin.as_ref().map(|(_,id)|*id);
-                    if job.reply.is_closed() {
-                        tracing::debug!(broker_id = id, %peer, ?session_id, operation, "abandoned desktop broker job skipped");
-                        continue;
-                    }
-                    let queue_ms = job.queued_at.elapsed().as_millis() as u64;
-                    if operation != "poll" {
-                        tracing::debug!(broker_id = id, %peer, ?session_id, operation, queue_ms, "desktop broker operation started");
-                    }
-                    let seat_started = Instant::now();
-                    let seat_before_ms = if operation == "poll" {
-                        0
-                    } else {
-                        seat.observe(tokio::task::spawn_blocking(query_primary_seat).await?, Instant::now());
-                        seat_started.elapsed().as_millis() as u64
+                job = jobs.recv() => {
+                    let Some(job) = job else {
+                        break;
                     };
-                    if seat_before_ms >= 150 {
-                        tracing::debug!(broker_id = id, %peer, ?session_id, operation, seat_before_ms, "slow desktop seat check before operation");
-                    }
-                    tracing::trace!(broker_id = id, %peer, ?session_id, operation, queue_ms, seat_before_ms, "desktop broker seat checked before operation");
-                    authorize_peer(&stream,daemon_uid,seat.state.active_authenticated_uid())?;
-                    if let Some((peer, session_id)) = &job.origin {
-                        let _policy = shared.policy.lock().await;
-                        let config = shared.config.read().await;
-                        let gate = seat.state.injection_gate();
-                        let current_session = shared.sessions.lock().await.get(peer).is_some_and(|s|s.id()==*session_id);
-                        let current = matches!(gate,InjectionGate::Normal{..})
-                            && receiver_authorized(&config,peer,gate)
-                            && current_session
-                            && shared.desktop.allows_session(peer,*session_id).await;
-                        if !current {
-                            tracing::warn!(broker_id = id, %peer, session_id, operation, "desktop authorization changed before compositor call");
-                            let _=job.reply.send(DesktopResponse::unavailable("Desktop authorization changed before the operation"));
-                            continue;
-                        }
-                    }
-                    let compositor_started = Instant::now();
-                    tracing::trace!(broker_id = id, %peer, ?session_id, operation, "desktop broker calling desktop compositor bridge");
-                    write_message(&mut stream,&job.request).await?;
-                    let response:DesktopResponse=tokio::time::timeout(Duration::from_millis(600),read_message(&mut stream)).await
-                        .context("Desktop bridge response timed out")??;
-                    response.validate()?;
-                    let compositor_ms = compositor_started.elapsed().as_millis() as u64;
-                    let outcome = desktop_response_kind(&response);
-                    let seat_started = Instant::now();
-                    let seat_after_ms = if operation == "poll" {
-                        0
-                    } else {
-                        seat.observe(tokio::task::spawn_blocking(query_primary_seat).await?, Instant::now());
-                        seat_started.elapsed().as_millis() as u64
-                    };
-                    authorize_peer(&stream,daemon_uid,seat.state.active_authenticated_uid())?;
-                    let elapsed_ms = job.queued_at.elapsed().as_millis() as u64;
-                    if operation != "poll" || elapsed_ms >= crate::desktop::POLL_HOLD_MS + 150 || outcome != "active" {
-                        tracing::debug!(broker_id = id, %peer, ?session_id, operation, outcome, queue_ms, seat_before_ms, compositor_ms, seat_after_ms, elapsed_ms, "desktop broker operation completed");
-                    } else {
-                        tracing::trace!(broker_id = id, %peer, ?session_id, operation, outcome, queue_ms, seat_before_ms, compositor_ms, seat_after_ms, elapsed_ms, "desktop broker operation completed");
-                    }
-                    if job.reply.send(response).is_err()
-                        && let DesktopRequest::Prepare {token,..}=job.request {
-                        tracing::debug!(broker_id = id, operation, "desktop prepare reply abandoned; cleaning compositor lease");
-                        write_message(&mut stream,&DesktopRequest::Finish{token}).await?;
-                        let _:DesktopResponse=tokio::time::timeout(Duration::from_millis(600),read_message(&mut stream)).await??;
-                    }
+                    broker_job(&shared, &mut stream, &mut latest, &mut seat, daemon_uid, id, job).await?;
                 }
-                _=interval.tick() => {
-                    seat.observe(tokio::task::spawn_blocking(query_primary_seat).await?, Instant::now());
-                    authorize_peer(&stream,daemon_uid,seat.state.active_authenticated_uid())?;
-                    let expired={
-                        let mut lease=shared.desktop.lease.lock().await;
-                        if lease.as_ref().is_some_and(|l|l.renewed.elapsed() >= Duration::from_millis(crate::desktop::LEASE_MS)) {lease.take()} else {None}
+                changed = latest.changed() => {
+                    changed.context("the seat watch stopped")?;
+                    seat.observe(latest.borrow_and_update().clone(), Instant::now());
+                }
+                () = sleep_until(seat.deadline()) => {
+                    seat.observe(latest.borrow().clone(), Instant::now());
+                }
+                () = sleep_until(lease_deadline) => {
+                    let expired = {
+                        let mut lease = shared.desktop.lease.lock().await;
+                        if lease.as_ref().is_some_and(|lease| {
+                            lease.renewed.elapsed() >= Duration::from_millis(crate::desktop::LEASE_MS)
+                        }) {
+                            lease.take()
+                        } else {
+                            None
+                        }
                     };
-                    if let Some(expired)=expired {
+                    if let Some(expired) = expired {
                         tracing::warn!(broker_id = id, peer = %expired.peer, session_id = expired.session_id, elapsed_ms = expired.renewed.elapsed().as_millis() as u64, "desktop handoff lease expired");
-                        if let Some(session)=shared.sessions.lock().await.get(&expired.peer).filter(|s|s.id()==expired.session_id) {
+                        if let Some(session) = shared
+                            .sessions
+                            .lock()
+                            .await
+                            .get(&expired.peer)
+                            .filter(|session| session.id() == expired.session_id)
+                        {
                             session.close(SessionCloseReason::BackendUnavailable);
                         }
                     }
-                    // Unix stream readiness detects a closed desktop agent without creating
-                    // another reader that could consume a response frame.
-                    let mut byte=[0u8;1];
+                }
+                // Between jobs the agent sends nothing, so readiness means it
+                // closed. No second reader can consume a response frame.
+                ready = stream.readable() => {
+                    ready?;
+                    let mut byte = [0u8; 1];
                     match stream.try_read(&mut byte) {
-                        Ok(0)=>break,
-                        Ok(_)=>bail!("Unexpected desktop bridge data"),
-                        Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{},
-                        Err(error)=>return Err(error.into()),
+                        Ok(0) => break,
+                        Ok(_) => bail!("Unexpected desktop bridge data"),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(error.into()),
                     }
                 }
             }
         }
         Ok(())
-    }.await;
+    }
+    .await;
     match &result {
         Ok(()) => tracing::info!(broker_id = id, "desktop agent stopped"),
         // Logout and user switches hand the seat to a greeter or another uid.
@@ -414,6 +351,92 @@ pub(super) async fn serve(
     }
     shared.desktop.disconnected(id, &shared.sessions).await;
     result
+}
+
+/// Runs one compositor call for a peer or for local cleanup, checking the
+/// seat and the peer's authorization right before and after it.
+async fn broker_job(
+    shared: &Shared,
+    stream: &mut UnixStream,
+    latest: &mut watch::Receiver<SeatState>,
+    seat: &mut SeatGrace,
+    daemon_uid: u32,
+    id: u64,
+    job: Job,
+) -> Result<()> {
+    let operation = desktop_operation(&job.request);
+    let peer = job
+        .origin
+        .as_ref()
+        .map(|(peer, _)| peer.as_str())
+        .unwrap_or("local_cleanup");
+    let session_id = job.origin.as_ref().map(|(_, id)| *id);
+    if job.reply.is_closed() {
+        tracing::debug!(broker_id = id, %peer, ?session_id, operation, "abandoned desktop broker job skipped");
+        return Ok(());
+    }
+    let queue_ms = job.queued_at.elapsed().as_millis() as u64;
+    if operation != "poll" {
+        tracing::debug!(broker_id = id, %peer, ?session_id, operation, queue_ms, "desktop broker operation started");
+    }
+    seat.observe(latest.borrow_and_update().clone(), Instant::now());
+    authorize_peer(stream, daemon_uid, seat.state.active_authenticated_uid())?;
+    if let Some((peer, session_id)) = &job.origin {
+        let _policy = shared.policy.lock().await;
+        let config = shared.config.read().await;
+        let gate = seat.state.injection_gate();
+        let current_session = shared
+            .sessions
+            .lock()
+            .await
+            .get(peer)
+            .is_some_and(|session| session.id() == *session_id);
+        let current = matches!(gate, InjectionGate::Normal { .. })
+            && receiver_authorized(&config, peer, gate)
+            && current_session
+            && shared.desktop.allows_session(peer, *session_id).await;
+        if !current {
+            tracing::warn!(broker_id = id, %peer, session_id, operation, "desktop authorization changed before compositor call");
+            let _ = job.reply.send(DesktopResponse::unavailable(
+                "Desktop authorization changed before the operation",
+            ));
+            return Ok(());
+        }
+    }
+    let compositor_started = Instant::now();
+    tracing::trace!(broker_id = id, %peer, ?session_id, operation, "desktop broker calling desktop compositor bridge");
+    write_message(stream, &job.request).await?;
+    let response: DesktopResponse =
+        tokio::time::timeout(Duration::from_millis(600), read_message(stream))
+            .await
+            .context("Desktop bridge response timed out")??;
+    response.validate()?;
+    let compositor_ms = compositor_started.elapsed().as_millis() as u64;
+    let outcome = desktop_response_kind(&response);
+    seat.observe(latest.borrow_and_update().clone(), Instant::now());
+    authorize_peer(stream, daemon_uid, seat.state.active_authenticated_uid())?;
+    let elapsed_ms = job.queued_at.elapsed().as_millis() as u64;
+    if operation != "poll"
+        || elapsed_ms >= crate::desktop::POLL_HOLD_MS + 150
+        || outcome != "active"
+    {
+        tracing::debug!(broker_id = id, %peer, ?session_id, operation, outcome, queue_ms, compositor_ms, elapsed_ms, "desktop broker operation completed");
+    } else {
+        tracing::trace!(broker_id = id, %peer, ?session_id, operation, outcome, queue_ms, compositor_ms, elapsed_ms, "desktop broker operation completed");
+    }
+    if job.reply.send(response).is_err()
+        && let DesktopRequest::Prepare { token, .. } = job.request
+    {
+        tracing::debug!(
+            broker_id = id,
+            operation,
+            "desktop prepare reply abandoned; cleaning compositor lease"
+        );
+        write_message(stream, &DesktopRequest::Finish { token }).await?;
+        let _: DesktopResponse =
+            tokio::time::timeout(Duration::from_millis(600), read_message(stream)).await??;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -474,43 +497,6 @@ mod tests {
                 .permits("mac", 5, 9)
         );
         assert!(!hub.allows_session("mac", 4).await);
-    }
-
-    #[test]
-    fn agent_seat_tolerates_a_short_unknown_but_not_a_definite_change() {
-        use crate::linux::{AuthenticatedSession, AuthenticatedSessionKind, RestrictedSeatState};
-        let unlocked = SeatState::Unlocked(AuthenticatedSession {
-            id: "2".into(),
-            uid: 1000,
-            kind: AuthenticatedSessionKind::Wayland,
-        });
-        let unknown = || SeatState::Unknown {
-            reason: "slow".into(),
-        };
-        let start = Instant::now();
-        let mut seat = AgentSeat {
-            state: unknown(),
-            definite_at: None,
-        };
-        seat.observe(unlocked.clone(), start);
-        seat.observe(unknown(), start + Duration::from_millis(900));
-        assert_eq!(seat.state, unlocked);
-        seat.observe(unknown(), start + SEAT_UNKNOWN_GRACE);
-        assert_eq!(seat.state.active_authenticated_uid(), None);
-
-        seat.observe(unlocked.clone(), start + Duration::from_secs(2));
-        let greeter = SeatState::Restricted(RestrictedSeatState::Greeter {
-            session_id: "c1".into(),
-        });
-        seat.observe(greeter.clone(), start + Duration::from_millis(2_100));
-        assert_eq!(seat.state, greeter);
-
-        let mut fresh = AgentSeat {
-            state: unlocked,
-            definite_at: None,
-        };
-        fresh.observe(unknown(), start);
-        assert_eq!(fresh.state.active_authenticated_uid(), None);
     }
 
     #[test]
