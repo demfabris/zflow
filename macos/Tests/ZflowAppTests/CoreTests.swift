@@ -46,6 +46,21 @@ import Testing
   await core.shutdown()
 }
 
+@Test func requestsAfterShutdownDoNotRestartTheEngine() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let file = directory.appendingPathComponent("zflow.toml")
+  try "[transport]\ndiscovery = false\n".write(to: file, atomically: true, encoding: .utf8)
+  let core = CoreBridge(path: file.path)
+  _ = try await core.request(CoreRequest(command: "snapshot"))
+  await core.shutdown()
+  do {
+    _ = try await core.request(CoreRequest(command: "snapshot"))
+    Issue.record("A request after shutdown must not recreate the engine")
+  } catch {}
+}
+
 @Test func workerReloadsSettingsWithoutWindowPolling() async throws {
   let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
   try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

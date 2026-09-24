@@ -92,8 +92,11 @@ private final class CoreHandle: @unchecked Sendable {
 actor CoreBridge {
   let path: String
   private var handle: CoreHandle?
+  // A request queued behind shutdown must not start a new engine during quit.
+  private var closed = false
   init(path: String) { self.path = path }
   func request(_ request: CoreRequest) throws -> Snapshot {
+    guard !closed else { throw AppError(message: "The sharing engine has stopped") }
     if handle == nil { handle = try CoreHandle(path: path) }
     let data = try JSONEncoder().encode(request)
     let text = String(decoding: data, as: UTF8.self)
@@ -109,5 +112,8 @@ actor CoreBridge {
     }
     return snapshot
   }
-  func shutdown() { handle = nil }
+  func shutdown() {
+    closed = true
+    handle = nil
+  }
 }
