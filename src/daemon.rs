@@ -73,6 +73,9 @@ pub fn run(config_path: PathBuf) -> Result<()> {
 }
 
 async fn run_async(config_path: PathBuf) -> Result<()> {
+    // systemctl stop and the sleep hook send SIGTERM. Handle it from the start
+    // so it always reaches the graceful shutdown below.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let config = Config::load(&config_path)
         .with_context(|| format!("failed to load {}", config_path.display()))?;
     validate_peer_identities(&config)?;
@@ -267,6 +270,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                 signal?;
                 break;
             }
+            _ = terminate.recv() => break,
         }
     }
 
