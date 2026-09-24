@@ -667,7 +667,7 @@ Each session records bounded local metrics:
 - capture-to-send and receive-to-inject processing time;
 - RTT, delay variation, loss, reordering, and datagram queue drops;
 - clock offset, skew, and residual error;
-- playout delay, scheduler lateness, catch-up amount, and explicit rebases;
+- playout delay, scheduler lateness, and catch-up amount;
 - input lease renewals, snapshot acknowledgements, synthetic releases, epoch/generation changes, and rejected stale events;
 - arming-to-grab time and switch-time leakage events;
 - path changes, service class, probe cadence, CPU wakeups, and energy data where the platform exposes them.

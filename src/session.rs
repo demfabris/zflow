@@ -1500,6 +1500,8 @@ async fn apply_control(
             .any(|effect| matches!(effect, ReceiverEffect::ActivationOpened(_)))
         {
             lock_metrics(metrics).begin_activation();
+            // Motion sequences restart with each activation.
+            motion_received_at.clear();
             *playout = Some(ReceiverPlayout::new(
                 options.playout,
                 receiver.active_context().expect("activation opened"),
@@ -1508,18 +1510,10 @@ async fn apply_control(
         if let Some(active) = playout.as_mut() {
             active.advance_control_watermark(sequence)?;
             if let Some(anchor) = anchor {
-                let rebase = active.rebase(anchor.through_motion_sequence, anchor.totals)?;
+                // The receiver injects whatever the anchor adds, so this only
+                // moves playout's baseline. Nothing is discarded.
+                active.rebase(anchor.through_motion_sequence, anchor.totals)?;
                 motion_received_at.retain(|sequence, _| *sequence > anchor.through_motion_sequence);
-                let mut metrics = lock_metrics(metrics);
-                metrics.explicit_rebases = metrics.explicit_rebases.saturating_add(1);
-                metrics.rebase_discarded_pointer_units = metrics
-                    .rebase_discarded_pointer_units
-                    .saturating_add(rebase.discarded_displacement.dx.unsigned_abs())
-                    .saturating_add(rebase.discarded_displacement.dy.unsigned_abs());
-                metrics.rebase_discarded_scroll_units = metrics
-                    .rebase_discarded_scroll_units
-                    .saturating_add(rebase.discarded_displacement.scroll_x.unsigned_abs())
-                    .saturating_add(rebase.discarded_displacement.scroll_y.unsigned_abs());
             }
         }
     }
@@ -1625,13 +1619,6 @@ async fn poll_playout(
         session_metrics.scheduler_late_events = session_metrics
             .scheduler_late_events
             .saturating_add(new_scheduler_late);
-        if new_scheduler_late > 0
-            && let Some(lateness) = after.last_scheduler_lateness
-        {
-            session_metrics
-                .scheduler_lateness_us
-                .record(lateness.as_secs_f64() * 1_000_000.0);
-        }
         session_metrics.catch_up_steps =
             session_metrics.catch_up_steps.saturating_add(new_catch_up);
         if new_catch_up > 0 {

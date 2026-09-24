@@ -137,9 +137,6 @@ pub struct SessionMetrics {
     pub unsupported_inputs_dropped: u64,
     pub epoch_changes: u64,
     pub generation_changes: u64,
-    pub explicit_rebases: u64,
-    pub rebase_discarded_pointer_units: u64,
-    pub rebase_discarded_scroll_units: u64,
     highest_motion_sequence: u64,
     recent_motion_sequences: BTreeSet<u64>,
     last_packet_delay_us: Option<u64>,
@@ -162,6 +159,7 @@ pub struct SessionMetricsSnapshot {
     /// raw per-datagram delay variation.
     pub adaptive_delay_variation_percentile_us: Option<SampleSummary>,
     pub playout_delay_us: Option<SampleSummary>,
+    /// How far past its deadline the session timer woke.
     pub scheduler_lateness_us: Option<SampleSummary>,
     pub clock_residual_us: Option<SampleSummary>,
     pub clock_offset_us: Option<f64>,
@@ -174,6 +172,7 @@ pub struct SessionMetricsSnapshot {
     pub duplicate_datagrams: u64,
     /// Datagrams replaced in the bounded latest-wins application queue.
     pub datagram_queue_drops: u64,
+    /// Motion targets that started playing after their playout deadline.
     pub scheduler_late_events: u64,
     pub catch_up_steps: u64,
     pub catch_up_pointer_units: u64,
@@ -186,9 +185,6 @@ pub struct SessionMetricsSnapshot {
     pub unsupported_inputs_dropped: u64,
     pub epoch_changes: u64,
     pub generation_changes: u64,
-    pub explicit_rebases: u64,
-    pub rebase_discarded_pointer_units: u64,
-    pub rebase_discarded_scroll_units: u64,
 }
 
 impl SessionMetrics {
@@ -289,9 +285,6 @@ impl SessionMetrics {
                 unsupported_inputs_dropped: self.unsupported_inputs_dropped,
                 epoch_changes: self.epoch_changes,
                 generation_changes: self.generation_changes,
-                explicit_rebases: self.explicit_rebases,
-                rebase_discarded_pointer_units: self.rebase_discarded_pointer_units,
-                rebase_discarded_scroll_units: self.rebase_discarded_scroll_units,
             },
         }
     }

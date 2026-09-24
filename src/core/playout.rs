@@ -202,7 +202,6 @@ pub struct PlayoutStats {
     pub late_frame_count: u64,
     pub scheduler_late_count: u64,
     pub maximum_lateness: Duration,
-    pub last_scheduler_lateness: Option<Duration>,
     pub catch_up_step_count: u64,
     pub last_packet_delay: Option<Duration>,
     pub duplicate_frame_count: u64,
@@ -262,7 +261,6 @@ pub struct ReceiverPlayout {
     late_frame_count: u64,
     scheduler_late_count: u64,
     maximum_lateness_micros: u64,
-    last_scheduler_lateness_micros: Option<u64>,
     catch_up_step_count: u64,
     duplicate_frame_count: u64,
     retired_frame_count: u64,
@@ -301,7 +299,6 @@ impl ReceiverPlayout {
             late_frame_count: 0,
             scheduler_late_count: 0,
             maximum_lateness_micros: 0,
-            last_scheduler_lateness_micros: None,
             catch_up_step_count: 0,
             duplicate_frame_count: 0,
             retired_frame_count: 0,
@@ -582,7 +579,6 @@ impl ReceiverPlayout {
         self.velocity_sample = None;
         self.last_observed_time = None;
         self.last_poll_time = None;
-        self.last_scheduler_lateness_micros = None;
         self.reset_count = self.reset_count.saturating_add(1);
     }
 
@@ -600,9 +596,6 @@ impl ReceiverPlayout {
             late_frame_count: self.late_frame_count,
             scheduler_late_count: self.scheduler_late_count,
             maximum_lateness: Duration::from_micros(self.maximum_lateness_micros),
-            last_scheduler_lateness: self
-                .last_scheduler_lateness_micros
-                .map(Duration::from_micros),
             catch_up_step_count: self.catch_up_step_count,
             last_packet_delay: self
                 .delay_samples
@@ -822,7 +815,6 @@ impl ReceiverPlayout {
             self.late_frame_count = self.late_frame_count.saturating_add(1);
         } else {
             self.scheduler_late_count = self.scheduler_late_count.saturating_add(1);
-            self.last_scheduler_lateness_micros = Some(lateness_micros);
         }
         self.maximum_lateness_micros = self.maximum_lateness_micros.max(lateness_micros);
     }
