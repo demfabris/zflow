@@ -188,7 +188,7 @@ The decoder MUST:
 - tolerate unknown optional fields;
 - expose a fuzz target for every message family.
 
-The wire encoding remains open until the protocol simulator compares at least two bounded, schema-driven options. The logical model below is fixed for the first prototype.
+Payloads use postcard inside the bounded envelope; the decoder accepts no other codec. The logical model below is fixed for the first prototype.
 
 Authenticated session negotiation selects one protocol version, maximum datagram size, input capabilities, pointer units, scroll fields, contact limit, receiver lease, and checkpoint bound. A required capability mismatch prevents activation.
 

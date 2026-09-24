@@ -25,6 +25,7 @@ use model::{
 
 const MAGIC: [u8; 2] = *b"ZF";
 const FRAMING_VERSION: u8 = 1;
+const POSTCARD_CODEC: u8 = 1;
 const FLAG_SESSION_CONTEXT: u8 = 1 << 0;
 const KNOWN_FLAGS: u8 = FLAG_SESSION_CONTEXT;
 const FIXED_HEADER_BYTES: usize = 17;
@@ -36,30 +37,6 @@ pub const MAX_MOTION_PAYLOAD_BYTES: usize = 8 * 1_024;
 pub const MAX_PROBE_PAYLOAD_BYTES: usize = 128;
 pub const MAX_DISCOVERY_PAYLOAD_BYTES: usize = 8 * 1_024;
 pub const MAX_PAIRING_PAYLOAD_BYTES: usize = 2 * 1_024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Codec {
-    Postcard = 1,
-    Bincode = 2,
-}
-
-impl TryFrom<u8> for Codec {
-    type Error = WireError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Postcard),
-            2 => Ok(Self::Bincode),
-            other => Err(WireError::UnknownCodec(other)),
-        }
-    }
-}
-
-/// Postcard is the default because the representative valid-message corpus in
-/// this module's tests is smaller with postcard than with bincode's standard
-/// variable-integer serde encoding. Both codecs carry identical model values.
-pub const DEFAULT_CODEC: Codec = Codec::Postcard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -158,19 +135,14 @@ pub struct DecodedMessage {
 }
 
 pub fn encode(message: &WireMessage) -> Result<Vec<u8>, WireError> {
-    encode_with_options(message, DEFAULT_CODEC, &[])
-}
-
-pub fn encode_with_codec(message: &WireMessage, codec: Codec) -> Result<Vec<u8>, WireError> {
-    encode_with_options(message, codec, &[])
+    encode_with_options(message, &[])
 }
 
 pub fn encode_with_options(
     message: &WireMessage,
-    selected_codec: Codec,
     optional_fields: &[OptionalField],
 ) -> Result<Vec<u8>, WireError> {
-    let encoded = prepare_payload(message, selected_codec)?;
+    let encoded = prepare_payload(message)?;
     let optional = encode_optional_fields(optional_fields)?;
     if encoded.payload.len() > encoded.family.maximum_payload_bytes() {
         return Err(WireError::SizeLimit {
@@ -201,7 +173,7 @@ pub fn encode_with_options(
     );
     bytes.extend_from_slice(&MAGIC);
     bytes.push(FRAMING_VERSION);
-    bytes.push(selected_codec as u8);
+    bytes.push(POSTCARD_CODEC);
     bytes.push(encoded.family as u8);
     bytes.push(encoded.message_type);
     bytes.push(if encoded.session.is_some() {
@@ -263,10 +235,7 @@ struct EncodedPayload {
     payload: Vec<u8>,
 }
 
-fn prepare_payload(
-    message: &WireMessage,
-    selected_codec: Codec,
-) -> Result<EncodedPayload, WireError> {
+fn prepare_payload(message: &WireMessage) -> Result<EncodedPayload, WireError> {
     let bounds = |error: BoundError| WireError::Bounds(error.to_string());
     Ok(match message {
         WireMessage::NegotiationOffer(offer) => {
@@ -277,7 +246,7 @@ fn prepare_payload(
                 protocol_version: CURRENT_PROTOCOL_VERSION,
                 session: None,
                 channel: ChannelFields::None,
-                payload: codec::encode(selected_codec, &value)?,
+                payload: codec::encode(&value)?,
             }
         }
         WireMessage::NegotiatedSession(session) => {
@@ -289,7 +258,7 @@ fn prepare_payload(
                 protocol_version: session.protocol_version,
                 session: None,
                 channel: ChannelFields::None,
-                payload: codec::encode(selected_codec, &value)?,
+                payload: codec::encode(&value)?,
             }
         }
         WireMessage::ReliableControl(message) => {
@@ -303,7 +272,7 @@ fn prepare_payload(
                 protocol_version: message.session.protocol_version,
                 session: Some(message.session),
                 channel: ChannelFields::Control(message.sequence),
-                payload: codec::encode(selected_codec, &value)?,
+                payload: codec::encode(&value)?,
             }
         }
         WireMessage::Motion(frame) => {
@@ -318,7 +287,7 @@ fn prepare_payload(
                     motion_sequence: frame.motion_sequence,
                     control_watermark: frame.control_watermark,
                 },
-                payload: codec::encode(selected_codec, &value)?,
+                payload: codec::encode(&value)?,
             }
         }
         WireMessage::Probe(message) => {
@@ -333,7 +302,7 @@ fn prepare_payload(
                 protocol_version: message.session.protocol_version,
                 session: Some(message.session),
                 channel: ChannelFields::None,
-                payload: codec::encode(selected_codec, &message.payload)?,
+                payload: codec::encode(&message.payload)?,
             }
         }
         WireMessage::Discovery(announcement) => {
@@ -344,7 +313,7 @@ fn prepare_payload(
                 protocol_version: CURRENT_PROTOCOL_VERSION,
                 session: None,
                 channel: ChannelFields::None,
-                payload: codec::encode(selected_codec, &value)?,
+                payload: codec::encode(&value)?,
             }
         }
         WireMessage::Desktop(message) => {
@@ -364,7 +333,7 @@ fn prepare_payload(
                 protocol_version: CURRENT_PROTOCOL_VERSION,
                 session: None,
                 channel: ChannelFields::None,
-                payload: codec::encode(selected_codec, &value)?,
+                payload: codec::encode(&value)?,
             }
         }
         WireMessage::Pairing(pairing) => {
@@ -375,7 +344,7 @@ fn prepare_payload(
                 protocol_version: CURRENT_PROTOCOL_VERSION,
                 session: None,
                 channel: ChannelFields::None,
-                payload: codec::encode(selected_codec, &value)?,
+                payload: codec::encode(&value)?,
             }
         }
     })
@@ -416,7 +385,6 @@ impl ChannelFields {
 }
 
 struct Header {
-    codec: Codec,
     family: Family,
     message_type: u8,
     protocol_version: ProtocolVersion,
@@ -442,7 +410,10 @@ fn parse_envelope(bytes: &[u8]) -> Result<ParsedEnvelope<'_>, WireError> {
     if framing_version != FRAMING_VERSION {
         return Err(WireError::UnsupportedFramingVersion(framing_version));
     }
-    let selected_codec = Codec::try_from(cursor.u8()?)?;
+    let codec = cursor.u8()?;
+    if codec != POSTCARD_CODEC {
+        return Err(WireError::UnknownCodec(codec));
+    }
     let family = Family::try_from(cursor.u8()?)?;
     let message_type = cursor.u8()?;
     if !family.valid_message_type(message_type) {
@@ -520,7 +491,6 @@ fn parse_envelope(bytes: &[u8]) -> Result<ParsedEnvelope<'_>, WireError> {
     let payload = cursor.take(payload_length)?;
     Ok(ParsedEnvelope {
         header: Header {
-            codec: selected_codec,
             family,
             message_type,
             protocol_version,
@@ -537,13 +507,13 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
     match header.family {
         Family::Negotiation => match header.message_type {
             1 => {
-                let value: WireNegotiationOffer = codec::decode(header.codec, payload)?;
+                let value: WireNegotiationOffer = codec::decode(payload)?;
                 Ok(WireMessage::NegotiationOffer(
                     value.try_into().map_err(bounds)?,
                 ))
             }
             2 => {
-                let value: WireNegotiatedSession = codec::decode(header.codec, payload)?;
+                let value: WireNegotiatedSession = codec::decode(payload)?;
                 Ok(WireMessage::NegotiatedSession(
                     value.into_model(header.protocol_version).map_err(bounds)?,
                 ))
@@ -551,7 +521,7 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
             _ => unreachable!("message type checked during header parsing"),
         },
         Family::ReliableControl => {
-            let value: WireReliableControl = codec::decode(header.codec, payload)?;
+            let value: WireReliableControl = codec::decode(payload)?;
             if value.message_type() != header.message_type {
                 return Err(WireError::InvalidEnvelope(
                     "reliable control type disagrees with its payload",
@@ -573,7 +543,7 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
             }))
         }
         Family::Motion => {
-            let value: WireMotionBody = codec::decode(header.codec, payload)?;
+            let value: WireMotionBody = codec::decode(payload)?;
             let session = header
                 .session
                 .ok_or(WireError::InvalidEnvelope("motion lacks session context"))?;
@@ -591,7 +561,7 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
             ))
         }
         Family::Probe => {
-            let value: ProbePayload = codec::decode(header.codec, payload)?;
+            let value: ProbePayload = codec::decode(payload)?;
             let value_type = match value {
                 ProbePayload::Probe { .. } => 1,
                 ProbePayload::ProbeEcho { .. } => 2,
@@ -609,12 +579,12 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
             }))
         }
         Family::Discovery => {
-            let value: WireDiscoveryAnnouncement = codec::decode(header.codec, payload)?;
+            let value: WireDiscoveryAnnouncement = codec::decode(payload)?;
             Ok(WireMessage::Discovery(value.try_into().map_err(bounds)?))
         }
         Family::Desktop => {
             let value: bounds::BoundedString<{ crate::desktop::MAX_MESSAGE_BYTES }> =
-                codec::decode(header.codec, payload)?;
+                codec::decode(payload)?;
             let message: crate::desktop::DesktopMessage =
                 serde_json::from_str(&value.into_string())
                     .map_err(|e| WireError::Bounds(e.to_string()))?;
@@ -624,7 +594,7 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
             Ok(WireMessage::Desktop(message))
         }
         Family::Pairing => {
-            let value: WirePairingOffer = codec::decode(header.codec, payload)?;
+            let value: WirePairingOffer = codec::decode(payload)?;
             Ok(WireMessage::Pairing(value.try_into().map_err(bounds)?))
         }
     }
@@ -931,34 +901,20 @@ mod tests {
     }
 
     #[test]
-    fn both_codecs_round_trip_every_family() {
-        for selected_codec in [Codec::Postcard, Codec::Bincode] {
-            for message in corpus() {
-                let bytes = encode_with_codec(&message, selected_codec).unwrap();
-                let decoded = decode(&bytes).unwrap();
-                assert_eq!(decoded.message, message);
-                assert!(decoded.optional_fields.is_empty());
-            }
+    fn every_family_round_trips() {
+        for message in corpus() {
+            let bytes = encode(&message).unwrap();
+            let decoded = decode(&bytes).unwrap();
+            assert_eq!(decoded.message, message);
+            assert!(decoded.optional_fields.is_empty());
         }
     }
 
     #[test]
-    fn postcard_is_selected_from_measured_valid_message_sizes() {
-        let messages = corpus();
-        let postcard_bytes: usize = messages
-            .iter()
-            .map(|message| encode_with_codec(message, Codec::Postcard).unwrap().len())
-            .sum();
-        let bincode_bytes: usize = messages
-            .iter()
-            .map(|message| encode_with_codec(message, Codec::Bincode).unwrap().len())
-            .sum();
-
-        assert!(
-            postcard_bytes < bincode_bytes,
-            "postcard={postcard_bytes}, bincode={bincode_bytes}"
-        );
-        assert_eq!(DEFAULT_CODEC, Codec::Postcard);
+    fn only_the_postcard_codec_is_accepted() {
+        let mut bytes = encode(&corpus().remove(4)).unwrap();
+        bytes[3] = 2;
+        assert_eq!(decode(&bytes), Err(WireError::UnknownCodec(2)));
     }
 
     #[test]
@@ -974,7 +930,7 @@ mod tests {
                 value: vec![4, 5],
             },
         ];
-        let bytes = encode_with_options(&message, Codec::Postcard, &options).unwrap();
+        let bytes = encode_with_options(&message, &options).unwrap();
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.message, message);
         assert_eq!(decoded.optional_fields, options);
@@ -1017,15 +973,12 @@ mod tests {
     }
 
     #[test]
-    fn collection_bound_is_enforced_by_both_decoders() {
-        for selected_codec in [Codec::Postcard, Codec::Bincode] {
-            let offer = corpus().remove(0);
-            let mut bytes = encode_with_codec(&offer, selected_codec).unwrap();
-            // Negotiation has no session/channel header. The first body value is
-            // the protocol_versions sequence length; 17 is the fixed header size.
-            bytes[FIXED_HEADER_BYTES] = (bounds::MAX_PROTOCOL_VERSIONS as u8) + 1;
-            assert!(decode(&bytes).is_err());
-        }
+    fn collection_bound_is_enforced_by_the_decoder() {
+        let mut bytes = encode(&corpus().remove(0)).unwrap();
+        // Negotiation has no session/channel header. The first body value is
+        // the protocol_versions sequence length; 17 is the fixed header size.
+        bytes[FIXED_HEADER_BYTES] = (bounds::MAX_PROTOCOL_VERSIONS as u8) + 1;
+        assert!(decode(&bytes).is_err());
     }
 
     #[test]
@@ -1051,7 +1004,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            encode_with_options(&probe, Codec::Postcard, &duplicate),
+            encode_with_options(&probe, &duplicate),
             Err(WireError::DuplicateOptionalField(7))
         );
     }
@@ -1087,27 +1040,25 @@ mod tests {
     #[test]
     fn desktop_metadata_round_trips_with_bounded_json() {
         use crate::desktop::*;
-        for codec in [Codec::Postcard, Codec::Bincode] {
-            let message = WireMessage::Desktop(DesktopMessage::Request {
-                id: 1,
-                request: DesktopRequest::Prepare {
-                    token: MAX_TOKEN,
-                    edge: Edge::Right,
-                    start: 0,
-                    end: FRACTION_MAX,
-                    position: 500_000,
-                },
-            });
-            let bytes = encode_with_codec(&message, codec).unwrap();
-            assert_eq!(decode(&bytes).unwrap().message, message);
-            let mut invalid = bytes;
-            // Unknown families fail before metadata is interpreted.
-            invalid[4] = 255;
-            assert!(matches!(
-                decode(&invalid),
-                Err(WireError::UnknownFamily(255))
-            ));
-        }
+        let message = WireMessage::Desktop(DesktopMessage::Request {
+            id: 1,
+            request: DesktopRequest::Prepare {
+                token: MAX_TOKEN,
+                edge: Edge::Right,
+                start: 0,
+                end: FRACTION_MAX,
+                position: 500_000,
+            },
+        });
+        let bytes = encode(&message).unwrap();
+        assert_eq!(decode(&bytes).unwrap().message, message);
+        let mut invalid = bytes;
+        // Unknown families fail before metadata is interpreted.
+        invalid[4] = 255;
+        assert!(matches!(
+            decode(&invalid),
+            Err(WireError::UnknownFamily(255))
+        ));
         assert!(
             encode(&WireMessage::Desktop(DesktopMessage::Request {
                 id: 1,

@@ -1,4 +1,4 @@
-use super::{Codec, Family};
+use super::Family;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WireError {
@@ -34,8 +34,8 @@ pub enum WireError {
     InvalidEnvelope(&'static str),
     #[error("optional field id {0} appears more than once")]
     DuplicateOptionalField(u16),
-    #[error("{codec:?} codec error: {detail}")]
-    Codec { codec: Codec, detail: String },
+    #[error("postcard codec error: {0}")]
+    Codec(String),
     #[error("wire bound violation: {0}")]
     Bounds(String),
     #[error("expected {expected:?}, received {actual:?}")]

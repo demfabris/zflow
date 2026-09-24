@@ -160,8 +160,8 @@ impl<'de, const N: usize> Deserialize<'de> for BoundedString<N> {
             }
         }
 
-        // Both codecs use their borrowed slice decoders, so the length check runs
-        // before this visitor allocates the owned String.
+        // Postcard's borrowed slice decoder runs the length check before this
+        // visitor allocates the owned String.
         deserializer.deserialize_str(BoundedStringVisitor)
     }
 }
