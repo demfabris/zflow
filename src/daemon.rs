@@ -66,7 +66,10 @@ pub fn run(config_path: PathBuf) -> Result<()> {
                 .unwrap_or_else(|_| "zflow=info".into()),
         )
         .init();
+    // The unit caps threads with TasksMax=128, and input runs on its own
+    // thread, so the control plane gets two workers rather than one per CPU.
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()?
         .block_on(run_async(config_path))
