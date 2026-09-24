@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{
 
 use crate::{
     config::{Config, DeviceSelector as ConfigDeviceSelector},
-    core::{HidUsage, Modifier, PointerButton, ReceiverEffect},
+    core::{HidUsage, PointerButton, ReceiverEffect},
     linux::{
         CaptureFrame, CaptureReadError, CaptureSet, CaptureSetError, CaptureTransition,
         CapturedDeviceFrame, DeviceInfo, InjectionError, KeyState, OwnershipEffect, OwnershipPhase,
@@ -1247,11 +1247,6 @@ fn apply_receiver_effect(
         ReceiverEffect::Button {
             button, pressed, ..
         } => virtual_input.pointer.set_button(button, pressed),
-        ReceiverEffect::Modifier {
-            modifier, pressed, ..
-        } => virtual_input
-            .keyboard
-            .set_key(modifier_usage(modifier), pressed),
         ReceiverEffect::TouchReplaced { state, synthetic } => {
             virtual_input.replace_touch_at(&state, if synthetic { None } else { touch_captured_at })
         }
@@ -1261,8 +1256,6 @@ fn apply_receiver_effect(
                 .map_err(|_| RuntimeDiagnostic::InjectionFailed);
         }
         ReceiverEffect::ActivationOpened(_)
-        | ReceiverEffect::ScrollBegan(_)
-        | ReceiverEffect::ScrollEnded { .. }
         | ReceiverEffect::SnapshotAck { .. }
         | ReceiverEffect::Rejected { .. } => Ok(()),
     };
@@ -1279,20 +1272,6 @@ fn injection_diagnostic(error: &InjectionError) -> RuntimeDiagnostic {
         }
         _ => RuntimeDiagnostic::InjectionRejected,
     }
-}
-
-fn modifier_usage(modifier: Modifier) -> HidUsage {
-    let usage = match modifier {
-        Modifier::LeftControl => 0xe0,
-        Modifier::LeftShift => 0xe1,
-        Modifier::LeftAlt => 0xe2,
-        Modifier::LeftMeta => 0xe3,
-        Modifier::RightControl => 0xe4,
-        Modifier::RightShift => 0xe5,
-        Modifier::RightAlt => 0xe6,
-        Modifier::RightMeta => 0xe7,
-    };
-    HidUsage::keyboard(usage)
 }
 
 pub fn watchdog_tick_interval(watchdog_timeout: Option<Duration>) -> Option<Duration> {
@@ -1698,18 +1677,6 @@ mod tests {
                 source: io::Error::from(io::ErrorKind::BrokenPipe),
             }),
             RuntimeDiagnostic::InjectionFailed
-        );
-    }
-
-    #[test]
-    fn modifier_mapping_matches_usb_hid_modifier_block() {
-        assert_eq!(
-            modifier_usage(Modifier::LeftControl),
-            HidUsage::keyboard(0xe0)
-        );
-        assert_eq!(
-            modifier_usage(Modifier::RightMeta),
-            HidUsage::keyboard(0xe7)
         );
     }
 

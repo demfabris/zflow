@@ -70,7 +70,7 @@ impl Family {
     fn valid_message_type(self, message_type: u8) -> bool {
         match self {
             Self::Negotiation => matches!(message_type, 1 | 2),
-            Self::ReliableControl => matches!(message_type, 1..=14 | 17),
+            Self::ReliableControl => matches!(message_type, 1 | 3..=6 | 10..=14 | 17),
             Self::Motion | Self::Discovery | Self::Pairing | Self::Desktop => message_type == 1,
             Self::Probe => matches!(message_type, 1 | 2),
         }
@@ -856,8 +856,6 @@ mod tests {
                     held: HeldState {
                         pressed_keys: BTreeSet::from([HidUsage::keyboard(4)]),
                         pressed_buttons: BTreeSet::from([PointerButton::PRIMARY]),
-                        modifiers: BTreeSet::from([Modifier::LeftShift]),
-                        active_scroll: None,
                         active_touch: touch_state(),
                     },
                     motion_anchor: anchor(),
@@ -925,8 +923,6 @@ mod tests {
         let held = HeldState {
             pressed_keys: BTreeSet::from([HidUsage::keyboard(4)]),
             pressed_buttons: BTreeSet::from([PointerButton::PRIMARY]),
-            modifiers: BTreeSet::new(),
-            active_scroll: None,
             active_touch: TouchState::default(),
         };
         let checkpoint = anchor(AnchorKind::Checkpoint);
@@ -1036,7 +1032,7 @@ mod tests {
     #[test]
     fn retired_control_types_are_rejected() {
         let mut bytes = encode(&corpus().remove(2)).unwrap();
-        for retired in [15, 16] {
+        for retired in [2, 7, 8, 9, 15, 16] {
             bytes[5] = retired;
             assert_eq!(
                 decode(&bytes),
@@ -1045,6 +1041,36 @@ mod tests {
                     message_type: retired,
                 })
             );
+        }
+    }
+
+    #[test]
+    fn retired_held_state_slots_must_stay_empty() {
+        let held = ReliableControl::StateSnapshot(StateSnapshot {
+            held: HeldState {
+                pressed_keys: BTreeSet::from([HidUsage::keyboard(4)]),
+                pressed_buttons: BTreeSet::from([PointerButton::PRIMARY]),
+                active_touch: TouchState::default(),
+            },
+            motion_anchor: MotionAnchor {
+                final_touch_state: TouchState::default(),
+                ..anchor()
+            },
+        });
+        let bytes = encode(&WireMessage::ReliableControl(ReliableControlMessage {
+            session: session(),
+            sequence: ControlSequence(1),
+            payload: held,
+        }))
+        .unwrap();
+        // Payload: variant, one key, one button, then the modifier count and
+        // the scroll option.
+        let payload = FIXED_HEADER_BYTES + 32 + 8;
+        for slot in [payload + 6, payload + 7] {
+            assert_eq!(bytes[slot], 0);
+            let mut filled = bytes.clone();
+            filled[slot] = 1;
+            assert!(matches!(decode(&filled), Err(WireError::Codec(_))));
         }
     }
 
@@ -1152,7 +1178,7 @@ mod tests {
         let message = WireMessage::ReliableControl(ReliableControlMessage {
             session: session(),
             sequence: ControlSequence(1),
-            payload: ReliableControl::Leave {
+            payload: ReliableControl::TouchEnd {
                 anchor: MotionAnchor {
                     activation_id: ActivationId(999),
                     ..anchor()

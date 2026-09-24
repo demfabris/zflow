@@ -30,9 +30,6 @@ pub struct MotionSequence(pub u64);
 pub struct ProbeSequence(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ScrollId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ContactId(pub u32);
 
 /// A timestamp from one process's monotonic clock, with no shared origin.
@@ -89,18 +86,6 @@ impl PointerButton {
     pub const PRIMARY: Self = Self(1);
     pub const SECONDARY: Self = Self(2);
     pub const MIDDLE: Self = Self(3);
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Modifier {
-    LeftControl,
-    LeftShift,
-    LeftAlt,
-    LeftMeta,
-    RightControl,
-    RightShift,
-    RightAlt,
-    RightMeta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -193,22 +178,6 @@ pub enum PointerUnit {
     DesktopAccelerated,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum ScrollUnit {
-    Device,
-    DiscreteStep,
-    Line,
-    Pixel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScrollSource {
-    pub unit: ScrollUnit,
-    /// Source units represented by one whole unit, when known.
-    pub resolution_x: Option<u32>,
-    pub resolution_y: Option<u32>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ScrollFields {
     pub high_resolution: bool,
@@ -228,27 +197,6 @@ impl ScrollFields {
             && (!self.phase || supported.phase)
             && (!self.momentum_phase || supported.momentum_phase)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ScrollPhase {
-    Begin,
-    Update,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MomentumPhase {
-    Begin,
-    Update,
-    End,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActiveScroll {
-    pub id: ScrollId,
-    pub source: ScrollSource,
-    pub phase: ScrollPhase,
-    pub momentum_phase: Option<MomentumPhase>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,8 +266,6 @@ impl TouchState {
 pub struct HeldState {
     pub pressed_keys: BTreeSet<HidUsage>,
     pub pressed_buttons: BTreeSet<PointerButton>,
-    pub modifiers: BTreeSet<Modifier>,
-    pub active_scroll: Option<ActiveScroll>,
     pub active_touch: TouchState,
 }
 
@@ -327,8 +273,6 @@ impl HeldState {
     pub fn is_neutral(&self) -> bool {
         self.pressed_keys.is_empty()
             && self.pressed_buttons.is_empty()
-            && self.modifiers.is_empty()
-            && self.active_scroll.is_none()
             && self.active_touch.is_empty()
     }
 
@@ -346,27 +290,6 @@ impl HeldState {
 
     pub fn release_button(&mut self, button: PointerButton) -> bool {
         self.pressed_buttons.remove(&button)
-    }
-
-    pub fn set_modifier(&mut self, modifier: Modifier, held: bool) -> bool {
-        if held {
-            self.modifiers.insert(modifier)
-        } else {
-            self.modifiers.remove(&modifier)
-        }
-    }
-
-    pub fn begin_scroll(&mut self, scroll: ActiveScroll) -> Option<ActiveScroll> {
-        self.active_scroll.replace(scroll)
-    }
-
-    pub fn end_scroll(&mut self, id: ScrollId) -> bool {
-        if self.active_scroll.is_some_and(|scroll| scroll.id == id) {
-            self.active_scroll = None;
-            true
-        } else {
-            false
-        }
     }
 
     pub fn replace_touch(&mut self, touch: TouchState) -> TouchState {
@@ -544,9 +467,6 @@ pub enum SessionCloseReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReliableControl {
     Enter,
-    Leave {
-        anchor: MotionAnchor,
-    },
     KeyDown {
         key: HidUsage,
     },
@@ -559,17 +479,6 @@ pub enum ReliableControl {
     },
     ButtonUp {
         button: PointerButton,
-        anchor: MotionAnchor,
-    },
-    ScrollBegin {
-        scroll: ActiveScroll,
-    },
-    ScrollEnd {
-        scroll_id: ScrollId,
-        anchor: MotionAnchor,
-    },
-    ScrollCancel {
-        scroll_id: ScrollId,
         anchor: MotionAnchor,
     },
     TouchBegin {
@@ -592,11 +501,8 @@ pub enum ReliableControl {
 impl ReliableControl {
     pub fn motion_anchor(&self) -> Option<&MotionAnchor> {
         match self {
-            Self::Leave { anchor }
-            | Self::ButtonDown { anchor, .. }
+            Self::ButtonDown { anchor, .. }
             | Self::ButtonUp { anchor, .. }
-            | Self::ScrollEnd { anchor, .. }
-            | Self::ScrollCancel { anchor, .. }
             | Self::TouchEnd { anchor }
             | Self::TouchCancel { anchor } => Some(anchor),
             Self::StateSnapshot(snapshot) => Some(&snapshot.motion_anchor),
@@ -804,32 +710,11 @@ mod tests {
         assert!(held.press_key(key));
         assert!(!held.press_key(key));
         assert!(held.press_button(PointerButton::PRIMARY));
-        assert!(held.set_modifier(Modifier::LeftShift, true));
         assert!(!held.is_neutral());
         assert!(held.release_key(key));
         assert!(!held.release_key(key));
 
         held.release_all();
-        assert!(held.is_neutral());
-    }
-
-    #[test]
-    fn held_state_ends_only_the_matching_scroll() {
-        let mut held = HeldState::default();
-        held.begin_scroll(ActiveScroll {
-            id: ScrollId(7),
-            source: ScrollSource {
-                unit: ScrollUnit::Device,
-                resolution_x: Some(120),
-                resolution_y: Some(120),
-            },
-            phase: ScrollPhase::Begin,
-            momentum_phase: None,
-        });
-
-        assert!(!held.end_scroll(ScrollId(8)));
-        assert!(held.active_scroll.is_some());
-        assert!(held.end_scroll(ScrollId(7)));
         assert!(held.is_neutral());
     }
 }

@@ -1039,13 +1039,6 @@ fn is_safety_release(effect: &ReceiverEffect) -> bool {
             pressed: false,
             synthetic: true,
             ..
-        } | ReceiverEffect::Modifier {
-            pressed: false,
-            synthetic: true,
-            ..
-        } | ReceiverEffect::ScrollEnded {
-            synthetic: true,
-            ..
         } | ReceiverEffect::ActivationClosed { .. }
     )
 }

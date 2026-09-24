@@ -203,7 +203,7 @@ The receiver MUST release state from the prior epoch before accepting a new epoc
 
 | Channel | QUIC primitive | Contents |
 |---|---|---|
-| Input control | One reliable ordered bidirectional stream | key and button transitions, ownership, scroll and touch lifecycle, state snapshots, acknowledgements, terminal anchors |
+| Input control | One reliable ordered bidirectional stream | key and button transitions, ownership, touch lifecycle, state snapshots, acknowledgements, terminal anchors |
 | Motion state | QUIC datagrams | cumulative pointer and scroll state, complete touch snapshots |
 | Probe | QUIC datagrams | application probe and echo data |
 | Bulk | separate best-effort QUIC connection and socket | clipboard or file data after v1 |
@@ -216,16 +216,15 @@ QUIC retransmission cannot deliver an event after connection death. The receiver
 
 The input-control stream carries:
 
-- Enter and Leave;
+- Enter;
 - KeyDown and KeyUp;
 - ButtonDown and ButtonUp;
-- ScrollBegin, ScrollEnd, and ScrollCancel;
 - TouchBegin, TouchEnd, and TouchCancel;
 - StateSnapshot;
 - SnapshotAck;
 - SessionClose.
 
-Each transition carries a control sequence. Pointer-sensitive transitions, including button events and Leave, also carry a MotionAnchor:
+Each transition carries a control sequence. Pointer-sensitive transitions, including button events and the sender's final SessionClose, also carry a MotionAnchor:
 
 ~~~~text
 MotionAnchor {
@@ -242,7 +241,7 @@ MotionAnchor {
 
 The receiver applies the anchor before the transition, so a click cannot overtake the motion that positioned it.
 
-StateSnapshot contains the full pressed-key, pressed-button, modifier, active-scroll, and active-touch state plus a MotionAnchor. The sender enqueues a snapshot on the critical control stream within 250 ms after cumulative totals change and at least every 250 ms while an activation remains live. Repeated datagrams may repair state before that checkpoint. SnapshotAck names the snapshot control sequence and accepted transport generation.
+StateSnapshot contains the full pressed-key, pressed-button, and active-touch state plus a MotionAnchor. Its retired modifier and active-scroll slots stay on the wire and must be empty. The sender enqueues a snapshot on the critical control stream within 250 ms after cumulative totals change and at least every 250 ms while an activation remains live. Repeated datagrams may repair state before that checkpoint. SnapshotAck names the snapshot control sequence and accepted transport generation.
 
 The receiver:
 
@@ -321,9 +320,9 @@ Linux captures EV_REL device deltas and injects them through a relative uinput d
 The wire model carries:
 
 - high-resolution horizontal and vertical totals;
-- source unit and resolution;
-- discrete step information when present;
-- begin, update, end, cancel, and momentum phase when the source exposes them.
+- discrete step information when present.
+
+Negotiation still names source unit, resolution, phase, and momentum fields. Both peers leave them off, and the messages that carried them are retired.
 
 A backend advertises its supported subset. It MUST NOT invent phase or momentum for a source that lacks those semantics.
 

@@ -9,10 +9,10 @@ use std::{collections::BTreeSet, time::Duration};
 use thiserror::Error;
 
 use super::{
-    ActivationId, ActiveScroll, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage,
-    Modifier, MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionSequence, PlayoutStep,
-    PointerButton, ProtocolVersion, ReliableControl, ReliableControlMessage, ScrollId,
-    SessionCloseReason, SessionContext, SessionEpoch, SnapshotAck, TouchState, TransportGeneration,
+    ActivationId, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage,
+    MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionSequence, PlayoutStep, PointerButton,
+    ProtocolVersion, ReliableControl, ReliableControlMessage, SessionCloseReason, SessionContext,
+    SessionEpoch, SnapshotAck, TouchState, TransportGeneration,
 };
 
 const MAX_HELD_STATE_LEASE: Duration = Duration::from_secs(1);
@@ -82,17 +82,6 @@ pub enum ReceiverEffect {
         pressed: bool,
         synthetic: bool,
     },
-    Modifier {
-        modifier: Modifier,
-        pressed: bool,
-        synthetic: bool,
-    },
-    ScrollBegan(ActiveScroll),
-    ScrollEnded {
-        id: ScrollId,
-        cancelled: bool,
-        synthetic: bool,
-    },
     TouchReplaced {
         state: TouchState,
         synthetic: bool,
@@ -119,9 +108,6 @@ impl ReceiverEffect {
             Self::Motion { .. }
                 | Self::Key { .. }
                 | Self::Button { .. }
-                | Self::Modifier { .. }
-                | Self::ScrollBegan(_)
-                | Self::ScrollEnded { .. }
                 | Self::TouchReplaced { .. }
         )
     }
@@ -273,7 +259,6 @@ impl Receiver {
             }
 
             match &message.payload {
-                ReliableControl::Leave { .. } => close = Some(SessionCloseReason::LocalRelease),
                 ReliableControl::KeyDown { key } => {
                     state.held.press_key(*key);
                     effects.push(ReceiverEffect::Key {
@@ -303,26 +288,6 @@ impl Receiver {
                     effects.push(ReceiverEffect::Button {
                         button: *button,
                         pressed: false,
-                        synthetic: false,
-                    });
-                }
-                ReliableControl::ScrollBegin { scroll } => {
-                    state.held.begin_scroll(*scroll);
-                    effects.push(ReceiverEffect::ScrollBegan(*scroll));
-                }
-                ReliableControl::ScrollEnd { scroll_id, .. } => {
-                    state.held.end_scroll(*scroll_id);
-                    effects.push(ReceiverEffect::ScrollEnded {
-                        id: *scroll_id,
-                        cancelled: false,
-                        synthetic: false,
-                    });
-                }
-                ReliableControl::ScrollCancel { scroll_id, .. } => {
-                    state.held.end_scroll(*scroll_id);
-                    effects.push(ReceiverEffect::ScrollEnded {
-                        id: *scroll_id,
-                        cancelled: true,
                         synthetic: false,
                     });
                 }
@@ -515,15 +480,6 @@ impl Receiver {
             ReliableControl::ButtonUp { button, anchor } => {
                 anchor.kind == AnchorKind::Checkpoint && state.held.pressed_buttons.contains(button)
             }
-            ReliableControl::ScrollBegin { .. } => state.held.active_scroll.is_none(),
-            ReliableControl::ScrollEnd { scroll_id, anchor }
-            | ReliableControl::ScrollCancel { scroll_id, anchor } => {
-                anchor.kind == AnchorKind::Checkpoint
-                    && state
-                        .held
-                        .active_scroll
-                        .is_some_and(|scroll| scroll.id == *scroll_id)
-            }
             ReliableControl::TouchBegin { initial_state } => {
                 state.held.active_touch.is_empty() && !initial_state.is_empty()
             }
@@ -534,7 +490,6 @@ impl Receiver {
                 snapshot.motion_anchor.kind == AnchorKind::Checkpoint
                     && snapshot.motion_anchor.final_touch_state == snapshot.held.active_touch
             }
-            ReliableControl::Leave { anchor } => anchor.kind == AnchorKind::Terminal,
             ReliableControl::SessionClose { final_anchor, .. } => final_anchor
                 .as_ref()
                 .is_none_or(|anchor| anchor.kind == AnchorKind::Terminal),
@@ -710,46 +665,6 @@ fn reconcile_held(
             pressed: true,
             synthetic: true,
         });
-    }
-    for modifier in state
-        .held
-        .modifiers
-        .difference(&authoritative.modifiers)
-        .copied()
-        .collect::<Vec<_>>()
-    {
-        state.held.set_modifier(modifier, false);
-        effects.push(ReceiverEffect::Modifier {
-            modifier,
-            pressed: false,
-            synthetic: true,
-        });
-    }
-    for modifier in authoritative
-        .modifiers
-        .difference(&state.held.modifiers)
-        .copied()
-        .collect::<Vec<_>>()
-    {
-        state.held.set_modifier(modifier, true);
-        effects.push(ReceiverEffect::Modifier {
-            modifier,
-            pressed: true,
-            synthetic: true,
-        });
-    }
-    if state.held.active_scroll != authoritative.active_scroll {
-        if let Some(scroll) = state.held.active_scroll {
-            effects.push(ReceiverEffect::ScrollEnded {
-                id: scroll.id,
-                cancelled: true,
-                synthetic: true,
-            });
-        }
-        state.held.active_scroll = authoritative.active_scroll;
-        if let Some(scroll) = authoritative.active_scroll {
-            effects.push(ReceiverEffect::ScrollBegan(scroll));
-        }
     }
     if state.held.active_touch != authoritative.active_touch {
         state.held.replace_touch(authoritative.active_touch.clone());

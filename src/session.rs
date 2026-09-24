@@ -12,12 +12,12 @@ use crate::{
     capture::{CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS},
     config::{Config, PlayoutMode},
     core::{
-        ActiveScroll, ClockConfig, ClockMapper, ControlSequence, HeldState, HidUsage, HidUsagePage,
+        ClockConfig, ClockMapper, ControlSequence, HeldState, HidUsage, HidUsagePage,
         InputCapabilities, InputCapability, MonotonicTimeMicros, MotionAnchor, MotionSequence,
         NegotiatedSession, NegotiationOffer, PlayoutConfig, PlayoutDelayMode, ProbeExchange,
         ProbeMessage, ProbePayload, ProbeSequence, Receiver, ReceiverConfig, ReceiverEffect,
         ReceiverLifecycle, ReceiverPlayout, RejectionReason, ReliableControl,
-        ReliableControlMessage, ScrollUnit, Sender, SenderConfig, SenderTick, SessionCloseReason,
+        ReliableControlMessage, Sender, SenderConfig, SenderTick, SessionCloseReason,
         SessionContext, TouchState, TransportGeneration,
     },
     metrics::{SessionMetrics, SessionMetricsSnapshot},
@@ -982,23 +982,11 @@ fn validate_negotiated_control(
 ) -> Result<()> {
     match payload {
         ReliableControl::Enter | ReliableControl::SnapshotAck(_) => {}
-        ReliableControl::Leave { anchor } => validate_negotiated_anchor(anchor, negotiated)?,
         ReliableControl::KeyDown { key } | ReliableControl::KeyUp { key } => {
             validate_negotiated_usage(*key, negotiated)?;
         }
         ReliableControl::ButtonDown { anchor, .. } | ReliableControl::ButtonUp { anchor, .. } => {
             require_capability(negotiated, InputCapability::Pointer, "pointer button")?;
-            validate_negotiated_anchor(anchor, negotiated)?;
-        }
-        ReliableControl::ScrollBegin { scroll } => {
-            validate_negotiated_scroll(*scroll, negotiated)?;
-        }
-        ReliableControl::ScrollEnd { anchor, .. }
-        | ReliableControl::ScrollCancel { anchor, .. } => {
-            require_capability(negotiated, InputCapability::Scroll, "scroll lifecycle")?;
-            if !negotiated.scroll_fields.phase {
-                bail!("peer sent scroll phase without negotiating phase support");
-            }
             validate_negotiated_anchor(anchor, negotiated)?;
         }
         ReliableControl::TouchBegin { initial_state } => {
@@ -1056,14 +1044,8 @@ fn validate_negotiated_held(state: &HeldState, negotiated: &NegotiatedSession) -
     for key in &state.pressed_keys {
         validate_negotiated_usage(*key, negotiated)?;
     }
-    if !state.modifiers.is_empty() {
-        require_capability(negotiated, InputCapability::Keyboard, "modifier state")?;
-    }
     if !state.pressed_buttons.is_empty() {
         require_capability(negotiated, InputCapability::Pointer, "pointer button")?;
-    }
-    if let Some(scroll) = state.active_scroll {
-        validate_negotiated_scroll(scroll, negotiated)?;
     }
     validate_negotiated_touch(&state.active_touch, negotiated)
 }
@@ -1080,25 +1062,6 @@ fn validate_negotiated_anchor(anchor: &MotionAnchor, negotiated: &NegotiatedSess
         }
     }
     validate_negotiated_touch(&anchor.final_touch_state, negotiated)
-}
-
-fn validate_negotiated_scroll(scroll: ActiveScroll, negotiated: &NegotiatedSession) -> Result<()> {
-    require_capability(negotiated, InputCapability::Scroll, "scroll lifecycle")?;
-    if !negotiated.scroll_fields.phase {
-        bail!("peer sent scroll phase without negotiating phase support");
-    }
-    if scroll.source.unit != ScrollUnit::Device && !negotiated.scroll_fields.source_unit {
-        bail!("peer sent a scroll source unit without negotiating it");
-    }
-    if (scroll.source.resolution_x.is_some() || scroll.source.resolution_y.is_some())
-        && !negotiated.scroll_fields.source_resolution
-    {
-        bail!("peer sent scroll resolution without negotiating it");
-    }
-    if scroll.momentum_phase.is_some() && !negotiated.scroll_fields.momentum_phase {
-        bail!("peer sent scroll momentum without negotiating it");
-    }
-    Ok(())
 }
 
 fn require_capability(
@@ -1764,13 +1727,6 @@ fn is_synthetic_release(effect: &ReceiverEffect) -> bool {
             pressed: false,
             synthetic: true,
             ..
-        } | ReceiverEffect::Modifier {
-            pressed: false,
-            synthetic: true,
-            ..
-        } | ReceiverEffect::ScrollEnded {
-            synthetic: true,
-            ..
         } | ReceiverEffect::TouchReplaced {
             synthetic: true,
             ..
@@ -2032,25 +1988,6 @@ mod tests {
                     key: HidUsage::consumer(0xe9),
                 },
                 &without_consumer,
-            )
-            .is_err()
-        );
-
-        assert!(
-            validate_negotiated_control(
-                &ReliableControl::ScrollBegin {
-                    scroll: ActiveScroll {
-                        id: crate::core::ScrollId(1),
-                        source: crate::core::ScrollSource {
-                            unit: ScrollUnit::Device,
-                            resolution_x: None,
-                            resolution_y: None,
-                        },
-                        phase: crate::core::ScrollPhase::Begin,
-                        momentum_phase: None,
-                    },
-                },
-                &selected,
             )
             .is_err()
         );

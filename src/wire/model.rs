@@ -155,12 +155,17 @@ impl TryFrom<WireTouchState> for TouchState {
     }
 }
 
+/// A retired wire slot. It has no values, so decoding one always fails.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Retired {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WireHeldState {
     pressed_keys: BoundedVec<HidUsage, MAX_HELD_KEYS>,
     pressed_buttons: BoundedVec<PointerButton, MAX_HELD_BUTTONS>,
-    modifiers: BoundedVec<Modifier, MAX_MODIFIERS>,
-    active_scroll: Option<ActiveScroll>,
+    // Retired modifier and scroll slots, always empty.
+    modifiers: BoundedVec<Retired, MAX_MODIFIERS>,
+    active_scroll: Option<Retired>,
     active_touch: WireTouchState,
 }
 
@@ -177,11 +182,8 @@ impl TryFrom<&HeldState> for WireHeldState {
                 value.pressed_buttons.iter().copied().collect(),
                 "pressed_buttons",
             )?,
-            modifiers: BoundedVec::try_from_vec(
-                value.modifiers.iter().copied().collect(),
-                "modifiers",
-            )?,
-            active_scroll: value.active_scroll,
+            modifiers: BoundedVec::try_from_vec(Vec::new(), "modifiers")?,
+            active_scroll: None,
             active_touch: WireTouchState::try_from(&value.active_touch)?,
         })
     }
@@ -191,11 +193,15 @@ impl TryFrom<WireHeldState> for HeldState {
     type Error = BoundError;
 
     fn try_from(value: WireHeldState) -> Result<Self, Self::Error> {
+        if let Some(retired) = value.modifiers.as_slice().first() {
+            match *retired {}
+        }
+        if let Some(retired) = value.active_scroll {
+            match retired {}
+        }
         Ok(Self {
             pressed_keys: unique_set(value.pressed_keys, "pressed_keys")?,
             pressed_buttons: unique_set(value.pressed_buttons, "pressed_buttons")?,
-            modifiers: unique_set(value.modifiers, "modifiers")?,
-            active_scroll: value.active_scroll,
             active_touch: value.active_touch.try_into()?,
         })
     }
@@ -269,17 +275,11 @@ impl TryFrom<WireStateSnapshot> for StateSnapshot {
     }
 }
 
-/// A retired message slot. It has no values, so decoding one always fails.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Retired {}
-
 // Postcard encodes the variant index, so retired variants keep their slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum WireReliableControl {
     Enter,
-    Leave {
-        anchor: WireMotionAnchor,
-    },
+    Leave(Retired),
     KeyDown {
         key: HidUsage,
     },
@@ -294,17 +294,9 @@ pub(crate) enum WireReliableControl {
         button: PointerButton,
         anchor: WireMotionAnchor,
     },
-    ScrollBegin {
-        scroll: ActiveScroll,
-    },
-    ScrollEnd {
-        scroll_id: ScrollId,
-        anchor: WireMotionAnchor,
-    },
-    ScrollCancel {
-        scroll_id: ScrollId,
-        anchor: WireMotionAnchor,
-    },
+    ScrollBegin(Retired),
+    ScrollEnd(Retired),
+    ScrollCancel(Retired),
     TouchBegin {
         initial_state: WireTouchState,
     },
@@ -330,9 +322,6 @@ impl TryFrom<&ReliableControl> for WireReliableControl {
     fn try_from(value: &ReliableControl) -> Result<Self, Self::Error> {
         Ok(match value {
             ReliableControl::Enter => Self::Enter,
-            ReliableControl::Leave { anchor } => Self::Leave {
-                anchor: anchor.try_into()?,
-            },
             ReliableControl::KeyDown { key } => Self::KeyDown { key: *key },
             ReliableControl::KeyUp { key } => Self::KeyUp { key: *key },
             ReliableControl::ButtonDown { button, anchor } => Self::ButtonDown {
@@ -341,15 +330,6 @@ impl TryFrom<&ReliableControl> for WireReliableControl {
             },
             ReliableControl::ButtonUp { button, anchor } => Self::ButtonUp {
                 button: *button,
-                anchor: anchor.try_into()?,
-            },
-            ReliableControl::ScrollBegin { scroll } => Self::ScrollBegin { scroll: *scroll },
-            ReliableControl::ScrollEnd { scroll_id, anchor } => Self::ScrollEnd {
-                scroll_id: *scroll_id,
-                anchor: anchor.try_into()?,
-            },
-            ReliableControl::ScrollCancel { scroll_id, anchor } => Self::ScrollCancel {
-                scroll_id: *scroll_id,
                 anchor: anchor.try_into()?,
             },
             ReliableControl::TouchBegin { initial_state } => Self::TouchBegin {
@@ -380,9 +360,6 @@ impl TryFrom<WireReliableControl> for ReliableControl {
     fn try_from(value: WireReliableControl) -> Result<Self, Self::Error> {
         Ok(match value {
             WireReliableControl::Enter => Self::Enter,
-            WireReliableControl::Leave { anchor } => Self::Leave {
-                anchor: anchor.try_into()?,
-            },
             WireReliableControl::KeyDown { key } => Self::KeyDown { key },
             WireReliableControl::KeyUp { key } => Self::KeyUp { key },
             WireReliableControl::ButtonDown { button, anchor } => Self::ButtonDown {
@@ -391,15 +368,6 @@ impl TryFrom<WireReliableControl> for ReliableControl {
             },
             WireReliableControl::ButtonUp { button, anchor } => Self::ButtonUp {
                 button,
-                anchor: anchor.try_into()?,
-            },
-            WireReliableControl::ScrollBegin { scroll } => Self::ScrollBegin { scroll },
-            WireReliableControl::ScrollEnd { scroll_id, anchor } => Self::ScrollEnd {
-                scroll_id,
-                anchor: anchor.try_into()?,
-            },
-            WireReliableControl::ScrollCancel { scroll_id, anchor } => Self::ScrollCancel {
-                scroll_id,
                 anchor: anchor.try_into()?,
             },
             WireReliableControl::TouchBegin { initial_state } => Self::TouchBegin {
@@ -415,7 +383,11 @@ impl TryFrom<WireReliableControl> for ReliableControl {
                 Self::StateSnapshot(snapshot.try_into()?)
             }
             WireReliableControl::SnapshotAck(ack) => Self::SnapshotAck(ack),
-            WireReliableControl::SessionTakeover(retired)
+            WireReliableControl::Leave(retired)
+            | WireReliableControl::ScrollBegin(retired)
+            | WireReliableControl::ScrollEnd(retired)
+            | WireReliableControl::ScrollCancel(retired)
+            | WireReliableControl::SessionTakeover(retired)
             | WireReliableControl::TakeoverAccepted(retired) => match retired {},
             WireReliableControl::SessionClose {
                 reason,
@@ -432,20 +404,21 @@ impl WireReliableControl {
     pub(crate) fn message_type(&self) -> u8 {
         match self {
             Self::Enter => 1,
-            Self::Leave { .. } => 2,
             Self::KeyDown { .. } => 3,
             Self::KeyUp { .. } => 4,
             Self::ButtonDown { .. } => 5,
             Self::ButtonUp { .. } => 6,
-            Self::ScrollBegin { .. } => 7,
-            Self::ScrollEnd { .. } => 8,
-            Self::ScrollCancel { .. } => 9,
             Self::TouchBegin { .. } => 10,
             Self::TouchEnd { .. } => 11,
             Self::TouchCancel { .. } => 12,
             Self::StateSnapshot(_) => 13,
             Self::SnapshotAck(_) => 14,
-            Self::SessionTakeover(retired) | Self::TakeoverAccepted(retired) => match *retired {},
+            Self::Leave(retired)
+            | Self::ScrollBegin(retired)
+            | Self::ScrollEnd(retired)
+            | Self::ScrollCancel(retired)
+            | Self::SessionTakeover(retired)
+            | Self::TakeoverAccepted(retired) => match *retired {},
             Self::SessionClose { .. } => 17,
         }
     }

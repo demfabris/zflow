@@ -9,10 +9,10 @@ use std::{collections::BTreeMap, time::Duration};
 use thiserror::Error;
 
 use super::{
-    ActiveScroll, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage, Modifier,
-    MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionFrame, MotionOverflow, MotionSequence,
-    PointerButton, ReliableControl, ReliableControlMessage, ScrollId, SessionCloseReason,
-    SessionContext, SnapshotAck, StateSnapshot, TouchState,
+    AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage, MonotonicTimeMicros,
+    MotionAnchor, MotionDelta, MotionFrame, MotionOverflow, MotionSequence, PointerButton,
+    ReliableControl, ReliableControlMessage, SessionCloseReason, SessionContext, SnapshotAck,
+    StateSnapshot, TouchState,
 };
 
 const MAX_PENDING_SNAPSHOTS: usize = 64;
@@ -261,17 +261,6 @@ impl Sender {
         self.control(ReliableControl::KeyUp { key })
     }
 
-    pub fn set_modifier(
-        &mut self,
-        modifier: Modifier,
-        held: bool,
-        now: MonotonicTimeMicros,
-    ) -> Result<ReliableControlMessage, SenderError> {
-        self.before_control(now)?;
-        self.held.set_modifier(modifier, held);
-        self.snapshot(now)
-    }
-
     pub fn button_down(
         &mut self,
         button: PointerButton,
@@ -296,38 +285,6 @@ impl Sender {
             return Err(SenderError::InvalidTransition);
         }
         self.control(ReliableControl::ButtonUp { button, anchor })
-    }
-
-    pub fn scroll_begin(
-        &mut self,
-        scroll: ActiveScroll,
-        now: MonotonicTimeMicros,
-    ) -> Result<ReliableControlMessage, SenderError> {
-        self.before_control(now)?;
-        if self.held.active_scroll.is_some() {
-            return Err(SenderError::InvalidTransition);
-        }
-        self.held.begin_scroll(scroll);
-        self.control(ReliableControl::ScrollBegin { scroll })
-    }
-
-    pub fn scroll_end(
-        &mut self,
-        scroll_id: ScrollId,
-        cancelled: bool,
-        now: MonotonicTimeMicros,
-    ) -> Result<ReliableControlMessage, SenderError> {
-        self.before_control(now)?;
-        let anchor = self.anchor(now, AnchorKind::Checkpoint);
-        if !self.held.end_scroll(scroll_id) {
-            return Err(SenderError::InvalidTransition);
-        }
-        let payload = if cancelled {
-            ReliableControl::ScrollCancel { scroll_id, anchor }
-        } else {
-            ReliableControl::ScrollEnd { scroll_id, anchor }
-        };
-        self.control(payload)
     }
 
     pub fn touch_begin(
