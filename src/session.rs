@@ -66,6 +66,18 @@ impl SessionOptions {
         playout.maximum_delay = Duration::from_millis(config.playout.maximum_delay_ms);
         playout.adaptive_percentile = (config.playout.percentile * 100.0).round() as u8;
         playout.validate()?;
+        // Snapshot acks wait for playout. A delay near the lease makes every
+        // held-key renewal miss its ack deadline.
+        if playout
+            .fixed_delay
+            .max(playout.maximum_delay)
+            .saturating_mul(2)
+            >= lease
+        {
+            bail!(
+                "playout.fixed_delay_ms and playout.maximum_delay_ms must be less than half of transport.lease_ms"
+            );
+        }
 
         let mut capabilities = InputCapabilities::from([
             InputCapability::Keyboard,
@@ -2053,6 +2065,22 @@ mod tests {
         let mut incomplete = offer.clone();
         incomplete.supported_capabilities = InputCapabilities::from([InputCapability::Keyboard]);
         assert!(select_negotiation(&offer, &incomplete).is_err());
+    }
+
+    #[test]
+    fn playout_delay_must_stay_below_half_the_lease() {
+        let mut config = Config::default();
+        config.playout.maximum_delay_ms = 449;
+        SessionOptions::from_config(&config).unwrap();
+        config.playout.maximum_delay_ms = 450;
+        let error = SessionOptions::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("half of transport.lease_ms"), "{error}");
+
+        let mut config = Config::default();
+        config.playout.fixed_delay_ms = 450;
+        assert!(SessionOptions::from_config(&config).is_err());
     }
 
     #[test]
