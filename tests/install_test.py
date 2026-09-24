@@ -21,6 +21,8 @@ command() {
     if [[ "$1" == -v ]]; then
         case "$2" in
             apt-get|dnf|pacman) [[ "$2" == "$MANAGER" ]]; return ;;
+            # Debian keeps these in /usr/sbin, outside a normal user's PATH.
+            getent|groupadd|useradd|runuser|modprobe|systemd-analyze) return 1 ;;
         esac
     fi
     builtin command "$@"
@@ -34,11 +36,8 @@ dpkg() { echo "${DPKG_ARCH:-amd64}"; }
 getconf() { echo "${LIBC:-glibc 2.39}"; }
 systemctl() { echo "${SYSTEMD_VERSION-259}"; }
 udevadm() { echo verify; }
-gjs() { echo "${GTK_VERSIONS:-4.12 1.5}"; }
+gjs() { [[ -z "${GTK_MISSING:-}" ]] || return 1; echo "${GTK_VERSIONS:-4.12 1.5}"; }
 gnome-extensions() { record "extension $*"; }
-for tool in getent groupadd useradd runuser modprobe systemd-analyze; do
-    eval "$tool() { :; }"
-done
 for tool in cargo rustup rustc swift xcrun xcode-select cc make; do
     eval "$tool() { record forbidden-toolchain; return 99; }"
 done
@@ -156,6 +155,14 @@ class InstallerTest(unittest.TestCase):
         output = self.run_shell("main --yes --headless", env={"LEGACY": "false", "ARCH": "aarch64", "DPKG_ARCH": "armhf"}, ok=False)
         self.assertIn("armhf", output)
         self.assertNotIn("fetch ", self.calls())
+
+    def test_old_gtk_stops_before_changes_but_missing_gtk_is_installed(self):
+        output = self.run_shell("main --yes --no-launch", env={"LEGACY": "false", "GTK_VERSIONS": "4.10 1.4"}, ok=False)
+        self.assertIn("GTK 4.12+", output)
+        self.assertNotIn("fetch ", self.calls())
+        self.assertNotIn("root ", self.calls())
+        self.run_shell("main --yes --no-launch", env={"LEGACY": "false", "GTK_MISSING": "1"})
+        self.assertIn("extension enable zflow@demfabris", self.calls())
 
     def test_headless_debian_skips_desktop_recommendations(self):
         self.run_shell("main --yes --headless", env={"LEGACY": "false"})

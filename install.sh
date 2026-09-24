@@ -83,23 +83,23 @@ linux_dependencies() {
     fi
 }
 
+# Runs before anything changes. Tools such as groupadd live in /usr/sbin, which is not
+# on a normal user's PATH everywhere (Debian), so the root-side setup checks those.
 check_linux() {
-    require systemctl
-    [[ -n "$(systemctl show --property=Version --value 2>/dev/null)" ]] || die 'Linux installation requires a running systemd system manager.'
-    local command
-    for command in getent groupadd useradd runuser modprobe systemd-analyze udevadm; do require "$command"; done
+    require udevadm
     udevadm --help | grep 'verify' >/dev/null || die 'udevadm verify is required (systemd 254 or newer).'
     if [[ "$desktop" == true ]]; then
         require gjs
         require gnome-extensions
         local versions gtk_version adw_version
+        # Missing libraries are installed with zflow; only reject ones that are too old.
         # These template expressions belong to JavaScript.
         # shellcheck disable=SC2016
-        versions=$(gjs -c 'imports.gi.versions.Gtk="4.0"; imports.gi.versions.Adw="1"; const {Gtk,Adw}=imports.gi; print(`${Gtk.get_major_version()}.${Gtk.get_minor_version()} ${Adw.get_major_version()}.${Adw.get_minor_version()}`);') \
-            || die 'Install the GTK4 and libadwaita GObject introspection libraries.'
-        IFS=' ' read -r gtk_version adw_version <<< "$versions"
-        if ! version_at_least "$gtk_version" 4.12 || ! version_at_least "$adw_version" 1.5; then
-            die 'GNOME settings require GTK 4.12+ and libadwaita 1.5+. Upgrade the distribution or use --headless.'
+        if versions=$(gjs -c 'imports.gi.versions.Gtk="4.0"; imports.gi.versions.Adw="1"; const {Gtk,Adw}=imports.gi; print(`${Gtk.get_major_version()}.${Gtk.get_minor_version()} ${Adw.get_major_version()}.${Adw.get_minor_version()}`);' 2>/dev/null); then
+            IFS=' ' read -r gtk_version adw_version <<< "$versions"
+            if ! version_at_least "$gtk_version" 4.12 || ! version_at_least "$adw_version" 1.5; then
+                die 'GNOME settings require GTK 4.12+ and libadwaita 1.5+. Upgrade the distribution or use --headless.'
+            fi
         fi
     fi
 }
@@ -186,13 +186,11 @@ install_linux() {
         installed_cli=/usr/bin/zflow
     else
         linux_dependencies
-        check_linux
         as_root bash "$payload_dir/scripts/install.sh" --install-built
         installed_cli=/usr/local/bin/zflow
     fi
     if [[ "$desktop" == true ]]; then
         say 'Installing GNOME integration for your desktop account…'
-        check_linux
         local output
         if [[ "$use_deb" == true ]]; then
             # The package owns the desktop files and extension under /usr/share.
@@ -286,6 +284,7 @@ main() {
         if [[ "$headless" == false && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
             case ":${XDG_CURRENT_DESKTOP:-}:" in *:GNOME:*|*:gnome:*) desktop=true;; esac
         fi
+        check_linux
     else
         check_macos
     fi
