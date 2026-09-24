@@ -18,7 +18,8 @@ case "${1:-}" in
     post)
         if [ -f "$marker" ] && [ ! -L "$marker" ]; then
             rm -f -- "$marker"
-            systemctl start zflowd.service
+            # Queue the start so resume does not wait for the daemon to become ready.
+            systemctl start --no-block zflowd.service
         fi
         ;;
 esac
