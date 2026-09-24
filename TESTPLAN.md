@@ -192,6 +192,22 @@ interval. Backdated events can produce separate libinput processing-lag warnings
 The synthetic regression does not prove that all historical touch-jump warnings
 are gone, or qualify GNOME gesture timers under burst delivery.
 
+Touch contacts travel in hundredths of a millimetre and the receiver places
+them by millimetres on a 200 x 150 mm pad. Unit tests cover the conversion on
+each source and the centered, clamped placement. Live check on Ubuntu GNOME
+with a Magic Trackpad sender:
+
+- `sudo libinput list-devices` shows `zflow remote touchpad` with
+  `Size: 200x150mm`;
+- `sudo libinput debug-events` shows a finger dragged across the full
+  trackpad width moving about 160 mm;
+- a three-finger workspace swipe and an Overview swipe need about the same
+  finger travel as on a native Linux touchpad, not about 1.6 times more;
+- slow pointer motion feels the same horizontally and vertically;
+- a thumb resting near the bottom edge does not break three-finger swipes.
+  libinput's thumb zones cover the bottom 15% of the pad, and a centered
+  Magic Trackpad now reaches only the top 5 mm of them.
+
 ## Historical GUI pairing and Mac-to-GNOME handoff, September 14
 
 The GUI now supports pairing, explicit Mac source start/stop, saved-layout edge

@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, sync::Once};
 
 use evdev::{AbsoluteAxisCode, EventType, InputEvent, SynchronizationCode, raw_stream::RawDevice};
 
@@ -11,11 +11,17 @@ use crate::{
 pub struct TouchAxisRange {
     minimum: i32,
     maximum: i32,
+    /// Units per millimetre; 0 when the driver does not report it.
+    resolution: i32,
 }
 
 impl TouchAxisRange {
-    pub fn new(minimum: i32, maximum: i32) -> Option<Self> {
-        (maximum > minimum).then_some(Self { minimum, maximum })
+    pub fn new(minimum: i32, maximum: i32, resolution: i32) -> Option<Self> {
+        (maximum > minimum).then_some(Self {
+            minimum,
+            maximum,
+            resolution,
+        })
     }
 
     fn normalize(self, value: i32) -> i32 {
@@ -40,6 +46,8 @@ struct SlotState {
 pub struct TouchAccumulator {
     x: TouchAxisRange,
     y: TouchAxisRange,
+    /// Device units per 100 mm on x and y.
+    units_per_100mm: [i64; 2],
     slots: [SlotState; MAX_TOUCHPAD_CONTACTS],
     current_slot: Option<usize>,
     dirty: bool,
@@ -67,10 +75,10 @@ impl TouchAccumulator {
         for (axis, info) in device.get_absinfo()? {
             match axis {
                 AbsoluteAxisCode::ABS_MT_POSITION_X => {
-                    x = TouchAxisRange::new(info.minimum(), info.maximum())
+                    x = TouchAxisRange::new(info.minimum(), info.maximum(), info.resolution())
                 }
                 AbsoluteAxisCode::ABS_MT_POSITION_Y => {
-                    y = TouchAxisRange::new(info.minimum(), info.maximum())
+                    y = TouchAxisRange::new(info.minimum(), info.maximum(), info.resolution())
                 }
                 _ => {}
             }
@@ -82,9 +90,20 @@ impl TouchAccumulator {
     }
 
     pub fn new(x: TouchAxisRange, y: TouchAxisRange) -> Self {
+        let units_per_100mm = if x.resolution > 0 && y.resolution > 0 {
+            [x.resolution, y.resolution].map(|resolution| 100 * i64::from(resolution))
+        } else {
+            static LOGGED: Once = Once::new();
+            LOGGED.call_once(|| {
+                tracing::warn!("touchpad reports no resolution; assuming it is 100 mm wide");
+            });
+            // Square units keep the pad's aspect ratio.
+            [i64::from(x.extent()); 2]
+        };
         Self {
             x,
             y,
+            units_per_100mm,
             slots: [SlotState::default(); MAX_TOUCHPAD_CONTACTS],
             current_slot: Some(0),
             dirty: false,
@@ -155,15 +174,16 @@ impl TouchAccumulator {
     }
 
     fn snapshot(&self) -> io::Result<TouchState> {
+        let [x_scale, y_scale] = self.units_per_100mm;
         let dimensions = Some(SourceDimensions {
-            width: self.x.extent(),
-            height: self.y.extent(),
+            width: hundredths_mm(self.x.extent().into(), x_scale) as u32,
+            height: hundredths_mm(self.y.extent().into(), y_scale) as u32,
         });
         TouchState::new(self.slots.iter().filter_map(|slot| {
             slot.tracking_id.map(|id| TouchContact {
                 id,
-                x: slot.x,
-                y: slot.y,
+                x: hundredths_mm(slot.x.into(), x_scale),
+                y: hundredths_mm(slot.y.into(), y_scale),
                 pressure: None,
                 major: None,
                 minor: None,
@@ -174,6 +194,12 @@ impl TouchAccumulator {
         }))
         .map_err(|id| io::Error::other(format!("duplicate active touch tracking id {}", id.0)))
     }
+}
+
+/// Converts non-negative device units to hundredths of a millimetre, rounded.
+fn hundredths_mm(units: i64, units_per_100mm: i64) -> i32 {
+    let hundredths = (units * 10_000 + units_per_100mm / 2) / units_per_100mm;
+    hundredths.min(i32::MAX.into()) as i32
 }
 
 #[cfg(test)]
@@ -194,9 +220,55 @@ mod tests {
 
     fn accumulator() -> TouchAccumulator {
         TouchAccumulator::new(
-            TouchAxisRange::new(100, 1_399).unwrap(),
-            TouchAxisRange::new(50, 772).unwrap(),
+            TouchAxisRange::new(100, 1_399, 13).unwrap(),
+            TouchAxisRange::new(50, 772, 10).unwrap(),
         )
+    }
+
+    fn land(touch: &mut TouchAccumulator, x: i32, y: i32) -> TouchContact {
+        for (axis, value) in [
+            (AbsoluteAxisCode::ABS_MT_SLOT, 0),
+            (AbsoluteAxisCode::ABS_MT_TRACKING_ID, 41),
+            (AbsoluteAxisCode::ABS_MT_POSITION_X, x),
+            (AbsoluteAxisCode::ABS_MT_POSITION_Y, y),
+        ] {
+            touch.push(abs(axis, value)).unwrap();
+        }
+        let (state, _) = touch.push(report()).unwrap().unwrap();
+        state.get(ContactId(41)).unwrap().clone()
+    }
+
+    #[test]
+    fn positions_and_size_use_the_axis_resolution() {
+        // 13 units/mm across and 10 down: the pad is 99.92 x 72.2 mm.
+        let contact = land(&mut accumulator(), 750, 411);
+        assert_eq!((contact.x, contact.y), (5_000, 3_610));
+        assert_eq!(
+            contact.source_dimensions,
+            Some(SourceDimensions {
+                width: 9_992,
+                height: 7_220,
+            })
+        );
+    }
+
+    #[test]
+    fn missing_resolution_assumes_100_mm_wide_with_square_units() {
+        for y_resolution in [0, 20] {
+            let mut touch = TouchAccumulator::new(
+                TouchAxisRange::new(0, 2_000, 0).unwrap(),
+                TouchAxisRange::new(0, 1_000, y_resolution).unwrap(),
+            );
+            let contact = land(&mut touch, 1_000, 500);
+            assert_eq!((contact.x, contact.y), (5_000, 2_500));
+            assert_eq!(
+                contact.source_dimensions,
+                Some(SourceDimensions {
+                    width: 10_000,
+                    height: 5_000,
+                })
+            );
+        }
     }
 
     #[test]
@@ -221,21 +293,14 @@ mod tests {
         assert_eq!(count, 4);
         assert_eq!(landed.len(), 1);
         let contact = landed.get(ContactId(41)).unwrap();
-        assert_eq!((contact.x, contact.y), (650, 361));
-        assert_eq!(
-            contact.source_dimensions,
-            Some(SourceDimensions {
-                width: 1_299,
-                height: 722,
-            })
-        );
+        assert_eq!((contact.x, contact.y), (5_000, 3_610));
         assert!(touch.push(report()).unwrap().is_none());
 
         touch
             .push(abs(AbsoluteAxisCode::ABS_MT_POSITION_Y, 500))
             .unwrap();
         let (moved, _) = touch.push(report()).unwrap().unwrap();
-        assert_eq!(moved.get(ContactId(41)).unwrap().y, 450);
+        assert_eq!(moved.get(ContactId(41)).unwrap().y, 4_500);
 
         touch
             .push(abs(AbsoluteAxisCode::ABS_MT_TRACKING_ID, -1))

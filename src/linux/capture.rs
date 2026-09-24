@@ -499,8 +499,8 @@ mod tests {
 
     fn touchpad() -> TouchAccumulator {
         TouchAccumulator::new(
-            TouchAxisRange::new(0, 100).unwrap(),
-            TouchAxisRange::new(0, 100).unwrap(),
+            TouchAxisRange::new(0, 100, 10).unwrap(),
+            TouchAxisRange::new(0, 100, 10).unwrap(),
         )
     }
 
