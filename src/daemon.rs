@@ -28,7 +28,7 @@ use crate::{
         ActivationId, InputCapability, ReceiverEffect, SessionCloseReason, SessionContext,
         SessionEpoch, TransportGeneration,
     },
-    discovery::{Advertisement, Discovery, DiscoveryEvent, local_unicast_addresses},
+    discovery::{Advertisement, Discovery, DiscoveryEvent},
     identity::Identity,
     linux::{InjectionGate, OwnershipPhase, query_primary_seat},
     runtime::{
@@ -1092,14 +1092,10 @@ fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {
         return None;
     }
     let result = (|| {
-        let addresses = local_unicast_addresses()?;
-        if addresses.is_empty() {
-            bail!("no usable local address is available for mDNS");
-        }
         let mut discovery = Discovery::new()?;
         discovery.register(Advertisement::new(
             listen.port(),
-            addresses,
+            Vec::<std::net::IpAddr>::new(),
             advertised_capabilities(config),
         )?)?;
         discovery.browse()?;
