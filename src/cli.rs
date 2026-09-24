@@ -94,7 +94,8 @@ struct SetupOptions {
 /// Orders zflowd before the display manager so input works at the greeter.
 /// It stays installed only while pre-login input is on: with Type=notify, a
 /// zflowd that never becomes ready would otherwise delay every boot.
-const PRELOGIN_DROPIN: &str = "/etc/systemd/system/zflowd.service.d/zflowd-prelogin.conf";
+/// Archive installs used this name, so `--prelogin off` also removes their copy.
+const PRELOGIN_DROPIN: &str = "/etc/systemd/system/zflowd.service.d/prelogin.conf";
 const PRELOGIN_ORDERING: &str = include_str!("../packaging/systemd/zflowd-prelogin.conf");
 
 pub fn run(path: PathBuf, command: Command) -> Result<()> {
