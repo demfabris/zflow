@@ -30,8 +30,8 @@ use super::{
 };
 
 const SERVER_NAME_PLACEHOLDER: &str = "zflow.invalid";
-const CONTROL_STREAM_PREFACE: &[u8] = b"zflow-control-v1\0";
-const PAIRING_STREAM_PREFACE: &[u8] = b"zflow-pair-v2\0";
+const CONTROL_STREAM_PREFACE: &[u8] = b"zflow-control\0";
+const PAIRING_STREAM_PREFACE: &[u8] = b"zflow-pair\0";
 const PAIRING_COMMITMENT_LABEL: &[u8] = b"zflow pairing commitment v2\0";
 const MAX_CONTROL_FRAME_BYTES: usize = MAX_RELIABLE_PAYLOAD_BYTES + 64;
 const MAX_PAIRING_FRAME_BYTES: usize = MAX_PAIRING_PAYLOAD_BYTES + 64;

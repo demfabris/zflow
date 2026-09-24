@@ -179,18 +179,19 @@ The service-manager watchdog kills a killable hung daemon within the configured 
 
 ### Versioning and limits
 
-Each input-session message carries a protocol version, message type, payload length, session epoch, transport generation, and activation identifier. Control and motion messages add their channel-specific sequences. Pairing uses handshake-scoped nonces and transcript identifiers before an input session exists.
+The QUIC ALPN is the only protocol version. Input connections use `zflow/N` and pairing connections `zflow-pair/N`; any change to the wire format bumps them, so a peer on another version fails the TLS handshake and reports a version mismatch. Messages carry no version field.
+
+Each input-session message carries a message type, payload length, session epoch, transport generation, and activation identifier. Control and motion messages add their channel-specific sequences. Pairing uses handshake-scoped nonces and transcript identifiers before an input session exists.
 
 The decoder MUST:
 
-- reject unknown required features;
 - cap message, collection, contact, and string lengths before allocation;
 - reject duplicate identifiers and invalid state transitions;
 - expose a fuzz target for every message family.
 
-Payloads use postcard inside the bounded envelope; the decoder accepts no other codec. The logical model below is fixed for the first prototype.
+Payloads use postcard inside the bounded envelope. The logical model below is fixed for the first prototype.
 
-Authenticated session negotiation selects one protocol version, maximum datagram size, input capabilities, pointer units, scroll fields, contact limit, receiver lease, and checkpoint bound. A required capability mismatch prevents activation.
+Authenticated session negotiation selects the maximum datagram size, input capabilities, pointer units, scroll fields, contact limit, receiver lease, and checkpoint bound. A required capability mismatch prevents activation.
 
 ### Identity, epoch, generation, and activation
 
@@ -379,7 +380,7 @@ The user may plug in Ethernet or Thunderbolt mid-session. zflow may move the ses
 
 ### Discovery
 
-mDNS advertises an ephemeral instance identifier, protocol version, capability summary, and connection candidates. It MUST NOT advertise a long-lived certificate fingerprint.
+mDNS advertises an ephemeral instance identifier, the input ALPN as its protocol version, a capability summary, and connection candidates. It MUST NOT advertise a long-lived certificate fingerprint.
 
 DNS-SD data remains untrusted until pairing or known-peer authentication completes. Long-lived identifiers in multicast records expose device identity to passive observers; [RFC 8882](https://www.rfc-editor.org/rfc/rfc8882.html#section-3.2) describes that privacy risk.
 

@@ -492,11 +492,10 @@ fn one_third_rounded_down(duration: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{ActivationId, ProtocolVersion, SessionEpoch, TransportGeneration};
+    use crate::core::{ActivationId, SessionEpoch, TransportGeneration};
 
     fn context() -> SessionContext {
         SessionContext {
-            protocol_version: ProtocolVersion(1),
             session_epoch: SessionEpoch([1; 16]),
             transport_generation: TransportGeneration(1),
             activation_id: ActivationId(1),

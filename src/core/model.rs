@@ -12,9 +12,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ProtocolVersion(pub u16);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionEpoch(pub [u8; 16]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -50,7 +47,6 @@ impl MonotonicTimeMicros {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContext {
-    pub protocol_version: ProtocolVersion,
     pub session_epoch: SessionEpoch,
     pub transport_generation: TransportGeneration,
     pub activation_id: ActivationId,
@@ -520,7 +516,6 @@ pub struct ProbeMessage {
 /// Values one peer is willing to negotiate for an authenticated input session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NegotiationOffer {
-    pub protocol_versions: Vec<ProtocolVersion>,
     pub maximum_datagram_size: u32,
     pub supported_capabilities: InputCapabilities,
     pub required_capabilities: InputCapabilities,
@@ -534,7 +529,6 @@ pub struct NegotiationOffer {
 /// The single schema selected after authenticated negotiation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NegotiatedSession {
-    pub protocol_version: ProtocolVersion,
     pub maximum_datagram_size: u32,
     pub capabilities: InputCapabilities,
     pub pointer_unit: Option<PointerUnit>,
@@ -549,9 +543,6 @@ impl NegotiatedSession {
     pub const MAX_CHECKPOINT_BOUND_MS: u32 = 250;
 
     pub fn validate_for(&self, offer: &NegotiationOffer) -> Result<(), NegotiationError> {
-        if !offer.protocol_versions.contains(&self.protocol_version) {
-            return Err(NegotiationError::UnsupportedProtocolVersion);
-        }
         if self.maximum_datagram_size == 0
             || self.maximum_datagram_size > offer.maximum_datagram_size
         {
@@ -600,7 +591,6 @@ impl NegotiatedSession {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NegotiationError {
-    UnsupportedProtocolVersion,
     InvalidDatagramSize,
     UnsupportedCapability,
     MissingRequiredCapability,

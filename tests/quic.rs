@@ -16,7 +16,7 @@ use zflow::{
         connect_input, connect_pairing, input_client_config, input_server_config,
         input_server_config_for_peers, pairing_client_config, pairing_server_config,
     },
-    wire::{CURRENT_PROTOCOL_VERSION, PairingOffer, WireMessage, encode},
+    wire::{PairingOffer, WireMessage, encode},
 };
 
 const LOOPBACK: SocketAddr =
@@ -116,7 +116,6 @@ async fn one_input_listener_authenticates_every_allowed_peer_and_rejects_an_unkn
 
 fn session() -> SessionContext {
     SessionContext {
-        protocol_version: CURRENT_PROTOCOL_VERSION,
         session_epoch: SessionEpoch([0x42; 16]),
         transport_generation: TransportGeneration(1),
         activation_id: ActivationId(1),
@@ -325,6 +324,29 @@ async fn unread_control_stream_hits_the_bounded_fail_closed_write_timeout() {
     tokio::time::timeout(Duration::from_secs(1), client.datagrams.closed())
         .await
         .expect("timed-out critical write did not close the connection");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_on_another_protocol_version_gets_a_clear_error() {
+    // The input and pairing ALPNs differ the same way two zflow versions do.
+    let (_client_directory, client_identity) = identity();
+    let (_server_directory, server_identity) = identity();
+    let client_config = input_client_config(&client_identity, server_identity.spki()).unwrap();
+    let server_config = pairing_server_config(&server_identity).unwrap();
+
+    let server_endpoint = quinn::Endpoint::server(server_config.quinn_config(), LOOPBACK).unwrap();
+    let server_address = server_endpoint.local_addr().unwrap();
+    let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
+    let accept_endpoint = server_endpoint.clone();
+    let accept =
+        tokio::spawn(async move { accept_pairing(accept_endpoint.accept().await.unwrap()).await });
+
+    let client = connect_input(&client_endpoint, server_address, &client_config).await;
+    assert!(matches!(client, Err(TransportError::InvalidAlpn)));
+    assert!(matches!(
+        accept.await.unwrap(),
+        Err(TransportError::InvalidAlpn)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

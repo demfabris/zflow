@@ -6,18 +6,10 @@ pub enum WireError {
     TooShort,
     #[error("invalid wire magic")]
     BadMagic,
-    #[error("unsupported framing version {0}")]
-    UnsupportedFramingVersion(u8),
-    #[error("unsupported protocol version {0}")]
-    UnsupportedProtocolVersion(u16),
-    #[error("unknown codec identifier {0}")]
-    UnknownCodec(u8),
     #[error("unknown message family {0}")]
     UnknownFamily(u8),
     #[error("unknown message type {message_type} for {family:?}")]
     UnknownMessageType { family: Family, message_type: u8 },
-    #[error("unknown required feature bits 0x{0:04x}")]
-    UnknownRequiredFeatures(u16),
     #[error("{what} length {actual} exceeds the cap of {maximum}")]
     SizeLimit {
         what: &'static str,

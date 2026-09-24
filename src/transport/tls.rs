@@ -26,8 +26,8 @@ use crate::identity::Identity;
 
 use super::TransportError;
 
-pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/1";
-pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/2";
+pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/2";
+pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/3";
 const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 const INPUT_IDLE_TIMEOUT_MS: u32 = 15_000;
 

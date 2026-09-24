@@ -27,7 +27,6 @@ use crate::{
     identity::Identity,
     session::{SessionEvent, SessionEventKind, SessionHandle, SessionOptions, start_session},
     transport::{InputClientConfig, InputConnection, connect_input, input_client_config},
-    wire::CURRENT_PROTOCOL_VERSION,
 };
 
 use super::{Activation, HandoffOptions, SourceStatus, refuse_inbound, run_crossing};
@@ -436,7 +435,6 @@ impl Session {
     fn next_context(&mut self) -> SessionContext {
         self.activations += 1;
         SessionContext {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
             session_epoch: self.epoch,
             transport_generation: self.handle.generation(),
             activation_id: ActivationId(self.activations),

@@ -9,7 +9,7 @@ pub enum TransportError {
     #[error("could not start QUIC connection: {0}")]
     Connect(#[from] quinn::ConnectError),
     #[error("QUIC connection failed: {0}")]
-    Connection(#[from] quinn::ConnectionError),
+    Connection(quinn::ConnectionError),
     #[error("critical control stream write failed: {0}")]
     ControlWrite(#[from] quinn::WriteError),
     #[error("critical control stream write exceeded its safety bound")]
@@ -22,7 +22,7 @@ pub enum TransportError {
     DatagramQueueClosed,
     #[error("wire message is invalid: {0}")]
     Wire(#[from] WireError),
-    #[error("peer did not negotiate the required zflow ALPN")]
+    #[error("peer runs a different zflow protocol version")]
     InvalidAlpn,
     #[error("peer did not present exactly one raw public key")]
     MissingPeerIdentity,
@@ -61,4 +61,21 @@ pub enum TransportError {
     InvalidPairingFamily,
     #[error("peer revealed a pairing offer that does not match its commitment")]
     PairingCommitmentMismatch,
+}
+
+impl From<quinn::ConnectionError> for TransportError {
+    fn from(error: quinn::ConnectionError) -> Self {
+        // TLS alert 120 (no_application_protocol) means the peers share no
+        // ALPN, which is how two zflow versions tell each other apart.
+        let code = match &error {
+            quinn::ConnectionError::ConnectionClosed(close) => Some(close.error_code),
+            quinn::ConnectionError::TransportError(error) => Some(error.code),
+            _ => None,
+        };
+        if code == Some(quinn::TransportErrorCode::crypto(120)) {
+            Self::InvalidAlpn
+        } else {
+            Self::Connection(error)
+        }
+    }
 }

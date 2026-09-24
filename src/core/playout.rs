@@ -807,7 +807,7 @@ fn limit_pair(first: i64, second: i64, cap: u64) -> (i64, i64, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{ActivationId, ProtocolVersion, SessionEpoch, TransportGeneration};
+    use crate::core::{ActivationId, SessionEpoch, TransportGeneration};
 
     fn time(value: u64) -> MonotonicTimeMicros {
         MonotonicTimeMicros(value)
@@ -815,7 +815,6 @@ mod tests {
 
     fn session(epoch: u8) -> SessionContext {
         SessionContext {
-            protocol_version: ProtocolVersion(1),
             session_epoch: SessionEpoch([epoch; 16]),
             transport_generation: TransportGeneration(1),
             activation_id: ActivationId(1),

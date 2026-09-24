@@ -29,7 +29,6 @@ use crate::{
     },
     metrics::{SessionMetrics, SessionMetricsSnapshot},
     transport::{InputChannels, InputConnection, InputControlMessage, InputDatagram},
-    wire::CURRENT_PROTOCOL_VERSION,
 };
 
 const SESSION_COMMAND_CAPACITY: usize = 512;
@@ -92,7 +91,6 @@ impl SessionOptions {
         ]);
         Ok(Self {
             offer: NegotiationOffer {
-                protocol_versions: vec![CURRENT_PROTOCOL_VERSION],
                 maximum_datagram_size: OFFER_DATAGRAM_SIZE,
                 supported_capabilities: capabilities,
                 required_capabilities,
@@ -408,9 +406,6 @@ async fn run_session(
                     SessionCommand::BeginOutbound(context) => {
                         if sender.is_some() {
                             bail!("outbound activation is already open");
-                        }
-                        if context.protocol_version != negotiated.protocol_version {
-                            bail!("outbound activation uses the wrong negotiated protocol");
                         }
                         let now = clock.now();
                         capture_merge.clear();
@@ -805,8 +800,8 @@ mod tests {
         core::{
             ActivationId, AnchorKind, ClockConfig, ClockMapper, ControlSequence, CumulativeMotion,
             HidUsage, MotionAnchor, MotionDelta, MotionSequence, PointerButton, ProbeExchange,
-            ProtocolVersion, Receiver, ReceiverPlayout, ReliableControlMessage, SessionEpoch,
-            SnapshotAck, TouchState,
+            Receiver, ReceiverPlayout, ReliableControlMessage, SessionEpoch, SnapshotAck,
+            TouchState,
         },
         identity::Identity,
         transport::{
@@ -840,7 +835,6 @@ mod tests {
 
     fn context() -> SessionContext {
         SessionContext {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
             session_epoch: SessionEpoch([7; 16]),
             transport_generation: TransportGeneration(1),
             activation_id: ActivationId(1),
@@ -959,7 +953,6 @@ mod tests {
 
         let frame = crate::core::MotionFrame {
             session: SessionContext {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
                 session_epoch: SessionEpoch([1; 16]),
                 transport_generation: TransportGeneration(1),
                 activation_id: ActivationId(1),
@@ -1340,7 +1333,6 @@ mod tests {
         let left = left.unwrap();
         let right = right.unwrap();
         let context = SessionContext {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
             session_epoch: SessionEpoch([7; 16]),
             transport_generation: TransportGeneration(1),
             activation_id: ActivationId(1),
@@ -1642,11 +1634,6 @@ mod tests {
                 left.close(SessionCloseReason::LocalRelease);
             }
         }
-    }
-
-    #[test]
-    fn protocol_version_is_current() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion(1));
     }
 
     #[test]

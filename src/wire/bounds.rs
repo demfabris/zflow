@@ -4,7 +4,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 pub use crate::discovery::MAX_DISCOVERY_CANDIDATES;
 
-pub const MAX_PROTOCOL_VERSIONS: usize = 16;
 pub const MAX_CONTACTS: usize = 32;
 pub const MAX_HELD_KEYS: usize = 32;
 pub const MAX_HELD_BUTTONS: usize = 16;

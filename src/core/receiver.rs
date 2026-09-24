@@ -11,8 +11,8 @@ use thiserror::Error;
 use super::{
     ActivationId, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage,
     MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionSequence, PlayoutStep, PointerButton,
-    ProtocolVersion, ReliableControl, ReliableControlMessage, SessionCloseReason, SessionContext,
-    SessionEpoch, SnapshotAck, TouchState, TransportGeneration,
+    ReliableControl, ReliableControlMessage, SessionCloseReason, SessionContext, SessionEpoch,
+    SnapshotAck, TouchState, TransportGeneration,
 };
 
 const MAX_HELD_STATE_LEASE: Duration = Duration::from_secs(1);
@@ -130,7 +130,7 @@ impl ActivationState {
 pub struct Receiver {
     config: ReceiverConfig,
     /// Taken from the first control message. One connection carries one.
-    context: Option<(ProtocolVersion, SessionEpoch, TransportGeneration)>,
+    context: Option<(SessionEpoch, TransportGeneration)>,
     highest_activation: Option<ActivationId>,
     activation: Option<ActivationState>,
     last_observed_time: MonotonicTimeMicros,
@@ -462,11 +462,7 @@ impl Receiver {
     }
 
     fn check_context(&mut self, session: SessionContext) -> Result<(), ReceiverError> {
-        let context = (
-            session.protocol_version,
-            session.session_epoch,
-            session.transport_generation,
-        );
+        let context = (session.session_epoch, session.transport_generation);
         match self.context {
             None => self.context = Some(context),
             Some(pinned) if pinned != context => return Err(ReceiverError::ContextChanged),
@@ -661,7 +657,6 @@ mod tests {
 
     fn context(epoch: u8, generation: u64, activation: u64) -> SessionContext {
         SessionContext {
-            protocol_version: ProtocolVersion(1),
             session_epoch: SessionEpoch([epoch; 16]),
             transport_generation: TransportGeneration(generation),
             activation_id: ActivationId(activation),
@@ -940,7 +935,7 @@ mod tests {
             .unwrap();
 
         let invalid = SessionContext {
-            protocol_version: ProtocolVersion(2),
+            transport_generation: TransportGeneration(2),
             ..session
         };
         assert_eq!(

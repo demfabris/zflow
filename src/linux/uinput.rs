@@ -828,11 +828,10 @@ mod tests {
     fn jitter_burst_keeps_capture_intervals_in_touch_reports() {
         use crate::core::{
             ActivationId, ClockMapper, ClockSample, ControlSequence, CumulativeMotion,
-            MonotonicTimeMicros, MotionFrame, MotionSequence, PlayoutConfig, ProtocolVersion,
-            ReceiverPlayout, SessionContext, SessionEpoch, TransportGeneration,
+            MonotonicTimeMicros, MotionFrame, MotionSequence, PlayoutConfig, ReceiverPlayout,
+            SessionContext, SessionEpoch, TransportGeneration,
         };
         let session = SessionContext {
-            protocol_version: ProtocolVersion(1),
             session_epoch: SessionEpoch([1; 16]),
             transport_generation: TransportGeneration(1),
             activation_id: ActivationId(1),

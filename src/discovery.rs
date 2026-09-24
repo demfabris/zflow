@@ -17,21 +17,21 @@ use mdns_sd::{
 use thiserror::Error;
 
 use crate::{
-    core::{InputCapabilities, InputCapability, ProtocolVersion},
+    core::{InputCapabilities, InputCapability},
     identity::encode_hex,
-    wire::CURRENT_PROTOCOL_VERSION,
+    transport::INPUT_ALPN_PROTOCOL,
 };
 
 pub const SERVICE_TYPE: &str = "_zflow._udp.local.";
 pub const MAX_DISCOVERY_CANDIDATES: usize = 16;
-pub const MAX_PROTOCOL_VERSIONS: usize = 16;
 pub const MAX_TXT_PROPERTIES: usize = 2;
 pub const MAX_TXT_BYTES: usize = 384;
 
 const INSTANCE_PREFIX: &str = "zf-";
 const INSTANCE_ENTROPY_BYTES: usize = 16;
 const INSTANCE_HEX_BYTES: usize = INSTANCE_ENTROPY_BYTES * 2;
-const TXT_PROTOCOL_VERSIONS: &str = "v";
+/// Carries the input ALPN, the only protocol version zflow has.
+const TXT_PROTOCOL: &str = "v";
 const TXT_CAPABILITIES: &str = "cap";
 
 /// Lists this host's current addresses. Loopback and non-unicast addresses
@@ -135,7 +135,7 @@ impl Advertisement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UntrustedCandidate {
     ephemeral_instance_id: Option<EphemeralInstanceId>,
-    protocol_versions: Vec<ProtocolVersion>,
+    compatible: bool,
     capability_summary: InputCapabilities,
     socket_addresses: Vec<SocketAddr>,
 }
@@ -146,7 +146,7 @@ impl UntrustedCandidate {
         validate_socket_address(address).map_err(CandidateParseError::InvalidAddress)?;
         Ok(Self {
             ephemeral_instance_id: None,
-            protocol_versions: Vec::new(),
+            compatible: false,
             capability_summary: InputCapabilities::default(),
             socket_addresses: vec![address],
         })
@@ -156,8 +156,9 @@ impl UntrustedCandidate {
         self.ephemeral_instance_id
     }
 
-    pub fn protocol_versions(&self) -> &[ProtocolVersion] {
-        &self.protocol_versions
+    /// Whether the record advertises the ALPN this build speaks.
+    pub fn is_compatible(&self) -> bool {
+        self.compatible
     }
 
     pub fn capability_summary(&self) -> &InputCapabilities {
@@ -410,7 +411,7 @@ fn parse_candidate_fields(
 
     Ok(UntrustedCandidate {
         ephemeral_instance_id: Some(instance_id),
-        protocol_versions: txt.protocol_versions,
+        compatible: txt.compatible,
         capability_summary: txt.capability_summary,
         socket_addresses,
     })
@@ -420,10 +421,10 @@ fn build_service_info(
     instance_id: EphemeralInstanceId,
     advertisement: &Advertisement,
 ) -> Result<ServiceInfo, DiscoveryError> {
-    let versions = CURRENT_PROTOCOL_VERSION.0.to_string();
+    let protocol = String::from_utf8_lossy(INPUT_ALPN_PROTOCOL).into_owned();
     let capabilities = format_capabilities(&advertisement.capability_summary);
     let properties = [
-        (TXT_PROTOCOL_VERSIONS.to_owned(), versions),
+        (TXT_PROTOCOL.to_owned(), protocol),
         (TXT_CAPABILITIES.to_owned(), capabilities),
     ];
     debug_assert!(txt_size(&properties) <= MAX_TXT_BYTES);
@@ -443,7 +444,7 @@ fn build_service_info(
 }
 
 struct ParsedTxt {
-    protocol_versions: Vec<ProtocolVersion>,
+    compatible: bool,
     capability_summary: InputCapabilities,
 }
 
@@ -453,7 +454,7 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
     }
 
     let mut total_size = 0usize;
-    let mut versions = None;
+    let mut compatible = None;
     let mut capabilities = None;
 
     for property in properties.iter() {
@@ -467,13 +468,13 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
         let value = std::str::from_utf8(value).map_err(|_| CandidateParseError::InvalidTxtValue)?;
 
         match property.key() {
-            TXT_PROTOCOL_VERSIONS if versions.is_none() => {
-                versions = Some(parse_protocol_versions(value)?);
+            TXT_PROTOCOL if compatible.is_none() => {
+                compatible = Some(value.as_bytes() == INPUT_ALPN_PROTOCOL);
             }
             TXT_CAPABILITIES if capabilities.is_none() => {
                 capabilities = Some(parse_capabilities(value)?);
             }
-            TXT_PROTOCOL_VERSIONS | TXT_CAPABILITIES => {
+            TXT_PROTOCOL | TXT_CAPABILITIES => {
                 return Err(CandidateParseError::DuplicateTxtProperty);
             }
             _ => return Err(CandidateParseError::UnexpectedTxtProperty),
@@ -481,34 +482,10 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
     }
 
     Ok(ParsedTxt {
-        protocol_versions: versions.ok_or(CandidateParseError::MissingTxtProperty(
-            TXT_PROTOCOL_VERSIONS,
-        ))?,
+        compatible: compatible.ok_or(CandidateParseError::MissingTxtProperty(TXT_PROTOCOL))?,
         capability_summary: capabilities
             .ok_or(CandidateParseError::MissingTxtProperty(TXT_CAPABILITIES))?,
     })
-}
-
-fn parse_protocol_versions(value: &str) -> Result<Vec<ProtocolVersion>, CandidateParseError> {
-    if value.is_empty() || value.len() > MAX_PROTOCOL_VERSIONS * 6 {
-        return Err(CandidateParseError::InvalidProtocolVersions);
-    }
-    let mut versions = BTreeSet::new();
-    for raw in value.split(',') {
-        if raw.is_empty() || (raw.len() > 1 && raw.starts_with('0')) {
-            return Err(CandidateParseError::InvalidProtocolVersions);
-        }
-        let version = raw
-            .parse::<u16>()
-            .map_err(|_| CandidateParseError::InvalidProtocolVersions)?;
-        if version == 0 || !versions.insert(ProtocolVersion(version)) {
-            return Err(CandidateParseError::InvalidProtocolVersions);
-        }
-        if versions.len() > MAX_PROTOCOL_VERSIONS {
-            return Err(CandidateParseError::InvalidProtocolVersions);
-        }
-    }
-    Ok(versions.into_iter().collect())
 }
 
 fn format_capabilities(capabilities: &InputCapabilities) -> String {
@@ -651,8 +628,6 @@ pub enum CandidateParseError {
     DuplicateTxtProperty,
     #[error("missing TXT property {0}")]
     MissingTxtProperty(&'static str),
-    #[error("protocol version summary is malformed")]
-    InvalidProtocolVersions,
     #[error("capability summary is malformed")]
     InvalidCapabilities,
 }
@@ -694,7 +669,10 @@ mod tests {
 
         let properties = service.get_properties();
         assert!(properties.len() <= MAX_TXT_PROPERTIES);
-        assert_eq!(properties.get_property_val_str("v"), Some("1"));
+        assert_eq!(
+            properties.get_property_val_str("v").map(str::as_bytes),
+            Some(INPUT_ALPN_PROTOCOL)
+        );
         assert_eq!(
             properties.get_property_val_str("cap"),
             Some("keyboard,pointer,scroll")
@@ -738,7 +716,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.ephemeral_instance_id(), Some(test_instance()));
-        assert_eq!(parsed.protocol_versions(), &[CURRENT_PROTOCOL_VERSION]);
+        assert!(parsed.is_compatible());
         assert_eq!(parsed.socket_addresses(), addresses);
         assert!(
             parsed
@@ -788,7 +766,7 @@ mod tests {
         let candidate = UntrustedCandidate::explicit(address).unwrap();
         assert_eq!(candidate.socket_addresses(), &[address]);
         assert_eq!(candidate.ephemeral_instance_id(), None);
-        assert!(candidate.protocol_versions().is_empty());
+        assert!(!candidate.is_compatible());
 
         assert!(
             UntrustedCandidate::explicit(SocketAddr::from((

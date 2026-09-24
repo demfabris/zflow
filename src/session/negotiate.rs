@@ -1,6 +1,6 @@
 //! Session negotiation and the checks that keep a peer inside what it negotiated.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::{
     core::{
@@ -38,13 +38,6 @@ pub(super) fn select_negotiation(
     left: &NegotiationOffer,
     right: &NegotiationOffer,
 ) -> Result<NegotiatedSession> {
-    let version = left
-        .protocol_versions
-        .iter()
-        .filter(|version| right.protocol_versions.contains(version))
-        .max()
-        .copied()
-        .context("peers have no protocol version in common")?;
     let capabilities = InputCapabilities::new(
         left.supported_capabilities
             .iter()
@@ -67,7 +60,6 @@ pub(super) fn select_negotiation(
         0
     };
     let selected = NegotiatedSession {
-        protocol_version: version,
         maximum_datagram_size: left.maximum_datagram_size.min(right.maximum_datagram_size),
         capabilities,
         pointer_unit,

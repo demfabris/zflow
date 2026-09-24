@@ -1,9 +1,9 @@
 //! Bounded, self-describing framing for the protocol domain model.
 //!
-//! The envelope is codec-independent and is parsed before serde sees a byte:
-//! magic, framing version, codec, family/type, required-feature bits, payload
-//! length, protocol version, then (for session traffic) epoch/generation/
-//! activation and channel sequences.
+//! The envelope is parsed before serde sees a byte: magic, family/type,
+//! payload length, then (for session traffic) epoch/generation/activation and
+//! channel sequences. The format has no version field of its own: the QUIC
+//! ALPN names the protocol, so a peer on another version never gets here.
 
 mod bounds;
 mod codec;
@@ -21,11 +21,8 @@ use model::{
 };
 
 const MAGIC: [u8; 2] = *b"ZF";
-const FRAMING_VERSION: u8 = 1;
-const POSTCARD_CODEC: u8 = 1;
-const FIXED_HEADER_BYTES: usize = 14;
+const FIXED_HEADER_BYTES: usize = 8;
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
 pub const MAX_NEGOTIATION_PAYLOAD_BYTES: usize = 4 * 1_024;
 pub const MAX_RELIABLE_PAYLOAD_BYTES: usize = 32 * 1_024;
 pub const MAX_MOTION_PAYLOAD_BYTES: usize = 8 * 1_024;
@@ -133,13 +130,9 @@ pub fn encode(message: &WireMessage) -> Result<Vec<u8>, WireError> {
             + encoded.payload.len(),
     );
     bytes.extend_from_slice(&MAGIC);
-    bytes.push(FRAMING_VERSION);
-    bytes.push(POSTCARD_CODEC);
     bytes.push(encoded.family as u8);
     bytes.push(encoded.message_type);
-    bytes.extend_from_slice(&0_u16.to_le_bytes()); // no required feature bits in v1
     bytes.extend_from_slice(&payload_length.to_le_bytes());
-    bytes.extend_from_slice(&encoded.protocol_version.0.to_le_bytes());
 
     if let Some(session) = encoded.session {
         bytes.extend_from_slice(&session.session_epoch.0);
@@ -177,7 +170,6 @@ fn decode_inner(bytes: &[u8], expected: Option<Family>) -> Result<WireMessage, W
 struct EncodedPayload {
     family: Family,
     message_type: u8,
-    protocol_version: ProtocolVersion,
     session: Option<SessionContext>,
     channel: ChannelFields,
     payload: Vec<u8>,
@@ -191,45 +183,38 @@ fn prepare_payload(message: &WireMessage) -> Result<EncodedPayload, WireError> {
             EncodedPayload {
                 family: Family::Negotiation,
                 message_type: 1,
-                protocol_version: CURRENT_PROTOCOL_VERSION,
                 session: None,
                 channel: ChannelFields::None,
                 payload: codec::encode(&value)?,
             }
         }
         WireMessage::NegotiatedSession(session) => {
-            check_protocol_version(session.protocol_version)?;
             let value = WireNegotiatedSession::try_from(session).map_err(bounds)?;
             EncodedPayload {
                 family: Family::Negotiation,
                 message_type: 2,
-                protocol_version: session.protocol_version,
                 session: None,
                 channel: ChannelFields::None,
                 payload: codec::encode(&value)?,
             }
         }
         WireMessage::ReliableControl(message) => {
-            check_protocol_version(message.session.protocol_version)?;
             validate_reliable_context(&message.payload, message.session)?;
             let value = WireReliableControl::try_from(&message.payload).map_err(bounds)?;
             let message_type = value.message_type();
             EncodedPayload {
                 family: Family::ReliableControl,
                 message_type,
-                protocol_version: message.session.protocol_version,
                 session: Some(message.session),
                 channel: ChannelFields::Control(message.sequence),
                 payload: codec::encode(&value)?,
             }
         }
         WireMessage::Motion(frame) => {
-            check_protocol_version(frame.session.protocol_version)?;
             let value = WireMotionBody::try_from(frame).map_err(bounds)?;
             EncodedPayload {
                 family: Family::Motion,
                 message_type: 1,
-                protocol_version: frame.session.protocol_version,
                 session: Some(frame.session),
                 channel: ChannelFields::Motion {
                     motion_sequence: frame.motion_sequence,
@@ -239,7 +224,6 @@ fn prepare_payload(message: &WireMessage) -> Result<EncodedPayload, WireError> {
             }
         }
         WireMessage::Probe(message) => {
-            check_protocol_version(message.session.protocol_version)?;
             let message_type = match message.payload {
                 ProbePayload::Probe { .. } => 1,
                 ProbePayload::ProbeEcho { .. } => 2,
@@ -247,7 +231,6 @@ fn prepare_payload(message: &WireMessage) -> Result<EncodedPayload, WireError> {
             EncodedPayload {
                 family: Family::Probe,
                 message_type,
-                protocol_version: message.session.protocol_version,
                 session: Some(message.session),
                 channel: ChannelFields::None,
                 payload: codec::encode(&message.payload)?,
@@ -267,7 +250,6 @@ fn prepare_payload(message: &WireMessage) -> Result<EncodedPayload, WireError> {
             EncodedPayload {
                 family: Family::Desktop,
                 message_type: 1,
-                protocol_version: CURRENT_PROTOCOL_VERSION,
                 session: None,
                 channel: ChannelFields::None,
                 payload: codec::encode(&value)?,
@@ -278,7 +260,6 @@ fn prepare_payload(message: &WireMessage) -> Result<EncodedPayload, WireError> {
             EncodedPayload {
                 family: Family::Pairing,
                 message_type: 1,
-                protocol_version: CURRENT_PROTOCOL_VERSION,
                 session: None,
                 channel: ChannelFields::None,
                 payload: codec::encode(&value)?,
@@ -324,7 +305,6 @@ impl ChannelFields {
 struct Header {
     family: Family,
     message_type: u8,
-    protocol_version: ProtocolVersion,
     session: Option<SessionContext>,
     channel: ChannelFields,
 }
@@ -337,14 +317,6 @@ fn parse_envelope(bytes: &[u8]) -> Result<(Header, &[u8]), WireError> {
     if cursor.take(2)? != MAGIC {
         return Err(WireError::BadMagic);
     }
-    let framing_version = cursor.u8()?;
-    if framing_version != FRAMING_VERSION {
-        return Err(WireError::UnsupportedFramingVersion(framing_version));
-    }
-    let codec = cursor.u8()?;
-    if codec != POSTCARD_CODEC {
-        return Err(WireError::UnknownCodec(codec));
-    }
     let family = Family::try_from(cursor.u8()?)?;
     let message_type = cursor.u8()?;
     if !family.valid_message_type(message_type) {
@@ -352,10 +324,6 @@ fn parse_envelope(bytes: &[u8]) -> Result<(Header, &[u8]), WireError> {
             family,
             message_type,
         });
-    }
-    let required_features = cursor.u16()?;
-    if required_features != 0 {
-        return Err(WireError::UnknownRequiredFeatures(required_features));
     }
     let payload_length = usize::try_from(cursor.u32()?).map_err(|_| WireError::SizeLimit {
         what: "payload",
@@ -369,14 +337,10 @@ fn parse_envelope(bytes: &[u8]) -> Result<(Header, &[u8]), WireError> {
             maximum: family.maximum_payload_bytes(),
         });
     }
-    let protocol_version = ProtocolVersion(cursor.u16()?);
-    check_protocol_version(protocol_version)?;
-
     let session = if family.requires_session() {
         let mut epoch = [0_u8; 16];
         epoch.copy_from_slice(cursor.take(16)?);
         Some(SessionContext {
-            protocol_version,
             session_epoch: SessionEpoch(epoch),
             transport_generation: TransportGeneration(cursor.u64()?),
             activation_id: ActivationId(cursor.u64()?),
@@ -400,7 +364,6 @@ fn parse_envelope(bytes: &[u8]) -> Result<(Header, &[u8]), WireError> {
     let header = Header {
         family,
         message_type,
-        protocol_version,
         session,
         channel,
     };
@@ -420,7 +383,7 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
             2 => {
                 let value: WireNegotiatedSession = codec::decode(payload)?;
                 Ok(WireMessage::NegotiatedSession(
-                    value.into_model(header.protocol_version).map_err(bounds)?,
+                    value.try_into().map_err(bounds)?,
                 ))
             }
             _ => unreachable!("message type checked during header parsing"),
@@ -501,14 +464,6 @@ fn decode_payload(header: &Header, payload: &[u8]) -> Result<WireMessage, WireEr
     }
 }
 
-fn check_protocol_version(version: ProtocolVersion) -> Result<(), WireError> {
-    if version == CURRENT_PROTOCOL_VERSION {
-        Ok(())
-    } else {
-        Err(WireError::UnsupportedProtocolVersion(version.0))
-    }
-}
-
 fn validate_reliable_context(
     payload: &ReliableControl,
     session: SessionContext,
@@ -555,12 +510,6 @@ impl<'a> Cursor<'a> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, WireError> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?.try_into().expect("length checked"),
-        ))
-    }
-
     fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(
             self.take(4)?.try_into().expect("length checked"),
@@ -582,7 +531,6 @@ mod tests {
 
     fn session() -> SessionContext {
         SessionContext {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
             session_epoch: SessionEpoch([0x11; 16]),
             transport_generation: TransportGeneration(7),
             activation_id: ActivationId(9),
@@ -640,7 +588,6 @@ mod tests {
         ]);
         vec![
             WireMessage::NegotiationOffer(NegotiationOffer {
-                protocol_versions: vec![CURRENT_PROTOCOL_VERSION],
                 maximum_datagram_size: 1_200,
                 supported_capabilities: capabilities.clone(),
                 required_capabilities: InputCapabilities::from([InputCapability::Keyboard]),
@@ -658,7 +605,6 @@ mod tests {
                 maximum_checkpoint_bound_ms: 250,
             }),
             WireMessage::NegotiatedSession(NegotiatedSession {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
                 maximum_datagram_size: 1_200,
                 capabilities,
                 pointer_unit: Some(PointerUnit::DeviceUnaccelerated),
@@ -781,7 +727,7 @@ mod tests {
                 payload,
             });
             let bytes = encode(&message).unwrap();
-            assert_eq!(bytes[5], message_type);
+            assert_eq!(bytes[3], message_type);
             assert_eq!(decode(&bytes).unwrap(), message);
         }
     }
@@ -790,7 +736,7 @@ mod tests {
     fn unknown_control_types_are_rejected() {
         let mut bytes = encode(&corpus().remove(2)).unwrap();
         for unknown in [0, 12, 255] {
-            bytes[5] = unknown;
+            bytes[3] = unknown;
             assert_eq!(
                 decode(&bytes),
                 Err(WireError::UnknownMessageType {
@@ -802,16 +748,9 @@ mod tests {
     }
 
     #[test]
-    fn only_the_postcard_codec_is_accepted() {
-        let mut bytes = encode(&corpus().remove(4)).unwrap();
-        bytes[3] = 2;
-        assert_eq!(decode(&bytes), Err(WireError::UnknownCodec(2)));
-    }
-
-    #[test]
     fn invalid_family_and_trailing_envelope_data_are_rejected() {
         let mut bytes = encode(&corpus().remove(4)).unwrap();
-        bytes[4] = 0xff;
+        bytes[2] = 0xff;
         assert_eq!(decode(&bytes), Err(WireError::UnknownFamily(0xff)));
 
         let mut bytes = encode(&corpus().remove(4)).unwrap();
@@ -834,7 +773,7 @@ mod tests {
     #[test]
     fn declared_oversize_payload_is_rejected_before_length_or_codec_work() {
         let mut bytes = encode(&corpus().remove(4)).unwrap();
-        bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
             decode(&bytes),
             Err(WireError::SizeLimit {
@@ -847,9 +786,9 @@ mod tests {
     #[test]
     fn collection_bound_is_enforced_by_the_decoder() {
         let mut bytes = encode(&corpus().remove(0)).unwrap();
-        // Negotiation has no session/channel header. The first body value is
-        // the protocol_versions sequence length; 17 is the fixed header size.
-        bytes[FIXED_HEADER_BYTES] = (bounds::MAX_PROTOCOL_VERSIONS as u8) + 1;
+        // Negotiation has no session/channel header. The body starts with the
+        // two-byte datagram size varint, then the capability count.
+        bytes[FIXED_HEADER_BYTES + 2] = (bounds::MAX_CAPABILITIES as u8) + 1;
         assert!(decode(&bytes).is_err());
     }
 
@@ -884,7 +823,7 @@ mod tests {
         );
 
         let mut bytes = encode(&corpus().remove(2)).unwrap();
-        bytes[5] = 1;
+        bytes[3] = 1;
         assert_eq!(
             decode(&bytes),
             Err(WireError::InvalidEnvelope(
@@ -909,7 +848,7 @@ mod tests {
         assert_eq!(decode(&bytes).unwrap(), message);
         let mut invalid = bytes;
         // Unknown families fail before metadata is interpreted.
-        invalid[4] = 255;
+        invalid[2] = 255;
         assert!(matches!(
             decode(&invalid),
             Err(WireError::UnknownFamily(255))

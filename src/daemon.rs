@@ -40,7 +40,6 @@ use crate::{
         InputConnection, InputServerConfig, accept_input, connect_input, input_client_config,
         input_server_config_for_peers,
     },
-    wire::CURRENT_PROTOCOL_VERSION,
 };
 
 const SESSION_EVENT_CAPACITY: usize = 1_024;
@@ -527,7 +526,6 @@ impl Shared {
             .cloned()
             .with_context(|| format!("peer {peer} disconnected before capture armed"))?;
         let context = SessionContext {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
             session_epoch: self.process_epoch,
             transport_generation: session.generation(),
             activation_id: self.allocate_activation()?,

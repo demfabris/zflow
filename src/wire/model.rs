@@ -8,7 +8,6 @@ use super::bounds::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WireNegotiationOffer {
-    protocol_versions: BoundedVec<ProtocolVersion, MAX_PROTOCOL_VERSIONS>,
     maximum_datagram_size: u32,
     supported_capabilities: BoundedVec<InputCapability, MAX_CAPABILITIES>,
     required_capabilities: BoundedVec<InputCapability, MAX_CAPABILITIES>,
@@ -29,10 +28,6 @@ impl TryFrom<&NegotiationOffer> for WireNegotiationOffer {
             ));
         }
         Ok(Self {
-            protocol_versions: BoundedVec::try_from_vec(
-                value.protocol_versions.clone(),
-                "protocol_versions",
-            )?,
             maximum_datagram_size: value.maximum_datagram_size,
             supported_capabilities: BoundedVec::try_from_vec(
                 value.supported_capabilities.iter().collect(),
@@ -64,7 +59,6 @@ impl TryFrom<WireNegotiationOffer> for NegotiationOffer {
             ));
         }
         Ok(Self {
-            protocol_versions: unique_vec(value.protocol_versions, "protocol_versions")?,
             maximum_datagram_size: value.maximum_datagram_size,
             supported_capabilities: InputCapabilities::new(unique_vec(
                 value.supported_capabilities,
@@ -114,21 +108,19 @@ impl TryFrom<&NegotiatedSession> for WireNegotiatedSession {
     }
 }
 
-impl WireNegotiatedSession {
-    pub(crate) fn into_model(
-        self,
-        protocol_version: ProtocolVersion,
-    ) -> Result<NegotiatedSession, BoundError> {
-        check_contact_limit(self.contact_limit)?;
-        Ok(NegotiatedSession {
-            protocol_version,
-            maximum_datagram_size: self.maximum_datagram_size,
-            capabilities: InputCapabilities::new(unique_vec(self.capabilities, "capabilities")?),
-            pointer_unit: self.pointer_unit,
-            scroll_fields: self.scroll_fields,
-            contact_limit: self.contact_limit,
-            receiver_lease_ms: self.receiver_lease_ms,
-            checkpoint_bound_ms: self.checkpoint_bound_ms,
+impl TryFrom<WireNegotiatedSession> for NegotiatedSession {
+    type Error = BoundError;
+
+    fn try_from(value: WireNegotiatedSession) -> Result<Self, Self::Error> {
+        check_contact_limit(value.contact_limit)?;
+        Ok(Self {
+            maximum_datagram_size: value.maximum_datagram_size,
+            capabilities: InputCapabilities::new(unique_vec(value.capabilities, "capabilities")?),
+            pointer_unit: value.pointer_unit,
+            scroll_fields: value.scroll_fields,
+            contact_limit: value.contact_limit,
+            receiver_lease_ms: value.receiver_lease_ms,
+            checkpoint_bound_ms: value.checkpoint_bound_ms,
         })
     }
 }

@@ -7,10 +7,7 @@ use std::{
 
 use tokio::sync::oneshot;
 
-use crate::{
-    discovery::{Discovery, DiscoveryEvent, UntrustedCandidate, local_unicast_addresses},
-    wire::CURRENT_PROTOCOL_VERSION,
-};
+use crate::discovery::{Discovery, DiscoveryEvent, UntrustedCandidate, local_unicast_addresses};
 
 const MAX_NEARBY: usize = 64;
 
@@ -35,9 +32,7 @@ impl NearbyRecord {
         Some(Self {
             instance: candidate.ephemeral_instance_id()?.to_string(),
             addresses: candidate.socket_addresses().to_vec(),
-            compatible: candidate
-                .protocol_versions()
-                .contains(&CURRENT_PROTOCOL_VERSION),
+            compatible: candidate.is_compatible(),
         })
     }
 }
@@ -299,7 +294,8 @@ mod tests {
 
     #[test]
     fn protocol_compatibility_comes_from_the_validated_record() {
-        for (version, compatible) in [(CURRENT_PROTOCOL_VERSION.0, true), (u16::MAX, false)] {
+        let ours = std::str::from_utf8(crate::transport::INPUT_ALPN_PROTOCOL).unwrap();
+        for (version, compatible) in [(ours, true), ("zflow/0", false)] {
             let instance = "zf-0123456789abcdef0123456789abcdef";
             let version = version.to_string();
             let service = mdns_sd::ServiceInfo::new(
