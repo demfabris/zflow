@@ -166,12 +166,12 @@ sudo udevadm trigger --action=change --subsystem-match=input
 sudo zflow doctor
 ```
 
-Raw touchpad forwarding is experimental. Enable it on both machines, then
-restart the daemons so they create and negotiate the virtual touchpads:
+Raw touchpad forwarding is experimental. Enable it on both machines. A running
+daemon applies it without a restart: it creates the virtual touchpad and ends
+open sessions, so the next connection negotiates touch:
 
 ```sh
 sudo zflow setup --experimental-touchpad on
-sudo systemctl restart zflowd.service
 sudo zflow doctor
 ```
 

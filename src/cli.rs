@@ -300,9 +300,11 @@ fn setup(path: PathBuf, options: SetupOptions, prelogin_dropin: Option<PathBuf>)
     #[cfg(target_os = "linux")]
     crate::runtime::LinuxRuntimeConfig::from_config(&config).validate()?;
     crate::session::SessionOptions::from_config(&config)?;
-    let restart_required = original_config.as_ref().map_or_else(Vec::new, |previous| {
-        restart_required_fields(previous, &config)
-    });
+    // The daemon binds its listen address once; everything else setup writes
+    // reaches a running daemon through a live reload.
+    let restart_required = original_config
+        .as_ref()
+        .is_some_and(|previous| previous.transport.listen != config.transport.listen);
     let rendered_rules = udev_rules
         .map(|rules_path| {
             render_capture_rules(&config.input.capture_devices).map(|rules| (rules_path, rules))
@@ -337,7 +339,7 @@ fn setup(path: PathBuf, options: SetupOptions, prelogin_dropin: Option<PathBuf>)
             .with_context(|| format!("could not update {}", dropin.display()))?;
             systemd_daemon_reload()?;
         }
-        if restart_required.is_empty() {
+        if !restart_required {
             reload_running_daemon(&config)?;
         }
         Ok(())
@@ -399,29 +401,11 @@ fn setup(path: PathBuf, options: SetupOptions, prelogin_dropin: Option<PathBuf>)
     for warning in chord_warnings(&config.input.activation_chord) {
         println!("warning: activation chord {warning}");
     }
-    if !restart_required.is_empty() {
-        println!("{}", restart_required_message(&restart_required));
+    if restart_required {
+        println!("daemon restart required to apply this setup (changed: transport.listen)");
     }
     println!("run `zflow devices` to inspect capture candidates");
     Ok(())
-}
-
-fn restart_required_fields(previous: &Config, next: &Config) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if previous.transport.listen != next.transport.listen {
-        fields.push("transport.listen");
-    }
-    if previous.input.experimental_touchpad != next.input.experimental_touchpad {
-        fields.push("input.experimental_touchpad");
-    }
-    fields
-}
-
-fn restart_required_message(fields: &[&str]) -> String {
-    format!(
-        "daemon restart required to apply this setup (changed: {})",
-        fields.join(", ")
-    )
 }
 
 #[derive(Debug, Serialize)]
@@ -1785,13 +1769,33 @@ mod tests {
     }
 
     #[test]
-    fn setup_persists_experimental_touchpad_as_restart_required() {
+    fn setup_hands_the_experimental_touchpad_to_a_running_daemon() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("zflow.toml");
+        let socket = directory.path().join("zflowd.sock");
         let mut config = Config::default();
         config.daemon.state_dir = directory.path().join("state");
-        config.daemon.control_socket = directory.path().join("missing.sock");
+        config.daemon.control_socket = socket.clone();
         config.save(&path).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let daemon = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                            .await
+                            .expect("setup never asked the daemon to reload")
+                            .unwrap();
+                    let request: Request = read_message(&mut stream).await.unwrap();
+                    write_message(&mut stream, &Response::Ack).await.unwrap();
+                    request
+                })
+        });
 
         setup(
             path.clone(),
@@ -1803,44 +1807,8 @@ mod tests {
         )
         .unwrap();
 
-        let saved = Config::load(&path).unwrap();
-        assert!(saved.input.experimental_touchpad);
-        assert_eq!(
-            restart_required_fields(&config, &saved),
-            ["input.experimental_touchpad"]
-        );
-    }
-
-    #[test]
-    fn setup_persists_offline_restart_only_overrides_without_live_reload() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("zflow.toml");
-        let stale_socket = directory.path().join("stale.sock");
-        let new_listen = "127.0.0.1:43219".parse().unwrap();
-        let mut config = Config::default();
-        config.daemon.state_dir = directory.path().join("state");
-        config.daemon.control_socket = stale_socket.clone();
-        config.save(&path).unwrap();
-        setup(
-            path.clone(),
-            SetupOptions {
-                listen: Some(new_listen),
-                ..Default::default()
-            },
-            None,
-        )
-        .unwrap();
-
-        let saved = Config::load(&path).unwrap();
-        assert_eq!(saved.transport.listen, new_listen);
-        assert_eq!(
-            restart_required_fields(&config, &saved),
-            ["transport.listen"]
-        );
-        assert_eq!(
-            restart_required_message(&restart_required_fields(&config, &saved)),
-            "daemon restart required to apply this setup (changed: transport.listen)"
-        );
+        assert_eq!(daemon.join().unwrap(), Request::ReloadConfig);
+        assert!(Config::load(&path).unwrap().input.experimental_touchpad);
     }
 
     #[cfg(unix)]
