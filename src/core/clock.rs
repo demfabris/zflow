@@ -304,22 +304,36 @@ impl ClockMapper {
         };
 
         let count = self.samples.len() as f64;
-        let (sum_x, sum_y) = self.samples.iter().fold((0.0, 0.0), |(x, y), sample| {
-            (
-                x + signed_difference(sample.sender_time.0, first.sender_time.0),
-                y + signed_difference(sample.receiver_time.0, first.receiver_time.0),
-            )
-        });
-        let mean_x = sum_x / count;
-        let mean_y = sum_y / count;
+        // A probe that sat in a queue has a wide uncertainty and a biased
+        // midpoint. Weighting by inverse variance lets clean round trips
+        // dominate the fit.
+        let weight = |sample: &ClockSample| {
+            let uncertainty = sample.uncertainty.as_micros().max(1) as f64;
+            1.0 / (uncertainty * uncertainty)
+        };
+        let (total_weight, sum_x, sum_y) =
+            self.samples
+                .iter()
+                .fold((0.0, 0.0, 0.0), |(total, x, y), sample| {
+                    let weight = weight(sample);
+                    (
+                        total + weight,
+                        x + weight * signed_difference(sample.sender_time.0, first.sender_time.0),
+                        y + weight
+                            * signed_difference(sample.receiver_time.0, first.receiver_time.0),
+                    )
+                });
+        let mean_x = sum_x / total_weight;
+        let mean_y = sum_y / total_weight;
         let (variance, covariance) =
             self.samples
                 .iter()
                 .fold((0.0, 0.0), |(variance, covariance), sample| {
+                    let weight = weight(sample);
                     let x = signed_difference(sample.sender_time.0, first.sender_time.0) - mean_x;
                     let y =
                         signed_difference(sample.receiver_time.0, first.receiver_time.0) - mean_y;
-                    (variance + x * x, covariance + x * y)
+                    (variance + weight * x * x, covariance + weight * x * y)
                 });
 
         let maximum_skew = f64::from(self.config.maximum_skew_ppm) / 1_000_000.0;
@@ -457,6 +471,32 @@ mod tests {
 
         assert_eq!(mapper.map(time(52_000)).unwrap(), time(12_000));
         assert_eq!(mapper.samples[0].uncertainty, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn queued_probes_barely_move_a_fit_built_from_clean_ones() {
+        // The receiver clock runs 10 ms ahead; every other echo waits 8 ms in
+        // a queue, which skews its midpoint by 4 ms.
+        let offset = 10_000;
+        let mut mapper = ClockMapper::default();
+        for second in 1..=8 {
+            let sent = second * 1_000_000;
+            let back = if second % 2 == 0 { 8_200 } else { 200 };
+            mapper
+                .ingest_probe(ProbeExchange {
+                    receiver_sent_at: time(sent),
+                    sender_received_at: time(sent + 200 - offset),
+                    sender_echoed_at: time(sent + 200 - offset),
+                    receiver_received_at: time(sent + 200 + back),
+                })
+                .unwrap();
+        }
+        let expected = 9_000_000 + offset;
+        let mapped = mapper.map(time(9_000_000)).unwrap().0;
+        assert!(
+            mapped.abs_diff(expected) < 100,
+            "mapped {mapped}, expected about {expected}"
+        );
     }
 
     #[test]
