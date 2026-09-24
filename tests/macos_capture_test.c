@@ -288,6 +288,7 @@ static CFMachPortRef fake_tap(CGEventTapLocation location,
   assert(placement == kCGHeadInsertEventTap);
   assert(options == kCGEventTapOptionDefault);
   assert(mask & CGEventMaskBit(kCGEventMouseMoved));
+  assert((mask & ZFLOW_SWALLOWED_EVENTS) == ZFLOW_SWALLOWED_EVENTS);
   assert(callback == event_callback && context == NULL);
   tap_calls++;
   return tap_available ? CFMachPortCreate(NULL, idle_port, NULL, NULL) : NULL;
@@ -477,6 +478,14 @@ static void event_tests(void) {
   atomic_store(&g_raw_contact_active, true);
   assert(event_callback(NULL, kCGEventMouseMoved, event, NULL) == NULL);
   ZFlowMacEvent captured;
+  assert(zflow_mac_capture_poll(&captured) == 0);
+
+  // Media keys and native gestures stay off the Mac while capturing.
+  const CGEventType swallowed[] = {NX_SYSDEFINED, 18, 19, 20, 29, 30, 31, 32, 33, 34};
+  for (size_t i = 0; i < sizeof(swallowed) / sizeof(swallowed[0]); i++) {
+    assert(event_callback(NULL, swallowed[i], event, NULL) == NULL);
+  }
+  assert(event_callback(NULL, kCGEventTabletPointer, event, NULL) == event);
   assert(zflow_mac_capture_poll(&captured) == 0);
 
   reset();

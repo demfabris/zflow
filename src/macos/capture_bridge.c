@@ -14,6 +14,17 @@
 #define ZFLOW_MAX_DISPLAYS 64
 #define ZFLOW_CAPS_LOCK 57
 
+// Media keys and native gestures would act on the Mac app under the frozen
+// cursor. Their payloads are not decoded, so capture swallows them. The
+// gesture numbers are NSEvent types: rotate 18, begin/end gesture 19-20,
+// gesture 29, magnify 30, swipe 31, smart magnify 32, quick look 33,
+// pressure 34.
+#define ZFLOW_SWALLOWED_EVENTS                                              \
+  (CGEventMaskBit(NX_SYSDEFINED) | CGEventMaskBit(18) | CGEventMaskBit(19) | \
+   CGEventMaskBit(20) | CGEventMaskBit(29) | CGEventMaskBit(30) |           \
+   CGEventMaskBit(31) | CGEventMaskBit(32) | CGEventMaskBit(33) |           \
+   CGEventMaskBit(34))
+
 typedef struct { double x, y; } ZFlowMacPosition;
 typedef struct { double x, y, width, height; } ZFlowMacRect;
 
@@ -441,6 +452,8 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
     return event;
   }
   if (atomic_load(&g_stop)) return event;
+  if ((uint32_t)type < 64 && (ZFLOW_SWALLOWED_EVENTS & CGEventMaskBit(type)))
+    return NULL;
 
   ZFlowMacEvent captured = {0};
   switch (type) {
@@ -607,7 +620,8 @@ static void *capture_thread(void *context) {
       CGEventMaskBit(kCGEventLeftMouseDragged) |
       CGEventMaskBit(kCGEventRightMouseDragged) |
       CGEventMaskBit(kCGEventOtherMouseDragged) |
-      CGEventMaskBit(kCGEventScrollWheel);
+      CGEventMaskBit(kCGEventScrollWheel) |
+      ZFLOW_SWALLOWED_EVENTS;
   g_event_tap = CGEventTapCreate(
       kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
       mask, event_callback, NULL);
