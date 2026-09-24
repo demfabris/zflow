@@ -16,9 +16,9 @@ use crate::{
         InputCapabilities, InputCapability, MonotonicTimeMicros, MotionAnchor, MotionSequence,
         NegotiatedSession, NegotiationOffer, PlayoutConfig, PlayoutDelayMode, ProbeExchange,
         ProbeMessage, ProbePayload, ProbeSequence, Receiver, ReceiverConfig, ReceiverEffect,
-        ReceiverLifecycle, ReceiverPlayout, RejectionReason, ReliableControl,
-        ReliableControlMessage, Sender, SenderConfig, SenderTick, SessionCloseReason,
-        SessionContext, TouchState, TransportGeneration,
+        ReceiverPlayout, RejectionReason, ReliableControl, ReliableControlMessage, Sender,
+        SenderConfig, SenderTick, SessionCloseReason, SessionContext, TouchState,
+        TransportGeneration,
     },
     metrics::{SessionMetrics, SessionMetricsSnapshot},
     transport::{InputChannels, InputConnection, InputControlMessage, InputDatagram},
@@ -847,7 +847,7 @@ async fn run_session(
         Ok(())
     };
     let cleanup_result = async {
-        let effects = receiver.lifecycle(ReceiverLifecycle::ConnectionLost, clock.now())?;
+        let effects = receiver.connection_lost(clock.now())?;
         emit_receiver_effects(
             &mut channels,
             effects,
@@ -1430,9 +1430,7 @@ fn receive_motion(
         update_clock_metrics(&mut lock_metrics(metrics), clock);
     }
     match playout.ingest_frame(frame, now, clock)? {
-        crate::core::EnqueueOutcome::Queued {
-            motion_sequence, ..
-        } => {
+        crate::core::EnqueueOutcome::Queued { motion_sequence } => {
             motion_received_at.insert(motion_sequence, received_at);
         }
         crate::core::EnqueueOutcome::Duplicate => {}
@@ -1739,7 +1737,6 @@ fn update_clock_metrics(metrics: &mut SessionMetrics, clock: &ClockMapper) {
     metrics.clock_offset_us = stats.offset_micros;
     metrics.clock_skew = stats.skew;
     metrics.clock_skew_ppm = stats.skew_ppm;
-    metrics.clock_reset_count = stats.reset_count;
 }
 
 fn lock_metrics(metrics: &Arc<Mutex<SessionMetrics>>) -> std::sync::MutexGuard<'_, SessionMetrics> {

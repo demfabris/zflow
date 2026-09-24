@@ -130,47 +130,6 @@ impl<const N: usize> From<[InputCapability; N]> for InputCapabilities {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum PeerPermission {
-    Connect,
-    ReceiveNormalSessionInput,
-    SendNormalSessionInput,
-    InjectBeforeLogin,
-    Clipboard,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PeerPermissions(BTreeSet<PeerPermission>);
-
-impl PeerPermissions {
-    pub fn new(permissions: impl IntoIterator<Item = PeerPermission>) -> Self {
-        Self(permissions.into_iter().collect())
-    }
-
-    pub fn contains(&self, permission: PeerPermission) -> bool {
-        self.0.contains(&permission)
-    }
-
-    pub fn grant(&mut self, permission: PeerPermission) -> bool {
-        self.0.insert(permission)
-    }
-
-    pub fn revoke(&mut self, permission: PeerPermission) -> bool {
-        self.0.remove(&permission)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = PeerPermission> + '_ {
-        self.0.iter().copied()
-    }
-}
-
-impl<const N: usize> From<[PeerPermission; N]> for PeerPermissions {
-    fn from(value: [PeerPermission; N]) -> Self {
-        Self::new(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PointerUnit {
     /// Device-like motion which the target input stack accelerates.
     DeviceUnaccelerated,
@@ -366,13 +325,6 @@ impl CumulativeMotion {
             total_scroll_x: checked_add(self.total_scroll_x, delta.scroll_x, MotionAxis::ScrollX)?,
             total_scroll_y: checked_add(self.total_scroll_y, delta.scroll_y, MotionAxis::ScrollY)?,
         })
-    }
-
-    /// Advances all axes atomically: on overflow `self` remains unchanged.
-    pub fn checked_advance(&mut self, delta: MotionDelta) -> Result<(), MotionOverflow> {
-        let next = self.checked_add(delta)?;
-        *self = next;
-        Ok(())
     }
 
     /// Computes the displacement needed to reconcile `previous` to `self`.
@@ -661,9 +613,8 @@ mod tests {
 
     #[test]
     fn cumulative_motion_advances_and_reconciles() {
-        let mut totals = CumulativeMotion::ZERO;
-        totals
-            .checked_advance(MotionDelta {
+        let totals = CumulativeMotion::ZERO
+            .checked_add(MotionDelta {
                 dx: 12,
                 dy: -7,
                 scroll_x: 3,
@@ -684,12 +635,9 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_motion_overflow_is_atomic_and_names_axis() {
-        let original = CumulativeMotion::new(4, 5, 6, i64::MAX);
-        let mut totals = original;
-
-        let error = totals
-            .checked_advance(MotionDelta {
+    fn cumulative_motion_overflow_names_axis() {
+        let error = CumulativeMotion::new(4, 5, 6, i64::MAX)
+            .checked_add(MotionDelta {
                 dx: 1,
                 dy: 1,
                 scroll_x: 1,
@@ -698,7 +646,6 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.axis, MotionAxis::ScrollY);
-        assert_eq!(totals, original);
     }
 
     #[test]

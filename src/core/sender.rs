@@ -155,27 +155,9 @@ impl Sender {
         &self.held
     }
 
-    pub fn totals(&self) -> CumulativeMotion {
-        self.totals
-    }
-
-    pub fn last_motion_sequence(&self) -> MotionSequence {
-        self.last_motion_sequence
-    }
-
-    pub fn last_control_sequence(&self) -> ControlSequence {
-        self.last_control_sequence
-    }
-
     /// The latest time any call has passed in. Earlier times are rejected.
     pub fn last_observed_time(&self) -> MonotonicTimeMicros {
         self.last_observed_time
-    }
-
-    pub fn last_acknowledged_checkpoint(&self) -> Option<(ControlSequence, &StateSnapshot)> {
-        self.last_acknowledged
-            .as_ref()
-            .map(|(sequence, snapshot)| (*sequence, snapshot))
     }
 
     pub fn enter(
@@ -601,7 +583,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            sender.last_acknowledged_checkpoint().unwrap().0,
+            sender.last_acknowledged.as_ref().unwrap().0,
             snapshot.sequence
         );
     }
@@ -624,10 +606,7 @@ mod tests {
                 accepted_generation: TransportGeneration(1),
             })
             .unwrap();
-        assert_eq!(
-            sender.last_acknowledged_checkpoint().unwrap().0,
-            first.sequence
-        );
+        assert_eq!(sender.last_acknowledged.as_ref().unwrap().0, first.sequence);
     }
 
     #[test]

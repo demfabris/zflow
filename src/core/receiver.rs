@@ -32,26 +32,6 @@ impl ReceiverConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceiverLifecycle {
-    ConnectionLost,
-    StreamReset,
-    BackendTeardown,
-    ProcessDeath,
-    Suspend,
-    Resume,
-}
-
-impl ReceiverLifecycle {
-    fn close_reason(self) -> SessionCloseReason {
-        match self {
-            Self::Suspend | Self::Resume => SessionCloseReason::Suspend,
-            Self::BackendTeardown | Self::ProcessDeath => SessionCloseReason::BackendUnavailable,
-            Self::ConnectionLost | Self::StreamReset => SessionCloseReason::LeaseExpired,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionReason {
     ClosedActivation,
     StaleActivation,
@@ -172,14 +152,6 @@ impl Receiver {
 
     pub fn active_context(&self) -> Option<SessionContext> {
         self.activation.as_ref().map(|state| state.session)
-    }
-
-    pub fn held_state(&self) -> Option<&HeldState> {
-        self.activation.as_ref().map(|state| &state.held)
-    }
-
-    pub fn injected_totals(&self) -> Option<CumulativeMotion> {
-        self.activation.as_ref().map(|state| state.injected_totals)
     }
 
     pub fn lease_deadline(&self) -> Option<MonotonicTimeMicros> {
@@ -420,14 +392,14 @@ impl Receiver {
         }
     }
 
-    pub fn lifecycle(
+    /// Releases everything the closing connection held.
+    pub fn connection_lost(
         &mut self,
-        event: ReceiverLifecycle,
         now: MonotonicTimeMicros,
     ) -> Result<Vec<ReceiverEffect>, ReceiverError> {
         self.observe_time(now)?;
         let mut effects = Vec::new();
-        self.close_activation(event.close_reason(), &mut effects);
+        self.close_activation(SessionCloseReason::LeaseExpired, &mut effects);
         Ok(effects)
     }
 
@@ -988,13 +960,11 @@ mod tests {
             ReceiverError::ContextChanged
         );
         assert_eq!(receiver.active_context(), Some(session));
-        assert!(receiver.held_state().unwrap().pressed_keys.contains(&key));
+        let held = &receiver.activation.as_ref().unwrap().held;
+        assert!(held.pressed_keys.contains(&key));
 
         let effects = receiver
-            .lifecycle(
-                ReceiverLifecycle::ConnectionLost,
-                MonotonicTimeMicros(10_000),
-            )
+            .connection_lost(MonotonicTimeMicros(10_000))
             .unwrap();
         assert!(matches!(
             effects.as_slice(),
@@ -1057,7 +1027,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(motion_dx(&first), 8);
-        assert_eq!(receiver.injected_totals().unwrap().total_dx(), 8);
+        assert_eq!(injected_dx(&receiver), 8);
 
         let final_step = receiver
             .receive_playout_step(
@@ -1078,7 +1048,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(motion_dx(&final_step), 5);
-        assert_eq!(receiver.injected_totals().unwrap().total_dx(), 13);
+        assert_eq!(injected_dx(&receiver), 13);
 
         let anchored_click = receiver
             .receive_control(
@@ -1264,10 +1234,7 @@ mod tests {
             .receive_control(*checkpoint, checkpoint_at)
             .unwrap();
         assert_eq!(motion_dx(&effects), 7);
-        assert_eq!(
-            receiver.activation.as_ref().unwrap().injected_totals,
-            CumulativeMotion::new(7, 0, 0, 0)
-        );
+        assert_eq!(injected_dx(&receiver), 7);
     }
 
     fn one_finger() -> TouchState {
@@ -1298,6 +1265,15 @@ mod tests {
             pointer_catch_up_limited: false,
             scroll_catch_up_limited: false,
         }
+    }
+
+    fn injected_dx(receiver: &Receiver) -> i64 {
+        receiver
+            .activation
+            .as_ref()
+            .unwrap()
+            .injected_totals
+            .total_dx()
     }
 
     fn motion_dx(effects: &[ReceiverEffect]) -> i64 {

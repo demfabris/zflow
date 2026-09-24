@@ -121,7 +121,6 @@ pub struct SessionMetrics {
     pub clock_offset_us: Option<f64>,
     pub clock_skew: Option<f64>,
     pub clock_skew_ppm: Option<f64>,
-    pub clock_reset_count: u64,
     pub loss: u64,
     pub reordered: u64,
     pub duplicate_datagrams: u64,
@@ -163,7 +162,6 @@ pub struct SessionMetricsSnapshot {
     pub clock_offset_us: Option<f64>,
     pub clock_skew: Option<f64>,
     pub clock_skew_ppm: Option<f64>,
-    pub clock_reset_count: u64,
     /// Unrecovered motion-sequence gaps observed in this live session.
     pub loss: u64,
     pub reordered: u64,
@@ -265,7 +263,6 @@ impl SessionMetrics {
                 clock_offset_us: self.clock_offset_us,
                 clock_skew: self.clock_skew,
                 clock_skew_ppm: self.clock_skew_ppm,
-                clock_reset_count: self.clock_reset_count,
                 loss: self.loss,
                 reordered: self.reordered,
                 duplicate_datagrams: self.duplicate_datagrams,

@@ -79,14 +79,6 @@ pub struct ProbeExchange {
     pub receiver_received_at: MonotonicTimeMicros,
 }
 
-/// Why an established affine fit was explicitly discarded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClockResetReason {
-    Suspend,
-    MonotonicDiscontinuity,
-    Manual,
-}
-
 /// A bounded snapshot suitable for metrics and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClockStats {
@@ -97,12 +89,6 @@ pub struct ClockStats {
     pub skew_ppm: Option<f64>,
     /// Root-mean-square residual over the current fit window.
     pub residual_error_micros: Option<f64>,
-    pub last_residual_micros: Option<f64>,
-    pub active_sample_count: usize,
-    pub accepted_sample_count: u64,
-    pub rejected_sample_count: u64,
-    pub reset_count: u64,
-    pub last_reset_reason: Option<ClockResetReason>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,7 +98,6 @@ struct Fit {
     centered_intercept: f64,
     skew: f64,
     residual_error_micros: f64,
-    last_residual_micros: f64,
 }
 
 /// Recent-window affine sender-to-receiver clock estimator.
@@ -122,10 +107,6 @@ pub struct ClockMapper {
     samples: VecDeque<ClockSample>,
     fit: Option<Fit>,
     arrival_bootstrap: bool,
-    accepted_sample_count: u64,
-    rejected_sample_count: u64,
-    reset_count: u64,
-    last_reset_reason: Option<ClockResetReason>,
 }
 
 impl ClockMapper {
@@ -136,26 +117,7 @@ impl ClockMapper {
             samples: VecDeque::with_capacity(config.sample_window),
             fit: None,
             arrival_bootstrap: false,
-            accepted_sample_count: 0,
-            rejected_sample_count: 0,
-            reset_count: 0,
-            last_reset_reason: None,
         })
-    }
-
-    pub fn config(&self) -> ClockConfig {
-        self.config
-    }
-
-    /// Applies new tuning without throwing away useful observations.
-    pub fn set_config(&mut self, config: ClockConfig) -> Result<(), ClockError> {
-        let config = config.validate()?;
-        self.config = config;
-        while self.samples.len() > config.sample_window {
-            self.samples.pop_front();
-        }
-        self.refit();
-        Ok(())
     }
 
     pub fn is_ready(&self) -> bool {
@@ -173,21 +135,20 @@ impl ClockMapper {
         &mut self,
         sender_time: MonotonicTimeMicros,
         receiver_time: MonotonicTimeMicros,
-    ) -> Result<ClockStats, ClockError> {
+    ) -> Result<(), ClockError> {
         if self.is_ready() {
             return Err(ClockError::InvalidSample(
                 "arrival bootstrap requires an empty clock fit",
             ));
         }
-        let stats = self.ingest_sample(ClockSample::exact(sender_time, receiver_time))?;
+        self.ingest_sample(ClockSample::exact(sender_time, receiver_time))?;
         self.arrival_bootstrap = true;
-        Ok(stats)
+        Ok(())
     }
 
     /// Adds an already-paired clock observation.
-    pub fn ingest_sample(&mut self, sample: ClockSample) -> Result<ClockStats, ClockError> {
+    pub fn ingest_sample(&mut self, sample: ClockSample) -> Result<(), ClockError> {
         if sample.uncertainty.as_micros() > u128::from(u64::MAX) {
-            self.rejected_sample_count = self.rejected_sample_count.saturating_add(1);
             return Err(ClockError::InvalidSample(
                 "clock sample uncertainty does not fit in microseconds",
             ));
@@ -197,34 +158,33 @@ impl ClockMapper {
         }
         self.samples.push_back(sample);
         self.arrival_bootstrap = false;
-        self.accepted_sample_count = self.accepted_sample_count.saturating_add(1);
         self.refit();
-        Ok(self.stats())
+        Ok(())
     }
 
     /// Converts an NTP-style four-timestamp exchange into one midpoint sample.
-    pub fn ingest_probe(&mut self, probe: ProbeExchange) -> Result<ClockStats, ClockError> {
-        let receiver_round_trip = match probe
+    pub fn ingest_probe(&mut self, probe: ProbeExchange) -> Result<(), ClockError> {
+        let receiver_round_trip = probe
             .receiver_received_at
             .0
             .checked_sub(probe.receiver_sent_at.0)
-        {
-            Some(duration) => duration,
-            None => return self.reject_probe("receiver probe clock moved backwards"),
-        };
-        let sender_processing = match probe
+            .ok_or(ClockError::InvalidSample(
+                "receiver probe clock moved backwards",
+            ))?;
+        let sender_processing = probe
             .sender_echoed_at
             .0
             .checked_sub(probe.sender_received_at.0)
-        {
-            Some(duration) => duration,
-            None => return self.reject_probe("sender probe clock moved backwards"),
-        };
+            .ok_or(ClockError::InvalidSample(
+                "sender probe clock moved backwards",
+            ))?;
 
         // Clock skew is bounded tightly enough that treating the two short
         // durations as the same unit is conservative for malformed exchanges.
         if sender_processing > receiver_round_trip {
-            return self.reject_probe("sender processing exceeded receiver round trip");
+            return Err(ClockError::InvalidSample(
+                "sender processing exceeded receiver round trip",
+            ));
         }
 
         let sender_midpoint = midpoint(probe.sender_received_at.0, probe.sender_echoed_at.0);
@@ -261,35 +221,7 @@ impl ClockMapper {
             skew: self.fit.map(|fit| fit.skew),
             skew_ppm: self.fit.map(|fit| (fit.skew - 1.0) * 1_000_000.0),
             residual_error_micros: self.fit.map(|fit| fit.residual_error_micros),
-            last_residual_micros: self.fit.map(|fit| fit.last_residual_micros),
-            active_sample_count: self.samples.len(),
-            accepted_sample_count: self.accepted_sample_count,
-            rejected_sample_count: self.rejected_sample_count,
-            reset_count: self.reset_count,
-            last_reset_reason: self.last_reset_reason,
         }
-    }
-
-    /// Clears the fit while preserving lifetime counters.
-    pub fn reset(&mut self, reason: ClockResetReason) {
-        self.samples.clear();
-        self.fit = None;
-        self.arrival_bootstrap = false;
-        self.reset_count = self.reset_count.saturating_add(1);
-        self.last_reset_reason = Some(reason);
-    }
-
-    pub fn on_suspend(&mut self) {
-        self.reset(ClockResetReason::Suspend);
-    }
-
-    pub fn on_monotonic_discontinuity(&mut self) {
-        self.reset(ClockResetReason::MonotonicDiscontinuity);
-    }
-
-    fn reject_probe(&mut self, message: &'static str) -> Result<ClockStats, ClockError> {
-        self.rejected_sample_count = self.rejected_sample_count.saturating_add(1);
-        Err(ClockError::InvalidSample(message))
     }
 
     fn refit(&mut self) {
@@ -340,13 +272,11 @@ impl ClockMapper {
         let centered_intercept = mean_y - skew * mean_x;
 
         let mut residual_squared = 0.0;
-        let mut last_residual = 0.0;
         for sample in &self.samples {
             let x = signed_difference(sample.sender_time.0, first.sender_time.0);
             let observed = signed_difference(sample.receiver_time.0, first.receiver_time.0);
             let residual = observed - (centered_intercept + skew * x);
             residual_squared += residual * residual;
-            last_residual = residual;
         }
 
         self.fit = Some(Fit {
@@ -355,7 +285,6 @@ impl ClockMapper {
             centered_intercept,
             skew,
             residual_error_micros: (residual_squared / count).sqrt(),
-            last_residual_micros: last_residual,
         });
     }
 }
@@ -495,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_probe_is_counted_without_destroying_the_fit() {
+    fn malformed_probe_keeps_the_fit() {
         let mut mapper = ClockMapper::default();
         mapper
             .ingest_sample(ClockSample::exact(time(1), time(2)))
@@ -511,7 +440,7 @@ mod tests {
 
         assert!(matches!(error, ClockError::InvalidSample(_)));
         assert!(mapper.is_ready());
-        assert_eq!(mapper.stats().rejected_sample_count, 1);
+        assert_eq!(mapper.samples.len(), 1);
     }
 
     #[test]
@@ -532,35 +461,12 @@ mod tests {
             .unwrap();
 
         assert!(!mapper.uses_arrival_bootstrap());
-        assert_eq!(mapper.stats().active_sample_count, 1);
+        assert_eq!(mapper.samples.len(), 1);
         assert_eq!(mapper.map(time(201_000)).unwrap(), time(201_000));
     }
 
     #[test]
-    fn lifecycle_resets_clear_fit_and_preserve_counters() {
-        let mut mapper = ClockMapper::default();
-        mapper
-            .ingest_sample(ClockSample::exact(time(1), time(2)))
-            .unwrap();
-        mapper.on_suspend();
-        assert!(!mapper.is_ready());
-        assert_eq!(mapper.stats().reset_count, 1);
-        assert_eq!(
-            mapper.stats().last_reset_reason,
-            Some(ClockResetReason::Suspend)
-        );
-
-        mapper
-            .ingest_sample(ClockSample::exact(time(3), time(4)))
-            .unwrap();
-        mapper.on_monotonic_discontinuity();
-        assert_eq!(mapper.stats().accepted_sample_count, 2);
-        assert_eq!(mapper.stats().reset_count, 2);
-        assert!(matches!(mapper.map(time(5)), Err(ClockError::NotReady)));
-    }
-
-    #[test]
-    fn recent_window_bounds_memory_and_reacts_to_new_fit() {
+    fn recent_window_bounds_memory() {
         let mut mapper = ClockMapper::new(ClockConfig {
             sample_window: 3,
             ..ClockConfig::default()
@@ -574,7 +480,7 @@ mod tests {
                 ))
                 .unwrap();
         }
-        assert_eq!(mapper.stats().active_sample_count, 3);
-        assert_eq!(mapper.stats().accepted_sample_count, 6);
+        assert_eq!(mapper.samples.len(), 3);
+        assert_eq!(mapper.samples[0].sender_time, time(3_000));
     }
 }

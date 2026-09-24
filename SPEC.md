@@ -293,7 +293,7 @@ The baseline does not discard stale cumulative displacement. The smoothing exper
 
 Sender monotonic timestamps do not share an origin with receiver timestamps. The receiver estimates an affine clock mapping with offset and skew from probe exchanges. It uses that mapping for playout order and delay variation, not for security decisions.
 
-The clock estimator MUST expose offset, skew, residual error, and reset count. It resets after suspend, a monotonic discontinuity, or a session epoch change.
+The clock estimator MUST expose offset, skew, and residual error. Each input connection starts a fresh estimate, and suspend closes every connection.
 
 ## Input semantics
 

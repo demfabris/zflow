@@ -159,10 +159,7 @@ impl PlayoutConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueOutcome {
-    Queued {
-        motion_sequence: MotionSequence,
-        deadline: MonotonicTimeMicros,
-    },
+    Queued { motion_sequence: MotionSequence },
     Duplicate,
     RetiredByCumulativeTarget,
     RetiredByRebase,
@@ -183,32 +180,15 @@ pub struct PlayoutStep {
     pub scroll_catch_up_limited: bool,
 }
 
-/// Exact accounting for an explicit, caller-authorized motion-history rebase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RebaseRecord {
-    pub through_sequence: MotionSequence,
-    pub discarded_displacement: MotionDelta,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayoutStats {
     pub current_delay: Duration,
     pub packet_delay_variation_percentile: Option<Duration>,
-    pub queued_frames: usize,
-    pub highest_seen_sequence: MotionSequence,
     pub selected_target_sequence: MotionSequence,
     pub completed_sequence: MotionSequence,
-    pub injected_totals: CumulativeMotion,
-    pub late_frame_count: u64,
     pub scheduler_late_count: u64,
-    pub maximum_lateness: Duration,
     pub catch_up_step_count: u64,
     pub last_packet_delay: Option<Duration>,
-    pub duplicate_frame_count: u64,
-    pub retired_frame_count: u64,
-    pub rebase_count: u64,
-    pub last_rebase: Option<RebaseRecord>,
-    pub reset_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -248,7 +228,6 @@ pub struct ReceiverPlayout {
     delay_samples: VecDeque<DelaySample>,
     adaptive_delay_micros: u64,
     delay_percentile_micros: Option<u64>,
-    highest_seen_sequence: MotionSequence,
     target: Target,
     completed_sequence: MotionSequence,
     injected_totals: CumulativeMotion,
@@ -258,15 +237,8 @@ pub struct ReceiverPlayout {
     velocity_sample: Option<VelocitySample>,
     last_observed_time: Option<MonotonicTimeMicros>,
     last_poll_time: Option<MonotonicTimeMicros>,
-    late_frame_count: u64,
     scheduler_late_count: u64,
-    maximum_lateness_micros: u64,
     catch_up_step_count: u64,
-    duplicate_frame_count: u64,
-    retired_frame_count: u64,
-    rebase_count: u64,
-    last_rebase: Option<RebaseRecord>,
-    reset_count: u64,
 }
 
 impl ReceiverPlayout {
@@ -280,7 +252,6 @@ impl ReceiverPlayout {
             delay_samples: VecDeque::with_capacity(config.delay_sample_window),
             adaptive_delay_micros: duration_micros(config.minimum_delay)?,
             delay_percentile_micros: None,
-            highest_seen_sequence: MotionSequence(0),
             target: Target {
                 sequence: MotionSequence(0),
                 totals: CumulativeMotion::ZERO,
@@ -296,31 +267,9 @@ impl ReceiverPlayout {
             velocity_sample: None,
             last_observed_time: None,
             last_poll_time: None,
-            late_frame_count: 0,
             scheduler_late_count: 0,
-            maximum_lateness_micros: 0,
             catch_up_step_count: 0,
-            duplicate_frame_count: 0,
-            retired_frame_count: 0,
-            rebase_count: 0,
-            last_rebase: None,
-            reset_count: 0,
         })
-    }
-
-    pub fn config(&self) -> PlayoutConfig {
-        self.config
-    }
-
-    /// Changes playout tuning without discarding queued cumulative state.
-    pub fn set_config(&mut self, config: PlayoutConfig) -> Result<(), PlayoutError> {
-        let config = config.validate()?;
-        self.config = config;
-        while self.delay_samples.len() > config.delay_sample_window {
-            self.delay_samples.pop_front();
-        }
-        self.recompute_adaptive_delay()?;
-        Ok(())
     }
 
     pub fn session(&self) -> SessionContext {
@@ -393,7 +342,6 @@ impl ReceiverPlayout {
             .rebase_cutoff
             .is_some_and(|cutoff| frame.motion_sequence <= cutoff)
         {
-            self.retired_frame_count = self.retired_frame_count.saturating_add(1);
             return Ok(EnqueueOutcome::RetiredByRebase);
         }
         if frame.motion_sequence <= self.target.sequence {
@@ -402,18 +350,12 @@ impl ReceiverPlayout {
             // evidence. Keeping it in the bounded delay window lets a burst
             // that reorders frames past playout grow the adaptive delay.
             let mapped_capture_time = clock.map(frame.sender_capture_time)?;
-            let prior_deadline = add_micros(mapped_capture_time, self.current_delay_micros());
-            if received_at > prior_deadline {
-                self.record_lateness(received_at.0 - prior_deadline.0, true);
-            }
             let packet_delay = received_at.0.saturating_sub(mapped_capture_time.0);
             self.record_delay_sample(received_at, packet_delay)?;
-            self.retired_frame_count = self.retired_frame_count.saturating_add(1);
             return Ok(EnqueueOutcome::RetiredByCumulativeTarget);
         }
         if let Some(existing) = self.queue.get(&frame.motion_sequence) {
             if existing.frame == frame {
-                self.duplicate_frame_count = self.duplicate_frame_count.saturating_add(1);
                 return Ok(EnqueueOutcome::Duplicate);
             }
             return Err(PlayoutError::ConflictingMotionSequence);
@@ -425,15 +367,9 @@ impl ReceiverPlayout {
         let mapped_capture_time = clock.map(frame.sender_capture_time)?;
         self.validate_capture_order(frame.motion_sequence, frame.sender_capture_time)?;
 
-        let prior_deadline = add_micros(mapped_capture_time, self.current_delay_micros());
-        if received_at > prior_deadline {
-            self.record_lateness(received_at.0 - prior_deadline.0, true);
-        }
         let packet_delay = received_at.0.saturating_sub(mapped_capture_time.0);
         self.record_delay_sample(received_at, packet_delay)?;
-        let deadline = add_micros(mapped_capture_time, self.current_delay_micros());
 
-        self.highest_seen_sequence = self.highest_seen_sequence.max(frame.motion_sequence);
         let sequence = frame.motion_sequence;
         self.queue.insert(
             sequence,
@@ -444,7 +380,6 @@ impl ReceiverPlayout {
         );
         Ok(EnqueueOutcome::Queued {
             motion_sequence: sequence,
-            deadline,
         })
     }
 
@@ -520,19 +455,14 @@ impl ReceiverPlayout {
         &mut self,
         through_sequence: MotionSequence,
         authoritative_totals: CumulativeMotion,
-    ) -> Result<RebaseRecord, PlayoutError> {
+    ) -> Result<(), PlayoutError> {
         if through_sequence < self.target.sequence {
             return Err(PlayoutError::RebaseMovedBackwards);
         }
-        let discarded_displacement =
-            authoritative_totals.checked_delta_from(self.injected_totals)?;
-        let record = RebaseRecord {
-            through_sequence,
-            discarded_displacement,
-        };
+        // The receiver rejects the same overflow when it applies the anchor.
+        authoritative_totals.checked_delta_from(self.injected_totals)?;
         self.queue
             .retain(|sequence, _| *sequence > through_sequence);
-        self.highest_seen_sequence = self.highest_seen_sequence.max(through_sequence);
         self.target = Target {
             sequence: through_sequence,
             totals: authoritative_totals,
@@ -549,37 +479,7 @@ impl ReceiverPlayout {
         self.velocity_sample = None;
         self.pointer_velocity_per_micro = 0.0;
         self.scroll_velocity_per_micro = 0.0;
-        self.rebase_count = self.rebase_count.saturating_add(1);
-        self.last_rebase = Some(record);
-        Ok(record)
-    }
-
-    /// Starts a new epoch/activation at zero cumulative state.
-    pub fn reset(&mut self, session: SessionContext) {
-        self.session = session;
-        self.applied_control_sequence = ControlSequence(0);
-        self.queue.clear();
-        self.delay_samples.clear();
-        self.adaptive_delay_micros = duration_micros(self.config.minimum_delay)
-            .expect("validated minimum delay fits in microseconds");
-        self.delay_percentile_micros = None;
-        self.highest_seen_sequence = MotionSequence(0);
-        self.target = Target {
-            sequence: MotionSequence(0),
-            totals: CumulativeMotion::ZERO,
-            sender_capture_time: None,
-            mapped_capture_time: MonotonicTimeMicros(0),
-            pending_touch_snapshot: None,
-        };
-        self.completed_sequence = MotionSequence(0);
-        self.injected_totals = CumulativeMotion::ZERO;
-        self.rebase_cutoff = None;
-        self.pointer_velocity_per_micro = 0.0;
-        self.scroll_velocity_per_micro = 0.0;
-        self.velocity_sample = None;
-        self.last_observed_time = None;
-        self.last_poll_time = None;
-        self.reset_count = self.reset_count.saturating_add(1);
+        Ok(())
     }
 
     pub fn stats(&self) -> PlayoutStats {
@@ -588,24 +488,14 @@ impl ReceiverPlayout {
             packet_delay_variation_percentile: self
                 .delay_percentile_micros
                 .map(Duration::from_micros),
-            queued_frames: self.queue.len(),
-            highest_seen_sequence: self.highest_seen_sequence,
             selected_target_sequence: self.target.sequence,
             completed_sequence: self.completed_sequence,
-            injected_totals: self.injected_totals,
-            late_frame_count: self.late_frame_count,
             scheduler_late_count: self.scheduler_late_count,
-            maximum_lateness: Duration::from_micros(self.maximum_lateness_micros),
             catch_up_step_count: self.catch_up_step_count,
             last_packet_delay: self
                 .delay_samples
                 .back()
                 .map(|sample| Duration::from_micros(sample.packet_delay_micros)),
-            duplicate_frame_count: self.duplicate_frame_count,
-            retired_frame_count: self.retired_frame_count,
-            rebase_count: self.rebase_count,
-            last_rebase: self.last_rebase,
-            reset_count: self.reset_count,
         }
     }
 
@@ -742,9 +632,8 @@ impl ReceiverPlayout {
         self.queue
             .retain(|queued_sequence, _| *queued_sequence > sequence);
 
-        let deadline = add_micros(queued.mapped_capture_time, delay);
-        if now > deadline {
-            self.record_lateness(now.0 - deadline.0, false);
+        if now > add_micros(queued.mapped_capture_time, delay) {
+            self.scheduler_late_count = self.scheduler_late_count.saturating_add(1);
         }
         self.update_velocity(VelocitySample {
             sender_capture_time: queued.frame.sender_capture_time,
@@ -808,15 +697,6 @@ impl ReceiverPlayout {
             velocity_scaled.ceil() as u64
         };
         Ok(rounded.clamp(minimum, maximum))
-    }
-
-    fn record_lateness(&mut self, lateness_micros: u64, network: bool) {
-        if network {
-            self.late_frame_count = self.late_frame_count.saturating_add(1);
-        } else {
-            self.scheduler_late_count = self.scheduler_late_count.saturating_add(1);
-        }
-        self.maximum_lateness_micros = self.maximum_lateness_micros.max(lateness_micros);
     }
 
     fn observe_time(&mut self, now: MonotonicTimeMicros) -> Result<(), PlayoutError> {
@@ -987,9 +867,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(playout.config().adaptive_percentile, 80);
-        assert_eq!(playout.config().minimum_delay, Duration::from_millis(3));
-        assert_eq!(playout.config().maximum_delay, Duration::from_millis(35));
+        let config = PlayoutConfig::default();
+        assert_eq!(config.adaptive_percentile, 80);
+        assert_eq!(config.minimum_delay, Duration::from_millis(3));
+        assert_eq!(config.maximum_delay, Duration::from_millis(35));
         assert_eq!(playout.current_delay(), Duration::from_millis(3));
         assert_eq!(
             playout.stats().packet_delay_variation_percentile,
@@ -1024,15 +905,11 @@ mod tests {
         playout
             .ingest_frame(frame(3, 3_000, 30, 0), time(101_001), &clock)
             .unwrap();
-        assert_eq!(playout.stats().queued_frames, 3);
+        assert_eq!(playout.queue.len(), 3);
         assert_eq!(playout.next_deadline(), Some(time(4_000)));
-        while playout.stats().injected_totals != CumulativeMotion::new(30, 0, 0, 0) {
+        while playout.injected_totals != CumulativeMotion::new(30, 0, 0, 0) {
             playout.poll(time(101_001)).unwrap();
         }
-        assert_eq!(
-            playout.stats().injected_totals,
-            CumulativeMotion::new(30, 0, 0, 0)
-        );
         assert!(matches!(
             playout.ingest_frame(frame(4, 2_500, 40, 0), time(101_002), &clock),
             Err(PlayoutError::CaptureTimeMovedBackwards)
@@ -1148,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn jitter_burst_grows_fast_counts_late_frames_and_conserves_final_totals() {
+    fn jitter_burst_grows_fast_and_conserves_final_totals() {
         let clock = identity_clock();
         let mut playout = ReceiverPlayout::new(PlayoutConfig::default(), session(1)).unwrap();
         let delays = [
@@ -1196,12 +1073,8 @@ mod tests {
 
         assert_eq!(next_arrival, arrivals.len());
         assert_eq!(emitted_dx, 90);
-        assert_eq!(
-            playout.stats().injected_totals,
-            CumulativeMotion::new(90, 0, 0, 0)
-        );
+        assert_eq!(playout.injected_totals, CumulativeMotion::new(90, 0, 0, 0));
         assert_eq!(playout.current_delay(), Duration::from_millis(35));
-        assert!(playout.stats().late_frame_count >= 3);
         assert!(playout.stats().catch_up_step_count > 0);
         assert!(catch_up_dx > 0);
     }
@@ -1249,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn no_default_stale_discard_and_explicit_rebase_is_accounted() {
+    fn no_default_stale_discard_and_explicit_rebase_retires_old_frames() {
         let clock = identity_clock();
         let mut playout = ReceiverPlayout::new(PlayoutConfig::default(), session(1)).unwrap();
         playout
@@ -1271,12 +1144,11 @@ mod tests {
         playout
             .ingest_frame(frame(2, 2_000, 140, 0), time(200_000), &clock)
             .unwrap();
-        let record = playout
+        playout
             .rebase(MotionSequence(2), CumulativeMotion::new(140, 0, 0, 0))
             .unwrap();
-        assert_eq!(record.discarded_displacement.dx, 40);
-        assert_eq!(playout.stats().rebase_count, 1);
-        assert_eq!(playout.stats().last_rebase, Some(record));
+        assert_eq!(playout.injected_totals, CumulativeMotion::new(140, 0, 0, 0));
+        assert!(playout.poll(time(200_000)).unwrap().is_none());
         assert_eq!(
             playout
                 .ingest_frame(frame(2, 2_000, 140, 0), time(201_000), &clock)
@@ -1286,31 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_drops_old_epoch_history_and_restores_adaptive_floor() {
-        let clock = identity_clock();
-        let mut playout = ReceiverPlayout::new(PlayoutConfig::default(), session(1)).unwrap();
-        playout
-            .ingest_frame(frame(1, 1_000, 10, 0), time(100_000), &clock)
-            .unwrap();
-        playout
-            .ingest_frame(frame(2, 2_000, 20, 0), time(200_000), &clock)
-            .unwrap();
-        assert!(playout.current_delay() > Duration::from_millis(3));
-
-        playout.reset(session(2));
-        let stats = playout.stats();
-        assert_eq!(stats.current_delay, Duration::from_millis(3));
-        assert_eq!(stats.queued_frames, 0);
-        assert_eq!(stats.injected_totals, CumulativeMotion::ZERO);
-        assert_eq!(stats.reset_count, 1);
-        assert!(matches!(
-            playout.ingest_frame(frame(2, 2_000, 20, 0), time(101_000), &clock),
-            Err(PlayoutError::SessionMismatch)
-        ));
-    }
-
-    #[test]
-    fn runtime_tuning_contracts_slowly_after_a_burst() {
+    fn adaptive_delay_contracts_slowly_after_a_burst() {
         let clock = identity_clock();
         let mut playout = ReceiverPlayout::new(PlayoutConfig::default(), session(1)).unwrap();
         playout
@@ -1333,12 +1181,5 @@ mod tests {
         }
         assert!(playout.current_delay() < Duration::from_millis(35));
         assert!(playout.current_delay() >= Duration::from_millis(3));
-
-        let mut config = playout.config();
-        config.adaptive_percentile = 95;
-        config.maximum_delay = Duration::from_millis(80);
-        playout.set_config(config).unwrap();
-        assert_eq!(playout.config().adaptive_percentile, 95);
-        assert_eq!(playout.config().maximum_delay, Duration::from_millis(80));
     }
 }
