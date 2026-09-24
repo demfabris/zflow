@@ -308,5 +308,24 @@ install_macos
         self.assertEqual(previous[0].read_text(), "old")
 
 
+class UninstallTest(unittest.TestCase):
+    def test_refuses_debian_package_host(self):
+        with tempfile.TemporaryDirectory(prefix="zflow-uninstall-test-") as temp:
+            tools = Path(temp)
+            log = tools / "calls"
+            for name, body in (("uname", "echo Linux"), ("dpkg-query", "echo 'install ok installed'"),
+                               ("systemctl", f"echo systemctl >> {shlex.quote(str(log))}")):
+                (tools / name).write_text(f"#!/bin/sh\n{body}\n")
+                (tools / name).chmod(0o755)
+            result = subprocess.run(
+                [BASH, str(INSTALLER.parent / "scripts/uninstall.sh")],
+                env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"},
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("managed by dpkg", result.stderr)
+            self.assertFalse(log.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

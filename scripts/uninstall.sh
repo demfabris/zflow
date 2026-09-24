@@ -49,6 +49,10 @@ esac
 [[ $# -le 1 ]] || die "too many arguments"
 
 [[ "$(uname -s)" == "Linux" ]] || die "Linux is required"
+# The package owns /usr/lib/systemd/system-sleep/zflow and the service.
+if command -v dpkg-query >/dev/null 2>&1 && [[ "$(dpkg-query -W -f='${Status}' zflow 2>/dev/null || true)" == 'install ok installed' ]]; then
+    die 'zflow is managed by dpkg. Remove it with: sudo apt remove zflow'
+fi
 [[ "$EUID" -eq 0 ]] || die "run as root: sudo ./scripts/uninstall.sh"
 
 if command -v systemctl >/dev/null 2>&1; then
