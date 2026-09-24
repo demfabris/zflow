@@ -35,6 +35,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // A working pinned address wins before other hosts on the network are tried.
 const NEARBY_DELAY: Duration = Duration::from_millis(300);
 const SNAPSHOT_RETRY: Duration = Duration::from_secs(5);
+// A receiver still replacing this peer's previous session refuses the first
+// snapshot for a few milliseconds, so retry quickly before backing off.
+const FIRST_SNAPSHOT_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(15);
 const STABLE_SESSION: Duration = Duration::from_secs(10);
 // Long enough for the close to leave; the receiver refuses a second session
@@ -449,7 +452,11 @@ impl Session {
         state: &watch::Sender<LinkState>,
     ) -> Option<String> {
         let mut ready = self.snapshot(state).await;
+        let mut retry = FIRST_SNAPSHOT_RETRY;
         loop {
+            if ready {
+                retry = FIRST_SNAPSHOT_RETRY;
+            }
             tokio::select! {
                 command = commands.recv() => match command {
                     None => return None,
@@ -474,8 +481,9 @@ impl Session {
                     Some(kind) => refuse_inbound(kind),
                     None => return Some("input session closed".into()),
                 },
-                () = tokio::time::sleep(SNAPSHOT_RETRY), if !ready => {
+                () = tokio::time::sleep(retry), if !ready => {
                     ready = self.snapshot(state).await;
+                    retry = (retry * 2).min(SNAPSHOT_RETRY);
                 }
             }
         }
