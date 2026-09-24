@@ -695,6 +695,7 @@ fn doctor_linux(config: &Config, failed: &mut bool) {
                 println!(
                     "ok  virtual input: keyboard, pointer, and experimental touchpad are ready on seat0"
                 );
+                doctor_touchpad_integration(failed);
             } else {
                 println!("ok  virtual input: keyboard and pointer are ready on seat0");
             }
@@ -801,38 +802,57 @@ fn doctor_linux(config: &Config, failed: &mut bool) {
     }
 }
 
+/// The udev property the packaged rule sets on the virtual touchpad. Without
+/// it libinput treats the touchpad as built in and adds palm zones and
+/// disable-while-typing.
+#[cfg(target_os = "linux")]
+const TOUCHPAD_INTEGRATION: (&str, &str) = ("ID_INPUT_TOUCHPAD_INTEGRATION", "external");
+
+#[cfg(target_os = "linux")]
+fn doctor_touchpad_integration(failed: &mut bool) {
+    let (property, value) = TOUCHPAD_INTEGRATION;
+    let properties = crate::linux::enumerate_devices()
+        .context("could not enumerate input devices")
+        .and_then(|scan| {
+            scan.devices
+                .into_iter()
+                .find(|device| {
+                    device.zflow_role() == Some(crate::linux::VirtualDeviceRole::Touchpad)
+                })
+                .context("could not open the zflow remote touchpad")
+        })
+        .and_then(|touchpad| udev_properties(&touchpad.path));
+    match properties {
+        Ok(properties) if properties.get(property) == Some(value) => {
+            println!("ok  touchpad integration: {value}");
+        }
+        Ok(_) => {
+            *failed = true;
+            println!("fail touchpad integration: {property}={value} is missing");
+        }
+        Err(error) => {
+            *failed = true;
+            println!("fail touchpad integration: {error}");
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn doctor_prelogin_ordering(failed: &mut bool) {
-    let mut command = ProcessCommand::new("/usr/bin/systemctl");
-    command
-        .arg("show")
-        .arg("--property=Before")
-        .arg("--value")
-        .arg("zflowd.service")
-        .env_clear()
-        .env("LANG", "C")
-        .env("LC_ALL", "C");
-    match bounded_command_output(&mut command, Duration::from_millis(750), 64 * 1024) {
-        Ok(output)
-            if output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .split_ascii_whitespace()
-                    .any(|unit| unit == "display-manager.service") =>
-        {
-            println!("ok  pre-login boot ordering: before display-manager.service");
-        }
-        Ok(output) if output.status.success() => {
+    // display-manager.service is an alias, and systemctl lists dependencies
+    // under the name the unit loaded as, such as gdm.service.
+    let ordered = systemctl_show("display-manager.service", "Id").and_then(|manager| {
+        let before = systemctl_show("zflowd.service", "Before")?;
+        Ok(before
+            .split_ascii_whitespace()
+            .any(|unit| unit == manager.trim()))
+    });
+    match ordered {
+        Ok(true) => println!("ok  pre-login boot ordering: before display-manager.service"),
+        Ok(false) => {
             *failed = true;
             println!(
                 "fail pre-login boot ordering: zflowd.service is not ordered before display-manager.service"
-            );
-        }
-        Ok(output) => {
-            *failed = true;
-            println!(
-                "fail pre-login boot ordering: systemctl exited with {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
             );
         }
         Err(error) => {
@@ -840,6 +860,28 @@ fn doctor_prelogin_ordering(failed: &mut bool) {
             println!("fail pre-login boot ordering: {error}");
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_show(unit: &str, property: &str) -> Result<String> {
+    let mut command = ProcessCommand::new("/usr/bin/systemctl");
+    command
+        .arg("show")
+        .arg(format!("--property={property}"))
+        .arg("--value")
+        .arg(unit)
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C");
+    let output = bounded_command_output(&mut command, Duration::from_millis(750), 64 * 1024)?;
+    if !output.status.success() {
+        bail!(
+            "systemctl exited with {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -1557,6 +1599,26 @@ mod tests {
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(require_group_access(&fs::metadata(&path).unwrap(), group, 0o040).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_expects_the_touchpad_integration_the_packaged_rule_sets() {
+        let (property, value) = TOUCHPAD_INTEGRATION;
+        let rules = include_str!("../packaging/udev/70-zflow.rules");
+        assert!(rules.lines().any(|rule| {
+            rule.contains("ENV{ZFLOW_DEVICE_ROLE}=\"remote-touchpad\"")
+                && rule.contains(&format!("ENV{{{property}}}=\"{value}\""))
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires systemd, a display manager, and the pre-login drop-in installed"]
+    fn live_prelogin_ordering_sees_through_the_display_manager_alias() {
+        let mut failed = false;
+        doctor_prelogin_ordering(&mut failed);
+        assert!(!failed);
     }
 
     #[cfg(target_os = "linux")]
