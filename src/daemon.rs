@@ -619,10 +619,9 @@ async fn handle_client(
     shared: Arc<Shared>,
     daemon_uid: u32,
 ) -> Result<()> {
-    let seat = tokio::task::spawn_blocking(query_primary_seat)
-        .await
-        .context("active-seat query task failed")?;
-    authorize_peer(&stream, daemon_uid, seat.active_authenticated_uid())?;
+    // The socket is mode 0660 for the service account, whose group has no
+    // members, so only root and the service itself can reach it.
+    authorize_peer(&stream, daemon_uid, None)?;
     let request: Request = read_message(&mut stream).await?;
     let response = match dispatch_result(request, &shared).await {
         Ok(response) => response,

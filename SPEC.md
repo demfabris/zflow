@@ -650,7 +650,7 @@ QUIC 0-RTT MUST NOT carry pairing, input, control, permission, or session-takeov
 
 ### Local authority
 
-The local socket uses restrictive filesystem ownership plus peer credentials. zflowd checks the active seat and caller identity for each privileged command.
+The local control socket uses restrictive filesystem ownership plus peer credentials and accepts only root and the service account. The desktop API checks the active seat and caller identity for each request.
 
 The network protocol exposes no remote configuration command. Local files and authenticated local IPC own configuration. A peer cannot disable the local escape chord, increase the receiver-configured lease duration, request arbitrary device grabs, or grant itself capabilities.
 
