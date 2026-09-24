@@ -1,17 +1,26 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 
 use crate::{
     identity::Identity,
     transport::{
-        PairingConnection, PairingServerConfig, accept_pairing, connect_pairing,
+        PairingConnection, PairingServerConfig, TransportError, accept_pairing, connect_pairing,
         pairing_client_config, pairing_server_config,
     },
     wire::{PairingMethod, PairingOffer, WireMessage, encode as encode_wire},
 };
 
 pub const DEFAULT_PAIRING_PORT: u16 = 43120;
+
+/// Bounds the automatic part of pairing, which never waits for a person.
+const PAIRING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Failed attempts one listener tolerates. Each one lets an active attacker
+/// try one more responder offer, so the cap stays small.
+const MAX_PAIRING_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingObservation {
@@ -96,19 +105,38 @@ impl<'identity> PairingListener<'identity> {
             .context("pairing listener has no local address")
     }
 
+    /// Waits for a peer to finish the offer exchange. A peer that fails or
+    /// stalls is dropped and the listener takes the next one, up to a cap.
     pub async fn accept(&self) -> Result<PairingSession> {
-        let incoming = self
-            .endpoint
-            .accept()
+        let mut failures = 0;
+        loop {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .context("pairing listener closed")?;
+            let error = match exchange(
+                self.identity,
+                &self.local_offer,
+                accept_pairing(incoming, &self.server_config),
+            )
             .await
-            .context("pairing listener closed")?;
-        let mut connection = accept_pairing(incoming, &self.server_config).await?;
-        let observation = complete(self.identity, &self.local_offer, &mut connection).await?;
-        Ok(PairingSession {
-            observation,
-            _connection: connection,
-            _endpoint: Some(self.endpoint.clone()),
-        })
+            {
+                Ok((connection, observation)) => {
+                    return Ok(PairingSession {
+                        observation,
+                        _connection: connection,
+                        _endpoint: Some(self.endpoint.clone()),
+                    });
+                }
+                Err(error) => error,
+            };
+            failures += 1;
+            if failures == MAX_PAIRING_ATTEMPTS {
+                return Err(error.context("too many failed pairing attempts"));
+            }
+            tracing::warn!("pairing attempt failed, still listening: {error:#}");
+        }
     }
 }
 
@@ -194,13 +222,31 @@ pub async fn connect(
     let endpoint = quinn::Endpoint::client(bind)
         .with_context(|| format!("could not bind a pairing client for {remote}"))?;
     let config = pairing_client_config(identity)?;
-    let mut connection = connect_pairing(&endpoint, remote, &config).await?;
-    let observation = complete(identity, local_offer, &mut connection).await?;
+    let (connection, observation) = exchange(
+        identity,
+        local_offer,
+        connect_pairing(&endpoint, remote, &config),
+    )
+    .await?;
     Ok(PairingSession {
         observation,
         _connection: connection,
         _endpoint: Some(endpoint),
     })
+}
+
+async fn exchange(
+    identity: &Identity,
+    local_offer: &PairingOffer,
+    connection: impl Future<Output = Result<PairingConnection, TransportError>>,
+) -> Result<(PairingConnection, PairingObservation)> {
+    tokio::time::timeout(PAIRING_EXCHANGE_TIMEOUT, async {
+        let mut connection = connection.await?;
+        let observation = complete(identity, local_offer, &mut connection).await?;
+        Ok((connection, observation))
+    })
+    .await
+    .context("pairing peer did not finish the exchange in time")?
 }
 
 async fn complete(
@@ -318,6 +364,39 @@ mod tests {
                 .peer_candidates
                 .contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43119))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listener_outlives_failed_attempts_up_to_a_cap() {
+        let left_dir = tempfile::tempdir().unwrap();
+        let right_dir = tempfile::tempdir().unwrap();
+        let left = Identity::load_or_create(left_dir.path()).unwrap();
+        let right = Identity::load_or_create(right_dir.path()).unwrap();
+        let offer = make_offer(None, 43119, Vec::new()).unwrap();
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+        // Connecting with the listener's own identity fails on both ends.
+        let listener = PairingListener::bind(&right, loopback, offer.clone()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let clients = async {
+            assert!(connect(&right, address, &offer).await.is_err());
+            connect(&left, address, &offer).await
+        };
+        let (seen_by_left, seen_by_right) = tokio::join!(clients, listener.accept());
+        assert_eq!(
+            seen_by_left.unwrap().authentication_code,
+            seen_by_right.unwrap().authentication_code
+        );
+
+        let listener = PairingListener::bind(&right, loopback, offer.clone()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let clients = async {
+            for _ in 0..MAX_PAIRING_ATTEMPTS {
+                assert!(connect(&right, address, &offer).await.is_err());
+            }
+        };
+        let ((), result) = tokio::join!(clients, listener.accept());
+        assert!(result.is_err());
     }
 
     #[test]
