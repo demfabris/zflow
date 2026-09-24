@@ -15,6 +15,7 @@ use crate::{
 };
 
 pub const DEFAULT_PAIRING_PORT: u16 = 43120;
+const MAX_LABEL_BYTES: usize = 255;
 
 /// Bounds the automatic part of pairing, which never waits for a person.
 const PAIRING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -146,10 +147,7 @@ pub async fn begin(
     remote: Option<SocketAddr>,
     input_port: u16,
 ) -> Result<PairingSession> {
-    let label = std::env::var("HOSTNAME")
-        .ok()
-        .filter(|label| label.len() <= 255 && validate_label(Some(label)).is_ok());
-    let offer = make_offer(label, input_port, Vec::new())?;
+    let offer = make_offer(local_device_label(), input_port, Vec::new())?;
     if let Some(remote) = remote {
         crate::discovery::UntrustedCandidate::explicit(remote)?;
         connect(identity, remote, &offer).await
@@ -175,7 +173,7 @@ pub fn add_confirmed_peer(
 ) -> Result<()> {
     let name = name.trim();
     validate_label(Some(name))?;
-    if name.len() > 255 {
+    if name.len() > MAX_LABEL_BYTES {
         bail!("Computer names must be at most 255 bytes");
     }
     if code != observation.authentication_code {
@@ -314,6 +312,29 @@ async fn complete(
     Ok(observation)
 }
 
+/// The OS host name, cut to the label bound. GUI apps and services do not
+/// inherit the shell's `$HOSTNAME`, so this asks the OS.
+pub(crate) fn local_device_label() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    // SAFETY: the pointer and length describe `buffer`, which outlives the call.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let end = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    let name = String::from_utf8_lossy(&buffer[..end]);
+    let mut end = name.len().min(MAX_LABEL_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let label = name[..end].trim();
+    validate_label(Some(label))
+        .is_ok()
+        .then(|| label.to_owned())
+}
+
 fn validate_label(label: Option<&str>) -> Result<()> {
     if label.is_some_and(|label| label.is_empty() || label.chars().any(char::is_control)) {
         bail!("pairing device labels must be non-empty printable text");
@@ -397,6 +418,14 @@ mod tests {
         };
         let ((), result) = tokio::join!(clients, listener.accept());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn device_label_comes_from_the_os_host_name() {
+        // cargo, like launchd and systemd, does not pass $HOSTNAME along.
+        let label = local_device_label().expect("this host has a name");
+        assert!(label.len() <= MAX_LABEL_BYTES);
+        validate_label(Some(&label)).unwrap();
     }
 
     #[test]
