@@ -34,8 +34,8 @@ const TXT_PROTOCOL_VERSIONS: &str = "v";
 const TXT_CAPABILITIES: &str = "cap";
 const TXT_ROTATING_TOKEN: &str = "token";
 
-/// Enumerates usable local addresses for the process-lifetime mDNS record.
-/// Loopback and non-unicast addresses never help another machine connect.
+/// Lists this host's current addresses. Loopback and non-unicast addresses
+/// never help another machine connect.
 pub fn local_unicast_addresses() -> Result<Vec<IpAddr>, DiscoveryError> {
     let addresses = if_addrs::get_if_addrs()
         .map_err(DiscoveryError::Interfaces)?
@@ -110,36 +110,21 @@ impl fmt::Display for EphemeralInstanceId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertisement {
     quic_port: u16,
-    addresses: Vec<IpAddr>,
     capability_summary: InputCapabilities,
     rotating_token: Option<[u8; 16]>,
 }
 
 impl Advertisement {
+    /// `addresses` is ignored because mdns-sd follows the host's interfaces
+    /// itself. It goes away once daemon.rs stops passing a snapshot.
     pub fn new(
         quic_port: u16,
-        addresses: impl IntoIterator<Item = IpAddr>,
+        _addresses: impl IntoIterator<Item = IpAddr>,
         capabilities: impl IntoIterator<Item = InputCapability>,
     ) -> Result<Self, DiscoveryError> {
         if quic_port == 0 {
             return Err(DiscoveryError::InvalidAdvertisement(
                 "QUIC port must be non-zero",
-            ));
-        }
-
-        let mut unique_addresses = BTreeSet::new();
-        for address in addresses {
-            validate_ip_address(address).map_err(DiscoveryError::InvalidAdvertisement)?;
-            unique_addresses.insert(address);
-            if unique_addresses.len() > MAX_DISCOVERY_CANDIDATES {
-                return Err(DiscoveryError::InvalidAdvertisement(
-                    "too many connection candidates",
-                ));
-            }
-        }
-        if unique_addresses.is_empty() {
-            return Err(DiscoveryError::InvalidAdvertisement(
-                "at least one connection candidate is required",
             ));
         }
 
@@ -152,7 +137,6 @@ impl Advertisement {
 
         Ok(Self {
             quic_port,
-            addresses: unique_addresses.into_iter().collect(),
             capability_summary,
             rotating_token: None,
         })
@@ -165,10 +149,6 @@ impl Advertisement {
 
     pub fn quic_port(&self) -> u16 {
         self.quic_port
-    }
-
-    pub fn addresses(&self) -> &[IpAddr] {
-        &self.addresses
     }
 
     pub fn capability_summary(&self) -> &InputCapabilities {
@@ -522,14 +502,17 @@ fn build_service_info(
     }
     debug_assert!(txt_size(&properties) <= MAX_TXT_BYTES);
 
+    // No address list: with addr_auto, mdns-sd adds and drops addresses as
+    // interfaces change, including ones that only appear after boot.
     ServiceInfo::new(
         SERVICE_TYPE,
         &instance_id.to_string(),
         &instance_id.hostname(),
-        advertisement.addresses.as_slice(),
+        (),
         advertisement.quic_port,
         properties.as_slice(),
     )
+    .map(ServiceInfo::enable_addr_auto)
     .map_err(DiscoveryError::Mdns)
 }
 
@@ -789,7 +772,7 @@ mod tests {
     fn advertisement() -> Advertisement {
         Advertisement::new(
             43_119,
-            [IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            std::iter::empty(),
             [
                 InputCapability::Keyboard,
                 InputCapability::Pointer,
@@ -811,6 +794,8 @@ mod tests {
             service.get_hostname(),
             "zf-abababababababababababababababab.local."
         );
+        assert!(service.is_addr_auto());
+        assert!(service.get_addresses().is_empty());
 
         let properties = service.get_properties();
         assert!(properties.len() <= MAX_TXT_PROPERTIES);
@@ -840,31 +825,11 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_enforces_candidate_bounds() {
-        let too_many = (1..=MAX_DISCOVERY_CANDIDATES + 1)
-            .map(|last| IpAddr::V4(Ipv4Addr::new(192, 0, 2, last as u8)));
-        assert!(matches!(
-            Advertisement::new(43_119, too_many, [InputCapability::Keyboard]),
-            Err(DiscoveryError::InvalidAdvertisement(
-                "too many connection candidates"
-            ))
-        ));
-        assert!(
-            Advertisement::new(
-                0,
-                [IpAddr::V4(Ipv4Addr::LOCALHOST)],
-                [InputCapability::Keyboard]
-            )
-            .is_err()
-        );
-        assert!(
-            Advertisement::new(
-                43_119,
-                [IpAddr::V4(Ipv4Addr::UNSPECIFIED)],
-                [InputCapability::Keyboard]
-            )
-            .is_err()
-        );
+    fn advertisement_needs_a_port_but_no_addresses() {
+        let no_addresses = std::iter::empty::<IpAddr>;
+        assert!(Advertisement::new(0, no_addresses(), [InputCapability::Keyboard]).is_err());
+        // Registering before the network is up is fine; mdns-sd adds addresses later.
+        assert!(Advertisement::new(43_119, no_addresses(), [InputCapability::Keyboard]).is_ok());
     }
 
     #[test]
