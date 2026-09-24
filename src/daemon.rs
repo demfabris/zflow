@@ -28,7 +28,7 @@ use crate::{
         ActivationId, InputCapability, ReceiverEffect, SessionCloseReason, SessionContext,
         SessionEpoch, TransportGeneration,
     },
-    discovery::{Advertisement, Discovery, DiscoveryEvent},
+    discovery::{Advertisement, Discovery, DiscoveryError},
     identity::Identity,
     linux::{InjectionGate, OwnershipPhase, query_primary_seat},
     runtime::{
@@ -252,31 +252,12 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                 }
                 shared.forward_capture(frame).await?;
             }
-            signal = next_discovery_signal(discovery.as_ref()), if discovery.is_some() => {
-                match signal {
-                    DiscoverySignal::Event(Ok(DiscoveryEvent::Candidate(candidate))) => {
-                        tracing::trace!(
-                            candidates = candidate.socket_addresses().len(),
-                            "received untrusted discovery hint"
-                        );
-                    }
-                    DiscoverySignal::Event(Ok(DiscoveryEvent::Removed(_))) => {}
-                    DiscoverySignal::Event(Ok(DiscoveryEvent::Stopped)) => {
-                        stop_discovery(&mut discovery).await;
-                    }
-                    DiscoverySignal::Event(Err(error)) => {
-                        tracing::warn!(%error, "mDNS browsing stopped");
-                        stop_discovery(&mut discovery).await;
-                    }
-                    DiscoverySignal::Daemon(Ok(error)) => {
-                        tracing::warn!(%error, "mDNS daemon error");
-                        stop_discovery(&mut discovery).await;
-                    }
-                    DiscoverySignal::Daemon(Err(error)) => {
-                        tracing::warn!(%error, "mDNS monitoring stopped");
-                        stop_discovery(&mut discovery).await;
-                    }
+            error = next_discovery_error(discovery.as_ref()), if discovery.is_some() => {
+                match error {
+                    Ok(error) => tracing::warn!(%error, "mDNS daemon error"),
+                    Err(error) => tracing::warn!(%error, "mDNS monitoring stopped"),
                 }
+                stop_discovery(&mut discovery).await;
             }
             _ = discovery_retry.tick(), if discovery.is_none() => {
                 let config = shared.config.read().await.clone();
@@ -1085,13 +1066,13 @@ fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {
     if !config.transport.discovery {
         return None;
     }
+    // Advertise only: the daemon has no use for other computers' records.
     let result = (|| {
         let mut discovery = Discovery::new()?;
         discovery.register(Advertisement::new(
             listen.port(),
             advertised_capabilities(config),
         )?)?;
-        discovery.browse()?;
         Ok::<_, anyhow::Error>(discovery)
     })();
     match result {
@@ -1125,17 +1106,13 @@ async fn stop_discovery(discovery: &mut Option<Discovery>) {
     }
 }
 
-enum DiscoverySignal {
-    Event(Result<DiscoveryEvent, crate::discovery::DiscoveryError>),
-    Daemon(Result<mdns_sd::Error, crate::discovery::DiscoveryError>),
-}
-
-async fn next_discovery_signal(discovery: Option<&Discovery>) -> DiscoverySignal {
-    let discovery = discovery.expect("select guard requires discovery");
-    tokio::select! {
-        event = discovery.next_event() => DiscoverySignal::Event(event),
-        error = discovery.next_daemon_error() => DiscoverySignal::Daemon(error),
-    }
+async fn next_discovery_error(
+    discovery: Option<&Discovery>,
+) -> Result<mdns_sd::Error, DiscoveryError> {
+    discovery
+        .expect("select guard requires discovery")
+        .next_daemon_error()
+        .await
 }
 
 fn prepare_socket_path(path: &Path) -> Result<()> {
