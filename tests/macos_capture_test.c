@@ -9,6 +9,8 @@
 #include <unistd.h>
 
 static void *fake_dlsym(void *, const char *);
+static void *fake_dlopen(const char *, int);
+static int fake_dlclose(void *);
 static CGError fake_associate(boolean_t);
 static CGError fake_hide(CGDirectDisplayID);
 static CGError fake_show(CGDirectDisplayID);
@@ -31,6 +33,8 @@ static CFRunLoopRunResult fake_run_loop(CFRunLoopMode, CFTimeInterval, Boolean);
 // These tests do not capture, hide, disconnect, or post input on the host.
 // The capture thread runs its real run loop on a plain Mach port.
 #define dlsym fake_dlsym
+#define dlopen fake_dlopen
+#define dlclose fake_dlclose
 #define CGEventTapEnable fake_tap_enable
 #define CFRunLoopRunInMode fake_run_loop
 #define CGAssociateMouseAndMouseCursorPosition fake_associate
@@ -245,7 +249,61 @@ static CGError fake_property(int source, int target, CFStringRef key,
   return error;
 }
 
+// A fake MultitouchSupport with one built-in (1) and one external (2) device.
+static int fake_multitouch;
+static int mt_registered, mt_unregistered, mt_started, mt_stopped;
+
+static CFMutableArrayRef fake_mt_list(void) {
+  CFMutableArrayRef list = CFArrayCreateMutable(NULL, 0, NULL);
+  CFArrayAppendValue(list, (const void *)1);
+  CFArrayAppendValue(list, (const void *)2);
+  return list;
+}
+
+static bool fake_mt_builtin(MTDeviceRef device) { return device == (MTDeviceRef)1; }
+
+static void fake_mt_register(MTDeviceRef device, MTContactCallback callback) {
+  assert(device == (MTDeviceRef)2 && callback == contact_callback);
+  mt_registered++;
+}
+
+static void fake_mt_unregister(MTDeviceRef device, MTContactCallback callback) {
+  assert(device == (MTDeviceRef)2 && callback == contact_callback);
+  mt_unregistered++;
+}
+
+static int fake_mt_start(MTDeviceRef device, int mode) {
+  assert(device == (MTDeviceRef)2 && mode == 0);
+  mt_started++;
+  return 0;
+}
+
+static int fake_mt_stop(MTDeviceRef device) {
+  assert(device == (MTDeviceRef)2);
+  mt_stopped++;
+  return 0;
+}
+
+static void *fake_dlopen(const char *path, int mode) {
+  assert(strstr(path, "MultitouchSupport") && mode == RTLD_NOW);
+  return &fake_multitouch;
+}
+
+static int fake_dlclose(void *handle) {
+  assert(handle == &fake_multitouch);
+  return 0;
+}
+
 static void *fake_dlsym(void *handle, const char *symbol) {
+  if (handle == &fake_multitouch) {
+    if (strcmp(symbol, "MTDeviceCreateList") == 0) return (void *)fake_mt_list;
+    if (strcmp(symbol, "MTDeviceIsBuiltIn") == 0) return (void *)fake_mt_builtin;
+    if (strcmp(symbol, "MTRegisterContactFrameCallback") == 0) return (void *)fake_mt_register;
+    if (strcmp(symbol, "MTUnregisterContactFrameCallback") == 0) return (void *)fake_mt_unregister;
+    if (strcmp(symbol, "MTDeviceStart") == 0) return (void *)fake_mt_start;
+    assert(strcmp(symbol, "MTDeviceStop") == 0);
+    return (void *)fake_mt_stop;
+  }
   assert(handle == RTLD_DEFAULT);
   if (missing_symbol) return NULL;
   if (strcmp(symbol, "_CGSDefaultConnection") == 0)
@@ -437,6 +495,17 @@ static void cursor_lifecycle_tests(void) {
   }
 }
 
+static void multitouch_tests(void) {
+  reset();
+  // The preflight only looks for a device; it never touches device state.
+  assert(zflow_mac_raw_touch_available() == 1);
+  assert(!mt_registered && !mt_started && !mt_stopped && !mt_unregistered);
+  assert(zflow_mac_capture_start(1, NULL) == 1);
+  assert(mt_registered == 1 && mt_started == 1);
+  assert(zflow_mac_capture_stop() == 0);
+  assert(mt_stopped == 1 && mt_unregistered == 1);
+}
+
 static void touch_tests(void) {
   reset();
   MTTouch touches[2] = {0};
@@ -558,6 +627,7 @@ int main(void) {
   cursor_lifecycle_tests();
   lost_stop_tests();
   return_cursor_tests();
+  multitouch_tests();
   touch_tests();
   event_tests();
   reset();

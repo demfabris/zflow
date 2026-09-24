@@ -573,20 +573,23 @@ static bool load_multitouch(bool start_devices) {
 
   g_device_list = MTDeviceCreateList();
   CFIndex count = g_device_list ? CFArrayGetCount(g_device_list) : 0;
+  bool found = false;
   for (CFIndex i = 0; i < count && g_raw_device_count < 8; i++) {
     MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(g_device_list, i);
     if (MTDeviceIsBuiltIn(device)) continue;
+    found = true;
+    // The preflight only needs one device. Only registered devices are kept,
+    // so unloading never stops a device that was never started.
+    if (!start_devices) break;
     g_raw_devices[g_raw_device_count++] = device;
-    if (start_devices) {
-      MTRegisterContactFrameCallback(device, contact_callback);
-      if (MTDeviceStart(device, 0) != 0) {
-        set_error("Magic Trackpad failed to start");
-        unload_multitouch();
-        return false;
-      }
+    MTRegisterContactFrameCallback(device, contact_callback);
+    if (MTDeviceStart(device, 0) != 0) {
+      set_error("Magic Trackpad failed to start");
+      unload_multitouch();
+      return false;
     }
   }
-  if (g_raw_device_count == 0) {
+  if (!found) {
     set_error("no external Magic Trackpad was enumerated");
     unload_multitouch();
     return false;
