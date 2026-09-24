@@ -993,6 +993,7 @@ fn mac_keycode_to_hid(code: u16) -> Option<HidUsage> {
         7 => 0x1b,
         8 => 0x06,
         9 => 0x19,
+        10 => 0x64, // ISO section
         11 => 0x05,
         12 => 0x14,
         13 => 0x1a,
@@ -1044,6 +1045,7 @@ fn mac_keycode_to_hid(code: u16) -> Option<HidUsage> {
         60 => 0xe5,
         61 => 0xe6,
         62 => 0xe4,
+        64 => 0x6c, // F17
         65 => 0x63,
         67 => 0x55,
         69 => 0x57,
@@ -1051,6 +1053,8 @@ fn mac_keycode_to_hid(code: u16) -> Option<HidUsage> {
         75 => 0x54,
         76 => 0x58,
         78 => 0x56,
+        79 => 0x6d, // F18
+        80 => 0x6e, // F19
         81 => 0x67,
         82 => 0x62,
         83 => 0x59,
@@ -1060,19 +1064,26 @@ fn mac_keycode_to_hid(code: u16) -> Option<HidUsage> {
         87 => 0x5d,
         88 => 0x5e,
         89 => 0x5f,
+        90 => 0x6f, // F20
         91 => 0x60,
         92 => 0x61,
+        93 => 0x89, // JIS yen
+        94 => 0x87, // JIS underscore (ro)
+        95 => 0x85, // JIS keypad comma
         96 => 0x3e,
         97 => 0x3f,
         98 => 0x40,
         99 => 0x3c,
         100 => 0x41,
         101 => 0x42,
+        102 => 0x91, // JIS eisu
         103 => 0x44,
+        104 => 0x90, // JIS kana
         105 => 0x68,
         106 => 0x6b,
         107 => 0x69,
         109 => 0x43,
+        110 => 0x65, // context menu
         111 => 0x45,
         113 => 0x6a,
         114 => 0x49,
@@ -1536,6 +1547,25 @@ mod tests {
     #[test]
     fn maps_main_return_to_hid_return() {
         assert_eq!(mac_keycode_to_hid(36), Some(HidUsage::keyboard(0x28)));
+    }
+
+    #[test]
+    fn maps_iso_jis_context_menu_and_high_function_keys() {
+        for (code, usage) in [
+            (10, 0x64),
+            (64, 0x6c),
+            (79, 0x6d),
+            (80, 0x6e),
+            (90, 0x6f),
+            (93, 0x89),
+            (94, 0x87),
+            (95, 0x85),
+            (102, 0x91),
+            (104, 0x90),
+            (110, 0x65),
+        ] {
+            assert_eq!(mac_keycode_to_hid(code), Some(HidUsage::keyboard(usage)));
+        }
     }
 
     #[test]
