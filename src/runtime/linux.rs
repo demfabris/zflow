@@ -460,6 +460,12 @@ impl ChordTracker {
         triggered
     }
 
+    /// Closed descriptors report no more releases, so forget what they held.
+    fn clear(&mut self) {
+        self.held_by_device.clear();
+        self.latched = false;
+    }
+
     fn remove_device(&mut self, path: &Path) {
         self.held_by_device.remove(path);
         self.latched = self.chord.0.iter().all(|member| {
@@ -840,7 +846,7 @@ impl RuntimeLoop {
             Err(_) => {
                 self.diagnostic(RuntimeDiagnostic::CaptureOpenFailed);
                 self.force_source_release(RuntimeCloseReason::CaptureFault);
-                self.capture.suspend();
+                self.suspend_capture();
             }
         }
         if !scan.failures.is_empty() && selection.unmatched > 0 {
@@ -849,7 +855,7 @@ impl RuntimeLoop {
         if self.register_capture_descriptors().is_err() {
             self.diagnostic(RuntimeDiagnostic::CaptureOpenFailed);
             self.force_source_release(RuntimeCloseReason::CaptureFault);
-            self.capture.suspend();
+            self.suspend_capture();
         }
     }
 
@@ -871,14 +877,14 @@ impl RuntimeLoop {
                 self.diagnostic(RuntimeDiagnostic::CaptureMappingLost);
                 self.force_source_release(RuntimeCloseReason::CaptureFault);
                 self.deregister_capture_descriptors();
-                self.capture.suspend();
+                self.suspend_capture();
                 self.next_rescan = Instant::now();
             }
             Err(_) => {
                 self.diagnostic(RuntimeDiagnostic::CaptureReadFailed);
                 self.force_source_release(RuntimeCloseReason::CaptureFault);
                 self.deregister_capture_descriptors();
-                self.capture.suspend();
+                self.suspend_capture();
                 self.next_rescan = Instant::now();
             }
         }
@@ -955,7 +961,7 @@ impl RuntimeLoop {
                     // earlier node, and post-grab neutrality rollback can fail
                     // too. Descriptor close is the only reliable recovery.
                     self.deregister_capture_descriptors();
-                    self.capture.suspend();
+                    self.suspend_capture();
                     self.next_rescan = Instant::now();
                     let _ = self.ownership.grab_failed();
                     self.selected_peer = None;
@@ -967,7 +973,7 @@ impl RuntimeLoop {
             OwnershipEffect::ReleaseGrabs => {
                 let failures = self.capture.ungrab_all();
                 if !failures.is_empty() || self.capture.is_grabbed() {
-                    self.capture.suspend();
+                    self.suspend_capture();
                     self.next_rescan = Instant::now();
                     self.diagnostic(RuntimeDiagnostic::UngrabRequiredDescriptorClose);
                 }
@@ -982,13 +988,19 @@ impl RuntimeLoop {
         }
     }
 
+    fn suspend_capture(&mut self) {
+        self.capture.suspend();
+        self.activation_chord.clear();
+        self.escape_chord.clear();
+    }
+
     fn force_source_release(&mut self, reason: RuntimeCloseReason) {
         let effect = self.ownership.force_release();
         match effect {
             OwnershipEffect::CloseActivationAndReleaseGrabs => {
                 let failures = self.capture.ungrab_all();
                 if !failures.is_empty() || self.capture.is_grabbed() {
-                    self.capture.suspend();
+                    self.suspend_capture();
                     self.next_rescan = Instant::now();
                     self.diagnostic(RuntimeDiagnostic::UngrabRequiredDescriptorClose);
                 }
@@ -1011,6 +1023,8 @@ impl RuntimeLoop {
         self.force_source_release(RuntimeCloseReason::Stop);
         self.deregister_capture_descriptors();
         let failures = self.capture.suspend();
+        self.activation_chord.clear();
+        self.escape_chord.clear();
         if !failures.is_empty() {
             self.diagnostic(RuntimeDiagnostic::UngrabRequiredDescriptorClose);
         }
@@ -1426,6 +1440,17 @@ mod tests {
         tracker.observe(Path::new("one"), &frame(&[(KeyCode::KEY_LEFTCTRL, 1)]));
         tracker.remove_device(Path::new("one"));
         assert!(!tracker.observe(Path::new("two"), &frame(&[(KeyCode::KEY_F12, 1)])));
+    }
+
+    #[test]
+    fn suspended_capture_forgets_a_half_held_chord() {
+        // After SYN_DROPPED or a read fault the descriptors close, so the
+        // release of a held chord key is never seen.
+        let chord = ConfiguredChord::parse(&["KEY_LEFTCTRL".into(), "KEY_F12".into()]).unwrap();
+        let mut tracker = ChordTracker::new(chord);
+        tracker.observe(Path::new("one"), &frame(&[(KeyCode::KEY_LEFTCTRL, 1)]));
+        tracker.clear();
+        assert!(!tracker.observe(Path::new("one"), &frame(&[(KeyCode::KEY_F12, 1)])));
     }
 
     #[test]
