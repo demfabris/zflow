@@ -813,11 +813,26 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
                 .await?;
         }
         RuntimeEvent::ActivationClosed(reason) => {
-            let has_active = shared.active_outbound.lock().await.is_some();
-            if has_active
-                && let Err(error) = shared.end_outbound(runtime_close_reason(reason)).await
-            {
-                tracing::warn!(%error, "outbound terminal state could not be sent after runtime close");
+            let active = shared.active_outbound.lock().await.clone();
+            if let Some(active) = active {
+                // The session may itself be waiting on this loop to apply input
+                // from the peer, so bound the wait and close it instead; the
+                // peer's receiver releases held state on connection loss.
+                let result = tokio::time::timeout(
+                    TERMINAL_SEND_TIMEOUT,
+                    shared.end_outbound(runtime_close_reason(reason)),
+                )
+                .await;
+                if !matches!(result, Ok(Ok(()))) {
+                    tracing::warn!("outbound terminal state could not be sent after runtime close");
+                    shared
+                        .close_session(
+                            &active.peer,
+                            active.session_id,
+                            SessionCloseReason::LocalRelease,
+                        )
+                        .await;
+                }
             }
         }
         RuntimeEvent::ReceiverStateReleased(reason) => {
