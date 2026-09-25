@@ -346,16 +346,10 @@ pub fn parse_resolved_service(
             "QUIC port must be non-zero",
         ));
     }
-    if service.addresses.is_empty() {
-        return Err(CandidateParseError::InvalidAddress(
-            "at least one address is required",
-        ));
-    }
-    if service.addresses.len() > MAX_DISCOVERY_CANDIDATES {
-        return Err(CandidateParseError::TooManyCandidates);
-    }
-
-    let mut addresses = Vec::with_capacity(service.addresses.len());
+    // Receivers advertise every interface address, and IPv6 privacy addresses
+    // pile up, so keep the first few in sort order (IPv4, then global IPv6)
+    // instead of dropping the whole record.
+    let mut addresses = BTreeSet::new();
     for scoped in &service.addresses {
         let address = match scoped {
             ScopedIp::V4(ipv4) => SocketAddr::new(IpAddr::V4(*ipv4.addr()), service.port),
@@ -365,17 +359,16 @@ pub fn parse_resolved_service(
                 0,
                 ipv6.scope_id().index,
             )),
-            _ => {
-                return Err(CandidateParseError::InvalidAddress(
-                    "unsupported address family",
-                ));
-            }
+            _ => continue,
         };
-        validate_socket_address(address).map_err(CandidateParseError::InvalidAddress)?;
-        addresses.push(address);
+        if validate_socket_address(address).is_ok() {
+            addresses.insert(address);
+        }
     }
-    addresses.sort_unstable();
-    addresses.dedup();
+    let addresses = addresses
+        .into_iter()
+        .take(MAX_DISCOVERY_CANDIDATES)
+        .collect();
 
     parse_candidate_fields(
         &service.fullname,
@@ -698,6 +691,29 @@ mod tests {
         assert!(Advertisement::new(0, [InputCapability::Keyboard]).is_err());
         // Registering before the network is up is fine; mdns-sd adds addresses later.
         assert!(Advertisement::new(43_119, [InputCapability::Keyboard]).is_ok());
+    }
+
+    #[test]
+    fn a_receiver_with_many_addresses_keeps_ipv4_and_the_first_few() {
+        let mut service = build_service_info(test_instance(), &advertisement())
+            .unwrap()
+            .as_resolved_service();
+        service.port = 43_119;
+        service.addresses = (1..=40_u16)
+            .map(|index| {
+                ScopedIp::from(IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 0, 0, 0, 0, index,
+                )))
+            })
+            .chain([ScopedIp::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))])
+            .collect();
+
+        let parsed = parse_resolved_service(&service).unwrap();
+        assert_eq!(parsed.socket_addresses().len(), MAX_DISCOVERY_CANDIDATES);
+        assert_eq!(
+            parsed.socket_addresses()[0],
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 43_119))
+        );
     }
 
     #[test]
