@@ -276,10 +276,14 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     shared
         .close_all(SessionCloseReason::BackendUnavailable)
         .await;
+    // Nothing reads session events any more, so release injected input now
+    // rather than after the slower network teardown; a key held from the
+    // peer would autorepeat until then.
+    let runtime_result = runtime.shutdown();
     seat_watcher.abort();
     shared.endpoint.close(0_u32.into(), b"daemon shutdown");
     stop_discovery(&mut discovery).await;
-    runtime.shutdown()?;
+    runtime_result?;
     Ok(())
 }
 
