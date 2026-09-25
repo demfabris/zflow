@@ -448,6 +448,11 @@ impl Shared {
             let config = self.config.read().await;
             peer_name_for_spki(&config, connection.peer_spki())?
         };
+        // A peer that reconnects after a silent network loss would otherwise
+        // wait for its old session's idle timeout. This connection is the same
+        // authenticated peer, so the old session goes first, and its close
+        // releases what it held before the new one is registered.
+        self.retire_session(&peer).await;
         let generation = self.allocate_generation()?;
         let options = {
             let config = self.config.read().await;
@@ -461,10 +466,7 @@ impl Shared {
             self.session_events.clone(),
         )
         .await?;
-        // A peer that reconnects after a silent network loss would otherwise
-        // wait for its old session's idle timeout. The new session is already
-        // authenticated, so it replaces the old one, but only after the old
-        // one's close has run and released anything it still held.
+        // Another reconnect can race this one; the last to finish wins.
         loop {
             {
                 let _policy = self.policy.lock().await;
@@ -478,6 +480,11 @@ impl Shared {
                     session.close(SessionCloseReason::PermissionRevoked);
                     bail!("peer authorization changed during inbound connection negotiation");
                 }
+                // A session that already ended has sent its Closed event, and
+                // nothing would ever remove it from the map.
+                if session.is_closed() {
+                    bail!("peer {peer} input session ended during setup");
+                }
                 let mut sessions = self.sessions.lock().await;
                 match sessions.get(&peer) {
                     None => {
@@ -487,6 +494,19 @@ impl Shared {
                     Some(old) => old.close(SessionCloseReason::Superseded),
                 }
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Closes the peer's current session and waits until its Closed event has
+    /// run, which is where its held input is released.
+    async fn retire_session(&self, peer: &str) {
+        loop {
+            let old = self.sessions.lock().await.get(peer).cloned();
+            let Some(old) = old else {
+                return;
+            };
+            old.close(SessionCloseReason::Superseded);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }

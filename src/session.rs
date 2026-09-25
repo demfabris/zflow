@@ -261,6 +261,11 @@ impl SessionHandle {
             .map_err(anyhow::Error::msg)
     }
 
+    /// True once the session has stopped, whatever the reason.
+    pub fn is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     pub fn close(&self, reason: SessionCloseReason) {
         let _ = self.commands.try_send(SessionCommand::Close(reason));
         // Revocation and backend teardown cannot wait for a peer to drain its
