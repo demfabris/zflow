@@ -952,6 +952,45 @@ mod pairing_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listener_answers_each_attempt_with_a_new_nonce() {
+        let client_directory = tempfile::tempdir().unwrap();
+        let server_directory = tempfile::tempdir().unwrap();
+        let client_identity = Identity::load_or_create(client_directory.path()).unwrap();
+        let server_identity = Identity::load_or_create(server_directory.path()).unwrap();
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let listener_offer = crate::pairing::make_offer(None, 43119, Vec::new()).unwrap();
+        let listener =
+            crate::pairing::PairingListener::bind(&server_identity, loopback, listener_offer)
+                .unwrap();
+        let address = listener.local_addr().unwrap();
+        let client_config = pairing_client_config(&client_identity).unwrap();
+        let client_endpoint = Endpoint::client(loopback).unwrap();
+
+        // A peer that reads the listener's offer and then fails on purpose
+        // must not see the same offer on its next try.
+        let committed = encode_wire(&WireMessage::Pairing(offer("committed"))).unwrap();
+        let revealed = encode_wire(&WireMessage::Pairing(offer("revealed"))).unwrap();
+        let attempts = async {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let mut client = connect_pairing(&client_endpoint, address, &client_config)
+                    .await
+                    .unwrap();
+                client.write(&pairing_commitment(&committed)).await.unwrap();
+                seen.push(client.read_frame().await.unwrap());
+                client.write_frame(&revealed).await.unwrap();
+                let _ = client.connection.closed().await;
+            }
+            seen
+        };
+        let seen = tokio::select! {
+            seen = attempts => seen,
+            _ = listener.accept() => panic!("listener accepted a mismatched reveal"),
+        };
+        assert_ne!(seen[0], seen[1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn responder_rejects_an_offer_that_does_not_match_the_commitment() {
         let client_directory = tempfile::tempdir().unwrap();
         let server_directory = tempfile::tempdir().unwrap();

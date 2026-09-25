@@ -52,6 +52,13 @@ impl std::ops::Deref for PairingSession {
     }
 }
 
+fn fresh_nonce() -> Result<[u8; 32]> {
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("could not generate the pairing nonce: {error}"))?;
+    Ok(nonce)
+}
+
 pub fn make_offer(
     device_label: Option<String>,
     input_port: u16,
@@ -61,11 +68,8 @@ pub fn make_offer(
         bail!("input port must be non-zero");
     }
     validate_label(device_label.as_deref())?;
-    let mut handshake_nonce = [0_u8; 32];
-    getrandom::fill(&mut handshake_nonce)
-        .map_err(|error| anyhow::anyhow!("could not generate the pairing nonce: {error}"))?;
     Ok(PairingOffer {
-        handshake_nonce,
+        handshake_nonce: fresh_nonce()?,
         device_label,
         input_port,
         input_candidates: input_candidates
@@ -113,17 +117,23 @@ impl<'identity> PairingListener<'identity> {
                 .accept()
                 .await
                 .context("pairing listener closed")?;
-            let error =
-                match exchange(self.identity, &self.local_offer, accept_pairing(incoming)).await {
-                    Ok((connection, observation)) => {
-                        return Ok(PairingSession {
-                            observation,
-                            _connection: connection,
-                            _endpoint: Some(self.endpoint.clone()),
-                        });
-                    }
-                    Err(error) => error,
-                };
+            // Each attempt needs a nonce no peer has seen. Otherwise a peer
+            // could fail once after reading this offer, then search offline
+            // for a commitment that makes its code match someone else's.
+            let offer = PairingOffer {
+                handshake_nonce: fresh_nonce()?,
+                ..self.local_offer.clone()
+            };
+            let error = match exchange(self.identity, &offer, accept_pairing(incoming)).await {
+                Ok((connection, observation)) => {
+                    return Ok(PairingSession {
+                        observation,
+                        _connection: connection,
+                        _endpoint: Some(self.endpoint.clone()),
+                    });
+                }
+                Err(error) => error,
+            };
             failures += 1;
             if failures == MAX_PAIRING_ATTEMPTS {
                 return Err(error.context("too many failed pairing attempts"));
