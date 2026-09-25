@@ -62,7 +62,9 @@ pub enum SenderExitReason {
 pub enum SenderTick {
     Idle,
     Checkpoint(Box<ReliableControlMessage>),
-    ExitRemote(SenderExitReason),
+    /// The receiver stopped acknowledging. The message tells it to close the
+    /// activation in case only the acks were lost.
+    ExitRemote(SenderExitReason, Box<ReliableControlMessage>),
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -360,10 +362,16 @@ impl Sender {
             .values()
             .any(|pending| pending.ack_deadline <= now)
         {
+            let close = self.control(ReliableControl::SessionClose {
+                reason: SessionCloseReason::LeaseExpired,
+                final_anchor: None,
+            })?;
             self.remote = false;
             self.held.release_all();
+            self.pending_snapshots.clear();
             return Ok(SenderTick::ExitRemote(
                 SenderExitReason::SnapshotAckTimedOut,
+                Box::new(close),
             ));
         }
 
@@ -630,10 +638,18 @@ mod tests {
             .unwrap();
         sender.tick(MonotonicTimeMicros(250_000)).unwrap();
 
-        assert_eq!(
-            sender.tick(MonotonicTimeMicros(1_150_000)).unwrap(),
-            SenderTick::ExitRemote(SenderExitReason::SnapshotAckTimedOut)
-        );
+        let SenderTick::ExitRemote(SenderExitReason::SnapshotAckTimedOut, close) =
+            sender.tick(MonotonicTimeMicros(1_150_000)).unwrap()
+        else {
+            panic!("expected the sender to leave remote");
+        };
+        assert!(matches!(
+            close.payload,
+            ReliableControl::SessionClose {
+                reason: SessionCloseReason::LeaseExpired,
+                final_anchor: None,
+            }
+        ));
         assert!(!sender.is_remote());
     }
 

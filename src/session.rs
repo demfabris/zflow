@@ -526,8 +526,12 @@ async fn run_session(
                             let mut metrics = reporter.metrics();
                             metrics.lease_renewals = metrics.lease_renewals.saturating_add(1);
                         }
-                        SenderTick::ExitRemote(_) => {
+                        SenderTick::ExitRemote(_, close) => {
                             sender = None;
+                            // The receiver may still hold the activation open
+                            // if only its acks were lost; it has to close for
+                            // the desktop handoff to finish.
+                            channels.control_send.send_control(&close).await?;
                             reporter.emit(SessionEventKind::OutboundEnded)?;
                         }
                         SenderTick::Idle => {}
@@ -2243,6 +2247,19 @@ mod tests {
                 released.elapsed()
             );
             assert!(!actor.is_finished(), "returning must not end the session");
+            // If only the acks were lost, the receiver still holds the
+            // activation open until the sender says it is gone.
+            loop {
+                let InputControlMessage::Reliable(message) =
+                    peer.control_receive.receive().await.unwrap()
+                else {
+                    continue;
+                };
+                if let ReliableControl::SessionClose { reason, .. } = message.payload {
+                    assert_eq!(reason, SessionCloseReason::LeaseExpired);
+                    break;
+                }
+            }
             commands
                 .send(SessionCommand::Close(SessionCloseReason::LocalRelease))
                 .await
