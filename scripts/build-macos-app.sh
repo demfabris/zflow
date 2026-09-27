@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             printf 'usage: ./scripts/build-macos-app.sh [--debug] [--sign IDENTITY]\n'
             printf 'Build target/release/zflow.app (target/debug with --debug).\n'
-            printf 'Use an ad-hoc signature unless --sign selects a code-signing identity.\n'
+            printf 'Sign with the first Apple Development identity, else ad-hoc (--sign - forces ad-hoc).\n'
             exit 0
             ;;
         *) die "unknown argument: $1" ;;
@@ -39,6 +39,12 @@ done
 command -v cargo >/dev/null 2>&1 || die 'cargo is required'
 if [[ "$explicit_sign" == true ]]; then
     command -v codesign >/dev/null 2>&1 || die 'codesign is required for --sign'
+elif development_identity="$(security find-identity -v -p codesigning 2>/dev/null |
+    awk '/"Apple Development: / { print $2; exit }')" && [[ -n "$development_identity" ]]; then
+    # macOS keys Accessibility grants to the signature. An ad-hoc signature changes
+    # on every build, so each rebuild would need a fresh grant. Sign by hash
+    # because renewed certificates share a name.
+    sign_identity="$development_identity"
 fi
 
 cargo_args=(build --locked --manifest-path "$REPO_ROOT/Cargo.toml"

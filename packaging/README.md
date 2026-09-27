@@ -172,6 +172,10 @@ library and Swift package, then assembles `target/{debug,release}/zflow.app`.
 The app requires macOS 26 and Swift 6.2 or newer. It uses SwiftUI Settings and
 MenuBarExtra with no Dock icon. The bundle contains the AWDL daemon and its
 SMAppService launchd plist. All executables use hardened runtime signatures.
+Without `--sign`, the script signs with the first Apple Development identity
+in your keychain, so the Accessibility grant survives rebuilds. With no such
+identity, or with `--sign -`, the build is ad hoc and macOS treats every
+rebuild as a new app that needs a fresh grant.
 
 Use an Apple-issued signing identity to install the privileged helper through
 the app. The app talks to the daemon over XPC directly; each side requires the
