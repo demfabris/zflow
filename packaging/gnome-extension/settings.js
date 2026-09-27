@@ -157,7 +157,8 @@ export class Settings {
         const nearby = new Adw.PreferencesGroup({title: 'Nearby computers'});
         page.add(nearby);
         const result = new Adw.PreferencesGroup();
-        const stage = new Adw.ActionRow({title: '', visible: false, subtitle_lines: 0});
+        // Peer names and remote error text end up here, so never parse them as markup.
+        const stage = new Adw.ActionRow({title: '', visible: false, subtitle_lines: 0, use_markup: false});
         result.add(stage);
         page.add(result);
         this._pairing = {dialog, code, renew, remote, entered, connect, stage, nearby, rows: [], nearbyKey: ''};

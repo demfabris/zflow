@@ -288,23 +288,42 @@ pub fn add_paired_peer(
         existing.addresses = record.addresses;
         return Ok(name.clone());
     }
-    let base = observation
-        .peer_label
-        .as_deref()
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .unwrap_or("Computer");
-    let mut end = base.len().min(MAX_BASE_NAME_BYTES);
-    while !base.is_char_boundary(end) {
-        end -= 1;
-    }
-    let base = &base[..end];
-    let name = std::iter::once(base.to_owned())
-        .chain((2..).map(|number| format!("{base} {number}")))
+    let base = peer_name(observation.peer_label.as_deref());
+    // A second computer with the same name gets a piece of its key's
+    // fingerprint, so the two entries are told apart by what they are.
+    let short = record.fingerprint_hex()?[..6].to_owned();
+    let name = [base.clone(), format!("{base} ({short})")]
+        .into_iter()
+        .chain((2..).map(|number| format!("{base} ({short}) {number}")))
         .find(|name| !config.peers.contains_key(name))
         .expect("some numbered name is free");
     config.peers.insert(name.clone(), record);
     Ok(name)
+}
+
+/// The name a new peer is saved under. The label comes from the other
+/// computer, so only plain ASCII survives: invisible, bidirectional and
+/// lookalike characters could make two computers look the same in a list.
+fn peer_name(label: Option<&str>) -> String {
+    let label = label.unwrap_or_default().trim();
+    let label = label
+        .len()
+        .checked_sub(".local".len())
+        .filter(|&end| label.is_char_boundary(end) && label[end..].eq_ignore_ascii_case(".local"))
+        .map_or(label, |end| &label[..end]);
+    let kept: String = label
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '-' | '_' | '\'')
+        })
+        .collect();
+    let mut name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    name.truncate(MAX_BASE_NAME_BYTES);
+    if name.is_empty() {
+        "Computer".into()
+    } else {
+        name
+    }
 }
 
 pub async fn connect(
@@ -329,7 +348,9 @@ pub async fn connect(
     .await
     .map_err(|error| {
         if is_wrong_code(&error) {
-            anyhow::anyhow!("That code does not match the one on the other computer")
+            anyhow::anyhow!(
+                "That code does not match the one on the other computer; check the code and the address"
+            )
         } else {
             error
         }
@@ -541,6 +562,22 @@ mod tests {
     }
 
     #[test]
+    fn peer_names_keep_only_plain_ascii() {
+        assert_eq!(
+            peer_name(Some("Fabricios-MacBook-Pro.local")),
+            "Fabricios-MacBook-Pro"
+        );
+        assert_eq!(peer_name(Some("  desk   pc  ")), "desk pc");
+        assert_eq!(peer_name(Some("Mac\u{202e}kooB")), "MackooB");
+        assert_eq!(peer_name(Some("<span>x</span>")), "spanxspan");
+        assert_eq!(peer_name(Some("Café")), "Caf");
+        assert_eq!(peer_name(Some("\u{200b}")), "Computer");
+        assert_eq!(peer_name(Some(".local")), "Computer");
+        assert_eq!(peer_name(None), "Computer");
+        assert!(peer_name(Some(&"a".repeat(400))).len() <= MAX_BASE_NAME_BYTES);
+    }
+
+    #[test]
     fn setup_codes_accept_what_people_type() {
         for typed in ["482913", "482 913", "482-913", " 482913 "] {
             assert_eq!(SetupCode::parse(typed).unwrap().as_bytes(), b"482913");
@@ -616,14 +653,17 @@ mod tests {
             vec!["192.0.2.9:43119".parse().unwrap()]
         );
 
-        // A different computer with the same host name gets its own entry.
+        // A different computer with the same host name gets its own entry,
+        // marked with part of its fingerprint, even if it hides characters.
         let twin = PairingObservation {
             peer_spki: other.spki().to_vec(),
+            peer_label: Some("ubun\u{200b}tu".into()),
             ..observation.clone()
         };
+        let expected = format!("ubuntu ({})", &other.fingerprint_hex()[..6]);
         assert_eq!(
             add_paired_peer(&mut config, &twin, false).unwrap(),
-            "ubuntu 2"
+            expected
         );
         assert_eq!(config.peers["ubuntu"].spki_der().unwrap(), known.spki());
 
