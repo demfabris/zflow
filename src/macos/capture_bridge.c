@@ -544,7 +544,12 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
   (void)proxy;
   (void)context;
   if (type == kCGEventTapDisabledByTimeout) {
-    // One slow callback should not end remote control.
+    // One slow callback should not end remote control, but a tap re-enabled
+    // after Accessibility was removed would hold the Mac's input.
+    if (!zflow_mac_event_tap_allowed()) {
+      end_capture("Accessibility access was removed; ending remote control");
+      return event;
+    }
     if (g_event_tap) CGEventTapEnable(g_event_tap, true);
     release_lifted_input();
     return event;

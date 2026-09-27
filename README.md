@@ -128,8 +128,9 @@ sharing = true
 block_awdl = false
 ```
 
-Sharing arms only after a paired receiver, a valid touching layout, permissions,
-and any requested helper are ready. GUI writes preserve unrelated settings and
+Sharing arms only after a paired receiver, a valid touching layout, and
+permissions are ready. A missing AWDL helper does not hold it back; sharing
+then runs without blocking AWDL and the health badge says so. GUI writes preserve unrelated settings and
 comments. External edits reload automatically; invalid edits display an error
 while the last valid configuration stays in use. Conflicting writes fail instead
 of overwriting an external edit.
