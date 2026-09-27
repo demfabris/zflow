@@ -77,9 +77,9 @@ dimensions, and return barriers.
    and shows a six-digit setup code; otherwise choose **Pair Computer…**.
 2. Open **Settings…** from the Mac's zflow menu-bar icon. Choose **Pair Computer…**,
    select the receiver (or type its IP address), and type the code Ubuntu
-   shows. Pairing finishes on both computers without another click, and each
-   side names the other after its host name. A network announcement alone
-   never authorizes a computer.
+   shows. Ubuntu then asks whether to allow your Mac; choose **Allow**. Each
+   side names the other after its host name. A network announcement or a
+   code alone never authorizes a computer.
 3. Use the health badge to allow Accessibility access. Allow Local Network
    access when macOS asks. The receiver's tile is placed against the Mac's
    right edge; drag the tiles only to change which edges touch. Changes save
@@ -217,8 +217,9 @@ sudo zflow pair connect desk 192.0.2.10:43120
 ```
 
 The code never crosses the network: both sides prove they know it through
-SPAKE2, so a wrong code writes no trust record. The listener accepts three
-wrong codes, then stops and needs a new code.
+SPAKE2, so a wrong code writes no trust record. The listener then asks whether
+to allow the connecting computer (pass `--yes` to skip the question in
+scripts). It accepts three wrong codes, then stops and needs a new code.
 
 Normal pairing never grants pre-login input. Grant that permission separately
 only if you need input at a greeter or lock screen:

@@ -46,6 +46,10 @@ pub(crate) enum Request {
         /// The code shown on the other computer, when connecting.
         code: Option<String>,
     },
+    /// Allows or declines the computer that proved this Mac's code.
+    PairRespond {
+        allow: bool,
+    },
     PairCancel,
     Forget {
         name: String,
@@ -164,6 +168,7 @@ impl NativeApp {
                 self.pairing
                     .start(self.document.path.clone(), remote, code)?;
             }
+            Request::PairRespond { allow } => self.pairing.respond(allow)?,
             Request::PairCancel => self.pairing.cancel(),
             Request::Forget { name } => {
                 self.document.draft.peers.remove(&name);
