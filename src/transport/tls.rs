@@ -27,7 +27,7 @@ use crate::identity::Identity;
 use super::TransportError;
 
 pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/2";
-pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/3";
+pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/4";
 const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 const INPUT_IDLE_TIMEOUT_MS: u32 = 15_000;
 
@@ -356,7 +356,9 @@ fn pairing_transport_config() -> quinn::TransportConfig {
         .max_concurrent_uni_streams(0_u8.into())
         .datagram_receive_buffer_size(None)
         .datagram_send_buffer_size(0)
-        .keep_alive_interval(None);
+        // The connection stays open while the listener's user decides whether
+        // to allow the pairing, which can take longer than the idle timeout.
+        .keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     config
 }
 

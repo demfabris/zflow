@@ -201,7 +201,10 @@ select_artifact() {
             asset="zflow-${version}-${architecture}-unknown-linux-gnu.tar.gz"
         fi
     else
-        asset="zflow-${version}-${architecture}-apple-darwin.tar.gz"
+        # Releases after v0.1.0 ship one universal Mac archive; older ones had
+        # one per CPU, which main falls back to when SHA256SUMS lacks this name.
+        asset="zflow-${version}-universal-apple-darwin.tar.gz"
+        legacy_asset="zflow-${version}-${architecture}-apple-darwin.tar.gz"
     fi
 }
 
@@ -341,6 +344,10 @@ main() {
     trap 'exit 143' TERM
     base_url="https://github.com/demfabris/zflow/releases/download/$version"
     fetch "$base_url/SHA256SUMS" "$work_dir/SHA256SUMS" || die "Checksums are unavailable for $version."
+    if [[ "$platform" == Darwin ]] && ! awk -v name="$asset" '$2 == name {found = 1} END {exit !found}' "$work_dir/SHA256SUMS"; then
+        asset=$legacy_asset
+        printf 'This release has no universal archive. Download: %s\n' "$asset"
+    fi
     fetch "$base_url/$asset" "$work_dir/$asset" || die "No downloadable artifact for $platform $architecture in $version."
     verify_download
     if [[ "$use_deb" == false ]]; then

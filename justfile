@@ -61,6 +61,10 @@ build platform *args: (_platform platform)
         cargo build --locked --bin zflow --bin zflowd "$@"
     fi
 
+# Pack the Mac app into target/release/zflow.dmg, signed like the app but not notarized.
+dmg *args: (_platform "mac")
+    ./scripts/build-macos-app.sh --dmg "$@"
+
 # Run Rust tests.
 test *args:
     cargo test --locked --all-targets "$@"

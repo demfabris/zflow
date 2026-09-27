@@ -32,12 +32,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # One Apple silicon runner builds, signs and notarizes the app for both CPUs.
           - runner: macos-26
-            target: aarch64-apple-darwin
-          - runner: macos-26-intel
-            target: x86_64-apple-darwin
+            target: universal-apple-darwin
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    # The Mac job waits up to 20 minutes each for Apple to notarize the app and the disk image.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,8 +72,9 @@ jobs:
         # Build with an ad-hoc signature before the signing keychain exists, so
         # no build script in this job can sign with the Developer ID.
         run: |
-          ./scripts/build-macos-app.sh
-          ZFLOW_RUST_LIB_DIR="$PWD/target/release" swift test --package-path macos
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          ./scripts/build-macos-app.sh --universal
+          ZFLOW_RUST_LIB_DIR="$PWD/target/universal-apple-darwin/release" swift test --package-path macos
           python3 tests/macos_notarization_test.py
       - name: Import macOS signing certificate
         if: runner.os == 'macOS'
@@ -117,6 +118,16 @@ jobs:
           xcrun notarytool store-credentials zflow-ci --keychain "$keychain" \
             --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID"
           ./scripts/notarize-macos-app.sh zflow-ci "$keychain"
+      # The disk image wraps the stapled app, so it is signed and notarized after it.
+      - name: Build and notarize macOS disk image
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          dmg="target/dist/zflow-v$version-macos.dmg"
+          ./scripts/build-macos-dmg.sh target/release/zflow.app "$dmg" --sign "$MACOS_SIGNING_IDENTITY"
+          ./scripts/notarize-macos-app.sh zflow-ci "$RUNNER_TEMP/zflow-signing.keychain-db" "$dmg"
       - name: Remove macOS signing credentials
         if: always() && runner.os == 'macOS'
         run: |
@@ -129,7 +140,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: ./scripts/package-release.sh "$TARGET"
-      - name: Verify notarized macOS archive
+      - name: Verify notarized macOS archive and disk image
         if: runner.os == 'macOS'
         env:
           TARGET: ${{ matrix.target }}
@@ -140,12 +151,18 @@ jobs:
           codesign --verify --strict --deep "$check_dir/zflow.app"
           xcrun stapler validate "$check_dir/zflow.app"
           spctl --assess --type execute --verbose=2 "$check_dir/zflow.app"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          dmg="target/dist/zflow-v$version-macos.dmg"
+          hdiutil verify "$dmg"
+          codesign --verify --strict "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
       - name: Preserve notarization results
         if: always() && runner.os == 'macOS'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: notarization-${{ matrix.target }}
-          path: target/notarization/*.json
+          path: target/notarization/**/*.json
           if-no-files-found: ignore
           retention-days: 7
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -191,13 +208,14 @@ jobs:
               exit 1
             fi
           fi
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu universal-apple-darwin; do
             test -s "target/dist/zflow-$tag-$target.tar.gz"
           done
+          test -s "target/dist/zflow-$tag-macos.dmg"
           test -s "target/dist/zflow_${version}_amd64.deb"
           test -s "target/dist/zflow_${version}_arm64.deb"
           cp install.sh target/dist/install.sh
-          (cd target/dist && sha256sum ./*.tar.gz ./*.deb install.sh | sed 's|  ./|  |' > SHA256SUMS)
+          (cd target/dist && sha256sum ./*.tar.gz ./*.dmg ./*.deb install.sh | sed 's|  ./|  |' > SHA256SUMS)
           prerelease=()
           if [[ "$version" == *-* ]]; then prerelease=(--prerelease); fi
           gh release create "$tag" target/dist/* --target "$GITHUB_SHA" --draft \

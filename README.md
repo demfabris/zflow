@@ -39,11 +39,17 @@ that off for one account. When ufw or firewalld is on, the installer allows
 UDP ports 43119 (input) and 43120 (pairing) and says so. It never turns a
 firewall on.
 
-On macOS, the installer places `zflow.app` in `/Applications`. The release
-workflow signs Mac apps with Developer ID and notarizes them, but v0.1.0 was
-built before that: its Mac apps are ad-hoc signed. Input sharing works, but they
-can't install the optional AWDL helper. Releases built by the signing workflow
-can install it from the app with administrator approval.
+On macOS, download `zflow-vVERSION-macos.dmg` from
+[Releases](https://github.com/demfabris/zflow/releases/latest), open it, and
+drag zflow onto Applications. One image covers Apple silicon and Intel. To
+update, quit zflow and drag the new version over the old one. Releases after
+v0.1.0 include the image. The curl command also works on macOS: it places
+`zflow.app` in `/Applications` and replaces an older copy there.
+
+The release workflow signs Mac apps with Developer ID and notarizes them, but
+v0.1.0 was built before that: its Mac apps are ad-hoc signed. Input sharing works,
+but they can't install the optional AWDL helper. Releases built by the signing
+workflow can install it from the app with administrator approval.
 
 Repeat the command to update. It keeps your configuration and paired identities;
 updating the Linux service interrupts an active connection. GNOME updates an
@@ -85,16 +91,18 @@ Applications on GNOME and `/Applications/zflow.app` on macOS. Keep the GNOME
 desktop agent running during use; it supplies cursor placement, desktop
 dimensions, and return barriers.
 
-1. On Ubuntu, open **zflow → Pair Computer… → Wait for Connection**.
-2. Open **Settings…** from the Mac's zflow menu-bar icon. Choose **Pair Computer…**
-   and select the receiver, or enter its IP address with pairing port `43120`.
-3. Enter the other computer's six-digit code on each side and confirm both.
-   A network announcement alone never authorizes a computer.
-4. Use the health badge to allow Accessibility access. Allow Local Network
+1. On Ubuntu, open zflow. A fresh install opens **Pair Computer** by itself
+   and shows a six-digit setup code; otherwise choose **Pair Computer…**.
+2. Open **Settings…** from the Mac's zflow menu-bar icon. Choose **Pair Computer…**,
+   select the receiver (or type its IP address), and type the code Ubuntu
+   shows. Ubuntu then asks whether to allow your Mac; choose **Allow**. Each
+   side names the other after its host name. A network announcement or a
+   code alone never authorizes a computer.
+3. Use the health badge to allow Accessibility access. Allow Local Network
    access when macOS asks. The receiver's tile is placed against the Mac's
    right edge; drag the tiles only to change which edges touch. Changes save
    automatically.
-5. Move through a touching edge with keys and mouse buttons released. Cross
+4. Move through a touching edge with keys and mouse buttons released. Cross
    back from Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses
    sharing. Resume from the menu-bar menu when you are ready.
 
@@ -156,8 +164,8 @@ the updated layout arms.
 ## Discover nearby computers
 
 Pairing lists receivers advertised on the local network. Discovery does not
-verify identity; both sides must confirm the six-digit codes. Manual addresses
-remain available. The Linux daemon advertises the receiver. Browsing continues
+verify identity; only the setup code shown on the receiver does. Manual
+addresses remain available. The Linux daemon advertises the receiver. Browsing continues
 while the Mac app is running, even with Settings closed.
 
 If the list stays empty, check zflow under **System Settings → Privacy & Security
@@ -213,20 +221,23 @@ as `KEY_LEFTCTRL`.
 Pairing uses a temporary listener on UDP port 43120. The normal input service
 listens on UDP port 43119.
 
-On the first machine:
+On the first machine, which prints a six-digit setup code:
 
 ```sh
 sudo zflow pair listen laptop
 ```
 
-On the second machine, connect to the first machine's LAN address:
+On the second machine, connect to the first machine's LAN address and type
+that code at the prompt (or pass `--code`):
 
 ```sh
 sudo zflow pair connect desk 192.0.2.10:43120
 ```
 
-Both commands display a six-digit code. Compare the codes in person, then
-enter the peer's code at each prompt. A mismatch writes no trust record.
+The code never crosses the network: both sides prove they know it through
+SPAKE2, so a wrong code writes no trust record. The listener then asks whether
+to allow the connecting computer (pass `--yes` to skip the question in
+scripts). It accepts three wrong codes, then stops and needs a new code.
 
 Normal pairing never grants pre-login input. Grant that permission separately
 only if you need input at a greeter or lock screen:
@@ -352,6 +363,7 @@ the problem to capture or playout behavior.
 ```sh
 just run mac                 # Build and open the native debug app
 just build mac               # Package the native release app
+just dmg                     # Pack it into a local disk image (--universal for both CPUs)
 just install-linux           # Install/update the Linux service
 just run linux               # Open native GNOME settings
 just debug mac               # Native app diagnostics under target/logs

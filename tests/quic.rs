@@ -415,7 +415,7 @@ async fn wrong_client_spki_pin_is_rejected_by_the_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pairing_proves_rpk_possession_and_exports_the_same_transcript_binding() {
+async fn pairing_proves_rpk_possession_and_the_setup_code() {
     let (_client_directory, client_identity) = identity();
     let (_server_directory, server_identity) = identity();
     let client_config = pairing_client_config(&client_identity).unwrap();
@@ -436,25 +436,19 @@ async fn pairing_proves_rpk_possession_and_exports_the_same_transcript_binding()
     let mut server = accept.await.unwrap();
     assert_eq!(client.peer_spki(), server_identity.spki());
     assert_eq!(server.peer_spki(), client_identity.spki());
-    assert_eq!(
-        client.transcript_binding().unwrap(),
-        server.transcript_binding().unwrap()
-    );
     let client_offer = PairingOffer {
-        handshake_nonce: [0x11; 32],
         device_label: Some("client".into()),
         input_port: 43119,
         input_candidates: vec!["127.0.0.1:43119".into()],
     };
     let server_offer = PairingOffer {
-        handshake_nonce: [0x22; 32],
         device_label: Some("server".into()),
         input_port: 43120,
         input_candidates: vec!["127.0.0.1:43120".into()],
     };
     let (seen_by_client, seen_by_server) = tokio::join!(
-        client.exchange_offer(&client_offer),
-        server.exchange_offer(&server_offer)
+        client.authenticate(client_identity.spki(), &client_offer, b"000417"),
+        server.authenticate(server_identity.spki(), &server_offer, b"000417")
     );
     assert_eq!(seen_by_client.unwrap(), server_offer);
     assert_eq!(seen_by_server.unwrap(), client_offer);
