@@ -290,11 +290,10 @@ impl NativeApp {
             self.observer.stop();
             return;
         }
-        if config.macos.block_awdl && !self.helper_ready {
-            return;
-        }
+        // A missing helper only costs Wi-Fi latency, so it never holds sharing back.
+        // Crossings read this when they start, so a later helper needs no restart.
+        self.observer.reduce_wifi_latency = config.macos.block_awdl && self.helper_ready;
         if !self.observer.is_enabled() && Instant::now() >= self.retry_at && self.any_ready() {
-            self.observer.reduce_wifi_latency = config.macos.block_awdl;
             match self.observer.enable(config, &self.layout.draft) {
                 Ok(()) => self.crossing_error = None,
                 Err(error) => {
@@ -416,6 +415,11 @@ impl NativeApp {
             .or_else(|| (!link_errors.is_empty()).then(|| link_errors.join("\n")));
         let checking = !ready && connecting;
         let sharing = config.macos.sharing && !self.emergency_paused;
+        let notice = if sharing && !self.observer.is_active() {
+            "Sharing starts when the checks above pass."
+        } else {
+            &self.observer.notice
+        };
         let status = if !sharing {
             "paused"
         } else if config.peers.is_empty() {
@@ -439,7 +443,7 @@ impl NativeApp {
         json!({
             "config_path":self.document.path,"layout_path":self.layout.path,"status":status,
             "sharing":sharing,"block_awdl":config.macos.block_awdl,"accessibility":self.accessibility,
-            "notice":self.observer.notice,"peers":config.peers.keys().collect::<Vec<_>>(),
+            "notice":notice,"peers":config.peers.keys().collect::<Vec<_>>(),
             "layout":self.layout.draft,"pairing":self.pairing.snapshot(),
             "nearby":self.nearby.snapshot().records.values().collect::<Vec<_>>(),
             "config_error":self.config_error,"layout_error":self.layout_error.as_ref().or(layout_issue.as_ref()),
