@@ -73,16 +73,18 @@ Applications on GNOME and `/Applications/zflow.app` on macOS. Keep the GNOME
 desktop agent running during use; it supplies cursor placement, desktop
 dimensions, and return barriers.
 
-1. On Ubuntu, open **zflow → Pair Computer… → Wait for Connection**.
-2. Open **Settings…** from the Mac's zflow menu-bar icon. Choose **Pair Computer…**
-   and select the receiver, or enter its IP address with pairing port `43120`.
-3. Enter the other computer's six-digit code on each side and confirm both.
-   A network announcement alone never authorizes a computer.
-4. Use the health badge to allow Accessibility access. Allow Local Network
+1. On Ubuntu, open zflow. A fresh install opens **Pair Computer** by itself
+   and shows a six-digit setup code; otherwise choose **Pair Computer…**.
+2. Open **Settings…** from the Mac's zflow menu-bar icon. Choose **Pair Computer…**,
+   select the receiver (or type its IP address), and type the code Ubuntu
+   shows. Pairing finishes on both computers without another click, and each
+   side names the other after its host name. A network announcement alone
+   never authorizes a computer.
+3. Use the health badge to allow Accessibility access. Allow Local Network
    access when macOS asks. The receiver's tile is placed against the Mac's
    right edge; drag the tiles only to change which edges touch. Changes save
    automatically.
-5. Move through a touching edge with keys and mouse buttons released. Cross
+4. Move through a touching edge with keys and mouse buttons released. Cross
    back from Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses
    sharing. Resume from the menu-bar menu when you are ready.
 
@@ -144,8 +146,8 @@ the updated layout arms.
 ## Discover nearby computers
 
 Pairing lists receivers advertised on the local network. Discovery does not
-verify identity; both sides must confirm the six-digit codes. Manual addresses
-remain available. The Linux daemon advertises the receiver. Browsing continues
+verify identity; only the setup code shown on the receiver does. Manual
+addresses remain available. The Linux daemon advertises the receiver. Browsing continues
 while the Mac app is running, even with Settings closed.
 
 If the list stays empty, check zflow under **System Settings → Privacy & Security
@@ -201,20 +203,22 @@ as `KEY_LEFTCTRL`.
 Pairing uses a temporary listener on UDP port 43120. The normal input service
 listens on UDP port 43119.
 
-On the first machine:
+On the first machine, which prints a six-digit setup code:
 
 ```sh
 sudo zflow pair listen laptop
 ```
 
-On the second machine, connect to the first machine's LAN address:
+On the second machine, connect to the first machine's LAN address and type
+that code at the prompt (or pass `--code`):
 
 ```sh
 sudo zflow pair connect desk 192.0.2.10:43120
 ```
 
-Both commands display a six-digit code. Compare the codes in person, then
-enter the peer's code at each prompt. A mismatch writes no trust record.
+The code never crosses the network: both sides prove they know it through
+SPAKE2, so a wrong code writes no trust record. The listener accepts three
+wrong codes, then stops and needs a new code.
 
 Normal pairing never grants pre-login input. Grant that permission separately
 only if you need input at a greeter or lock screen:

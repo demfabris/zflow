@@ -1,4 +1,4 @@
-//! Desktop peer metadata, user-confirmed pairing, and desktop session attachment.
+//! Desktop peer metadata, setup-code pairing, and desktop session attachment.
 
 use std::collections::BTreeMap;
 
@@ -19,24 +19,25 @@ pub enum Request {
         name: String,
     },
     Desktop {},
+    /// Listens and shows a fresh setup code, or connects to `remote` with the
+    /// code shown on it.
     Pair {
         remote: Option<std::net::SocketAddr>,
-    },
-    PairConfirm {
-        name: String,
-        authentication_code: String,
+        code: Option<String>,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PairingEvent {
-    Ready,
-    Confirm {
-        peer_label: Option<String>,
-        authentication_code: String,
+    /// The setup code this computer shows while it waits.
+    Listening {
+        code: String,
     },
-    Paired,
+    /// Both computers proved the code and this one saved the other as `name`.
+    Paired {
+        name: String,
+    },
     Error {
         message: String,
     },
@@ -129,7 +130,7 @@ mod tests {
             r#"{"command":"status","path":"/etc/zflow"}"#,
             r#"{"command":"snapshot"}"#,
             r#"{"command":"pair","remote":null,"identity":"attacker"}"#,
-            r#"{"command":"pair_confirm","name":"desk","authentication_code":"123456","permissions":{"inject_prelogin":true}}"#,
+            r#"{"command":"pair","remote":null,"code":null,"name":"desk","permissions":{"inject_prelogin":true}}"#,
         ] {
             assert!(serde_json::from_str::<Request>(json).is_err());
         }

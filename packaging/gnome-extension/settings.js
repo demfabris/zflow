@@ -111,6 +111,12 @@ export class Settings {
                 this._peerRows.push(row);
             }
         }
+        // A fresh install opens pairing with its code on screen, so the Mac
+        // can pair without anyone clicking through settings here.
+        if (daemon && !this._checkedFirstRun) {
+            this._checkedFirstRun = true;
+            if (!Object.keys(daemon.peers ?? {}).length) this._openPairing();
+        }
         this._updatePairing(snapshot);
     }
 
@@ -128,45 +134,33 @@ export class Settings {
 
     _openPairing() {
         if (this._pairing) return;
-        const dialog = new Adw.Dialog({title: 'Pair Computer', content_width: 440, content_height: 520});
+        const dialog = new Adw.Dialog({title: 'Pair Computer', content_width: 440, content_height: 560});
         const toolbar = new Adw.ToolbarView();
         toolbar.add_top_bar(new Adw.HeaderBar());
         const page = new Adw.PreferencesPage();
         toolbar.content = page;
         dialog.child = toolbar;
-        const setup = new Adw.PreferencesGroup({title: 'Connect a computer', description: 'On your Mac, open zflow settings and choose Pair Computer. Then choose this computer.'});
-        const listen = button('Wait for Connection', () => this._startPair(null), ['suggested-action']);
-        setup.add(listen);
-        const remote = new Adw.EntryRow({title: 'IP address and port', text: ''});
-        setup.add(remote);
-        setup.add(button('Connect to Address', () => this._startPair(remote.text.trim())));
-        page.add(setup);
-        const nearby = new Adw.PreferencesGroup({title: 'Nearby computers', description: 'Open pairing on the other computer before connecting.'});
+        const shown = new Adw.PreferencesGroup({title: 'Setup code', description: 'On your Mac, open zflow, choose this computer, and type this code.'});
+        const code = new Gtk.Label({label: '', selectable: true, css_classes: ['title-1', 'numeric'], margin_top: 18, margin_bottom: 18});
+        shown.add(code);
+        const renew = button('Show a New Code', () => this._listen());
+        shown.add(renew);
+        page.add(shown);
+        const other = new Adw.PreferencesGroup({title: 'Or type another computer’s code', description: 'Open Pair Computer on the other computer, then enter its address and the code it shows.'});
+        const remote = new Adw.EntryRow({title: 'IP address'});
+        const entered = new Adw.EntryRow({title: 'Its setup code', input_purpose: Gtk.InputPurpose.DIGITS});
+        const connect = button('Pair', () => this._connect(remote.text, entered.text), ['suggested-action']);
+        other.add(remote);
+        other.add(entered);
+        other.add(connect);
+        page.add(other);
+        const nearby = new Adw.PreferencesGroup({title: 'Nearby computers'});
         page.add(nearby);
-        const progress = new Adw.PreferencesGroup({visible: false});
-        const stage = new Adw.ActionRow({title: 'Waiting for another computer…', subtitle_lines: 0});
-        progress.add(stage);
-        page.add(progress);
-        const confirmation = new Adw.PreferencesGroup({title: 'Confirm on both computers', visible: false, description: 'Enter the code shown on the other computer. Enter this computer’s code on the other side.'});
-        const code = new Adw.ActionRow({title: '', subtitle: 'This computer’s code'});
-        code.add_css_class('numeric');
-        confirmation.add(code);
-        const name = new Adw.EntryRow({title: 'Computer name'});
-        const entered = new Adw.EntryRow({title: 'Other computer’s six-digit code', input_purpose: Gtk.InputPurpose.DIGITS});
-        confirmation.add(name);
-        confirmation.add(entered);
-        const confirm = button('Pair Computer', () => this._run({command: 'pair_confirm', name: name.text.trim(), code: entered.text.trim()}), ['suggested-action']);
-        confirmation.add(confirm);
-        page.add(confirmation);
-        const issueGroup = new Adw.PreferencesGroup();
-        const issue = new Adw.ActionRow({title: 'Pairing needs attention', visible: false, subtitle_lines: 0});
-        issueGroup.add(issue);
-        page.add(issueGroup);
-        const cancel = button('Cancel Pairing', async () => {
-            if (await this._run({command: 'pair_cancel'})) this._pairOwned = false;
-        });
-        progress.add(cancel);
-        this._pairing = {dialog, setup, progress, stage, confirmation, code, name, entered, confirm, nearby, rows: [], nearbyKey: '', lastState: '', issue, cancel};
+        const result = new Adw.PreferencesGroup();
+        const stage = new Adw.ActionRow({title: '', visible: false, subtitle_lines: 0});
+        result.add(stage);
+        page.add(result);
+        this._pairing = {dialog, code, renew, remote, entered, connect, stage, nearby, rows: [], nearbyKey: ''};
         dialog.connect('closed', () => {
             this._pairing = null;
             if (this._pairOwned) {
@@ -177,41 +171,51 @@ export class Settings {
         });
         dialog.present(this.window);
         this._updatePairing(this.client.snapshot ?? {});
+        // Showing a code is the usual case: the Mac types it.
+        this._listen();
     }
 
-    async _startPair(remote) {
-        if (remote !== null && !remote) { this._showError('Enter an IP address and port, for example 192.168.1.20:43120.'); return; }
-        this._pendingPair = this._run({command: 'pair', remote});
+    _listen() {
+        return this._startPair({command: 'pair', remote: null});
+    }
+
+    _connect(remote, code) {
+        remote = remote.trim();
+        if (!remote) { this._showError('Enter the other computer’s IP address.'); return Promise.resolve(false); }
+        return this._startPair({command: 'pair', remote, code: code.replace(/[\s-]/g, '')});
+    }
+
+    async _startPair(request) {
+        // One pairing runs at a time, so a new request replaces the code on screen.
+        if (this._pairOwned) {
+            this._pairOwned = false;
+            await this.client.call({command: 'pair_cancel'}).catch(() => {});
+        }
+        this._pendingPair = this._run(request);
         const started = await this._pendingPair;
         this._pendingPair = null;
         if (started && (!this._pairing || this._disposed)) {
             await this.client.call({command: 'pair_cancel'}).catch(() => {});
-            return;
+            return false;
         }
         this._pairOwned = started;
+        return started;
     }
 
     _updatePairing(snapshot) {
         const ui = this._pairing;
         if (!ui) return;
         const pairing = snapshot.pairing ?? {state: 'idle'};
-        const active = ['waiting', 'confirm', 'saving'].includes(pairing.state);
-        ui.setup.visible = !active && pairing.state !== 'paired';
-        ui.nearby.visible = ui.setup.visible;
-        ui.progress.visible = active || pairing.state === 'paired';
-        ui.confirmation.visible = pairing.state === 'confirm' || pairing.state === 'saving';
-        ui.confirm.sensitive = pairing.state === 'confirm' && !this._busy;
-        ui.cancel.visible = active;
-        ui.stage.title = {waiting: 'Waiting for another computer…', confirm: 'Check the codes on both computers', saving: 'Pairing…', paired: 'Computer paired'}[pairing.state] ?? '';
-        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window and arrange your computers on the sending Mac.' : '';
-        if (pairing.state === 'confirm' && ui.lastState !== 'confirm') {
-            ui.code.title = pairing.code ?? '';
-            ui.name.text = pairing.name ?? '';
-            ui.entered.text = '';
-        }
-        ui.lastState = pairing.state;
-        ui.issue.visible = !!(pairing.error || this._actionError);
-        ui.issue.subtitle = pairing.error || this._actionError || '';
+        const listening = pairing.state === 'listening';
+        const connecting = pairing.state === 'connecting';
+        ui.code.label = listening ? (pairing.code ?? '…') : 'No code shown';
+        ui.code.sensitive = listening;
+        ui.renew.visible = !listening && !connecting;
+        ui.connect.sensitive = !connecting && !this._busy;
+        const issue = pairing.error || this._actionError;
+        ui.stage.visible = connecting || pairing.state === 'paired' || !!issue;
+        ui.stage.title = connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
+        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange your computers in zflow on the Mac.' : connecting ? '' : issue || '';
         const key = JSON.stringify([snapshot.nearby, snapshot.discovery_error]);
         if (key !== ui.nearbyKey) {
             ui.nearbyKey = key;
@@ -219,18 +223,20 @@ export class Settings {
             ui.rows = [];
             for (const record of snapshot.nearby ?? []) {
                 const address = record.addresses[0];
-                const row = new Adw.ActionRow({title: address, subtitle: record.compatible ? 'Available on your network' : 'Update zflow on this computer', use_markup: false});
-                const connect = button('Connect', () => {
-                    const separator = address.lastIndexOf(':');
-                    this._startPair(`${address.slice(0, separator)}:43120`);
+                const separator = address.lastIndexOf(':');
+                const row = new Adw.ActionRow({title: address.slice(0, separator), subtitle: record.compatible ? 'Available on your network' : 'Update zflow on this computer', use_markup: false});
+                const use = button('Use', () => {
+                    // Receivers advertise their input port; pairing listens on 43120.
+                    ui.remote.text = `${address.slice(0, separator)}:43120`;
+                    ui.entered.grab_focus();
                 });
-                connect.sensitive = record.compatible;
-                row.add_suffix(connect);
+                use.sensitive = record.compatible;
+                row.add_suffix(use);
                 ui.nearby.add(row);
                 ui.rows.push(row);
             }
             if (!ui.rows.length) {
-                const row = new Adw.ActionRow({title: 'No computers found', subtitle: snapshot.discovery_error || 'You can wait for a connection or enter an address.', subtitle_lines: 0});
+                const row = new Adw.ActionRow({title: 'No other computers found', subtitle: snapshot.discovery_error || 'You can enter an address instead.', subtitle_lines: 0});
                 ui.nearby.add(row);
                 ui.rows.push(row);
             }

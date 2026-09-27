@@ -57,8 +57,10 @@ pub enum TransportError {
     PairingFrameTooLarge { actual: usize, maximum: usize },
     #[error("message family is not allowed on the pairing-only stream")]
     InvalidPairingFamily,
-    #[error("peer revealed a pairing offer that does not match its commitment")]
-    PairingCommitmentMismatch,
+    #[error("the setup code did not match")]
+    PairingCodeMismatch,
+    #[error("peer sent an invalid pairing key exchange")]
+    PairingKeyExchange,
 }
 
 impl From<quinn::ConnectionError> for TransportError {
