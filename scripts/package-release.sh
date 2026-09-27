@@ -20,7 +20,12 @@ case "$target" in
             cp -R "$root/packaging/$directory" "$stage/$name/packaging/"
         done
         ;;
-    x86_64-apple-darwin|aarch64-apple-darwin)
+    universal-apple-darwin)
+        for executable in "$binary_dir/zflow.app/Contents/MacOS/"*; do
+            for arch in arm64 x86_64; do
+                lipo "$executable" -verify_arch "$arch" || { printf '%s has no %s code\n' "$executable" "$arch" >&2; exit 1; }
+            done
+        done
         codesign --verify --strict --deep "$binary_dir/zflow.app"
         ditto "$binary_dir/zflow.app" "$stage/$name/zflow.app"
         ;;
