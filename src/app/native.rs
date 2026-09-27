@@ -6,7 +6,7 @@ use super::{
     pairing::Pairing,
     sharing::{self, Observer},
 };
-use crate::macos::{LinkState, Links};
+use crate::macos::{LinkState, Links, LocalNetwork};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,6 +19,9 @@ use std::{
 
 const MAINTENANCE: Duration = Duration::from_secs(2);
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5);
+/// Once allowed, the probe only watches for access being turned off, and each
+/// probe that goes through is a packet on the network.
+const LOCAL_NETWORK_RECHECK: Duration = Duration::from_secs(60);
 /// Each refused tap leaks a Mach port inside CoreGraphics.
 const TAP_RECHECK: Duration = Duration::from_secs(10);
 
@@ -57,6 +60,8 @@ pub(crate) enum Request {
     Retry,
     /// Rechecks Accessibility now instead of at the next maintenance tick.
     CheckAccessibility,
+    /// Starts looking for computers and checks Local Network access now.
+    Discover,
 }
 
 pub(crate) struct NativeApp {
@@ -72,6 +77,10 @@ pub(crate) struct NativeApp {
     desktops: BTreeMap<String, (u32, u32)>,
     accessibility: bool,
     tap_refused: Option<Instant>,
+    /// Set once setup asks to look for computers.
+    discover: bool,
+    local_network: LocalNetwork,
+    local_network_checked: Instant,
     helper_ready: bool,
     emergency_paused: bool,
     config_error: Option<String>,
@@ -99,6 +108,9 @@ impl NativeApp {
             desktops: BTreeMap::new(),
             accessibility: crate::macos::accessibility_authorized(false),
             tap_refused: None,
+            discover: false,
+            local_network: LocalNetwork::Unknown,
+            local_network_checked: Instant::now(),
             helper_ready: false,
             emergency_paused: false,
             config_error: None,
@@ -183,6 +195,13 @@ impl NativeApp {
                 self.restart();
             }
             Request::CheckAccessibility => self.accessibility = self.accessibility_granted(),
+            Request::Discover => {
+                self.discover = true;
+                self.sync_discovery();
+                if self.discovers() {
+                    self.check_local_network();
+                }
+            }
         }
         Ok(self.snapshot())
     }
@@ -207,6 +226,38 @@ impl NativeApp {
         let allowed = crate::macos::event_tap_allowed();
         self.tap_refused = (!allowed).then(Instant::now);
         allowed
+    }
+
+    /// macOS asks for Local Network access on the first send to the network,
+    /// so nothing is sent until the setup step that explains it, or until a
+    /// paired computer needs the network anyway.
+    fn discovers(&self) -> bool {
+        let config = self.document.saved();
+        config.transport.discovery && (self.discover || !config.peers.is_empty())
+    }
+
+    fn sync_discovery(&mut self) {
+        if self.discovers() {
+            self.nearby.start();
+        } else {
+            self.nearby.stop();
+            self.local_network = LocalNetwork::Unknown;
+        }
+        self.links.set_nearby(self.nearby_addresses());
+    }
+
+    fn check_local_network(&mut self) {
+        let previous = std::mem::replace(
+            &mut self.local_network,
+            crate::macos::local_network_access(),
+        );
+        self.local_network_checked = Instant::now();
+        // Queries sent while access was off were dropped, and the browser
+        // waits longer before each retry. A new one asks again at once.
+        if previous == LocalNetwork::Blocked && self.local_network == LocalNetwork::Allowed {
+            self.nearby.stop();
+            self.sync_discovery();
+        }
     }
 
     fn save_config(&mut self) -> Result<()> {
@@ -283,12 +334,13 @@ impl NativeApp {
             // Also a fallback for display and permission changes that sent no callback.
             sharing::forget_geometry();
             self.accessibility = self.accessibility_granted();
-            if self.document.saved().transport.discovery {
-                self.nearby.start();
-            } else {
-                self.nearby.stop();
+            self.sync_discovery();
+            if self.discovers()
+                && (self.local_network != LocalNetwork::Allowed
+                    || self.local_network_checked.elapsed() >= LOCAL_NETWORK_RECHECK)
+            {
+                self.check_local_network();
             }
-            self.links.set_nearby(self.nearby_addresses());
             if let Err(error) = self.sync_layout() {
                 self.layout_error = Some(format!("{error:#}"));
             }
@@ -483,6 +535,7 @@ impl NativeApp {
             "nearby":self.nearby.snapshot().records.values().collect::<Vec<_>>(),
             "config_error":self.config_error,"layout_error":self.layout_error.as_ref().or(layout_issue.as_ref()),
             "receiver_error":receiver_error,"receiver_checked":ready && receiver_error.is_none(),"checking":checking,
+            "local_network":self.local_network,
         })
     }
 }
@@ -507,5 +560,25 @@ mod tests {
             assert_eq!(app.helper_ready, ready);
             assert_eq!(app.retry_at, armed_at);
         }
+    }
+
+    #[test]
+    fn network_waits_for_setup_or_a_paired_computer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        // Discovery is on by default; only the missing peers hold it back.
+        std::fs::write(&path, "[macos]\nsharing = true\n").unwrap();
+        let mut app = NativeApp::open(path).unwrap();
+        app.tick();
+        assert!(!app.discovers());
+        assert!(!app.nearby.is_running());
+        assert_eq!(app.local_network, LocalNetwork::Unknown);
+        // With discovery off, setup's request sends nothing either.
+        app.document.draft.transport.discovery = false;
+        app.save_config().unwrap();
+        let snapshot = app.request(Request::Discover).unwrap();
+        assert!(app.discover && !app.discovers());
+        assert!(!app.nearby.is_running());
+        assert_eq!(snapshot["local_network"], "unknown");
     }
 }

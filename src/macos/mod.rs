@@ -2,6 +2,7 @@
 
 mod awdl;
 mod link;
+mod local_network;
 
 use std::{
     ffi::CStr,
@@ -29,6 +30,7 @@ use crate::{
 };
 
 pub use link::{Crossing, LinkState, Links};
+pub use local_network::{LocalNetwork, local_network_access};
 
 // Yield to the session between batches so a backlog after a stall cannot
 // overflow its 512-command queue in one burst.

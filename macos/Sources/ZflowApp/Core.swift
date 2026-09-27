@@ -40,6 +40,8 @@ struct Snapshot: Decodable, Sendable {
   var receiverError: String?
   var receiverChecked: Bool
   var checking: Bool
+  /// "allowed", "blocked", or "unknown" until setup asks to find computers.
+  var localNetwork: String
 
   var title: String {
     switch status {
