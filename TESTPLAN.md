@@ -103,7 +103,7 @@ Native UI and live matrix:
 - Launch an isolated bundle configuration with sharing paused. Check menu
   actions, native Settings, keyboard focus, health popover, pairing sheet,
   AWDL switch, automatic window sizing, and light/dark system appearance.
-- Pair through both six-digit confirmations; cancellation must never save trust.
+- Pair by typing the receiver's setup code on the Mac; a wrong code or a cancelled pairing must never save trust, and three wrong codes stop the listener.
 - Drag computers in all directions, including offsets. Check snapping,
   overlap rejection, reopening, and external layout conflicts.
 - Check first launch, malformed/deleted TOML, correction, GUI writes preserving

@@ -36,11 +36,14 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
             break;
         case 'set_autostart': snapshot.autostart = request.enabled; break;
         case 'forget': delete snapshot.daemon.peers[request.name]; break;
-        case 'pair': snapshot.pairing = {state: 'confirm', name: 'Mac mini', code: '123456'}; break;
-        case 'pair_confirm':
-            assert(request.code === '123456', 'confirmation must forward the entered code');
-            snapshot.pairing = {state: 'paired'};
-            snapshot.daemon.peers[request.name] = {};
+        case 'pair':
+            if (request.remote === null) {
+                snapshot.pairing = {state: 'listening', code: '482 913'};
+            } else {
+                assert(request.remote === '192.0.2.7' && request.code === '123456', 'connecting forwards the address and the typed code');
+                snapshot.pairing = {state: 'paired', name: 'Mac mini'};
+                snapshot.daemon.peers['Mac mini'] = {};
+            }
             break;
         case 'pair_cancel': snapshot.pairing = {state: 'idle'}; break;
         default: throw new Error(`Unexpected request ${request.command}`);
@@ -75,21 +78,29 @@ app.connect('activate', () => {
         failSharing = false;
         settings._login.active = false;
         await waitFor(() => !snapshot.autostart && !settings._busy);
+        assert(!settings._pairing, 'a computer with peers does not open pairing by itself');
         settings._openPairing();
-        await settings._startPair(null);
-        await waitFor(() => settings._pairing.confirmation.visible);
-        settings._pairing.entered.text = '123456';
-        settings._pairing.confirm.emit('clicked');
+        await waitFor(() => settings._pairing.code.label === '482 913' && !settings._busy);
+        settings._pairing.remote.text = '192.0.2.7';
+        settings._pairing.entered.text = '123 456';
+        settings._pairing.connect.emit('clicked');
         await waitFor(() => snapshot.pairing.state === 'paired' && !settings._busy);
-        assert(snapshot.daemon.peers['Mac mini'] !== undefined, 'pairing saves confirmed name');
+        assert(snapshot.daemon.peers['Mac mini'] !== undefined, 'pairing saves the other computer');
+        await waitFor(() => settings._pairing.stage.title === 'Paired with Mac mini');
         settings._pairing.dialog.close();
         await waitFor(() => settings._pairing === null && snapshot.pairing.state === 'idle');
-        settings._openPairing();
-        await settings._startPair(null);
-        settings._pairing.dialog.close();
-        await waitFor(() => snapshot.pairing.state === 'idle');
         await settings._run({command: 'forget', name: 'MacBook'});
+        await settings._run({command: 'forget', name: 'Mac mini'});
         assert(!snapshot.daemon.peers.MacBook, 'forget uses daemon API');
+        const freshWindow = new Adw.ApplicationWindow({application: app, default_width: 520, default_height: 640});
+        const fresh = new Settings(freshWindow);
+        freshWindow.content = fresh.page;
+        freshWindow.present();
+        await waitFor(() => fresh._pairing !== null && snapshot.pairing.state === 'listening' && fresh._pairing.code.label === '482 913');
+        fresh._pairing.dialog.close();
+        await waitFor(() => snapshot.pairing.state === 'idle');
+        fresh.destroy();
+        freshWindow.close();
         snapshot.daemon = null;
         snapshot.error = 'Start the zflow system service';
         await settings.client.refresh();
@@ -100,7 +111,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, focus, pause, rollback, login, pairing, cancel, forget, offline and cleanup passed');
+        print('GTK settings: status, focus, pause, rollback, login, pairing, first-run pairing, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

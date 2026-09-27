@@ -9,9 +9,12 @@ use std::{
 };
 
 use bytes::Bytes;
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt};
 use rustls::pki_types::CertificateDer;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
+use spake2::{Ed25519Group, Spake2};
 use tokio::sync::Notify;
 
 use crate::{
@@ -32,12 +35,20 @@ use super::{
 const SERVER_NAME_PLACEHOLDER: &str = "zflow.invalid";
 const CONTROL_STREAM_PREFACE: &[u8] = b"zflow-control\0";
 const PAIRING_STREAM_PREFACE: &[u8] = b"zflow-pair\0";
-const PAIRING_COMMITMENT_LABEL: &[u8] = b"zflow pairing commitment v2\0";
+const PAIRING_PASSWORD_LABEL: &[u8] = b"zflow pairing setup code v4\0";
+const PAIRING_TRANSCRIPT_LABEL: &[u8] = b"zflow pairing transcript v4\0";
+const PAIRING_CLIENT_PROOF_LABEL: &[u8] = b"zflow pairing client proof v4";
+const PAIRING_SERVER_PROOF_LABEL: &[u8] = b"zflow pairing server proof v4";
+/// One side byte plus a compressed Ed25519 point.
+const PAIRING_KEY_EXCHANGE_BYTES: usize = 33;
+const PAIRING_PROOF_BYTES: usize = 32;
 const MAX_CONTROL_FRAME_BYTES: usize = MAX_RELIABLE_PAYLOAD_BYTES + 64;
 const MAX_PAIRING_FRAME_BYTES: usize = MAX_PAIRING_PAYLOAD_BYTES + 64;
 const CRITICAL_STREAM_ERROR: VarInt = VarInt::from_u32(0x100);
 const PROTOCOL_ERROR: VarInt = VarInt::from_u32(0x101);
-const PAIRING_EXPORTER_LABEL: &[u8] = b"EXPORTER-zflow-pairing-v1";
+/// Tells the initiator its setup code was wrong rather than the network lost.
+const PAIRING_CODE_MISMATCH: VarInt = VarInt::from_u32(0x102);
+const PAIRING_EXPORTER_LABEL: &[u8] = b"EXPORTER-zflow-pairing-v2";
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,8 +677,8 @@ impl PairingConnection {
         &self.peer_spki
     }
 
-    /// A handshake-unique value for the pairing transcript/SAS calculation.
-    pub fn transcript_binding(&self) -> Result<[u8; 32], TransportError> {
+    /// A handshake-unique value that ties the pairing proofs to this TLS session.
+    fn transcript_binding(&self) -> Result<[u8; 32], TransportError> {
         let mut binding = [0_u8; 32];
         self.connection
             .export_keying_material(&mut binding, PAIRING_EXPORTER_LABEL, b"")
@@ -679,46 +690,151 @@ impl PairingConnection {
         self.connection.remote_address()
     }
 
-    /// Exchange bounded offers by commit then reveal on the one pairing stream.
+    /// Proves both sides know the setup code, then returns the peer's offer.
     ///
-    /// The initiator sends a hash of its offer, the responder answers with its
-    /// offer, and only then does the initiator reveal. Each side fixes its offer
-    /// before it sees the other one, so a man in the middle cannot search for
-    /// offers that make the codes on both screens match.
-    pub async fn exchange_offer(
+    /// SPAKE2 turns the six-digit code into a shared key without exposing the
+    /// code to offline guessing. The initiator proves the key first and the
+    /// listener answers only after checking that proof, so each connection
+    /// tests one guess. Both proofs cover the TLS exporter, both presented
+    /// keys, both offers and both key-exchange messages, so a relay between
+    /// two TLS sessions cannot make them match.
+    pub async fn authenticate(
         &mut self,
+        local_spki: &[u8],
         local: &PairingOffer,
+        code: &[u8],
     ) -> Result<PairingOffer, TransportError> {
-        let encoded = encode_wire(&WireMessage::Pairing(local.clone()))?;
-        if encoded.len() > MAX_PAIRING_FRAME_BYTES {
+        let local_frame = encode_wire(&WireMessage::Pairing(local.clone()))?;
+        if local_frame.len() > MAX_PAIRING_FRAME_BYTES {
             return Err(TransportError::PairingFrameTooLarge {
-                actual: encoded.len(),
+                actual: local_frame.len(),
                 maximum: MAX_PAIRING_FRAME_BYTES,
             });
         }
+        let binding = self.transcript_binding()?;
+        let peer_spki = self.peer_spki.clone();
+        let (client_spki, server_spki) = match self.role {
+            PairingRole::Client => (local_spki, peer_spki.as_ref()),
+            PairingRole::Server => (peer_spki.as_ref(), local_spki),
+        };
+        let password = spake2::Password::new([PAIRING_PASSWORD_LABEL, code].concat());
+        let client_id = spake2::Identity::new(client_spki);
+        let server_id = spake2::Identity::new(server_spki);
         match self.role {
             PairingRole::Client => {
-                self.write(&pairing_commitment(&encoded)).await?;
-                let frame = self.read_frame().await?;
-                let peer = self.decode_offer(&frame)?;
-                self.write_frame(&encoded).await?;
+                let (exchange, client_message) =
+                    Spake2::<Ed25519Group>::start_a(&password, &client_id, &server_id);
+                self.write_frame(&local_frame).await?;
+                self.write(&client_message).await?;
+                let peer_frame = self.read_frame().await?;
+                let peer = self.decode_offer(&peer_frame)?;
+                let mut server_message = [0_u8; PAIRING_KEY_EXCHANGE_BYTES];
+                self.read_exact(&mut server_message).await?;
+                let proofs = self.proof_keys(exchange, &server_message, &binding)?;
+                let transcript = pairing_transcript(
+                    &binding,
+                    [
+                        client_spki,
+                        server_spki,
+                        &local_frame,
+                        &peer_frame,
+                        &client_message,
+                        &server_message,
+                    ],
+                );
+                self.write(&proofs.sign(PairingRole::Client, &transcript))
+                    .await?;
+                let mut proof = [0_u8; PAIRING_PROOF_BYTES];
+                if let Err(error) = self.read_exact(&mut proof).await {
+                    return Err(if self.closed_for_wrong_code() {
+                        TransportError::PairingCodeMismatch
+                    } else {
+                        error
+                    });
+                }
+                if !proofs.verify(PairingRole::Server, &transcript, &proof) {
+                    close_protocol(&self.connection, b"pairing proof mismatch");
+                    return Err(TransportError::PairingCodeMismatch);
+                }
                 Ok(peer)
             }
             PairingRole::Server => {
-                let mut commitment = [0_u8; 32];
-                self.read_exact(&mut commitment).await?;
-                self.write_frame(&encoded).await?;
-                let frame = self.read_frame().await?;
-                if pairing_commitment(&frame) != commitment {
-                    close_protocol(
-                        &self.connection,
-                        b"pairing offer does not match its commitment",
-                    );
-                    return Err(TransportError::PairingCommitmentMismatch);
+                let peer_frame = self.read_frame().await?;
+                let peer = self.decode_offer(&peer_frame)?;
+                let mut client_message = [0_u8; PAIRING_KEY_EXCHANGE_BYTES];
+                self.read_exact(&mut client_message).await?;
+                let (exchange, server_message) =
+                    Spake2::<Ed25519Group>::start_b(&password, &client_id, &server_id);
+                let proofs = self.proof_keys(exchange, &client_message, &binding)?;
+                self.write_frame(&local_frame).await?;
+                self.write(&server_message).await?;
+                let transcript = pairing_transcript(
+                    &binding,
+                    [
+                        client_spki,
+                        server_spki,
+                        &peer_frame,
+                        &local_frame,
+                        &client_message,
+                        &server_message,
+                    ],
+                );
+                let mut proof = [0_u8; PAIRING_PROOF_BYTES];
+                self.read_exact(&mut proof).await?;
+                if !proofs.verify(PairingRole::Client, &transcript, &proof) {
+                    self.connection
+                        .close(PAIRING_CODE_MISMATCH, b"wrong setup code");
+                    return Err(TransportError::PairingCodeMismatch);
                 }
-                self.decode_offer(&frame)
+                self.write(&proofs.sign(PairingRole::Server, &transcript))
+                    .await?;
+                Ok(peer)
             }
         }
+    }
+
+    /// The listener says whether it kept the pairing, so the initiator saves
+    /// the peer only when both computers will trust each other. The listener
+    /// then waits briefly for the initiator to close, so the answer arrives.
+    pub async fn finish(&mut self, saved: bool) -> Result<(), TransportError> {
+        match self.role {
+            PairingRole::Client => self.close(),
+            PairingRole::Server => {
+                self.write(&[u8::from(saved)]).await?;
+                let _ = self.send.finish();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), self.connection.closed()).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the listener's answer from [`Self::finish`].
+    pub async fn read_saved(&mut self) -> Result<bool, TransportError> {
+        let mut saved = [0_u8; 1];
+        self.read_exact(&mut saved).await?;
+        Ok(saved == [1])
+    }
+
+    fn proof_keys(
+        &self,
+        exchange: Spake2<Ed25519Group>,
+        peer_message: &[u8],
+        binding: &[u8; 32],
+    ) -> Result<PairingProofKeys, TransportError> {
+        let shared = exchange.finish(peer_message).map_err(|_| {
+            close_protocol(&self.connection, b"invalid pairing key exchange");
+            TransportError::PairingKeyExchange
+        })?;
+        Ok(PairingProofKeys::derive(&shared, binding))
+    }
+
+    fn closed_for_wrong_code(&self) -> bool {
+        matches!(
+            self.connection.close_reason(),
+            Some(quinn::ConnectionError::ApplicationClosed(close))
+                if close.error_code == PAIRING_CODE_MISMATCH
+        )
     }
 
     fn decode_offer(&self, frame: &[u8]) -> Result<PairingOffer, TransportError> {
@@ -849,12 +965,50 @@ fn verify_connection(
     Ok(presented)
 }
 
-fn pairing_commitment(encoded_offer: &[u8]) -> [u8; 32] {
-    Sha256::new()
-        .chain_update(PAIRING_COMMITMENT_LABEL)
-        .chain_update(encoded_offer)
-        .finalize()
-        .into()
+/// Proof keys from the SPAKE2 secret, salted with the TLS exporter.
+struct PairingProofKeys {
+    client: [u8; 32],
+    server: [u8; 32],
+}
+
+impl PairingProofKeys {
+    fn derive(shared: &[u8], binding: &[u8; 32]) -> Self {
+        let keys = Hkdf::<Sha256>::new(Some(binding), shared);
+        let mut client = [0_u8; 32];
+        let mut server = [0_u8; 32];
+        keys.expand(PAIRING_CLIENT_PROOF_LABEL, &mut client)
+            .expect("32 bytes is a valid HKDF-SHA256 output");
+        keys.expand(PAIRING_SERVER_PROOF_LABEL, &mut server)
+            .expect("32 bytes is a valid HKDF-SHA256 output");
+        Self { client, server }
+    }
+
+    fn mac(&self, role: PairingRole, transcript: &[u8]) -> Hmac<Sha256> {
+        let key = match role {
+            PairingRole::Client => &self.client,
+            PairingRole::Server => &self.server,
+        };
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+        mac.update(transcript);
+        mac
+    }
+
+    fn sign(&self, role: PairingRole, transcript: &[u8]) -> [u8; PAIRING_PROOF_BYTES] {
+        self.mac(role, transcript).finalize().into_bytes().into()
+    }
+
+    fn verify(&self, role: PairingRole, transcript: &[u8], proof: &[u8]) -> bool {
+        self.mac(role, transcript).verify_slice(proof).is_ok()
+    }
+}
+
+fn pairing_transcript(binding: &[u8; 32], parts: [&[u8]; 6]) -> Vec<u8> {
+    let mut transcript = [PAIRING_TRANSCRIPT_LABEL, binding].concat();
+    for part in parts {
+        transcript.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        transcript.extend_from_slice(part);
+    }
+    transcript
 }
 
 fn close_critical(connection: &Connection, reason: &'static [u8]) {
@@ -942,86 +1096,106 @@ mod pairing_tests {
         transport::{pairing_client_config, pairing_server_config},
     };
 
+    const LOOPBACK: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
     fn offer(label: &str) -> PairingOffer {
         PairingOffer {
-            handshake_nonce: [0x11; 32],
             device_label: Some(label.into()),
             input_port: 43119,
             input_candidates: Vec::new(),
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn listener_answers_each_attempt_with_a_new_nonce() {
-        let client_directory = tempfile::tempdir().unwrap();
-        let server_directory = tempfile::tempdir().unwrap();
-        let client_identity = Identity::load_or_create(client_directory.path()).unwrap();
-        let server_identity = Identity::load_or_create(server_directory.path()).unwrap();
-        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let listener_offer = crate::pairing::make_offer(None, 43119, Vec::new()).unwrap();
-        let listener =
-            crate::pairing::PairingListener::bind(&server_identity, loopback, listener_offer)
-                .unwrap();
-        let address = listener.local_addr().unwrap();
-        let client_config = pairing_client_config(&client_identity).unwrap();
-        let client_endpoint = Endpoint::client(loopback).unwrap();
+    fn identity() -> (tempfile::TempDir, Identity) {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(directory.path()).unwrap();
+        (directory, identity)
+    }
 
-        // A peer that reads the listener's offer and then fails on purpose
-        // must not see the same offer on its next try.
-        let committed = encode_wire(&WireMessage::Pairing(offer("committed"))).unwrap();
-        let revealed = encode_wire(&WireMessage::Pairing(offer("revealed"))).unwrap();
-        let attempts = async {
-            let mut seen = Vec::new();
-            for _ in 0..2 {
-                let mut client = connect_pairing(&client_endpoint, address, &client_config)
-                    .await
-                    .unwrap();
-                client.write(&pairing_commitment(&committed)).await.unwrap();
-                seen.push(client.read_frame().await.unwrap());
-                client.write_frame(&revealed).await.unwrap();
-                let _ = client.connection.closed().await;
-            }
-            seen
-        };
-        let seen = tokio::select! {
-            seen = attempts => seen,
-            _ = listener.accept() => panic!("listener accepted a mismatched reveal"),
-        };
-        assert_ne!(seen[0], seen[1]);
+    /// One pairing connection from `client` to a fresh listener for `server`.
+    async fn connected(
+        client: &Identity,
+        server: &Identity,
+    ) -> (PairingConnection, PairingConnection) {
+        let server_config = pairing_server_config(server).unwrap();
+        let server_endpoint = Endpoint::server(server_config.quinn_config(), LOOPBACK).unwrap();
+        let address = server_endpoint.local_addr().unwrap();
+        let client_endpoint = Endpoint::client(LOOPBACK).unwrap();
+        let client_config = pairing_client_config(client).unwrap();
+        let (client, server) = tokio::join!(
+            connect_pairing(&client_endpoint, address, &client_config),
+            async { accept_pairing(server_endpoint.accept().await.unwrap()).await }
+        );
+        (client.unwrap(), server.unwrap())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn responder_rejects_an_offer_that_does_not_match_the_commitment() {
-        let client_directory = tempfile::tempdir().unwrap();
-        let server_directory = tempfile::tempdir().unwrap();
-        let client_identity = Identity::load_or_create(client_directory.path()).unwrap();
-        let server_identity = Identity::load_or_create(server_directory.path()).unwrap();
-        let client_config = pairing_client_config(&client_identity).unwrap();
-        let server_config = pairing_server_config(&server_identity).unwrap();
-        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let server_endpoint = Endpoint::server(server_config.quinn_config(), loopback).unwrap();
-        let server_address = server_endpoint.local_addr().unwrap();
-        let client_endpoint = Endpoint::client(loopback).unwrap();
-        let (client, server) = tokio::join!(
-            connect_pairing(&client_endpoint, server_address, &client_config),
-            async { accept_pairing(server_endpoint.accept().await.unwrap()).await }
+    async fn matching_codes_authenticate_both_sides_and_report_the_save() {
+        let (_c, client_identity) = identity();
+        let (_s, server_identity) = identity();
+        let (mut client, mut server) = connected(&client_identity, &server_identity).await;
+        let (client_offer, server_offer) = (offer("client"), offer("server"));
+        let (seen_by_client, seen_by_server) = tokio::join!(
+            client.authenticate(client_identity.spki(), &client_offer, b"482913"),
+            server.authenticate(server_identity.spki(), &server_offer, b"482913"),
         );
-        let (mut client, mut server) = (client.unwrap(), server.unwrap());
+        assert_eq!(seen_by_client.unwrap(), offer("server"));
+        assert_eq!(seen_by_server.unwrap(), offer("client"));
+        let (saved, finished) = tokio::join!(
+            async {
+                let saved = client.read_saved().await;
+                client.finish(true).await.unwrap();
+                saved
+            },
+            server.finish(true)
+        );
+        assert!(saved.unwrap());
+        finished.unwrap();
+    }
 
-        // A man in the middle commits to one offer, sees the responder's offer,
-        // then tries to reveal a different one.
-        let committed = encode_wire(&WireMessage::Pairing(offer("committed"))).unwrap();
-        let revealed = encode_wire(&WireMessage::Pairing(offer("revealed"))).unwrap();
-        let cheat = async {
-            client.write(&pairing_commitment(&committed)).await.unwrap();
-            client.read_frame().await.unwrap();
-            client.write_frame(&revealed).await.unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wrong_code_fails_on_both_sides_as_a_code_mismatch() {
+        let (_c, client_identity) = identity();
+        let (_s, server_identity) = identity();
+        let (mut client, mut server) = connected(&client_identity, &server_identity).await;
+        let (client_offer, server_offer) = (offer("client"), offer("server"));
+        let (client, server) = tokio::join!(
+            client.authenticate(client_identity.spki(), &client_offer, b"482913"),
+            server.authenticate(server_identity.spki(), &server_offer, b"482914"),
+        );
+        assert!(matches!(server, Err(TransportError::PairingCodeMismatch)));
+        assert!(matches!(client, Err(TransportError::PairingCodeMismatch)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_between_two_sessions_cannot_pair_even_with_the_right_code() {
+        let (_c, client_identity) = identity();
+        let (_s, server_identity) = identity();
+        let (_m, relay_identity) = identity();
+        // The relay terminates TLS on both sides and copies the pairing bytes.
+        let (mut client, mut relay_server) = connected(&client_identity, &relay_identity).await;
+        let (mut relay_client, mut server) = connected(&relay_identity, &server_identity).await;
+        let (client_offer, server_offer) = (offer("client"), offer("server"));
+        let relay = async {
+            tokio::select! {
+                _ = tokio::io::copy(&mut relay_server.receive, &mut relay_client.send) => {}
+                _ = tokio::io::copy(&mut relay_client.receive, &mut relay_server.send) => {}
+            }
+            relay_server.close();
+            relay_client.close();
         };
-        let server_offer = offer("server");
-        let (result, ()) = tokio::join!(server.exchange_offer(&server_offer), cheat);
-        assert!(matches!(
-            result,
-            Err(TransportError::PairingCommitmentMismatch)
-        ));
+        let honest = async {
+            tokio::join!(
+                client.authenticate(client_identity.spki(), &client_offer, b"482913"),
+                server.authenticate(server_identity.spki(), &server_offer, b"482913"),
+            )
+        };
+        let ((client, server), ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(honest, relay)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(server, Err(TransportError::PairingCodeMismatch)));
+        assert!(client.is_err());
     }
 }
