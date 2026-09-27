@@ -225,9 +225,24 @@ class InstallerTest(unittest.TestCase):
                 self.assertIn(f"/releases/download/v0.1.0/zflow-v0.1.0-{target}.tar.gz", self.calls())
                 self.assertNotIn("latest", self.calls())
         # An arm64 Mac running this script under Rosetta still gets the native app.
-        output = self.run_shell('platform=Darwin; version=v0.1.0; select_artifact; echo "$asset"',
+        output = self.run_shell('platform=Darwin; version=v0.1.0; select_artifact; echo "$legacy_asset"',
                                 env={"ARCH": "x86_64", "ROSETTA": "1"})
         self.assertIn("zflow-v0.1.0-aarch64-apple-darwin.tar.gz", output)
+
+    def test_macos_prefers_universal_archive(self):
+        universal = self.release / "zflow-v0.1.0-universal-apple-darwin.tar.gz"
+        with tarfile.open(universal, "w:gz") as archive:
+            archive.add(self.source, arcname="zflow-release")
+        self.write_checksums()
+        for architecture in ("arm64", "x86_64"):
+            with self.subTest(architecture=architecture):
+                self.log.write_text("")
+                self.run_shell("main --yes --no-launch --version 0.1.0",
+                               before='install_macos() { test -d "$payload_dir/zflow.app"; }',
+                               env={"PLATFORM": "Darwin", "ARCH": architecture})
+                downloads = [line for line in self.calls().splitlines() if line.startswith("fetch ")]
+                self.assertEqual(len(downloads), 2)
+                self.assertTrue(downloads[1].endswith("/v0.1.0/zflow-v0.1.0-universal-apple-darwin.tar.gz"))
 
     def test_latest_resolution_is_pinned_for_all_downloads(self):
         self.run_shell("main --yes --headless")
