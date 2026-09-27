@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=zflow
+Comment=Connect zflow to the GNOME desktop
+Exec=/usr/bin/zflow desktop-agent
+TryExec=/usr/bin/zflow
+OnlyShowIn=GNOME;
+Terminal=false

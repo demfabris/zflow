@@ -17,10 +17,14 @@ override_dh_auto_install:
 	install -D -m 0644 packaging/udev/71-zflow-capture.rules debian/zflow/usr/share/zflow/71-zflow-capture.rules
 	install -D -m 0644 packaging/config/zflow.toml debian/zflow/usr/share/zflow/zflow.toml
 	install -D -m 0755 packaging/linux/host-setup.sh debian/zflow/usr/lib/zflow/host-setup.sh
+	install -D -m 0755 packaging/linux/firewall.sh debian/zflow/usr/lib/zflow/firewall.sh
 	install -D -m 0644 packaging/linux/io.zflow.zflow.desktop debian/zflow/usr/share/applications/io.zflow.zflow.desktop
 	install -D -m 0644 packaging/linux/io.zflow.Desktop.service debian/zflow/usr/share/dbus-1/services/io.zflow.Desktop.service
+	install -D -m 0644 packaging/linux/io.zflow.desktop-agent.desktop debian/zflow/etc/xdg/autostart/io.zflow.desktop-agent.desktop
+	# The same files scripts/pack-extension.sh uploads to extensions.gnome.org.
 	install -d debian/zflow/usr/share/gnome-shell/extensions/zflow@demfabris
-	install -m 0644 packaging/gnome-extension/*.js packaging/gnome-extension/metadata.json debian/zflow/usr/share/gnome-shell/extensions/zflow@demfabris/
+	install -m 0644 $(addprefix packaging/gnome-extension/,metadata.json extension.js indicator.js client.js settings.js prefs.js) \
+		debian/zflow/usr/share/gnome-shell/extensions/zflow@demfabris/
 
 override_dh_installsystemd:
 	dh_installsystemd --name=zflowd --restart-after-upgrade

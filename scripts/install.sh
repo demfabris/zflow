@@ -19,6 +19,11 @@ readonly VIRTUAL_RULE_FILE="$UDEV_RULE_DIR/70-zflow.rules"
 readonly CAPTURE_RULE_FILE="$UDEV_RULE_DIR/71-zflow-capture.rules"
 readonly MODULE_FILE="/etc/modules-load.d/zflow.conf"
 readonly SLEEP_HOOK_FILE="/usr/lib/systemd/system-sleep/zflow"
+readonly FIREWALL_SCRIPT="$LIB_DIR/firewall.sh"
+# Every GNOME user gets these; the session bus and desktop search /usr/local/share.
+readonly LAUNCHER_FILE="/usr/local/share/applications/io.zflow.zflow.desktop"
+readonly DBUS_SERVICE_FILE="/usr/local/share/dbus-1/services/io.zflow.Desktop.service"
+readonly AUTOSTART_FILE="/etc/xdg/autostart/io.zflow.desktop-agent.desktop"
 install_built=false
 
 die() {
@@ -36,6 +41,15 @@ require_regular_source() {
 
 refuse_symlink() {
     [[ ! -L "$1" ]] || die "refusing to replace symlink: $1"
+}
+
+# The shared session files name /usr/bin/zflow, where the Debian package puts it.
+install_session_file() {
+    refuse_symlink "$2"
+    install -d -o root -g root -m 0755 "${2%/*}"
+    sed 's|/usr/bin/zflow|/usr/local/bin/zflow|g' "$1" > "$2"
+    chown root:root "$2"
+    chmod 0644 "$2"
 }
 
 build_binaries() {
@@ -60,6 +74,10 @@ done
 for source in \
     "$SCRIPT_DIR/uninstall.sh" \
     "$REPO_ROOT/packaging/linux/host-setup.sh" \
+    "$REPO_ROOT/packaging/linux/firewall.sh" \
+    "$REPO_ROOT/packaging/linux/io.zflow.zflow.desktop" \
+    "$REPO_ROOT/packaging/linux/io.zflow.Desktop.service" \
+    "$REPO_ROOT/packaging/linux/io.zflow.desktop-agent.desktop" \
     "$REPO_ROOT/packaging/config/zflow.toml" \
     "$REPO_ROOT/packaging/modules-load.d/zflow.conf" \
     "$REPO_ROOT/packaging/system-sleep/zflow" \
@@ -82,7 +100,7 @@ if [[ "$install_built" == false ]]; then
     build_binaries
 fi
 
-for command in grep install systemctl systemd-analyze; do
+for command in grep install sed systemctl systemd-analyze; do
     require_command "$command"
 done
 
@@ -102,6 +120,7 @@ refuse_symlink "$MODULE_FILE"
 refuse_symlink "$SLEEP_HOOK_FILE"
 refuse_symlink "$LIB_DIR"
 refuse_symlink "$UNINSTALLER"
+refuse_symlink "$FIREWALL_SCRIPT"
 
 install -d -o root -g root -m 0755 \
     "$BIN_DIR" "$LIB_DIR" "$UDEV_RULE_DIR" /etc/modules-load.d /usr/lib/systemd/system-sleep
@@ -109,8 +128,12 @@ install -o root -g root -m 0755 "$binary_dir/zflow" "$BIN_DIR/zflow"
 install -o root -g root -m 0755 "$binary_dir/zflowd" "$BIN_DIR/zflowd"
 # Release archives are extracted to a temporary directory, so keep a copy of the uninstaller.
 install -o root -g root -m 0755 "$SCRIPT_DIR/uninstall.sh" "$UNINSTALLER"
-# Retire the old desktop launcher when upgrading an existing installation.
-rm -f -- "$BIN_DIR/zflow-gui" /usr/local/share/applications/io.zflow.zflow.desktop
+install -o root -g root -m 0755 "$REPO_ROOT/packaging/linux/firewall.sh" "$FIREWALL_SCRIPT"
+# Older installs had a separate desktop app.
+rm -f -- "$BIN_DIR/zflow-gui"
+install_session_file "$REPO_ROOT/packaging/linux/io.zflow.zflow.desktop" "$LAUNCHER_FILE"
+install_session_file "$REPO_ROOT/packaging/linux/io.zflow.Desktop.service" "$DBUS_SERVICE_FILE"
+install_session_file "$REPO_ROOT/packaging/linux/io.zflow.desktop-agent.desktop" "$AUTOSTART_FILE"
 # Keep the pre-login ordering only when the configuration enables pre-login input.
 if ! grep -Eqs '^[[:space:]]*allow_prelogin_input[[:space:]]*=[[:space:]]*true([[:space:]#]|$)' "$CONFIG_FILE"; then
     rm -f -- "$PRELOGIN_DROPIN"
@@ -124,6 +147,7 @@ install -o root -g root -m 0755 "$REPO_ROOT/packaging/system-sleep/zflow" "$SLEE
 # Run through bash so a noexec temporary directory still works.
 bash "$REPO_ROOT/packaging/linux/host-setup.sh" "$REPO_ROOT/packaging/config/zflow.toml" \
     "$REPO_ROOT/packaging/udev/71-zflow-capture.rules" "$VIRTUAL_RULE_FILE"
+bash "$FIREWALL_SCRIPT" open
 
 systemd-analyze verify "$UNIT_FILE"
 systemctl daemon-reload
@@ -146,6 +170,6 @@ printf 'Inspect logs with: journalctl -u zflowd.service -f\n'
 printf 'Remove zflow with: sudo %s\n' "$UNINSTALLER"
 printf 'Pre-login input stays disabled until you grant it during setup.\n'
 
-printf 'For GNOME handoff, run as your desktop user (without sudo):\n'
+printf 'GNOME users get the zflow launcher and start the desktop agent at login.\n'
+printf 'To add the GNOME extension and start the agent now, run as your desktop user (without sudo):\n'
 printf '  %s/zflow desktop-agent --install\n' "$BIN_DIR"
-printf '  %s/zflow settings\n' "$BIN_DIR"
