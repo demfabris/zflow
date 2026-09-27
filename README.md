@@ -27,11 +27,17 @@ apt, dnf, or pacman. GNOME settings need GJS, GTK 4.12+, and libadwaita 1.5+.
 System changes request administrator access once, through GNOME's password
 dialog when available, or `sudo` in the terminal.
 
-On macOS, the installer places `zflow.app` in `/Applications`. The release
-workflow signs Mac apps with Developer ID and notarizes them, but v0.1.0 was
-built before that: its Mac apps are ad-hoc signed. Input sharing works, but they
-can't install the optional AWDL helper. Releases built by the signing workflow
-can install it from the app with administrator approval.
+On macOS, download `zflow-vVERSION-macos.dmg` from
+[Releases](https://github.com/demfabris/zflow/releases/latest), open it, and
+drag zflow onto Applications. One image covers Apple silicon and Intel. To
+update, quit zflow and drag the new version over the old one. Releases after
+v0.1.0 include the image. The curl command also works on macOS: it places
+`zflow.app` in `/Applications` and replaces an older copy there.
+
+The release workflow signs Mac apps with Developer ID and notarizes them, but
+v0.1.0 was built before that: its Mac apps are ad-hoc signed. Input sharing works,
+but they can't install the optional AWDL helper. Releases built by the signing
+workflow can install it from the app with administrator approval.
 
 Repeat the command to update. It keeps your configuration and paired identities;
 updating the Linux service interrupts an active connection. Log out and back in
@@ -338,6 +344,7 @@ the problem to capture or playout behavior.
 ```sh
 just run mac                 # Build and open the native debug app
 just build mac               # Package the native release app
+just dmg                     # Pack it into a local disk image (--universal for both CPUs)
 just install-linux           # Install/update the Linux service
 just run linux               # Open native GNOME settings
 just debug mac               # Native app diagnostics under target/logs
