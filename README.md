@@ -73,8 +73,9 @@ dimensions, and return barriers.
 3. Enter the other computer's six-digit code on each side and confirm both.
    A network announcement alone never authorizes a computer.
 4. Use the health badge to allow Accessibility access. Allow Local Network
-   access when macOS asks. Arrange the computer tiles by dragging them until
-   the desired edges touch. Changes save automatically.
+   access when macOS asks. The receiver's tile is placed against the Mac's
+   right edge; drag the tiles only to change which edges touch. Changes save
+   automatically.
 5. Move through a touching edge with keys and mouse buttons released. Cross
    back from Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses
    sharing. Resume from the menu-bar menu when you are ready.
