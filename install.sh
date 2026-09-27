@@ -6,13 +6,14 @@ usage() {
     cat <<'USAGE'
 Usage: bash install.sh [options]
 
-  --yes                 Accept installation and runtime dependencies
   --version VERSION     Install a release tag (default: latest)
   --headless            Linux: install the service without GNOME integration
   --no-launch           Do not open the app after installation
+  --yes                 Accepted for older command lines; changes nothing
   -h, --help            Show this help
 
-Run as your normal user. Only system changes request administrator access.
+Run as your normal user. The administrator password prompt is the only
+confirmation; cancel it to stop without changing anything.
 USAGE
 }
 
@@ -204,6 +205,23 @@ select_artifact() {
     fi
 }
 
+# What happens next, printed before the password prompt that confirms it.
+describe_linux() {
+    if [[ "$use_deb" == true ]]; then
+        printf '  - the zflow command and the zflowd service, from %s and apt\n' "$asset"
+    else
+        linux_dependencies
+        printf '  - the zflow command and the zflowd service, under /usr/local\n'
+        printf '  - runtime packages from %s: %s\n' "$manager" "${packages[*]}"
+    fi
+    printf '  - a locked zflow system account that types remote input through /dev/uinput\n'
+    printf '  - an allow rule for UDP ports 43119 and 43120 when ufw or firewalld is on\n'
+    if [[ "$desktop" == true ]]; then
+        printf '  - for every GNOME user: the zflow launcher, and the desktop agent at login\n'
+        printf '  - for you: the zflow GNOME extension (GNOME asks before it downloads it)\n'
+    fi
+}
+
 install_linux() {
     say 'Installing the service. An existing zflow connection will disconnect during its restart.'
     local root_args=("$work_dir/$asset" "$checksum")
@@ -219,27 +237,16 @@ install_linux() {
     # cancelling it leaves nothing half installed.
     as_root bash -c "set -euo pipefail; $(declare -f die sha256_of root_install); root_install \"\$@\"" \
         zflow-install "${root_args[@]}"
-    if [[ "$desktop" == true ]]; then
-        say 'Installing GNOME integration for your desktop account…'
-        local output
-        if [[ "$use_deb" == true ]]; then
-            # The package owns the desktop files and extension under /usr/share.
-            gnome-extensions enable zflow@demfabris 2>/dev/null || true
-            say 'Enable Start at Login in Settings to start sharing on future logins.'
-        elif output=$("$installed_cli" desktop-agent --install </dev/null 2>&1); then
-            printf '%s\n' "$output"
-        else
-            printf '%s\n' "$output" >&2
-            # The CLI reports this only after writing all assets, if Shell cannot enable them yet.
-            [[ "$output" == *'Integration installed.'* ]] \
-                || die 'The service is installed, but desktop setup failed. Run zflow desktop-agent --install after correcting the error above.'
-        fi
-        say 'Log out and back in to load the GNOME extension. Enable zflow in GNOME Extensions if needed, then open it from Applications.'
-        if [[ "$launch" == true ]]; then
-            "$installed_cli" settings </dev/null >/dev/null 2>&1 &
-        fi
-    else
+    if [[ "$desktop" == false ]]; then
         say 'The Linux service is installed. Run zflow desktop-agent --install from a GNOME session to add the desktop app.'
+        return
+    fi
+    say 'Setting up GNOME for your account…'
+    # Adds the extension and starts the desktop agent in this session.
+    "$installed_cli" desktop-agent --install </dev/null \
+        || die 'The service is installed, but desktop setup failed. Run zflow desktop-agent --install after correcting the error above.'
+    if [[ "$launch" == true ]]; then
+        "$installed_cli" settings </dev/null >/dev/null 2>&1 &
     fi
 }
 
@@ -278,7 +285,7 @@ install_macos() {
 }
 
 main() {
-    local assume_yes=false headless=false command base_url
+    local headless=false command base_url
     platform=$(uname -s)
     version=latest
     launch=true
@@ -288,7 +295,8 @@ main() {
     mac_destination=/Applications/zflow.app
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --yes) assume_yes=true ;;
+            # The password prompt is the confirmation; --yes stays valid for old commands.
+            --yes) ;;
             --headless) headless=true ;;
             --no-launch) launch=false ;;
             --version)
@@ -321,13 +329,12 @@ main() {
     select_artifact
     say "zflow binary installer ($version, $platform $architecture)"
     printf 'Download: %s\n' "$asset"
-    printf 'Existing service/app configuration and paired identities are preserved.\n'
-    if [[ "$assume_yes" == false ]]; then
-        local answer
-        printf 'Install zflow and its runtime dependencies? [y/N] ' >/dev/tty 2>/dev/null || die 'No terminal is available; pass --yes to accept installation.'
-        IFS= read -r answer </dev/tty || die 'Could not read confirmation.'
-        case "$answer" in y|Y|yes|YES) ;; *) say 'Installation cancelled.'; return;; esac
+    if [[ "$platform" == Linux ]]; then
+        printf 'This installs:\n'
+        describe_linux
     fi
+    printf 'Existing service/app configuration and paired identities are preserved.\n'
+    printf 'The administrator password prompt confirms the installation.\n'
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/zflow-install.XXXXXXXX")
     trap cleanup EXIT
     trap 'exit 130' INT

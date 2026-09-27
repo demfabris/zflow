@@ -3,6 +3,7 @@
 import hashlib
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tarfile
@@ -168,13 +169,15 @@ class InstallerTest(unittest.TestCase):
                 self.assertNotIn("installed-zflow", self.calls())
                 self.assertNotIn("pacman -Sy", self.calls())
 
-    def test_debian_uses_package_manager_and_global_desktop_assets(self):
-        self.run_shell("main --yes --no-launch", env={"LEGACY": "false"})
+    def test_debian_uses_package_manager_then_sets_up_the_desktop_user(self):
+        self.run_shell("main --no-launch", env={"LEGACY": "false"})
         self.assertEqual(len(self.elevations()), 1)
         self.assertIn(f"apt-get install -y {self.root}/root/zflow-install.", self.calls())
         self.assertIn("/zflow_0.1.0_amd64.deb", self.calls())
-        self.assertIn("extension enable zflow@demfabris", self.calls())
-        self.assertNotIn("desktop-agent --install", self.calls())
+        # The package ships the launcher, autostart and D-Bus files; the user step
+        # adds the extension and starts the agent in this session.
+        self.assertTrue(self.calls().endswith("user deb-zflow desktop-agent --install\n"), self.calls())
+        self.assertNotIn("extension ", self.calls())
         self.assertNotIn("setup ", self.calls())
         self.assert_temporary_files_removed()
 
@@ -204,12 +207,12 @@ class InstallerTest(unittest.TestCase):
         self.assertNotIn("fetch ", self.calls())
         self.assertNotIn("root ", self.calls())
         self.run_shell("main --yes --no-launch", env={"LEGACY": "false", "GTK_MISSING": "1"})
-        self.assertIn("extension enable zflow@demfabris", self.calls())
+        self.assertIn("deb-zflow desktop-agent --install", self.calls())
 
     def test_headless_debian_skips_desktop_recommendations(self):
         self.run_shell("main --yes --headless", env={"LEGACY": "false"})
         self.assertIn("--no-install-recommends", self.calls())
-        self.assertNotIn("extension enable", self.calls())
+        self.assertNotIn("desktop-agent", self.calls())
 
     def test_platform_and_architecture_select_release_assets(self):
         for platform, architecture, target in (
@@ -262,12 +265,15 @@ class InstallerTest(unittest.TestCase):
                 self.assertNotIn("fetch ", self.calls())
                 self.assertNotIn("root ", self.calls())
 
-    def test_gnome_delayed_enable_succeeds_but_write_errors_fail(self):
-        args = "main --yes --no-launch"
-        output = self.run_shell(args, env={"DESKTOP_STATUS": "1", "DESKTOP_OUTPUT": "Integration installed. Log out and back in"})
+    def test_desktop_step_reports_the_next_step_and_fails_on_errors(self):
+        args = "main --no-launch"
+        output = self.run_shell(args, env={"DESKTOP_OUTPUT": "Log out and back in to finish setting up zflow in GNOME."})
+        self.assertIn("Log out and back in", output)
         self.assertIn("installation finished", output)
         output = self.run_shell(args, env={"DESKTOP_STATUS": "1", "DESKTOP_OUTPUT": "Permission denied"}, ok=False)
+        self.assertIn("Permission denied", output)
         self.assertIn("desktop setup failed", output)
+        self.assertNotIn("installation finished", output)
 
     def test_rejects_root_and_invalid_options(self):
         cases = (("--yes", {"MOCK_UID": "0"}), ("--version", {}), ("--version --yes", {}),
@@ -286,14 +292,22 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
 
-    def test_confirmation_without_terminal_requires_yes(self):
+    def test_no_question_before_the_password_prompt(self):
+        # No terminal at all: the password prompt is the only confirmation.
         result = subprocess.run(
-            [BASH, "-c", f'source {shlex.quote(str(INSTALLER))}\n{HOST_COMMANDS}\nmain --version 0.1.0'],
+            [BASH, "-c", f'source {shlex.quote(str(INSTALLER))}\n{HOST_COMMANDS}\nmain --version 0.1.0 --no-launch'],
             env=self.env, stdin=subprocess.DEVNULL, start_new_session=True, capture_output=True, text=True,
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("pass --yes", result.stderr)
-        self.assertEqual(self.calls(), "")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("[y/N]", result.stdout)
+        # The elevated step starts right after "Installing the service".
+        summary = result.stdout[:result.stdout.index("Installing the service")]
+        for line in ("This installs:", "UDP ports 43119 and 43120", "for every GNOME user", "GNOME extension"):
+            self.assertIn(line, summary)
+        # --yes stays accepted so older command lines keep working.
+        self.log.write_text("")
+        self.run_shell("main --yes --version 0.1.0 --no-launch")
+        self.assertEqual(len(self.elevations()), 1)
 
     def test_graphical_auth_and_terminal_auth(self):
         code = r'''
@@ -368,6 +382,39 @@ install_macos
         previous = list(destination.parent.glob(".zflow-install.*/previous.app/Contents/version"))
         self.assertEqual(len(previous), 1)
         self.assertEqual(previous[0].read_text(), "old")
+
+
+class PackagingTest(unittest.TestCase):
+    ROOT = INSTALLER.parent
+
+    def read(self, path):
+        return (self.ROOT / path).read_text()
+
+    def test_every_install_path_ships_the_extension_files_desktop_rs_writes(self):
+        rust = self.read("src/app/desktop.rs")
+        block = rust[rust.index("const EXTENSION_FILES"):]
+        written = set(re.findall(r'"([\w.]+)",\s*include_str!', block[:block.index("];")]))
+        packed = set(re.search(r"files=\(([^)]*)\)", self.read("scripts/pack-extension.sh")).group(1).split())
+        packaged = set(re.search(r"addprefix packaging/gnome-extension/,([^)]*)\)", self.read("debian/rules")).group(1).split())
+        self.assertEqual(written, packed)
+        self.assertEqual(written, packaged)
+        # The setup banner installs extensions, which extensions.gnome.org reviewers reject.
+        self.assertNotIn("setup.js", written)
+        self.assertNotIn("app.js", written)
+
+    def test_archive_install_and_uninstall_cover_the_same_session_files(self):
+        install, uninstall = self.read("scripts/install.sh"), self.read("scripts/uninstall.sh")
+        for path in ("/usr/local/share/applications/io.zflow.zflow.desktop",
+                     "/usr/local/share/dbus-1/services/io.zflow.Desktop.service",
+                     "/etc/xdg/autostart/io.zflow.desktop-agent.desktop",
+                     "firewall.sh"):
+            with self.subTest(path=path):
+                self.assertIn(path.rsplit("/", 1)[-1], install)
+                self.assertIn(path.rsplit("/", 1)[-1], uninstall)
+        entry = self.read("packaging/linux/io.zflow.desktop-agent.desktop")
+        self.assertIn("OnlyShowIn=GNOME;", entry)
+        # A removed-but-not-purged package leaves this conffile behind.
+        self.assertIn("TryExec=/usr/bin/zflow", entry)
 
 
 class UninstallTest(unittest.TestCase):
