@@ -91,20 +91,37 @@ Applications on GNOME and `/Applications/zflow.app` on macOS. Keep the GNOME
 desktop agent running during use; it supplies cursor placement, desktop
 dimensions, and return barriers.
 
-1. On Ubuntu, open zflow. A fresh install opens **Pair Computer** by itself
-   and shows a six-digit setup code; otherwise choose **Pair Computer…**.
-2. Open **Settings…** from the Mac's zflow menu-bar icon. Choose **Pair Computer…**,
-   select the receiver (or type its IP address), and type the code Ubuntu
-   shows. Ubuntu then asks whether to allow your Mac; choose **Allow**. Each
-   side names the other after its host name. A network announcement or a
-   code alone never authorizes a computer.
-3. Use the health badge to allow Accessibility access. Allow Local Network
-   access when macOS asks. The receiver's tile is placed against the Mac's
-   right edge; drag the tiles only to change which edges touch. Changes save
-   automatically.
-4. Move through a touching edge with keys and mouse buttons released. Cross
-   back from Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses
-   sharing. Resume from the menu-bar menu when you are ready.
+On Ubuntu, open zflow. A fresh install opens **Pair Computer** by itself and
+shows a six-digit setup code; otherwise choose **Pair Computer…**.
+
+While no computer is paired, the Mac app opens a setup window at launch. Open
+it again from the menu-bar icon with **Set Up…**. Each step checks itself off
+and moves on, and **Back** returns to an earlier one:
+
+1. **Move**, only when zflow runs from its disk image or another temporary
+   place: drag it into Applications and open it from there.
+2. **Accessibility**: choose **Allow…** and turn on zflow in the list.
+3. **Local Network**: zflow starts looking for computers here, so macOS asks
+   now. Choose **Allow**. If access stays off, the step says where to turn it on.
+4. **Pair**: Linux computers running zflow nearby are listed by address.
+   Choose **Pair…** and type the code Ubuntu shows, or use **Enter an
+   Address…**. Ubuntu then asks whether to allow your Mac; choose **Allow**.
+   Each side names the other after its host name. A network announcement or a
+   code alone never authorizes a computer. While none is found, the step shows
+   the install command with a copy button.
+5. **Try It**: move the pointer off the edge that leads to the Linux computer.
+   The receiver's tile is placed against the Mac's right edge, so that is the
+   right edge until you rearrange the tiles in Settings. The check turns green
+   once you control it. **Done** saves **Open zflow at login**, on by default,
+   and **Reduce Wi-Fi lag**, which is off by default and installs the AWDL
+   helper described below.
+
+To pair another computer later, use **Pair Computer…** in **Settings…**. Move
+through a touching edge with keys and mouse buttons released. Cross back from
+Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses sharing.
+Resume from the menu-bar menu when you are ready. Later problems, such as
+Accessibility or Local Network access being turned off, show on the health
+badge in Settings.
 
 Closing Settings leaves sharing running. **Pause Sharing** returns input to
 the Mac; **Quit zflow** stops the engine and finishes cleanup. While sharing is
@@ -129,8 +146,9 @@ sharing = true
 block_awdl = false
 ```
 
-Sharing arms only after a paired receiver, a valid touching layout, permissions,
-and any requested helper are ready. GUI writes preserve unrelated settings and
+Sharing arms only after a paired receiver, a valid touching layout, and
+permissions are ready. A missing AWDL helper does not hold it back; sharing
+then runs without blocking AWDL and the health badge says so. GUI writes preserve unrelated settings and
 comments. External edits reload automatically; invalid edits display an error
 while the last valid configuration stays in use. Conflicting writes fail instead
 of overwriting an external edit.
@@ -165,8 +183,11 @@ the updated layout arms.
 
 Pairing lists receivers advertised on the local network. Discovery does not
 verify identity; only the setup code shown on the receiver does. Manual
-addresses remain available. The Linux daemon advertises the receiver. Browsing continues
-while the Mac app is running, even with Settings closed.
+addresses remain available. The Linux daemon advertises the receiver. macOS
+asks for Local Network access the first time the Mac browses, so the Mac waits
+for the setup's Local Network step or **Pair Computer…** in Settings. Once a
+computer is paired, it browses from launch. Browsing then continues while the
+Mac app is running, even with Settings closed.
 
 If the list stays empty, check zflow under **System Settings → Privacy & Security
 → Local Network**, or use a manual address. Terminal tools have different

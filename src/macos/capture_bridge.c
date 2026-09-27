@@ -49,6 +49,29 @@ int zflow_mac_accessibility_authorized(int prompt) {
   return trusted ? 1 : 0;
 }
 
+static CGEventRef pass_event(CGEventTapProxy proxy, CGEventType type,
+                             CGEventRef event, void *context) {
+  (void)proxy;
+  (void)type;
+  (void)context;
+  return event;
+}
+
+// AXIsProcessTrusted can stay true after zflow is removed from the
+// Accessibility list, but the window server then refuses an active tap for
+// mouse events. This one wants only middle-button presses, which almost never
+// arrive in the microseconds before it is disabled; nothing services it.
+int zflow_mac_event_tap_allowed(void) {
+  CFMachPortRef tap = CGEventTapCreate(
+      kCGHIDEventTap, kCGTailAppendEventTap, kCGEventTapOptionDefault,
+      CGEventMaskBit(kCGEventOtherMouseDown), pass_event, NULL);
+  if (!tap) return 0;
+  CGEventTapEnable(tap, false);
+  CFMachPortInvalidate(tap);
+  CFRelease(tap);
+  return 1;
+}
+
 int zflow_mac_cursor_position(ZFlowMacPosition *position) {
   if (!position) return -1;
   CGEventRef event = CGEventCreate(NULL);
@@ -521,7 +544,12 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
   (void)proxy;
   (void)context;
   if (type == kCGEventTapDisabledByTimeout) {
-    // One slow callback should not end remote control.
+    // One slow callback should not end remote control, but a tap re-enabled
+    // after Accessibility was removed would hold the Mac's input.
+    if (!zflow_mac_event_tap_allowed()) {
+      end_capture("Accessibility access was removed; ending remote control");
+      return event;
+    }
     if (g_event_tap) CGEventTapEnable(g_event_tap, true);
     release_lifted_input();
     return event;
