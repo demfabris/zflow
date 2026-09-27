@@ -108,7 +108,9 @@ version="$(cargo metadata --no-deps --format-version 1 --manifest-path "$REPO_RO
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 if command -v codesign >/dev/null 2>&1; then
-    "$SCRIPT_DIR/sign-macos-app.sh" "$sign_identity" "$app"
+    sign_args=("$sign_identity" "$app")
+    if [[ "$explicit_sign" == false ]]; then sign_args+=(--no-timestamp); fi
+    "$SCRIPT_DIR/sign-macos-app.sh" "${sign_args[@]}"
 fi
 
 rm -rf -- "$bundle"

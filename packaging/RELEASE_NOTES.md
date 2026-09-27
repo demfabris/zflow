@@ -1,4 +1,5 @@
-Prebuilt zflow for Linux x86-64/ARM64 and macOS Intel/Apple Silicon.
+Prebuilt zflow for Linux x86-64/ARM64 and one universal macOS app for Apple silicon and Intel.
+On a Mac, open `zflow-VERSION-macos.dmg` and drag zflow to Applications, or use the command below.
 This is a prototype release; the live qualification checklist is in TESTPLAN.md.
 
 ```sh
