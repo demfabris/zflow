@@ -442,6 +442,57 @@ mod tests {
         }
     }
 
+    /// Tests that own org.gnome.Shell on the shared private bus take turns.
+    static SHELL_NAME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// GNOME Shell's extension API as seen over D-Bus, with the state it reports.
+    struct Extensions(Arc<Mutex<Option<f64>>>);
+
+    #[zbus::interface(name = "org.gnome.Shell.Extensions")]
+    impl Extensions {
+        fn get_extension_info(
+            &self,
+            uuid: &str,
+        ) -> std::collections::HashMap<String, zbus::zvariant::OwnedValue> {
+            assert_eq!(uuid, crate::desktop::EXTENSION_ID);
+            let state = *self.0.lock().unwrap();
+            state
+                .map(|state| {
+                    (
+                        "state".into(),
+                        zbus::zvariant::Value::from(state).try_into().unwrap(),
+                    )
+                })
+                .into_iter()
+                .collect()
+        }
+        fn install_remote_extension(&self, _uuid: &str) -> String {
+            *self.0.lock().unwrap() = Some(ACTIVE);
+            "successful".into()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
+    async fn an_extension_shell_has_not_seen_comes_from_extensions_gnome_org() {
+        let _turn = SHELL_NAME.lock().await;
+        let state = Arc::new(Mutex::new(None));
+        let _shell = zbus::connection::Builder::session()
+            .unwrap()
+            .name("org.gnome.Shell")
+            .unwrap()
+            .serve_at("/org/gnome/Shell", Extensions(state.clone()))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let agent = zbus::Connection::session().await.unwrap();
+        assert_eq!(extension_state(&agent).await.unwrap(), None);
+        // Loaded live, so neither files nor settings change.
+        assert!(install_extension(Some(&agent)).await.unwrap());
+        assert_eq!(extension_state(&agent).await.unwrap(), Some(ACTIVE));
+    }
+
     #[test]
     fn gsettings_lists_round_trip() {
         assert_eq!(parse_strv("@as []\n"), Some(vec![]));
@@ -474,6 +525,7 @@ mod tests {
     #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
     async fn receiver_waits_for_gnome_shell_and_calls_from_its_own_connection() {
         use crate::desktop::{BUS_NAME, OBJECT_PATH};
+        let _turn = SHELL_NAME.lock().await;
         let state = Mutex::new(State::default());
         let agent = zbus::Connection::session().await.unwrap();
         // Login can start the agent before Shell enables the extension.
