@@ -57,10 +57,13 @@ trap cleanup EXIT
 mkdir "$work/zflow"
 ditto "$app" "$work/zflow/zflow.app"
 ln -s /Applications "$work/zflow/Applications"
+# HFS+ with zlib is what dmgbuild, create-dmg and electron-builder produce, so
+# it is the format Apple's notary service has seen most.
 # GitHub's macOS runners sometimes fail with "Resource busy" while background
 # scanners hold the new image (actions/runner-images#7522); a retry gets past it.
 for attempt in 1 2 3 4; do
-    hdiutil create -quiet -ov -volname zflow -srcfolder "$work/zflow" -fs HFS+ -format ULMO "$work/zflow.dmg" && break
+    hdiutil create -quiet -ov -volname zflow -srcfolder "$work/zflow" -fs HFS+ \
+        -format UDZO -imagekey zlib-level=9 "$work/zflow.dmg" && break
     [[ "$attempt" -lt 4 ]] || die 'hdiutil could not create the image'
     sleep $((attempt * 5))
 done
