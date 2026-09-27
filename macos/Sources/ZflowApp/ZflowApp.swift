@@ -12,6 +12,7 @@ struct ZflowApp: App {
       Button(model.snapshot?.sharing == true ? "Pause Sharing" : "Resume Sharing") {
         model.send(CoreRequest(command: "set_sharing", enabled: model.snapshot?.sharing != true))
       }.disabled(model.snapshot == nil)
+      SetUpButton()
       SettingsLink { Text("Settings…") }.keyboardShortcut(",")
       Divider()
       Button("Quit zflow") { model.quit() }.keyboardShortcut("q").disabled(model.busy)
@@ -25,6 +26,14 @@ struct ZflowApp: App {
     }
     .defaultSize(width: 600, height: 560)
     .windowResizability(.contentSize)
+
+    Window("Set Up zflow", id: "setup") {
+      OnboardingView(model: model)
+    }
+    .windowResizability(.contentSize)
+    .defaultPosition(.center)
+    .restorationBehavior(.disabled)
+    .defaultLaunchBehavior(.suppressed)
   }
 }
 
@@ -42,14 +51,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 }
 
+private struct SetUpButton: View {
+  @Environment(\.openWindow) private var openWindow
+  var body: some View {
+    Button("Set Up…") {
+      openWindow(id: "setup")
+      NSApplication.shared.activate()
+    }
+  }
+}
+
 private struct MenuIcon: View {
   var model: AppModel
   @Environment(\.openSettings) private var openSettings
+  @Environment(\.openWindow) private var openWindow
   var body: some View {
     Image(systemName: model.healthy ? "computermouse" : "computermouse.fill")
       .accessibilityLabel("zflow, \(model.title)")
       .task {
-        if model.showSettingsAtLaunch {
+        // The engine's first answer says whether any computer is paired.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while model.snapshot == nil && model.error == nil && ContinuousClock.now < deadline {
+          try? await Task.sleep(for: .milliseconds(50))
+        }
+        if model.snapshot?.peers.isEmpty == true {
+          openWindow(id: "setup")
+          NSApplication.shared.activate()
+        } else if model.showSettingsAtLaunch || model.snapshot == nil {
           NSApplication.shared.activate()
           openSettings()
         }

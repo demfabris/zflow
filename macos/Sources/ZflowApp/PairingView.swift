@@ -2,6 +2,8 @@ import SwiftUI
 
 struct PairingView: View {
   @Bindable var model: AppModel
+  /// Prefills the address of a computer chosen before the sheet opened.
+  var initialAddress: String? = nil
   @Environment(\.dismiss) private var dismiss
   @State private var address = ""
   @State private var name = ""
@@ -68,6 +70,7 @@ struct PairingView: View {
       }
     }.padding(28).frame(width: 440)
       .onChange(of: pairing?.name) { _, proposed in if name.isEmpty { name = proposed ?? "" } }
+      .onAppear { if let initialAddress { address = initialAddress } }
   }
   func start(_ address: String?) {
     model.send(CoreRequest(command: "pair_start", address: address))
