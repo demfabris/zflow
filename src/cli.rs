@@ -717,8 +717,10 @@ fn doctor_linux(config: &Config, failed: &mut bool) {
     }
 
     let selection = if config.input.capture_devices.is_empty() {
-        *failed = true;
-        println!("fail capture selection: no physical input devices are configured");
+        // Receiving never reads local devices; only sending from here needs them.
+        println!(
+            "ok  capture selection: none, so this computer only receives (select devices to send from it)"
+        );
         None
     } else {
         match crate::runtime::diagnose_capture_selection(&config.input.capture_devices) {

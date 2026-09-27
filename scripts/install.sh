@@ -130,8 +130,8 @@ systemctl daemon-reload
 systemctl enable zflowd.service
 systemctl restart zflowd.service
 
-printf '\nzflow is installed and zflowd is running.\n'
-printf 'Next steps:\n'
+printf '\nzflow is installed and zflowd is running. This computer can receive input now.\n'
+printf 'To also send input from it to another Linux computer, select its devices:\n'
 printf '  1. List input devices:\n'
 printf '     sudo %s/zflow devices\n' "$BIN_DIR"
 printf '  2. Select the physical devices in one command (repeat --device):\n'
