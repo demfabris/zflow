@@ -15,6 +15,7 @@ struct Pairing: Decodable, Sendable {
   var state: String
   var code: String?
   var name: String?
+  var address: String?
   var error: String?
 }
 struct Nearby: Decodable, Identifiable, Sendable {
@@ -65,6 +66,7 @@ struct CoreRequest: Encodable, Sendable {
   var address: String?
   var name: String?
   var code: String?
+  var allow: Bool?
 }
 struct CoreResponse: Decodable {
   var snapshot: Snapshot?

@@ -87,10 +87,10 @@ and moves on, and **Back** returns to an earlier one:
    now. Choose **Allow**. If access stays off, the step says where to turn it on.
 4. **Pair**: Linux computers running zflow nearby are listed by address.
    Choose **Pair…** and type the code Ubuntu shows, or use **Enter an
-   Address…**. Pairing finishes on both computers without another click, and
-   each side names the other after its host name. A network announcement alone
-   never authorizes a computer. While none is found, the step shows the install
-   command with a copy button.
+   Address…**. Ubuntu then asks whether to allow your Mac; choose **Allow**.
+   Each side names the other after its host name. A network announcement or a
+   code alone never authorizes a computer. While none is found, the step shows
+   the install command with a copy button.
 5. **Try It**: move the pointer off the edge that leads to the Linux computer.
    The receiver's tile is placed against the Mac's right edge, so that is the
    right edge until you rearrange the tiles in Settings. The check turns green
@@ -237,8 +237,9 @@ sudo zflow pair connect desk 192.0.2.10:43120
 ```
 
 The code never crosses the network: both sides prove they know it through
-SPAKE2, so a wrong code writes no trust record. The listener accepts three
-wrong codes, then stops and needs a new code.
+SPAKE2, so a wrong code writes no trust record. The listener then asks whether
+to allow the connecting computer (pass `--yes` to skip the question in
+scripts). It accepts three wrong codes, then stops and needs a new code.
 
 Normal pairing never grants pre-login input. Grant that permission separately
 only if you need input at a greeter or lock screen:

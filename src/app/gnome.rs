@@ -42,6 +42,9 @@ enum Request {
         /// The code shown on the other computer, when connecting.
         code: Option<String>,
     },
+    PairRespond {
+        allow: bool,
+    },
     PairCancel,
     OpenSettings,
 }
@@ -96,6 +99,12 @@ impl Service {
                 ensure!(!state.pairing.active(), "Pairing is already open");
                 state.pairing.start(PathBuf::new(), remote, code)?;
             }
+            Request::PairRespond { allow } => self
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pairing
+                .respond(allow)?,
             Request::PairCancel => self
                 .0
                 .lock()

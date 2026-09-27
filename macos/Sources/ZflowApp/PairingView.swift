@@ -12,11 +12,18 @@ struct PairingView: View {
   /// The code last sent, so the sixth digit and Return don't both start a pairing.
   @State private var submitted: String?
   var pairing: Pairing? { model.snapshot?.pairing }
-  var busy: Bool { ["listening", "connecting"].contains(pairing?.state ?? "") }
+  var busy: Bool {
+    ["listening", "confirm", "connecting", "approving"].contains(pairing?.state ?? "")
+  }
   var body: some View {
     VStack(alignment: .leading, spacing: 20) {
       Text("Pair a computer").font(.title2.bold())
-      if pairing?.state == "listening" {
+      if pairing?.state == "confirm" {
+        Text("Allow \(pairing?.name ?? "this computer") to pair with this Mac?").font(.headline)
+        Text(
+          "It entered this Mac's code from \(pairing?.address ?? "your network"). Allow it only if it is the computer you are setting up."
+        ).foregroundStyle(.secondary)
+      } else if pairing?.state == "listening" {
         Text("Type this code on the other computer:")
         Text(pairing?.code ?? "…").font(.system(size: 34, weight: .medium, design: .monospaced))
           .textSelection(.enabled)
@@ -41,6 +48,11 @@ struct PairingView: View {
           HStack {
             ProgressView().controlSize(.small)
             Text("Pairing…")
+          }
+        } else if pairing?.state == "approving" {
+          HStack {
+            ProgressView().controlSize(.small)
+            Text("On \(Self.host(target)), choose Allow.")
           }
         } else {
           Text("On Linux, the code is in zflow under Pair Computer.").font(.callout)
@@ -81,6 +93,11 @@ struct PairingView: View {
         }
         Spacer()
         Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+        if pairing?.state == "confirm" {
+          Button("Decline") { model.send(CoreRequest(command: "pair_respond", allow: false)) }
+          Button("Allow") { model.send(CoreRequest(command: "pair_respond", allow: true)) }
+            .keyboardShortcut(.defaultAction)
+        }
         if target != nil, !busy {
           Button("Pair", action: connect).keyboardShortcut(.defaultAction).disabled(code.count != 6)
         }
