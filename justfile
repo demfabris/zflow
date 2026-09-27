@@ -79,6 +79,7 @@ test-desktop:
 test-gtk: (_platform "linux")
     dbus-run-session -- cargo test --locked --lib app:: -- --ignored --skip native_desktop_geometry
     GTK_A11Y=none GIO_USE_VFS=local dbus-run-session -- gjs -m tests/gnome_settings_test.js
+    GSETTINGS_BACKEND=memory GTK_A11Y=none GIO_USE_VFS=local dbus-run-session -- gjs -m tests/gnome_setup_test.js
 
 # Exercise installation and recovery without changing the host (requires Python 3).
 test-install:
