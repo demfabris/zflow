@@ -26,8 +26,11 @@ firewalld_running() {
     command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1
 }
 
+# Only a first install opens the ports. After that the admin owns the rules,
+# so an upgrade neither re-adds a removed rule nor reloads firewalld, which
+# would drop its runtime-only rules.
 open_ports() {
-    if ufw_active; then
+    if ufw_active && [[ ! -e "$UFW_PROFILE" ]]; then
         [[ ! -L "$UFW_PROFILE" ]] || die "refusing symlink: $UFW_PROFILE"
         install -d -m 0755 "${UFW_PROFILE%/*}"
         printf '[zflow]\ntitle=zflow\ndescription=Keyboard and pointer sharing between paired computers\nports=43119/udp|43120/udp\n' \
@@ -39,7 +42,7 @@ open_ports() {
             warn "ufw refused the zflow profile. Allow $PORTS yourself."
         fi
     fi
-    if firewalld_running; then
+    if firewalld_running && [[ ! -e "$FIREWALLD_SERVICE" ]]; then
         [[ ! -L "$FIREWALLD_SERVICE" ]] || die "refusing symlink: $FIREWALLD_SERVICE"
         install -d -m 0755 "${FIREWALLD_SERVICE%/*}"
         cat > "$FIREWALLD_SERVICE" <<'XML'

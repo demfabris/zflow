@@ -43,7 +43,7 @@ jobs:
       - name: Shell scripts
         run: |
           shellcheck -x install.sh scripts/*.sh packaging/linux/*.sh packaging/system-sleep/zflow \
-            debian/zflow.postinst debian/zflow.postrm debian/zflow.preinst tests/deb_lifecycle.sh
+            debian/zflow.postinst debian/zflow.postrm debian/zflow.preinst debian/zflow.prerm tests/deb_lifecycle.sh
 
   macos:
     name: macOS
