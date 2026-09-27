@@ -34,11 +34,12 @@ struct PairingView: View {
         if let nearby = model.snapshot?.nearby, !nearby.isEmpty {
           VStack(alignment: .leading, spacing: 8) {
             ForEach(nearby) { candidate in
+              let address = candidate.addresses.first.map(Self.pairingAddress)
               Button {
-                start(candidate.addresses.first)
+                start(address)
               } label: {
-                Label(candidate.addresses.first ?? "Nearby computer", systemImage: "display")
-              }.disabled(!candidate.compatible)
+                Label(address ?? "Nearby computer", systemImage: "display")
+              }.disabled(!candidate.compatible || address == nil)
             }
           }
         }
@@ -70,5 +71,11 @@ struct PairingView: View {
   }
   func start(_ address: String?) {
     model.send(CoreRequest(command: "pair_start", address: address))
+  }
+  /// Receivers advertise their input port; pairing listens on its own port
+  /// (DEFAULT_PAIRING_PORT in src/pairing.rs).
+  static func pairingAddress(_ advertised: String) -> String {
+    guard let separator = advertised.lastIndex(of: ":") else { return advertised }
+    return "\(advertised[..<separator]):43120"
   }
 }
