@@ -59,6 +59,14 @@ await new Promise(setImmediate);
 assert.equal(panel._status.label.text, 'Sharing paused');
 assert.equal(panel._sharing.state, false);
 assert.equal(panel._icon.icon_name, 'media-playback-pause-symbolic');
+// An agent from another API level gets "Update zflow" instead of a broken menu.
+snapshot.api = 2;
+await panel._client.refresh();
+assert.equal(panel._status.label.text, 'Update zflow');
+assert.equal(panel._icon.icon_name, 'dialog-warning-symbolic');
+snapshot.api = 1;
+await panel._client.refresh();
+assert.equal(panel._status.label.text, 'Sharing paused');
 panel.destroy();
 assert.equal(timers.size, 0, 'disable removes panel polling');
 assert.ok(panel._button.destroyed);
@@ -76,4 +84,4 @@ assert.equal(calls.at(-1).flags, 0, 'opening preferences explicitly starts the s
 await settings.refresh();
 assert.equal(calls.at(-1).flags, 1, 'subsequent reads do not keep restarting a stopped agent');
 settings.destroy();
-console.log('GNOME panel status, pause, activation policy and cleanup checks passed');
+console.log('GNOME panel status, pause, API check, activation policy and cleanup checks passed');

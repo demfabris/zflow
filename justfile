@@ -88,6 +88,10 @@ test-install:
 test-package:
     ./tests/deb_lifecycle.sh
 
+# Pack the GNOME extension for extensions.gnome.org under target/dist.
+pack-extension: (_platform "linux")
+    ./scripts/pack-extension.sh
+
 # Format Rust code.
 fmt:
     cargo fmt --all
