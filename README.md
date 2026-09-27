@@ -24,8 +24,20 @@ On Ubuntu/Debian, a fresh installation uses the `.deb` package. On other
 supported Linux distributions, or when updating an existing `/usr/local`
 installation, it uses the binary archive. Linux runtime dependencies come from
 apt, dnf, or pacman. GNOME settings need GJS, GTK 4.12+, and libadwaita 1.5+.
-System changes request administrator access once, through GNOME's password
-dialog when available, or `sudo` in the terminal.
+The installer lists what it will change, then requests administrator access
+once, through GNOME's password dialog when available, or `sudo` in the
+terminal. That prompt is the only confirmation.
+
+On GNOME, the installer then sets up your account and starts the desktop agent,
+so the Mac can connect right away. GNOME asks to download the zflow extension
+from extensions.gnome.org, then loads it without a logout. If it can't (the
+extension isn't published there yet, no network, extension installs turned off
+by policy, no version for your GNOME, or you choose Cancel), zflow uses the
+copy it ships and asks you to log out and back in once. Every GNOME user on the computer gets the zflow launcher
+and starts the desktop agent at login; **Start at Login** in Settings turns
+that off for one account. When ufw or firewalld is on, the installer allows
+UDP ports 43119 (input) and 43120 (pairing) and says so. It never turns a
+firewall on.
 
 On macOS, the installer places `zflow.app` in `/Applications`. The release
 workflow signs Mac apps with Developer ID and notarizes them, but v0.1.0 was
@@ -34,10 +46,12 @@ can't install the optional AWDL helper. Releases built by the signing workflow
 can install it from the app with administrator approval.
 
 Repeat the command to update. It keeps your configuration and paired identities;
-updating the Linux service interrupts an active connection. Log out and back in
-after installing or updating the GNOME extension, then enable zflow in GNOME
-Extensions if needed. Debian packages install the Applications launcher and
-extension for all users; use **Start at Login** in Settings to enable autostart.
+updating the Linux service interrupts an active connection. GNOME updates an
+extension from extensions.gnome.org by itself when the Extensions app or
+Extension Manager is installed; a bundled copy changes at your next login. If the extension and the app get too far apart,
+the panel and settings say **Update zflow**. Until the extension is set up,
+the zflow window shows a banner with the step that is left: **Install**,
+**Turn On**, or **Log Out**.
 
 Pass options after `bash -s --`:
 
@@ -45,12 +59,14 @@ Pass options after `bash -s --`:
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.1.0 --no-launch
 ```
 
-Omit `--version` for the latest release. `--headless` skips GNOME integration;
-`--yes` accepts installation but still requires administrator authentication.
+Omit `--version` for the latest release. `--headless` skips GNOME integration.
+`--yes` is still accepted, but there is no question left for it to answer.
 The script does not fall back to compiling if a release is unavailable.
 
 You can also download a `.deb` from [Releases](https://github.com/demfabris/zflow/releases)
 and install it with `sudo apt install ./zflow_0.1.0_amd64.deb` (use `arm64` on ARM).
+Then open zflow from Applications and follow its banner, or run
+`zflow desktop-agent --install` as yourself for the same setup the installer does.
 See [packaging/README.md](packaging/README.md) for migration from a source/archive
 installation, package removal, and building releases.
 
@@ -58,7 +74,9 @@ To remove zflow from Linux, run `sudo apt remove zflow` on a `.deb` install
 (`apt purge zflow` also deletes the configuration and device selections). An
 archive install keeps its uninstaller at `/usr/local/lib/zflow/uninstall.sh`;
 run it with `sudo`, adding `--purge` to also delete the configuration, paired
-identities, and the service account.
+identities, and the service account. Both close the firewall ports the
+installer opened. The GNOME extension stays in each account until you remove
+it in Extensions.
 
 ## Mac → Ubuntu setup
 
@@ -343,6 +361,7 @@ just test                    # Rust tests
 just test-native             # Swift bridge tests (macOS)
 just test-desktop            # GNOME extension tests (Node.js)
 just test-gtk                # Native GTK controls and D-Bus tests (Linux display)
+just pack-extension          # Zip for extensions.gnome.org (Linux with GNOME Shell)
 just test-install            # Binary installer and recovery tests (Python 3)
 just test-package            # Debian lifecycle tests in Docker (build a .deb first)
 just check                   # Formatting, Clippy, Rust, GNOME, installer tests
