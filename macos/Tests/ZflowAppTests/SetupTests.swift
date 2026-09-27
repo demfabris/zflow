@@ -66,17 +66,6 @@ private func location(_ path: String, quarantined: Bool = false, readOnly: Bool 
   #expect(one.advance(.computers, from: two) == .computers)
 }
 
-@Test func nearbyComputersShowTheirHostAndPairOnThePairingPort() {
-  let v4 = Nearby(
-    instance: "a", addresses: ["192.168.1.20:43119", "[2001:db8::1]:43119"], compatible: true)
-  #expect(v4.host == "192.168.1.20")
-  #expect(v4.pairingAddress == "192.168.1.20:43120")
-  let v6 = Nearby(instance: "b", addresses: ["[fe80::1%4]:43119"], compatible: true)
-  #expect(v6.host == "fe80::1%4")
-  #expect(v6.pairingAddress == "[fe80::1%4]:43120")
-  #expect(Nearby(instance: "c", addresses: [], compatible: true).pairingAddress == nil)
-}
-
 @Test func tryItNamesTheEdgeThatLeadsToTheComputer() throws {
   var snapshot = try JSONDecoder.snake.decode(Snapshot.self, from: Data(minimalSnapshot.utf8))
   let mac = Computer(id: "local", label: "This Mac", x: 0, y: 0, width: 1512, height: 982)

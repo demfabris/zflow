@@ -119,7 +119,7 @@ struct OnboardingView: View {
       case .computers:
         (
           "desktopcomputer", "Pair Your Linux Computer",
-          "Computers running zflow on this network show up here."
+          "Computers running zflow on this network show up here. Pair one and type the code it shows."
         )
       case .tryIt:
         (
@@ -179,12 +179,14 @@ struct OnboardingView: View {
         ScrollView {
           VStack(spacing: 0) {
             ForEach(nearby) { computer in
+              // Receivers list IPv4 first and advertise their input port.
+              let address = computer.addresses.first.map(PairingView.pairingAddress)
               HStack {
                 Label(
-                  "Linux computer · \(computer.host ?? "unknown address")",
+                  "Linux computer · \(address.map(PairingView.host) ?? "unknown address")",
                   systemImage: "desktopcomputer")
                 Spacer()
-                if let address = computer.pairingAddress, computer.compatible {
+                if let address, computer.compatible {
                   Button("Pair…") { pairing = PairingTarget(address: address) }
                 } else {
                   Text("Update zflow on it to pair").font(.callout).foregroundStyle(.secondary)

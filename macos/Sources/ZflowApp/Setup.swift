@@ -117,23 +117,3 @@ extension Snapshot {
     return nil
   }
 }
-
-extension Nearby {
-  /// Receivers list IPv4 first and advertise their input port.
-  private var address: String? { addresses.first }
-
-  /// The same host on the pairing port (DEFAULT_PAIRING_PORT in src/pairing.rs).
-  var pairingAddress: String? {
-    guard let address, let port = address.lastIndex(of: ":") else { return nil }
-    return "\(address[..<port]):43120"
-  }
-
-  /// The address without its port, as people read it.
-  var host: String? {
-    guard let address else { return nil }
-    if address.hasPrefix("["), let end = address.firstIndex(of: "]") {
-      return String(address[address.index(after: address.startIndex)..<end])
-    }
-    return address.lastIndex(of: ":").map { String(address[..<$0]) } ?? address
-  }
-}
