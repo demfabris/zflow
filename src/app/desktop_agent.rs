@@ -67,7 +67,7 @@ fn install_agent() -> Result<()> {
             let session = zbus::Connection::session().await.ok();
             let running = super::desktop::install_extension(session.as_ref()).await?;
             if let Some(connection) = &session {
-                super::gnome::start_agent(connection).await?;
+                super::gnome::start_agent(connection, true).await?;
             }
             Ok::<_, anyhow::Error>(running)
         })?;

@@ -302,12 +302,32 @@ pub(super) fn install() -> Result<()> {
     Ok(())
 }
 
-/// Starts the desktop agent in this login session unless it already runs.
-pub(super) async fn start_agent(connection: &zbus::Connection) -> Result<()> {
+/// Starts the desktop agent in this login session. With `replace`, a running
+/// agent stops first, so the binary an update just installed takes over.
+pub(super) async fn start_agent(connection: &zbus::Connection, replace: bool) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let bus = zbus::fdo::DBusProxy::new(connection).await?;
-    if bus.name_has_owner(BUS.try_into()?).await? {
-        return Ok(());
+    if let Ok(owner) = bus.get_name_owner(BUS.try_into()?).await {
+        if !replace {
+            return Ok(());
+        }
+        let pid = bus
+            .get_connection_unix_process_id(owner.into_inner().into())
+            .await?;
+        // Stop only the agent itself, which exits cleanly on SIGTERM.
+        let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if name.trim() != "zflow" {
+            return Ok(());
+        }
+        std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status()?;
+        for _ in 0..50 {
+            if !bus.name_has_owner(BUS.try_into()?).await? {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
     // D-Bus activation runs the agent outside the caller's terminal and logs
     // to the journal. The bus may not have read a service file installed
@@ -336,7 +356,7 @@ pub fn settings() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async { start_agent(&zbus::Connection::session().await?).await })?;
+    runtime.block_on(async { start_agent(&zbus::Connection::session().await?, false).await })?;
     drop(runtime);
     Err(std::process::Command::new("gjs")
         .arg("-m")

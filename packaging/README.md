@@ -257,7 +257,8 @@ wrote, since they would shadow the system files. Then:
    Shell has not loaded yet. It prints "Log out and back in" when GNOME only
    loads it at the next login.
 4. It starts the agent through D-Bus activation, or directly if the bus
-   cannot, so the Mac can connect without waiting for the next login.
+   cannot, so the Mac can connect without waiting for the next login. An agent
+   that is already running is stopped first, so an update takes effect now.
 
 Opening zflow runs `zflow settings`. Its window shows a banner until the
 extension runs: **Install** (asks the agent to do the steps above), **Turn On**
