@@ -80,8 +80,13 @@ final class Services {
       return
     }
     do {
-      if helper.status == .requiresApproval {
+      let status = helper.status
+      if status == .requiresApproval {
         SMAppService.openSystemSettingsLoginItems()
+      } else if status == .enabled, await Self.checkHelper() {
+        // The panel refreshes every 10 s, so this button can outlive the approval
+        // that started the helper. Unregistering disables the item, and macOS
+        // refuses an immediate register, so a working helper is left alone.
       } else {
         if helper.status == .enabled { try await helper.unregister() }
         try helper.register()
