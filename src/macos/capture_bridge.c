@@ -49,6 +49,29 @@ int zflow_mac_accessibility_authorized(int prompt) {
   return trusted ? 1 : 0;
 }
 
+static CGEventRef pass_event(CGEventTapProxy proxy, CGEventType type,
+                             CGEventRef event, void *context) {
+  (void)proxy;
+  (void)type;
+  (void)context;
+  return event;
+}
+
+// AXIsProcessTrusted can stay true after zflow is removed from the
+// Accessibility list, but the window server then refuses an active tap for
+// mouse events. This one wants only middle-button presses, which almost never
+// arrive in the microseconds before it is disabled; nothing services it.
+int zflow_mac_event_tap_allowed(void) {
+  CFMachPortRef tap = CGEventTapCreate(
+      kCGHIDEventTap, kCGTailAppendEventTap, kCGEventTapOptionDefault,
+      CGEventMaskBit(kCGEventOtherMouseDown), pass_event, NULL);
+  if (!tap) return 0;
+  CGEventTapEnable(tap, false);
+  CFMachPortInvalidate(tap);
+  CFRelease(tap);
+  return 1;
+}
+
 int zflow_mac_cursor_position(ZFlowMacPosition *position) {
   if (!position) return -1;
   CGEventRef event = CGEventCreate(NULL);

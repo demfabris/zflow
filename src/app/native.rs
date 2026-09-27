@@ -19,6 +19,8 @@ use std::{
 
 const MAINTENANCE: Duration = Duration::from_secs(2);
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5);
+/// Each refused tap leaks a Mach port inside CoreGraphics.
+const TAP_RECHECK: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -53,6 +55,8 @@ pub(crate) enum Request {
     },
     AllowAccessibility,
     Retry,
+    /// Rechecks Accessibility now instead of at the next maintenance tick.
+    CheckAccessibility,
 }
 
 pub(crate) struct NativeApp {
@@ -67,6 +71,7 @@ pub(crate) struct NativeApp {
     /// Receiver desktop sizes read over each peer's session.
     desktops: BTreeMap<String, (u32, u32)>,
     accessibility: bool,
+    tap_refused: Option<Instant>,
     helper_ready: bool,
     emergency_paused: bool,
     config_error: Option<String>,
@@ -93,6 +98,7 @@ impl NativeApp {
             pairing: Pairing::default(),
             desktops: BTreeMap::new(),
             accessibility: crate::macos::accessibility_authorized(false),
+            tap_refused: None,
             helper_ready: false,
             emergency_paused: false,
             config_error: None,
@@ -168,15 +174,39 @@ impl NativeApp {
                 self.restart();
             }
             Request::AllowAccessibility => {
-                self.accessibility = crate::macos::accessibility_authorized(true);
+                crate::macos::accessibility_authorized(true);
+                self.accessibility = self.accessibility_granted();
             }
             Request::Retry => {
                 self.crossing_error = None;
                 self.links.retry();
                 self.restart();
             }
+            Request::CheckAccessibility => self.accessibility = self.accessibility_granted(),
         }
         Ok(self.snapshot())
+    }
+
+    /// AXIsProcessTrusted can stay true after zflow is removed from the
+    /// Accessibility list. A crossing's tap then blocks the Mac's input, and
+    /// new crossings fail. The window server knows, so ask it for a tap while
+    /// sharing is armed and until access comes back.
+    fn accessibility_granted(&mut self) -> bool {
+        if !crate::macos::accessibility_authorized(false) {
+            return false;
+        }
+        if self.accessibility && !self.observer.is_active() {
+            return true;
+        }
+        if self
+            .tap_refused
+            .is_some_and(|refused| refused.elapsed() < TAP_RECHECK)
+        {
+            return false;
+        }
+        let allowed = crate::macos::event_tap_allowed();
+        self.tap_refused = (!allowed).then(Instant::now);
+        allowed
     }
 
     fn save_config(&mut self) -> Result<()> {
@@ -252,7 +282,7 @@ impl NativeApp {
             self.reload();
             // Also a fallback for display and permission changes that sent no callback.
             sharing::forget_geometry();
-            self.accessibility = crate::macos::accessibility_authorized(false);
+            self.accessibility = self.accessibility_granted();
             if self.document.saved().transport.discovery {
                 self.nearby.start();
             } else {
@@ -280,6 +310,11 @@ impl NativeApp {
             }
         }
         if self.observer.has_session() {
+            // Without Accessibility the crossing's tap stalls the Mac's input,
+            // so end the crossing, which removes the tap.
+            if !self.accessibility && self.observer.is_enabled() {
+                self.observer.stop();
+            }
             return;
         }
         let config = self.document.saved();

@@ -115,6 +115,15 @@ pub fn accessibility_authorized(prompt: bool) -> bool {
     unsafe { zflow_mac_accessibility_authorized(i32::from(prompt)) == 1 }
 }
 
+/// Asks the window server for an active event tap and releases it at once.
+/// Unlike `accessibility_authorized`, this notices access removed while
+/// zflow runs. A refused tap leaks a Mach port inside CoreGraphics, so
+/// callers must not retry a refusal quickly.
+pub fn event_tap_allowed() -> bool {
+    // SAFETY: the bridge creates, disables and releases its own tap.
+    unsafe { zflow_mac_event_tap_allowed() == 1 }
+}
+
 pub fn cursor_position() -> Result<CursorPosition> {
     let mut position = CursorPosition::default();
     // SAFETY: the output has the bridge's two-double C layout.
@@ -1013,6 +1022,7 @@ struct NativeEvent {
 
 unsafe extern "C" {
     fn zflow_mac_accessibility_authorized(prompt: i32) -> i32;
+    fn zflow_mac_event_tap_allowed() -> i32;
     fn zflow_mac_cursor_position(position: *mut CursorPosition) -> i32;
     fn zflow_mac_desktop_rectangles(rectangles: *mut DesktopRect, capacity: u32) -> i32;
     fn zflow_mac_display_generation() -> u32;
