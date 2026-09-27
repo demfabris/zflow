@@ -65,26 +65,6 @@ impl Identity {
     pub fn fingerprint_hex(&self) -> String {
         encode_hex(&self.fingerprint)
     }
-
-    /// Six decimal digits derived from both identities and the pairing transcript.
-    pub fn pairing_code(&self, peer_spki: &[u8], transcript: &[u8]) -> String {
-        let (first, second) = if self.spki.as_slice() <= peer_spki {
-            (self.spki.as_slice(), peer_spki)
-        } else {
-            (peer_spki, self.spki.as_slice())
-        };
-        let digest = Sha256::new()
-            .chain_update(b"zflow pairing code v1\0")
-            .chain_update((first.len() as u64).to_be_bytes())
-            .chain_update(first)
-            .chain_update((second.len() as u64).to_be_bytes())
-            .chain_update(second)
-            .chain_update((transcript.len() as u64).to_be_bytes())
-            .chain_update(transcript)
-            .finalize();
-        let value = u32::from_be_bytes(digest[..4].try_into().unwrap()) % 1_000_000;
-        format!("{value:06}")
-    }
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), IdentityError> {
@@ -185,20 +165,5 @@ mod tests {
         let second = Identity::load_or_create(directory.path()).unwrap();
         assert_eq!(second.fingerprint_hex(), fingerprint);
         assert_eq!(second.spki(), spki);
-    }
-
-    #[test]
-    fn pairing_code_is_symmetric_and_fixed_width() {
-        let left_dir = tempfile::tempdir().unwrap();
-        let right_dir = tempfile::tempdir().unwrap();
-        let left = Identity::load_or_create(left_dir.path()).unwrap();
-        let right = Identity::load_or_create(right_dir.path()).unwrap();
-        let transcript = b"nonces and transport transcript";
-
-        let left_code = left.pairing_code(right.spki(), transcript);
-        let right_code = right.pairing_code(left.spki(), transcript);
-        assert_eq!(left_code, right_code);
-        assert_eq!(left_code.len(), 6);
-        assert!(left_code.bytes().all(|byte| byte.is_ascii_digit()));
     }
 }

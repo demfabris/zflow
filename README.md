@@ -27,11 +27,17 @@ apt, dnf, or pacman. GNOME settings need GJS, GTK 4.12+, and libadwaita 1.5+.
 System changes request administrator access once, through GNOME's password
 dialog when available, or `sudo` in the terminal.
 
-On macOS, the installer places `zflow.app` in `/Applications`. The release
-workflow signs Mac apps with Developer ID and notarizes them, but v0.1.0 was
-built before that: its Mac apps are ad-hoc signed. Input sharing works, but they
-can't install the optional AWDL helper. Releases built by the signing workflow
-can install it from the app with administrator approval.
+On macOS, download `zflow-vVERSION-macos.dmg` from
+[Releases](https://github.com/demfabris/zflow/releases/latest), open it, and
+drag zflow onto Applications. One image covers Apple silicon and Intel. To
+update, quit zflow and drag the new version over the old one. Releases after
+v0.1.0 include the image. The curl command also works on macOS: it places
+`zflow.app` in `/Applications` and replaces an older copy there.
+
+The release workflow signs Mac apps with Developer ID and notarizes them, but
+v0.1.0 was built before that: its Mac apps are ad-hoc signed. Input sharing works,
+but they can't install the optional AWDL helper. Releases built by the signing
+workflow can install it from the app with administrator approval.
 
 Repeat the command to update. It keeps your configuration and paired identities;
 updating the Linux service interrupts an active connection. Log out and back in
@@ -67,6 +73,9 @@ Applications on GNOME and `/Applications/zflow.app` on macOS. Keep the GNOME
 desktop agent running during use; it supplies cursor placement, desktop
 dimensions, and return barriers.
 
+On Ubuntu, open zflow. A fresh install opens **Pair Computer** by itself and
+shows a six-digit setup code; otherwise choose **Pair Computer…**.
+
 While no computer is paired, the Mac app opens a setup window at launch. Open
 it again from the menu-bar icon with **Set Up…**. Each step checks itself off
 and moves on, and **Back** returns to an earlier one:
@@ -77,9 +86,11 @@ and moves on, and **Back** returns to an earlier one:
 3. **Local Network**: zflow starts looking for computers here, so macOS asks
    now. Choose **Allow**. If access stays off, the step says where to turn it on.
 4. **Pair**: Linux computers running zflow nearby are listed by address.
-   Choose **Pair…** and finish pairing, or **Enter an Address…** with pairing
-   port `43120`. A network announcement alone never authorizes a computer.
-   While none is found, the step shows the install command with a copy button.
+   Choose **Pair…** and type the code Ubuntu shows, or use **Enter an
+   Address…**. Pairing finishes on both computers without another click, and
+   each side names the other after its host name. A network announcement alone
+   never authorizes a computer. While none is found, the step shows the install
+   command with a copy button.
 5. **Try It**: move the pointer off the edge that leads to the Linux computer.
    The receiver's tile is placed against the Mac's right edge, so that is the
    right edge until you rearrange the tiles in Settings. The check turns green
@@ -87,8 +98,9 @@ and moves on, and **Back** returns to an earlier one:
    and **Reduce Wi-Fi lag**, which is off by default and installs the AWDL
    helper described below.
 
-Move through a touching edge with keys and mouse buttons released. Cross back
-from Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses sharing.
+To pair another computer later, use **Pair Computer…** in **Settings…**. Move
+through a touching edge with keys and mouse buttons released. Cross back from
+Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses sharing.
 Resume from the menu-bar menu when you are ready. Later problems, such as
 Accessibility or Local Network access being turned off, show on the health
 badge in Settings.
@@ -151,12 +163,12 @@ the updated layout arms.
 ## Discover nearby computers
 
 Pairing lists receivers advertised on the local network. Discovery does not
-verify identity; both sides must confirm the six-digit codes. Manual addresses
-remain available. The Linux daemon advertises the receiver. macOS asks for
-Local Network access the first time the Mac browses, so the Mac waits for the
-setup's Local Network step or **Pair Computer…** in Settings. Once a computer
-is paired, it browses from launch. Browsing then continues while the Mac app
-is running, even with Settings closed.
+verify identity; only the setup code shown on the receiver does. Manual
+addresses remain available. The Linux daemon advertises the receiver. macOS
+asks for Local Network access the first time the Mac browses, so the Mac waits
+for the setup's Local Network step or **Pair Computer…** in Settings. Once a
+computer is paired, it browses from launch. Browsing then continues while the
+Mac app is running, even with Settings closed.
 
 If the list stays empty, check zflow under **System Settings → Privacy & Security
 → Local Network**, or use a manual address. Terminal tools have different
@@ -211,20 +223,22 @@ as `KEY_LEFTCTRL`.
 Pairing uses a temporary listener on UDP port 43120. The normal input service
 listens on UDP port 43119.
 
-On the first machine:
+On the first machine, which prints a six-digit setup code:
 
 ```sh
 sudo zflow pair listen laptop
 ```
 
-On the second machine, connect to the first machine's LAN address:
+On the second machine, connect to the first machine's LAN address and type
+that code at the prompt (or pass `--code`):
 
 ```sh
 sudo zflow pair connect desk 192.0.2.10:43120
 ```
 
-Both commands display a six-digit code. Compare the codes in person, then
-enter the peer's code at each prompt. A mismatch writes no trust record.
+The code never crosses the network: both sides prove they know it through
+SPAKE2, so a wrong code writes no trust record. The listener accepts three
+wrong codes, then stops and needs a new code.
 
 Normal pairing never grants pre-login input. Grant that permission separately
 only if you need input at a greeter or lock screen:
@@ -350,6 +364,7 @@ the problem to capture or playout behavior.
 ```sh
 just run mac                 # Build and open the native debug app
 just build mac               # Package the native release app
+just dmg                     # Pack it into a local disk image (--universal for both CPUs)
 just install-linux           # Install/update the Linux service
 just run linux               # Open native GNOME settings
 just debug mac               # Native app diagnostics under target/logs

@@ -97,7 +97,6 @@ impl WireMessage {
 /// Metadata exchanged only after the pairing-only TLS handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingOffer {
-    pub handshake_nonce: [u8; 32],
     pub device_label: Option<String>,
     pub input_port: u16,
     pub input_candidates: Vec<String>,
@@ -288,7 +287,6 @@ mod tests {
 
     fn pairing() -> PairingOffer {
         PairingOffer {
-            handshake_nonce: [0x33; 32],
             device_label: Some("workstation".into()),
             input_port: 43119,
             input_candidates: vec!["192.0.2.1:43119".into()],

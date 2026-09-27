@@ -17,11 +17,15 @@ installing, so no process running as the user can swap files mid-install.
 | --- | --- | --- |
 | Linux x86-64 | Ubuntu 24.04 | `zflow-vVERSION-x86_64-unknown-linux-gnu.tar.gz`, `zflow_VERSION_amd64.deb` |
 | Linux ARM64 | Ubuntu 24.04 ARM | `zflow-vVERSION-aarch64-unknown-linux-gnu.tar.gz`, `zflow_VERSION_arm64.deb` |
-| macOS Apple Silicon | macOS 26 | `zflow-vVERSION-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | macOS 26 Intel | `zflow-vVERSION-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon and Intel | macOS 26 | `zflow-vVERSION-macos.dmg`, `zflow-vVERSION-universal-apple-darwin.tar.gz` |
 
-Linux uses Ubuntu 24.04 to keep the glibc floor at 2.39. Rust is pinned in the
-workflow; the app's minimum macOS version remains 26. After all builds and tests
+Linux uses Ubuntu 24.04 to keep the glibc floor at 2.39. The Mac job builds the
+Rust library for both CPUs, merges the two with `lipo`, and builds the Swift
+package for arm64 and x86_64, so both Mac files hold one universal app. The disk
+image is for people; `install.sh` uses the archive. Releases up to v0.1.0 had
+one Mac archive per CPU, and `install.sh` falls back to those names when a
+release lists no universal archive. Rust is pinned in the workflow; the app's
+minimum macOS version remains 26. After all builds and tests
 pass, the publish job combines the artifacts, computes `SHA256SUMS`, uploads a
 draft release, and publishes it. It refuses to replace an existing release.
 The release also contains `install.sh`. Checksums detect corrupt or mismatched
@@ -35,11 +39,16 @@ publishes. Manual publication creates the tag at the workflow's commit.
 Prerelease version suffixes produce GitHub prereleases, which users select
 with `--version`; the default `latest` selects a normal published release.
 
-The release workflow signs both Mac architectures with Developer ID, submits
-each app to Apple, and staples the accepted notarization ticket. It checks
-signatures, the ticket, and Gatekeeper again after extracting the final archive.
-A signing or notarization failure blocks publication, including manual builds
-with `publish` off.
+The release workflow signs the universal app with Developer ID, submits it to
+Apple, and staples the accepted notarization ticket. It then packs the stapled
+app into the disk image with `scripts/build-macos-dmg.sh`, signs the image, and
+notarizes and staples the image too. It checks signatures, tickets, and
+Gatekeeper again on the final archive and disk image. A signing or notarization
+failure blocks publication, including manual builds with `publish` off.
+
+The disk image holds `zflow.app` and a link to `/Applications`, and opens in
+Finder's default view. It is plain `hdiutil` output, with no background picture
+or saved icon positions, so it adds no build dependency.
 
 Configure these GitHub Actions repository secrets before running the workflow:
 
@@ -52,27 +61,35 @@ Configure these GitHub Actions repository secrets before running the workflow:
 | `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password generated for that account |
 | `APPLE_TEAM_ID` | Developer team ID matching the certificate |
 
-Each Mac job builds and tests the app with an ad-hoc signature first, so no
+The Mac job builds and tests the app with an ad-hoc signature first, so no
 build script runs while the certificate is available. It then imports the
 certificate into a temporary keychain, signs with `scripts/sign-macos-app.sh`,
-notarizes, and deletes the keychain before packaging, also on failure.
-Credentials stay in GitHub secrets and the runner's temporary keychain. Notarization JSON results remain in separate workflow
+notarizes, builds and notarizes the disk image, and deletes the keychain before
+packaging, also on failure. Credentials stay in GitHub secrets and the runner's
+temporary keychain. Notarization JSON results remain in separate workflow
 artifacts for seven days; they do not enter the published release.
 
-For a local signed and notarized build:
+For a local signed and notarized build (`--universal` needs
+`rustup target add aarch64-apple-darwin x86_64-apple-darwin`):
 
 ```sh
-./scripts/build-macos-app.sh --sign 'Developer ID Application: NAME (TEAM_ID)'
+./scripts/build-macos-app.sh --universal --sign 'Developer ID Application: NAME (TEAM_ID)'
 xcrun notarytool store-credentials zflow-notary --team-id TEAM_ID
 ./scripts/notarize-macos-app.sh zflow-notary
-./scripts/package-release.sh aarch64-apple-darwin  # x86_64-apple-darwin on Intel
+./scripts/build-macos-dmg.sh target/release/zflow.app target/dist/zflow-vVERSION-macos.dmg \
+  --sign 'Developer ID Application: NAME (TEAM_ID)'
+./scripts/notarize-macos-app.sh zflow-notary '' target/dist/zflow-vVERSION-macos.dmg
+./scripts/package-release.sh universal-apple-darwin
 ```
 
-The notarization script accepts an optional keychain path as its second argument.
-It waits up to 20 minutes. If Apple takes longer, the job fails and retains the
-submission ID in `target/notarization/submission.json`; inspect that submission
-with `xcrun notarytool info ID --keychain-profile PROFILE` before submitting again.
-Rebuilding or signing the app again requires another notarization.
+The notarization script takes an optional keychain path as its second argument
+(empty for your default keychains) and a disk image to notarize instead of the
+app as its third. It waits up to 20 minutes. If Apple takes longer, the job fails
+and retains the submission ID in `target/notarization/submission.json`
+(`target/notarization/dmg/` for the disk image); inspect that submission with
+`xcrun notarytool info ID --keychain-profile PROFILE` before submitting again.
+Rebuilding or signing the app again requires another notarization and a new
+disk image.
 
 Local artifact assembly after building the native release binaries:
 
@@ -82,8 +99,9 @@ Local artifact assembly after building the native release binaries:
 ```
 
 Both commands package existing binaries under `target/release`; neither builds
-them. Substitute the native target from the table for the archive command.
-Outputs go under `target/dist`.
+them. Substitute the native target from the table for the archive command; on a
+Mac that is `universal-apple-darwin`, which requires an app built with
+`--universal`. Outputs go under `target/dist`.
 
 ## Debian packages
 
@@ -167,8 +185,12 @@ Use `--purge` only when you also want to delete those files and the account.
 
 ## Native macOS app
 
-`scripts/build-macos-app.sh [--debug] [--sign IDENTITY]` builds the Rust static
-library and Swift package, then assembles `target/{debug,release}/zflow.app`.
+`scripts/build-macos-app.sh [--debug] [--universal] [--dmg] [--sign IDENTITY]`
+builds the Rust static library and Swift package, then assembles
+`target/{debug,release}/zflow.app`. It builds for the current CPU unless
+`--universal` asks for Apple silicon and Intel in one app. `--dmg`, or `just dmg`,
+also packs `zflow.dmg` beside the app, signed with the app's identity unless that
+is ad hoc, and never notarized.
 The app requires macOS 26 and Swift 6.2 or newer. It uses SwiftUI Settings and
 MenuBarExtra with no Dock icon. The bundle contains the AWDL daemon and its
 SMAppService launchd plist. All executables use hardened runtime signatures.

@@ -46,11 +46,10 @@ pub(crate) enum Request {
         tolerance: u32,
     },
     PairStart {
-        address: Option<std::net::SocketAddr>,
-    },
-    PairConfirm {
-        name: String,
-        code: String,
+        /// Absent to listen; otherwise an IP address, with the port optional.
+        address: Option<String>,
+        /// The code shown on the other computer, when connecting.
+        code: Option<String>,
     },
     PairCancel,
     Forget {
@@ -172,13 +171,17 @@ impl NativeApp {
                 }
                 self.restart();
             }
-            Request::PairStart { address } => {
-                if let Some(address) = address {
-                    ensure!(address.port() != 0, "Enter an IP address and port");
+            Request::PairStart { address, code } => {
+                let remote = address
+                    .as_deref()
+                    .map(crate::pairing::parse_pairing_address)
+                    .transpose()?;
+                if let Some(remote) = remote {
+                    ensure!(remote.port() != 0, "Enter the other computer's IP address");
                 }
-                self.pairing.start(self.document.path.clone(), address)?;
+                self.pairing
+                    .start(self.document.path.clone(), remote, code)?;
             }
-            Request::PairConfirm { name, code } => self.pairing.confirm(name, code)?,
             Request::PairCancel => self.pairing.cancel(),
             Request::Forget { name } => {
                 self.document.draft.peers.remove(&name);

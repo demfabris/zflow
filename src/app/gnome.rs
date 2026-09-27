@@ -37,11 +37,10 @@ enum Request {
         name: String,
     },
     Pair {
-        remote: Option<std::net::SocketAddr>,
-    },
-    PairConfirm {
-        name: String,
-        code: String,
+        /// Absent to listen; otherwise an IP address, with the port optional.
+        remote: Option<String>,
+        /// The code shown on the other computer, when connecting.
+        code: Option<String>,
     },
     PairCancel,
     OpenSettings,
@@ -88,17 +87,15 @@ impl Service {
                 crate::peer_view::request(&DaemonRequest::Forget { name }).await?;
             }
             Request::SetAutostart { enabled } => set_autostart(enabled)?,
-            Request::Pair { remote } => {
+            Request::Pair { remote, code } => {
+                let remote = remote
+                    .as_deref()
+                    .map(crate::pairing::parse_pairing_address)
+                    .transpose()?;
                 let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
                 ensure!(!state.pairing.active(), "Pairing is already open");
-                state.pairing.start(PathBuf::new(), remote)?;
+                state.pairing.start(PathBuf::new(), remote, code)?;
             }
-            Request::PairConfirm { name, code } => self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pairing
-                .confirm(name, code)?,
             Request::PairCancel => self
                 .0
                 .lock()

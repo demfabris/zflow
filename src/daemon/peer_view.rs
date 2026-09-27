@@ -38,12 +38,12 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
                         crate::peer_view::Request::Desktop {} => {
                             super::desktop::serve(shared.clone(), stream, daemon_uid).await?;
                         }
-                        crate::peer_view::Request::Pair { remote } => {
+                        crate::peer_view::Request::Pair { remote, code } => {
                             let result = async {
                                 let _slot = pairing_slot
                                     .try_acquire_owned()
                                     .context("Another pairing is already open")?;
-                                pair(&mut stream, &shared, daemon_uid, remote).await
+                                pair(&mut stream, &shared, daemon_uid, remote, code).await
                             }
                             .await;
                             if let Err(error) = result {
@@ -56,9 +56,6 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
                                 )
                                 .await;
                             }
-                        }
-                        crate::peer_view::Request::PairConfirm { .. } => {
-                            bail!("Start pairing before confirming a code")
                         }
                         request => {
                             let reply = desktop_command(&mut stream, &shared, daemon_uid, request)
@@ -128,43 +125,60 @@ async fn desktop_command(
     }
 }
 
+/// A listener here waits up to this long for the other computer to be set up.
+const LISTEN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn pair(
     stream: &mut tokio::net::UnixStream,
     shared: &Arc<Shared>,
     daemon_uid: u32,
     remote: Option<std::net::SocketAddr>,
+    code: Option<String>,
 ) -> Result<()> {
-    use crate::peer_view::{PairingEvent, Request};
-    let (session, name, authentication_code) = tokio::time::timeout(Duration::from_secs(120), async {
-    write_message(stream, &PairingEvent::Ready).await?;
+    use crate::{
+        pairing::SetupCode,
+        peer_view::{PairingEvent, Request},
+    };
     let input_port = shared.config.read().await.transport.listen.port();
+    let (code, limit) = match remote {
+        Some(_) => (
+            SetupCode::parse(code.as_deref().unwrap_or_default())?,
+            CONNECT_TIMEOUT,
+        ),
+        None => {
+            let code = SetupCode::generate()?;
+            write_message(
+                stream,
+                &PairingEvent::Listening {
+                    code: code.to_string(),
+                },
+            )
+            .await?;
+            (code, LISTEN_TIMEOUT)
+        }
+    };
     let session = tokio::select! {
-        session = crate::pairing::begin(&shared.identity, remote, input_port) => session?,
-        _ = read_message::<_, Request>(stream) => bail!("Pairing cancelled or confirmed before a code was available"),
+        session = tokio::time::timeout(limit, crate::pairing::begin(&shared.identity, remote, input_port, &code)) => {
+            session.context("Pairing expired; try again")??
+        }
+        _ = read_message::<_, Request>(stream) => bail!("Pairing cancelled"),
     };
-    write_message(stream, &PairingEvent::Confirm {
-        peer_label: session.peer_label.clone(),
-        authentication_code: session.authentication_code.clone(),
-    }).await?;
-    let Request::PairConfirm { name, authentication_code } = read_message(stream).await? else {
-        bail!("Expected a pairing confirmation");
-    };
-    Ok::<_, anyhow::Error>((session, name, authentication_code))
-    }).await.context("Pairing expired; try again")??;
-    let _mutation = shared.config_mutation.lock().await;
-    authorize_peer(stream, daemon_uid, shared.active_uid())?;
-    let mut config = shared.config.read().await.clone();
-    crate::pairing::add_confirmed_peer(
-        &mut config,
-        session.observation(),
-        &name,
-        &authentication_code,
-        true,
-    )?;
-    shared.apply_config_locked(config, true).await?;
+    let saved = async {
+        let _mutation = shared.config_mutation.lock().await;
+        authorize_peer(stream, daemon_uid, shared.active_uid())?;
+        let mut config = shared.config.read().await.clone();
+        let name = crate::pairing::add_paired_peer(&mut config, session.observation(), true)?;
+        shared.apply_config_locked(config, true).await?;
+        Ok::<_, anyhow::Error>(name)
+    }
+    .await;
+    // The other computer saves this one only after hearing that we kept it.
+    session.finish(saved.is_ok()).await;
+    let name = saved?;
     tokio::time::timeout(
         Duration::from_secs(3),
-        write_message(stream, &PairingEvent::Paired),
+        write_message(stream, &PairingEvent::Paired { name }),
     )
     .await??;
     Ok(())

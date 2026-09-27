@@ -21,10 +21,12 @@ No host service, input device, or system package is changed by these tests.
 
 The release workflow runs the bootstrap tests on Linux and macOS runners,
 Linux Rust/GNOME checks and package lifecycle tests on both Linux architectures,
-and native Mac app builds and Swift bridge tests on both Mac architectures.
-Mac jobs also run `python3 tests/macos_notarization_test.py`, sign with Developer
-ID, require Apple's acceptance, and staple the ticket. They extract each release
-archive and check its signature, ticket, and Gatekeeper assessment before upload.
+and one universal (Apple silicon and Intel) Mac app build with Swift bridge tests
+on Apple silicon. The Mac job also runs `python3 tests/macos_notarization_test.py`,
+signs with Developer ID and a secure timestamp, requires Apple's acceptance for the
+app and then the disk image, and staples both. It extracts the release archive and
+checks the app's and the image's signature, ticket, and Gatekeeper assessment
+before upload.
 Only a complete build matrix can publish a release.
 
 Live installation checks remain:
@@ -32,8 +34,9 @@ Live installation checks remain:
 - Install/update on Ubuntu, Fedora, and Arch GNOME sessions, including password
   approval/cancellation, extension activation, runtime dependencies, and app launch.
 - Install headless from a terminal with no compiler toolchain present.
-- On macOS 26+, install each architecture's released bundle, update a running
-  app, grant first-launch permissions, and test Open at login at its final path.
+- On macOS 26+, install from the disk image on Apple silicon and on Intel, update
+  a running app, grant first-launch permissions, and test Open at login at its
+  final path.
 
 ## Native GNOME app and panel, September 16
 
@@ -63,7 +66,7 @@ Live checks after installing the updated service and desktop integration:
   Confirm status, native theme, keyboard focus, and one desktop agent.
 - Pause while receiving and while sending. Held input must release and new
   connections must stay blocked. Resume must preserve the paired identities.
-- Pair with a Mac and another Linux computer. Cancel before confirmation and
+- Pair with a Mac and another Linux computer. Cancel while the code shows and
   enter a wrong code; neither should add trust. Forget an active computer and
   verify immediate cleanup. Keep pre-login permissions unchanged.
 - Close settings and cross edges repeatedly. Disable/re-enable the extension,
@@ -103,7 +106,7 @@ Native UI and live matrix:
 - Launch an isolated bundle configuration with sharing paused. Check menu
   actions, native Settings, keyboard focus, health popover, pairing sheet,
   AWDL switch, automatic window sizing, and light/dark system appearance.
-- Pair through both six-digit confirmations; cancellation must never save trust.
+- Pair by typing the receiver's setup code on the Mac; a wrong code or a cancelled pairing must never save trust, and three wrong codes stop the listener.
 - Drag computers in all directions, including offsets. Check snapping,
   overlap rejection, reopening, and external layout conflicts.
 - Check first launch, malformed/deleted TOML, correction, GUI writes preserving
