@@ -38,7 +38,7 @@ if name == "xcrun" and args[:2] == ["stapler", "validate"] and mode == "bad-tick
 
 
 class NotarizationTest(unittest.TestCase):
-    def run_notarization(self, mode):
+    def run_notarization(self, mode, *extra):
         with tempfile.TemporaryDirectory(prefix="zflow notary test ") as temp:
             root = Path(temp)
             (root / "scripts").mkdir()
@@ -53,7 +53,7 @@ class NotarizationTest(unittest.TestCase):
                 tool.chmod(0o755)
             calls = root / "calls.jsonl"
             result = subprocess.run(
-                [os.environ.get("TEST_BASH", "bash"), str(script), "test-profile", str(root / "test.keychain-db")],
+                [os.environ.get("TEST_BASH", "bash"), str(script), "test-profile", str(root / "test.keychain-db"), *extra],
                 env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "CALLS": str(calls), "MODE": mode},
                 capture_output=True, text=True,
             )
@@ -89,6 +89,14 @@ class NotarizationTest(unittest.TestCase):
     def test_invalid_ticket_fails_release(self):
         result, _, _ = self.run_notarization("bad-ticket")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_disk_image_is_submitted_and_stapled_as_is(self):
+        result, calls, _ = self.run_notarization("accepted", "/release/zflow-v1.0.0-macos.dmg")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("ditto", [call[0] for call in calls])
+        self.assertIn(["xcrun", "notarytool", "submit", "/release/zflow-v1.0.0-macos.dmg"], [call[:4] for call in calls])
+        self.assertIn(["xcrun", "stapler", "staple", "/release/zflow-v1.0.0-macos.dmg"], calls)
+        self.assertEqual(calls[-1][:4], ["spctl", "--assess", "--type", "open"])
 
 
 if __name__ == "__main__":
