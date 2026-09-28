@@ -567,9 +567,16 @@ static void signal_tests(void) {
   assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
   // Key up 40, flagsChanged 56, right button up, then nothing goes down.
   char expected[64];
-  snprintf(expected, sizeof(expected), "%d 40\n%d 56\n%d 1\nlate post -1\n",
-           (int)kCGEventKeyUp, (int)kCGEventFlagsChanged, (int)kCGEventRightMouseUp);
-  assert(strcmp(text, expected) == 0);
+  int released = snprintf(expected, sizeof(expected), "%d 40\n%d 56\n%d 1\n",
+                          (int)kCGEventKeyUp, (int)kCGEventFlagsChanged,
+                          (int)kCGEventRightMouseUp);
+  assert(strncmp(text, expected, (size_t)released) == 0);
+  // A SIGTERM sent before the handler restored the default action runs it
+  // again. That run has nothing left to release, so only the late post repeats.
+  const char *late = "late post -1\n";
+  const char *rest = text + released;
+  assert(*rest);
+  for (; *rest; rest += strlen(late)) assert(strncmp(rest, late, strlen(late)) == 0);
 }
 
 int main(int argc, char **argv) {
