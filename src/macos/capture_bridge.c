@@ -13,6 +13,8 @@
 #define ZFLOW_MAX_CONTACTS 5
 #define ZFLOW_MAX_DISPLAYS 64
 #define ZFLOW_CAPS_LOCK 57
+// HIToolbox's kKeyboardISO, the characters 'ISO '.
+#define ZFLOW_KEYBOARD_ISO 0x49534F20
 
 // Media keys and native gestures would act on the Mac app under the frozen
 // cursor. Their payloads are not decoded, so capture swallows them. The
@@ -27,6 +29,7 @@
 
 // From Carbon's HIToolbox; declared here instead of including all of Carbon.
 extern Boolean IsSecureEventInputEnabled(void);
+extern OSType KBGetLayoutType(SInt16 keyboard_type);
 
 typedef struct { double x, y; } ZFlowMacPosition;
 typedef struct { double x, y, width, height; } ZFlowMacRect;
@@ -208,6 +211,9 @@ static ZFlowMacRect g_entry_region;
 // sleep instead of polling the queue.
 static void (*g_wake)(void);
 static bool g_forwarded_keys[128];
+// The code each held key went out as. Its release sends the same code, even
+// one replayed without an event after the keyboard type changed.
+static uint16_t g_forwarded_codes[128];
 static bool g_forwarded_buttons[33];
 static _Atomic bool g_stop;
 static _Atomic bool g_pause_requested;
@@ -380,6 +386,18 @@ static bool owns_transition(bool *held, bool pressed) {
   return true;
 }
 
+// On ISO keyboards macOS swaps keycodes 10 and 50: 10 is the key left of 1
+// and 50 the key left of Z, the reverse of ANSI and JIS. Swap them back so
+// each code names one position, as SDL, Chromium and Firefox do. The type
+// comes from the event, so a built-in ISO and an external ANSI keyboard can
+// both be right.
+static uint16_t physical_keycode(CGEventRef event, uint16_t keycode) {
+  if (keycode != 10 && keycode != 50) return keycode;
+  SInt16 keyboard = (SInt16)CGEventGetIntegerValueField(
+      event, kCGKeyboardEventKeyboardType);
+  return KBGetLayoutType(keyboard) == ZFLOW_KEYBOARD_ISO ? 60 - keycode : keycode;
+}
+
 static void wake(void) {
   if (g_wake) g_wake();
 }
@@ -510,14 +528,15 @@ static CGEventRef forward(const ZFlowMacEvent *event) {
 
 // Releases that happened while macOS had the tap disabled went to the Mac, so
 // the other computer still holds those keys and buttons. Release whatever is
-// no longer down.
+// no longer down. Key state is read by raw keycode, but each release sends the
+// code its press went out as.
 static void release_lifted_input(void) {
   ZFlowMacEvent release = {.kind = ZFLOW_EVENT_KEY};
   for (uint16_t key = 0; key < 128; key++) {
     if (!g_forwarded_keys[key] ||
         CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, key)) continue;
     g_forwarded_keys[key] = false;
-    release.code = key;
+    release.code = g_forwarded_codes[key];
     forward(&release);
   }
   release = (ZFlowMacEvent){.kind = ZFLOW_EVENT_BUTTON};
@@ -596,8 +615,13 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
       // Repeats of a key held since before capture belong to neither computer.
       if (type == kCGEventKeyDown && keycode < 128 && !g_forwarded_keys[keycode] &&
           CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat)) return NULL;
-      if (keycode < 128 &&
-          !owns_transition(&g_forwarded_keys[keycode], captured.pressed)) return event;
+      if (keycode < 128) {
+        bool held = g_forwarded_keys[keycode];
+        if (!owns_transition(&g_forwarded_keys[keycode], captured.pressed)) return event;
+        // Autorepeat and the release keep the code the first press chose.
+        if (!held) g_forwarded_codes[keycode] = physical_keycode(event, keycode);
+        captured.code = g_forwarded_codes[keycode];
+      }
       return forward(&captured);
     }
     case kCGEventLeftMouseDown:
