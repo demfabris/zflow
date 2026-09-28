@@ -24,7 +24,7 @@ let package = Package(
         .unsafeFlags(["-L", rustLibrary, "-lzflow"]),
         .linkedFramework("AppKit"), .linkedFramework("ApplicationServices"),
         .linkedFramework("Carbon"), .linkedFramework("CoreFoundation"),
-        .linkedFramework("IOKit"), .linkedFramework("Security"),
+        .linkedFramework("ImageIO"), .linkedFramework("IOKit"), .linkedFramework("Security"),
       ]),
     .executableTarget(name: "AWDLDaemon", dependencies: ["AWDLGuardian"]),
   ]

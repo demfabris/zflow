@@ -15,10 +15,12 @@ use tokio::sync::{mpsc, oneshot};
 use super::{
     CursorPosition,
     awdl::HeldLease,
+    clipboard::{Clipboard, MacPasteboard, Pasteboard},
     handoff_server::{Desk, HandoffServer},
     inject::{self, Injector},
 };
 use crate::{
+    clipboard::Clip,
     config::{PeerConfig, PeerPermissions},
     core::{KeyboardMode, ReceiverEffect, SessionCloseReason},
     desktop::{DesktopRequest, DesktopResponse, Geometry, Point, SharedLayout},
@@ -266,16 +268,18 @@ pub(super) fn answer_while_sending(kind: SessionEventKind) {
 
 /// Answers events that arrived while the link was idle, including the
 /// OutboundEnded that trails the previous crossing's release. A peer's
-/// layout goes to `layout`.
+/// layout goes to `layout`, and its clipboard to `clip`.
 pub(super) fn answer_waiting_events(
     events: &mut mpsc::Receiver<SessionEvent>,
     mut layout: impl FnMut(SharedLayout),
+    mut clip: impl FnMut(Clip),
 ) -> Result<()> {
     loop {
         match events.try_recv() {
             Ok(event) => match event.kind {
                 SessionEventKind::Closed { reason } => bail!("input session closed: {reason}"),
                 SessionEventKind::Layout { layout: shared } => layout(shared),
+                SessionEventKind::Clipboard { clip: shared } => clip(shared),
                 kind => answer_while_sending(kind),
             },
             Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
@@ -468,15 +472,21 @@ pub(crate) struct Receiving {
     handoff: Arc<HandoffServer<MacDesk>>,
     policy: Mutex<Policy>,
     sessions: Sessions,
+    clipboard: Arc<Clipboard>,
 }
 
 impl Receiving {
-    /// Posts on this Mac.
+    /// Posts on this Mac, and shares its pasteboard.
     pub fn mac() -> Result<Arc<Self>> {
-        Ok(Self::new(Injector::mac()?, Arc::new(MacScreen)))
+        let pasteboard = Arc::new(MacPasteboard);
+        Ok(Self::new(Injector::mac()?, Arc::new(MacScreen), pasteboard))
     }
 
-    pub fn new(injector: Injector, screen: Arc<dyn Screen>) -> Arc<Self> {
+    pub fn new(
+        injector: Injector,
+        screen: Arc<dyn Screen>,
+        pasteboard: Arc<dyn Pasteboard>,
+    ) -> Arc<Self> {
         let ownership = Ownership::default();
         let injector = Arc::new(injector);
         let sessions = Sessions::default();
@@ -501,11 +511,16 @@ impl Receiving {
             handoff,
             policy: Mutex::default(),
             sessions,
+            clipboard: Clipboard::new(pasteboard),
         })
     }
 
     pub fn ownership(&self) -> &Ownership {
         &self.ownership
+    }
+
+    pub fn clipboard(&self) -> &Arc<Clipboard> {
+        &self.clipboard
     }
 
     fn policy(&self) -> MutexGuard<'_, Policy> {
@@ -645,6 +660,11 @@ impl Inbound {
         });
     }
 
+    /// The clipboard this Mac shares, which the session's clips go to.
+    pub fn clipboard(&self) -> Arc<Clipboard> {
+        self.receiving.clipboard.clone()
+    }
+
     /// Whether this session's peer controls this Mac, or holds its desktop
     /// for a handoff.
     pub fn controls(&self) -> bool {
@@ -729,6 +749,8 @@ impl Inbound {
             // Closing the activation already let go of everything.
             self.wifi = None;
             tracing::info!(peer = %self.peer, "peer let go of this Mac");
+            // The pointer went back to the peer, so the clipboard goes along.
+            self.receiving.clipboard.share(&self.session);
         }
         if refused {
             return Err(REJECTED.into());
@@ -1042,7 +1064,7 @@ mod tests {
             }))
             .await
             .unwrap();
-        answer_waiting_events(&mut events, drop).unwrap();
+        answer_waiting_events(&mut events, drop, drop).unwrap();
         assert_eq!(
             desktop.await.unwrap(),
             DesktopResponse::unavailable(SENDING)
@@ -1053,8 +1075,8 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(answer_waiting_events(&mut events, drop).is_err());
+        assert!(answer_waiting_events(&mut events, drop, drop).is_err());
         drop(sender);
-        assert!(answer_waiting_events(&mut events, drop).is_err());
+        assert!(answer_waiting_events(&mut events, drop, drop).is_err());
     }
 }

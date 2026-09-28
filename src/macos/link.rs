@@ -233,12 +233,22 @@ impl Links {
     }
 
     /// Links that post through `backend` instead of on this Mac, with
-    /// motion that is not accelerated.
+    /// motion that is not accelerated, and a pasteboard of their own.
     #[cfg(test)]
     pub(crate) fn with_backend(backend: super::inject::FakeBackend) -> Result<Self> {
+        Self::with_fakes(backend, Default::default())
+    }
+
+    /// Links that also share `pasteboard` instead of this Mac's.
+    #[cfg(test)]
+    pub(crate) fn with_fakes(
+        backend: super::inject::FakeBackend,
+        pasteboard: super::clipboard::FakePasteboard,
+    ) -> Result<Self> {
         let profile = super::pointer::Profile::Flat { speed: 0.0 };
         let injector = super::inject::Injector::start(backend.clone(), profile)?;
-        Self::with_receiving(Receiving::new(injector, Arc::new(backend)))
+        let receiving = Receiving::new(injector, Arc::new(backend), Arc::new(pasteboard));
+        Self::with_receiving(receiving)
     }
 
     fn with_receiving(receiving: Arc<Receiving>) -> Result<Self> {
@@ -295,6 +305,8 @@ impl Links {
     fn sync_links(&mut self, config: Option<&Config>) {
         let peers = config.map(|config| config.peers.clone());
         self.receiving.set_peers(peers.unwrap_or_default());
+        let share = config.is_some_and(|config| config.clipboard.share);
+        self.receiving.clipboard().set_share(share);
         let settings = config.map(session_settings);
         let wanted: BTreeMap<&String, &PeerConfig> = config
             .into_iter()
@@ -458,6 +470,11 @@ impl Links {
         }
     }
 
+    /// Why the clipboard last went nowhere, while that still holds.
+    pub fn clipboard_notice(&self) -> Option<String> {
+        self.receiving.clipboard().notice()
+    }
+
     /// Why peers cannot connect to this Mac, if they cannot.
     pub fn listen_error(&self) -> Option<&str> {
         self.listen_error.as_deref()
@@ -591,6 +608,8 @@ fn session_settings(config: &Config) -> Config {
     Config {
         peers: BTreeMap::new(),
         macos: Default::default(),
+        switching: Default::default(),
+        clipboard: Default::default(),
         ..config.clone()
     }
 }
@@ -1049,10 +1068,12 @@ impl Session {
                         guard,
                     }) => {
                         let context = self.next_context();
+                        let clipboard = inbound.clipboard();
                         let activation = Activation {
                             session: &self.handle,
                             events: &mut self.events,
                             layouts: &mut *layouts,
+                            clipboard: &clipboard,
                             context,
                             raw_touch: self.raw_touch,
                         };
@@ -1094,7 +1115,10 @@ impl Session {
                         let _ = applied.send(inbound.effects(effects, received_at).await);
                     }
                     Some(SessionEventKind::Layout { layout }) => layouts.take(&self.handle, layout),
-                    Some(SessionEventKind::OutboundEnded | SessionEventKind::Clipboard { .. }) => {}
+                    Some(SessionEventKind::Clipboard { clip }) => {
+                        inbound.clipboard().keep(self.handle.peer(), clip);
+                    }
+                    Some(SessionEventKind::OutboundEnded) => {}
                     None => return Served::Lost("input session closed".into()),
                 },
                 Ok(()) = layouts.kept.changed() => layouts.offer(&self.handle),
@@ -1231,10 +1255,12 @@ mod tests {
     use super::*;
     use crate::{
         capture::{CaptureFrame, CaptureTransition, CapturedDeviceFrame, KeyState},
+        clipboard::{Clip, ClipKind},
         config::PeerPermissions,
         core::{HidUsage, ReceiverEffect},
         desktop::{Edge, FRACTION_MAX, Point, Rect},
         macos::{
+            clipboard::FakePasteboard,
             inject::FakeBackend,
             receive::{self, Ownership},
         },
@@ -1277,6 +1303,7 @@ mod tests {
         effects: mpsc::UnboundedReceiver<(u64, ReceiverEffect)>,
         closed: mpsc::UnboundedReceiver<u64>,
         layouts: mpsc::UnboundedReceiver<SharedLayout>,
+        clips: mpsc::UnboundedReceiver<Clip>,
         /// While set, desktop requests wait in `held` for the test to answer.
         hold: Arc<std::sync::atomic::AtomicBool>,
         held: mpsc::UnboundedReceiver<(DesktopRequest, oneshot::Sender<DesktopResponse>)>,
@@ -1295,6 +1322,7 @@ mod tests {
         let (effects_tx, effects) = mpsc::unbounded_channel();
         let (closed_tx, closed) = mpsc::unbounded_channel();
         let (layouts_tx, layouts) = mpsc::unbounded_channel();
+        let (clips_tx, clips) = mpsc::unbounded_channel();
         let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (held_tx, held) = mpsc::unbounded_channel();
         let holding = hold.clone();
@@ -1317,10 +1345,11 @@ mod tests {
                     continue;
                 };
                 let _ = sessions_tx.send(session);
-                let (effects_tx, closed_tx, layouts_tx, held_tx) = (
+                let (effects_tx, closed_tx, layouts_tx, clips_tx, held_tx) = (
                     effects_tx.clone(),
                     closed_tx.clone(),
                     layouts_tx.clone(),
+                    clips_tx.clone(),
                     held_tx.clone(),
                 );
                 let holding = holding.clone();
@@ -1349,8 +1378,10 @@ mod tests {
                             SessionEventKind::Layout { layout } => {
                                 let _ = layouts_tx.send(layout);
                             }
-                            SessionEventKind::OutboundEnded
-                            | SessionEventKind::Clipboard { .. } => {}
+                            SessionEventKind::Clipboard { clip } => {
+                                let _ = clips_tx.send(clip);
+                            }
+                            SessionEventKind::OutboundEnded => {}
                         }
                     }
                 });
@@ -1362,6 +1393,7 @@ mod tests {
             effects,
             closed,
             layouts,
+            clips,
             hold,
             held,
             _endpoint: endpoint,
@@ -1473,7 +1505,7 @@ mod tests {
             let prepared = session.handle.desktop_request(prepare).await.unwrap();
             assert!(matches!(prepared, DesktopResponse::Prepared { .. }));
             // The previous release left an OutboundEnded behind.
-            receive::answer_waiting_events(&mut session.events, drop).unwrap();
+            receive::answer_waiting_events(&mut session.events, drop, drop).unwrap();
             let context = session.next_context();
             session.handle.begin_outbound(context).unwrap();
             session.handle.capture(key(KeyState::Pressed)).unwrap();
@@ -1602,8 +1634,10 @@ mod tests {
         wait_until(&mut links, ready);
         let first = server.block_on(receiver.sessions.recv()).unwrap();
 
-        // Radio settings apply per crossing, so they leave the session alone.
+        // Radio, clipboard and edge settings leave the session alone.
         config.macos.block_awdl = true;
+        config.clipboard.share = true;
+        config.switching.pause_at_edges = true;
         let task = links.links["linux"].task.id();
         links.sync(Some(&config));
         assert_eq!(links.links["linux"].task.id(), task);
@@ -1653,12 +1687,13 @@ mod tests {
     }
 
     /// A fake Linux computer on its own runtime, and this Mac's links to it,
-    /// ready, posting into `fake`.
+    /// ready, posting into `fake` and sharing `pasteboard`.
     struct Pair {
         links: Links,
         receiver: Receiver,
         config: Config,
         fake: FakeBackend,
+        pasteboard: FakePasteboard,
         server: tokio::runtime::Runtime,
         directories: [tempfile::TempDir; 2],
     }
@@ -1678,7 +1713,8 @@ mod tests {
         peer.permissions.send_normal = true;
         record(peer);
         let fake = FakeBackend::default();
-        let mut links = Links::with_backend(fake.clone()).unwrap();
+        let pasteboard = FakePasteboard::default();
+        let mut links = Links::with_fakes(fake.clone(), pasteboard.clone()).unwrap();
         links.set_receive_policy(true, false);
         links.sync(Some(&config));
         wait_until(&mut links, |links| {
@@ -1691,6 +1727,7 @@ mod tests {
             receiver,
             config,
             fake,
+            pasteboard,
             server,
             directories,
         }
@@ -1698,10 +1735,14 @@ mod tests {
 
     /// The first activation of the fake computer's session.
     fn activation(session: &SessionHandle) -> SessionContext {
+        activation_number(session, 1)
+    }
+
+    fn activation_number(session: &SessionHandle, id: u64) -> SessionContext {
         SessionContext {
             session_epoch: SessionEpoch([9; 16]),
             transport_generation: session.generation(),
-            activation_id: ActivationId(1),
+            activation_id: ActivationId(id),
         }
     }
 
@@ -1846,6 +1887,68 @@ mod tests {
         assert_eq!(links.controller(), None);
         assert!(links.receiving.ownership().begin_outbound().is_some());
         drop(links);
+    }
+
+    /// The fake computer takes control of this Mac with activation `id`,
+    /// types a key, and lets go.
+    fn control_once(pair: &mut Pair, linux: &SessionHandle, id: u64) {
+        linux.begin_outbound(activation_number(linux, id)).unwrap();
+        linux.capture(key(KeyState::Pressed)).unwrap();
+        linux.capture(key(KeyState::Released)).unwrap();
+        posted(&pair.fake, "key 0 up", Duration::from_secs(2));
+        pair.fake.take_log();
+        pair.server
+            .block_on(linux.end_outbound(SessionCloseReason::LocalRelease))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pair.links.controller().is_some() {
+            assert!(Instant::now() < deadline, "the peer kept control");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The next clip the fake computer gets within `within`, if one comes.
+    fn clip(pair: &mut Pair, within: Duration) -> Option<Clip> {
+        let clips = &mut pair.receiver.clips;
+        pair.server
+            .block_on(async { tokio::time::timeout(within, clips.recv()).await })
+            .ok()
+            .flatten()
+    }
+
+    #[test]
+    fn the_clipboard_follows_the_pointer_back_to_a_peer_and_never_bounces() {
+        let mut pair = pair(|_| {});
+        let linux = pair.server.block_on(pair.receiver.sessions.recv()).unwrap();
+        pair.pasteboard.copy(ClipKind::Text, b"copied on the mac");
+
+        // Sharing is off, so the pasteboard is not even read.
+        control_once(&mut pair, &linux, 1);
+        assert!(clip(&mut pair, Duration::from_millis(200)).is_none());
+        assert_eq!(pair.pasteboard.board().reads, 0);
+
+        pair.config.clipboard.share = true;
+        pair.links.sync(Some(&pair.config));
+        control_once(&mut pair, &linux, 2);
+        let sent = clip(&mut pair, Duration::from_secs(2)).expect("the clipboard went along");
+        assert_eq!(sent.kind(), ClipKind::Text);
+        assert_eq!(sent.data(), b"copied on the mac");
+
+        // A clip from the peer lands on the pasteboard, and does not go back.
+        let theirs = Clip::new(ClipKind::Text, b"copied on linux".to_vec()).unwrap();
+        pair.server
+            .block_on(async { linux.send_clipboard(theirs.clone()) });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pair.pasteboard.board().writes.is_empty() {
+            assert!(Instant::now() < deadline, "the clip was not kept");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(pair.pasteboard.board().writes, [theirs]);
+        let reads = pair.pasteboard.board().reads;
+        control_once(&mut pair, &linux, 3);
+        assert!(clip(&mut pair, Duration::from_millis(300)).is_none());
+        assert_eq!(pair.pasteboard.board().reads, reads + 1);
+        drop(pair.links);
     }
 
     #[test]
@@ -2065,6 +2168,7 @@ mod tests {
             fake,
             server,
             directories: _directories,
+            ..
         } = pair(|_| {});
         let linux = server.block_on(receiver.sessions.recv()).unwrap();
         linux.begin_outbound(activation(&linux)).unwrap();

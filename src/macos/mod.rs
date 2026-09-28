@@ -2,6 +2,7 @@
 
 mod advertise;
 mod awdl;
+mod clipboard;
 mod handoff_server;
 mod inject;
 mod keys;
@@ -16,7 +17,7 @@ use std::{
     os::raw::c_char,
     path::PathBuf,
     pin::Pin,
-    sync::{Mutex, Once, PoisonError},
+    sync::{Arc, Mutex, Once, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -218,6 +219,7 @@ struct Activation<'a> {
     session: &'a SessionHandle,
     events: &'a mut mpsc::Receiver<SessionEvent>,
     layouts: &'a mut link::LayoutRoute,
+    clipboard: &'a Arc<clipboard::Clipboard>,
     context: SessionContext,
     raw_touch: bool,
 }
@@ -287,9 +289,11 @@ async fn cross(
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<Option<u32>> {
     let session = activation.session;
-    receive::answer_waiting_events(activation.events, |layout| {
-        activation.layouts.take(session, layout)
-    })?;
+    receive::answer_waiting_events(
+        activation.events,
+        |layout| activation.layouts.take(session, layout),
+        |clip| activation.clipboard.keep(session.peer(), clip),
+    )?;
     if stopped(stop) {
         return Ok(None);
     }
@@ -496,6 +500,8 @@ async fn capture<'a>(
         "native capture started"
     );
     let _ = status.send(SourceStatus::Sharing);
+    // The pointer left for the peer, so the clipboard goes along.
+    activation.clipboard.share(activation.session);
     // Polling renews the receiver's handoff and reports its return edge.
     *poll = Some(poll_desktop(activation.session, token));
     let ended = forward(
@@ -673,6 +679,9 @@ async fn forward<'a>(
                     return ended.failed("input session closed", error);
                 }
                 Some(SessionEventKind::Layout { layout }) => activation.layouts.take(session, layout),
+                Some(SessionEventKind::Clipboard { clip }) => {
+                    activation.clipboard.keep(session.peer(), clip);
+                }
                 Some(kind) => receive::answer_while_sending(kind),
                 None => {
                     let error = anyhow!("input session event channel closed");

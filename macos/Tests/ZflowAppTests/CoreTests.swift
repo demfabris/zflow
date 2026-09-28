@@ -131,3 +131,19 @@ import Testing
   #expect(saved.contains("keyboard = \"pc_positions\"") && saved.contains("reverse_scroll = true"))
   await core.shutdown()
 }
+
+@Test func theClipboardSwitchReachesTheEngine() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let file = directory.appendingPathComponent("zflow.toml")
+  try "[transport]\ndiscovery = false\n[macos]\nsharing = false\n".write(
+    to: file, atomically: true, encoding: .utf8)
+  let core = CoreBridge(path: file.path)
+  let initial = try await core.request(CoreRequest(command: "snapshot"))
+  #expect(initial.shareClipboard == false)
+  let changed = try await core.request(CoreRequest(command: "set_clipboard", share: true))
+  #expect(changed.shareClipboard == true)
+  #expect(try String(contentsOf: file, encoding: .utf8).contains("[clipboard]\nshare = true"))
+  await core.shutdown()
+}

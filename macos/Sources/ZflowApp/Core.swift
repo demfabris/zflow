@@ -38,6 +38,8 @@ struct Snapshot: Decodable, Sendable {
   var pairing: Pairing
   var nearby: [Nearby]
   var shortcuts: [Shortcut]
+  /// Whether the clipboard goes along with the pointer.
+  var shareClipboard: Bool?
   /// Nil here: the app keeps the login item itself.
   var autostart: Bool?
   var configPath: String
@@ -101,6 +103,7 @@ struct CoreRequest: Encodable, Sendable {
   var allowControl: Bool?
   var keyboard: String?
   var reverseScroll: Bool?
+  var share: Bool?
 }
 struct CoreResponse: Decodable {
   var snapshot: Snapshot?

@@ -135,6 +135,18 @@ struct SettingsView: View {
           }
         }
       }
+      if let share = snapshot.shareClipboard {
+        Section {
+          Toggle(
+            isOn: Binding(
+              get: { share },
+              set: { model.send(CoreRequest(command: "set_clipboard", share: $0)) })
+          ) {
+            Text("Share clipboard")
+            Text("Sends text or an image up to 3 MB when the pointer moves to another computer.")
+          }
+        }
+      }
       Section {
         Toggle(
           "Start at Login",

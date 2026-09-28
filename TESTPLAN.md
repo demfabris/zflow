@@ -136,8 +136,19 @@ Checks:
     this Mac" once Ubuntu connects. A tile moved on either computer shows up
     on the other within 2 s, and an Ubuntu edge push enters the Mac at the
     matching point and returns at the matching point.
-21. **Clipboard**, once the Mac half lands: note whether macOS shows its paste
-    privacy alert.
+21. **Clipboard.** Turn on **Share clipboard** on both computers. Copy text in
+    TextEdit, cross to Ubuntu and paste it in gedit; copy other text there,
+    return and paste it in TextEdit. Do the same with a PNG both ways: a
+    screenshot region copied with Cmd+Ctrl+Shift+4 on the Mac pastes into GIMP,
+    and an image copied on Ubuntu pastes into Preview (File > New from
+    Clipboard). Copy a 5 MiB image on the Mac and cross: nothing goes, and
+    Settings shows "Clipboard not shared: 5.0 MB is over the 3 MB limit" under
+    Checks until the next clip goes. No bounce: after pasting Ubuntu's text on
+    the Mac, cross to Ubuntu and back without copying; the Mac log shows no
+    "clipboard sent" line, and Ubuntu's clipboard is unchanged. Note whether
+    macOS 27 shows its paste privacy alert when the Mac reads the clipboard at
+    a crossing, and what the alert says. Turn the switch off on the Mac: a clip
+    from Ubuntu is dropped ("clipboard from peer dropped: sharing is off").
 
 Known before the sitting: the Mac reads every sender's scroll as 120 units per
 detent, so a Mac trackpad sending to a Mac receiver scrolls slowly. Only Mac to

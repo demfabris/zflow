@@ -262,10 +262,15 @@ impl NativeApp {
                 // so a crossing in progress carries on.
                 self.sync_links();
             }
+            Request::SetClipboard { share } => {
+                self.document.draft.clipboard.share = share;
+                self.save_config()?;
+                // Links take it without reconnecting, like peer settings.
+                self.sync_links();
+            }
             // The app keeps the login item.
             Request::SetAutostart { .. }
             | Request::SetSwitching { .. }
-            | Request::SetClipboard { .. }
             | Request::OpenSettings
             | Request::OpenLogs
             | Request::InstallExtension => bail!("Not available on this computer"),
@@ -766,6 +771,14 @@ impl NativeApp {
                 ..Health::new("config", Level::Error, "Configuration", error.clone())
             });
         }
+        if let Some(notice) = self.links.clipboard_notice() {
+            health.push(Health::new(
+                "clipboard",
+                Level::Warning,
+                "Clipboard",
+                notice,
+            ));
+        }
         if let BrowserStatus::Failed(error) = nearby.status {
             health.push(Health::new(
                 "discovery",
@@ -787,7 +800,7 @@ impl NativeApp {
                 title: "Return input to this computer".into(),
                 keys: "⌃⌘⌫".into(),
             }],
-            share_clipboard: None,
+            share_clipboard: Some(config.clipboard.share),
             autostart: None,
             config_path: self.document.path.clone(),
             platform: MacPlatform {
@@ -1052,6 +1065,7 @@ mod tests {
         assert_eq!(value["sharing"], false);
         assert_eq!(value["health"][0]["id"], "sharing");
         assert_eq!(value["shortcuts"][0]["keys"], "⌃⌘⌫");
+        assert_eq!(value["share_clipboard"], false);
         assert_eq!(value["autostart"], Value::Null);
         assert_eq!(value["config_path"], path.to_str().unwrap());
         assert_eq!(
@@ -1108,6 +1122,12 @@ mod tests {
         assert_eq!(row["allow_control"], true);
         assert_eq!(row["keyboard"], "pc_positions");
         assert_eq!(row["reverse_scroll"], true);
+
+        // The clipboard switch reaches the links without a restart too.
+        let value = app.request(Request::SetClipboard { share: true }).unwrap();
+        assert_eq!(app.retry_at, armed_at, "sharing did not restart");
+        assert_eq!(value["share_clipboard"], true);
+        assert!(Config::load(&path).unwrap().clipboard.share);
     }
 
     #[test]
