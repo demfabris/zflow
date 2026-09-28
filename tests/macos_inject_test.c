@@ -556,11 +556,20 @@ static void signal_tests(void) {
   assert(posix_spawn(&child, path, &actions, NULL, arguments, environ) == 0);
   posix_spawn_file_actions_destroy(&actions);
   close(output[1]);
-  char text[256] = {0};
+  // A loaded machine can run the handler many times before the process
+  // dies, so read to the end: a pipe closed early kills the child with
+  // SIGPIPE, and a full buffer cuts the last line.
+  static char text[1 << 16];
   size_t length = 0;
+  char chunk[256];
   ssize_t count;
-  while ((count = read(output[0], text + length, sizeof(text) - 1 - length)) > 0)
-    length += (size_t)count;
+  while ((count = read(output[0], chunk, sizeof(chunk))) > 0) {
+    size_t room = sizeof(text) - 1 - length;
+    size_t kept = (size_t)count < room ? (size_t)count : room;
+    memcpy(text + length, chunk, kept);
+    length += kept;
+  }
+  text[length] = 0;
   close(output[0]);
   int status = 0;
   assert(waitpid(child, &status, 0) == child);
