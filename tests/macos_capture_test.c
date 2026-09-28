@@ -680,6 +680,16 @@ static void event_tests(void) {
     assert(captured.kind == ZFLOW_EVENT_MOTION);
     assert(captured.dx == 17 && captured.dy == -9);
   }
+  // Up is positive on both sides; CoreGraphics counts left and the wire right.
+  CGEventRef scroll = CGEventCreateScrollWheelEvent2(
+      NULL, kCGScrollEventUnitPixel, 2, -40, 7, 0);
+  assert(scroll);
+  assert(event_callback(NULL, kCGEventScrollWheel, scroll, NULL) == NULL);
+  CFRelease(scroll);
+  ZFlowMacEvent scrolled;
+  assert(zflow_mac_capture_poll(&scrolled) == 1);
+  assert(scrolled.kind == ZFLOW_EVENT_MOTION);
+  assert(scrolled.scroll_x == -7 && scrolled.scroll_y == -40);
   g_request_raw_touch = true;
   atomic_store(&g_raw_contact_active, true);
   assert(event_callback(NULL, kCGEventMouseMoved, event, NULL) == NULL);

@@ -148,9 +148,11 @@ impl Posted {
             }
             Self::Scroll { scroll, flags } => {
                 native.kind = NativePostKind::Scroll as u32;
+                // Up is positive for both, but the wire counts right as
+                // positive, as Linux does, and CoreGraphics counts left.
                 (native.wheel_x, native.wheel_y, native.pixel) = match scroll {
-                    Scroll::Lines { x, y } => (x, y, 0),
-                    Scroll::Pixels { x, y } => (x, y, 1),
+                    Scroll::Lines { x, y } => (x.saturating_neg(), y, 0),
+                    Scroll::Pixels { x, y } => (x.saturating_neg(), y, 1),
                 };
                 native.flags = flags;
             }
@@ -2155,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn scroll_keeps_its_axes_and_units() {
+    fn scroll_keeps_its_axes_and_units_and_turns_right_into_cg_left() {
         let native = Posted::Scroll {
             scroll: Scroll::Lines { x: -1, y: 2 },
             flags: 0,
@@ -2163,14 +2165,20 @@ mod tests {
         .native();
         assert_eq!(
             (native.kind, native.wheel_x, native.wheel_y, native.pixel),
-            (5, -1, 2, 0)
+            (5, 1, 2, 0)
         );
         let native = Posted::Scroll {
             scroll: Scroll::Pixels { x: 7, y: -9 },
             flags: 0,
         }
         .native();
-        assert_eq!((native.wheel_x, native.wheel_y, native.pixel), (7, -9, 1));
+        assert_eq!((native.wheel_x, native.wheel_y, native.pixel), (-7, -9, 1));
+        let native = Posted::Scroll {
+            scroll: Scroll::Pixels { x: i32::MIN, y: 0 },
+            flags: 0,
+        }
+        .native();
+        assert_eq!(native.wheel_x, i32::MAX);
     }
 
     #[test]
