@@ -55,11 +55,11 @@ struct PairingView: View {
             Text("On \(Self.host(target)), choose Allow.")
           }
         } else {
-          Text("On Linux, the code is in zflow under Pair Computer.").font(.callout)
+          Text("On the other computer, the code is in zflow under Pair Computer.").font(.callout)
             .foregroundStyle(.secondary)
         }
       } else {
-        Text("Choose the computer this Mac should control.").foregroundStyle(.secondary)
+        Text("Choose the computer to pair with.").foregroundStyle(.secondary)
         if let nearby = model.snapshot?.nearby, !nearby.isEmpty {
           VStack(alignment: .leading, spacing: 8) {
             ForEach(nearby) { candidate in
@@ -68,7 +68,7 @@ struct PairingView: View {
                 if let address { choose(address) }
               } label: {
                 Label(
-                  address.map { "Linux computer · \(Self.host($0))" } ?? "Nearby computer",
+                  address.map { "Computer · \(Self.host($0))" } ?? "Nearby computer",
                   systemImage: "display")
               }.disabled(!candidate.compatible || address == nil)
             }

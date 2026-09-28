@@ -147,7 +147,7 @@ impl ReturnMapping {
         ensure!(
             position >= (self.remote_start * f64::from(FRACTION_MAX)).round() as u32
                 && position <= (self.remote_end * f64::from(FRACTION_MAX)).round() as u32,
-            "The receiver returned an invalid crossing position"
+            "The other computer returned an invalid crossing position"
         );
         let remote = f64::from(position) / f64::from(FRACTION_MAX);
         let progress =

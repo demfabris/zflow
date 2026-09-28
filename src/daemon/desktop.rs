@@ -141,7 +141,7 @@ impl Hub {
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "desktop broker reply channel closed"
                 );
-                DesktopResponse::unavailable("The desktop receiver did not respond")
+                DesktopResponse::unavailable("The desktop did not respond")
             }
             Err(_) => {
                 tracing::warn!(
@@ -150,7 +150,7 @@ impl Hub {
                     timeout_ms = 700,
                     "desktop broker request timed out"
                 );
-                DesktopResponse::unavailable("The desktop receiver did not respond")
+                DesktopResponse::unavailable("The desktop did not respond")
             }
         }
     }
