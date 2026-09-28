@@ -38,6 +38,8 @@ pub(super) struct Observer {
     running: Option<Running>,
     previous: Option<Point>,
     secure_input_notice: bool,
+    /// The notice says a peer controls this Mac.
+    controlled: bool,
     pub notice: String,
     pub reduce_wifi_latency: bool,
     pub pause_requested: bool,
@@ -51,6 +53,7 @@ impl Default for Observer {
             running: None,
             previous: None,
             secure_input_notice: false,
+            controlled: false,
             notice: "Sharing is off.".into(),
             reduce_wifi_latency: false,
             pause_requested: false,
@@ -126,6 +129,11 @@ impl Observer {
     }
 
     pub fn tick(&mut self, links: &Links) {
+        self.tick_with(links.controller(), links);
+    }
+
+    /// `controller` is the peer controlling this Mac, if any.
+    fn tick_with(&mut self, controller: Option<String>, links: &Links) {
         if self.running.is_some() {
             self.watch_crossing();
         }
@@ -134,6 +142,19 @@ impl Observer {
             if self.enabled && self.running.is_none() {
                 self.notice = READY.into();
             }
+        }
+        if let Some(peer) = controller {
+            // Nothing crosses while a peer controls this Mac, and a cursor it
+            // leaves resting on an edge does not cross once it lets go.
+            self.previous = None;
+            if self.enabled && self.running.is_none() {
+                self.notice = format!("Controlled by {peer}");
+                self.controlled = true;
+            }
+            return;
+        }
+        if std::mem::take(&mut self.controlled) && self.enabled && self.running.is_none() {
+            self.notice = READY.into();
         }
         if self.enabled
             && self.running.is_none()
@@ -431,6 +452,19 @@ mod tests {
         assert!(observer.notice.contains("without returning"));
         let observer = finished(&[], false);
         assert!(!observer.is_enabled() && !observer.pause_requested);
+    }
+
+    #[test]
+    fn nothing_crosses_while_a_peer_controls_the_mac() {
+        let links = Links::new().unwrap();
+        let mut observer = Observer::default();
+        observer.enabled = true;
+        observer.previous = Some(Point { x: 1, y: 540 });
+        observer.tick_with(Some("linux".into()), &links);
+        // Observing would have disarmed this observer, which has no layout.
+        assert!(observer.is_enabled());
+        assert_eq!(observer.previous, None);
+        assert_eq!(observer.notice, "Controlled by linux");
     }
 
     #[test]

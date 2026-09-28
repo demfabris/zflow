@@ -29,7 +29,11 @@ use crate::{
     transport::{InputClientConfig, InputConnection, connect_input, input_client_config},
 };
 
-use super::{Activation, HandoffOptions, SourceStatus, refuse_inbound, run_crossing};
+use super::{
+    Activation, HandoffOptions, SourceStatus,
+    receive::{self, OutboundGuard, Ownership},
+    run_crossing,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // A working pinned address wins before other hosts on the network are tried.
@@ -67,6 +71,8 @@ enum Command {
         reduce_wifi_latency: bool,
         stop: watch::Receiver<bool>,
         status: mpsc::UnboundedSender<SourceStatus>,
+        /// Keeps a peer from taking control until input is back on the Mac.
+        guard: OutboundGuard,
     },
     Retry,
 }
@@ -86,6 +92,7 @@ pub struct Links {
     closing: BTreeMap<String, JoinHandle<()>>,
     nearby: watch::Sender<Vec<SocketAddr>>,
     changed: bool,
+    ownership: Ownership,
 }
 
 impl Links {
@@ -102,6 +109,7 @@ impl Links {
             closing: BTreeMap::new(),
             nearby: watch::channel(Vec::new()).0,
             changed: false,
+            ownership: Ownership::default(),
         })
     }
 
@@ -181,7 +189,8 @@ impl Links {
             .map(|(name, link)| (name.as_str(), link.state.borrow().clone()))
     }
 
-    /// Hands a crossing to `peer`'s link, if that link is ready.
+    /// Hands a crossing to `peer`'s link, if that link is ready and no peer
+    /// controls this Mac.
     pub fn cross(
         &self,
         peer: &str,
@@ -192,6 +201,7 @@ impl Links {
         if !matches!(*link.state.borrow(), LinkState::Ready(_)) {
             return None;
         }
+        let guard = self.ownership.begin_outbound()?;
         let (stop, stopped) = watch::channel(false);
         let (status, events) = mpsc::unbounded_channel();
         link.commands
@@ -200,12 +210,18 @@ impl Links {
                 reduce_wifi_latency,
                 stop: stopped,
                 status,
+                guard,
             })
             .ok()?;
         Some(Crossing {
             stop,
             status: events,
         })
+    }
+
+    /// The peer controlling this Mac, or about to.
+    pub fn controller(&self) -> Option<String> {
+        self.ownership.controller()
     }
 
     /// Reconnects waiting links now and rechecks connected receivers.
@@ -318,7 +334,8 @@ fn retry_delay(failures: u32) -> Duration {
 }
 
 fn refuse(command: Command, reason: &str) {
-    if let Command::Cross { status, .. } = command {
+    if let Command::Cross { status, guard, .. } = command {
+        drop(guard);
         let _ = status.send(SourceStatus::Cancelled(reason.into()));
     }
 }
@@ -462,7 +479,7 @@ impl Session {
                     None => return None,
                     Some(Command::Retry) => ready = self.snapshot(state).await,
                     Some(command) if !ready => refuse(command, "the other computer is not ready"),
-                    Some(Command::Cross { handoff, reduce_wifi_latency, stop, status }) => {
+                    Some(Command::Cross { handoff, reduce_wifi_latency, stop, status, guard }) => {
                         let context = self.next_context();
                         let activation = Activation {
                             session: &self.handle,
@@ -470,7 +487,14 @@ impl Session {
                             context,
                             raw_touch: self.raw_touch,
                         };
-                        if run_crossing(activation, handoff, reduce_wifi_latency, stop, status).await {
+                        let failed =
+                            run_crossing(activation, handoff, reduce_wifi_latency, stop, status.clone())
+                                .await;
+                        // Input is back on the Mac. Let a peer take control
+                        // before the observer hears the crossing ended.
+                        drop(guard);
+                        drop(status);
+                        if failed {
                             // The receiver may have changed; check it before the next crossing.
                             ready = self.snapshot(state).await;
                         }
@@ -478,7 +502,7 @@ impl Session {
                 },
                 event = self.events.recv() => match event.map(|event| event.kind) {
                     Some(SessionEventKind::Closed { reason }) => return Some(reason),
-                    Some(kind) => refuse_inbound(kind),
+                    Some(kind) => receive::refuse_inbound(kind),
                     None => return Some("input session closed".into()),
                 },
                 () = tokio::time::sleep(retry), if !ready => {
@@ -743,7 +767,7 @@ mod tests {
             let prepared = session.handle.desktop_request(prepare).await.unwrap();
             assert!(matches!(prepared, DesktopResponse::Prepared { .. }));
             // The previous release left an OutboundEnded behind.
-            super::super::refuse_waiting_events(&mut session.events).unwrap();
+            receive::answer_waiting_events(&mut session.events).unwrap();
             let context = session.next_context();
             session.handle.begin_outbound(context).unwrap();
             session.handle.capture(key(KeyState::Pressed)).unwrap();
@@ -888,6 +912,17 @@ mod tests {
         wait_until(&mut links, ready);
         assert!(links.cross("other", handoff(), false).is_none());
 
+        // While a peer controls this Mac, nothing crosses.
+        let claim = links.ownership.claim_inbound("linux", 1).unwrap();
+        assert_eq!(links.controller().as_deref(), Some("linux"));
+        assert!(links.cross("linux", handoff(), false).is_none());
+        drop(claim);
+        assert_eq!(links.controller(), None);
+        assert!(
+            links.ownership.begin_outbound().is_some(),
+            "no crossing kept input"
+        );
+
         // Closing the link reaches the receiver now, not at its idle timeout.
         links.sync(None);
         assert!(links.states().next().is_none());
@@ -903,6 +938,26 @@ mod tests {
             }
         });
         drop(links);
+    }
+
+    #[test]
+    fn a_refused_crossing_gives_input_back() {
+        let ownership = Ownership::default();
+        let (status, mut statuses) = mpsc::unbounded_channel();
+        let command = Command::Cross {
+            handoff: handoff(),
+            reduce_wifi_latency: false,
+            stop: watch::channel(false).1,
+            status,
+            guard: ownership.begin_outbound().unwrap(),
+        };
+        assert!(ownership.claim_inbound("linux", 1).is_none());
+        refuse(command, "the other computer is not connected");
+        assert!(matches!(
+            statuses.try_recv(),
+            Ok(SourceStatus::Cancelled(_))
+        ));
+        assert!(ownership.claim_inbound("linux", 1).is_some());
     }
 
     #[test]

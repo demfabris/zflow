@@ -6,6 +6,7 @@ mod keys;
 mod link;
 mod local_network;
 mod pointer;
+mod receive;
 
 use std::{
     ffi::CStr,
@@ -248,7 +249,7 @@ async fn cross(
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<Option<u32>> {
-    refuse_waiting_events(activation.events)?;
+    receive::answer_waiting_events(activation.events)?;
     if stopped(stop) {
         return Ok(None);
     }
@@ -637,7 +638,7 @@ async fn forward<'a>(
                     let error = anyhow!("input session closed: {reason}");
                     return ended.failed("input session closed", error);
                 }
-                Some(kind) => refuse_inbound(kind),
+                Some(kind) => receive::answer_while_sending(kind),
                 None => {
                     let error = anyhow!("input session event channel closed");
                     return ended.failed("input session closed", error);
@@ -654,43 +655,6 @@ async fn next_poll(poll: &mut Option<DesktopPoll<'_>>) -> Result<DesktopResponse
     };
     *poll = None;
     response
-}
-
-/// The Mac only sends input. Refuse whatever a receiver would handle.
-fn refuse_inbound(kind: SessionEventKind) {
-    match kind {
-        SessionEventKind::Desktop { reply, .. } => {
-            let _ = reply.send(DesktopResponse::unavailable(
-                "Mac source cannot receive desktop handoffs",
-            ));
-        }
-        SessionEventKind::ReceiverEffects { applied, .. } => {
-            let _ = applied.send(Err(
-                "the Mac does not accept input from other computers".into()
-            ));
-        }
-        SessionEventKind::OutboundEnded
-        | SessionEventKind::Closed { .. }
-        | SessionEventKind::Layout { .. }
-        | SessionEventKind::Clipboard { .. } => {}
-    }
-}
-
-/// Answers events that arrived while the link was idle, including the
-/// OutboundEnded that trails the previous crossing's release.
-fn refuse_waiting_events(events: &mut mpsc::Receiver<SessionEvent>) -> Result<()> {
-    loop {
-        match events.try_recv() {
-            Ok(event) => {
-                if let SessionEventKind::Closed { reason } = event.kind {
-                    bail!("input session closed: {reason}");
-                }
-                refuse_inbound(event.kind);
-            }
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => bail!("input session closed"),
-        }
-    }
 }
 
 fn stopped(stop: &watch::Receiver<bool>) -> bool {
@@ -1060,42 +1024,6 @@ mod tests {
         let mut kept = cancelled();
         keep_first_failure(&mut kept, Ok(()), "cleanup");
         assert!(kept.unwrap_err().is::<AdmissionCancelled>());
-    }
-
-    #[tokio::test]
-    async fn idle_events_are_answered_and_a_closed_session_refuses_the_crossing() {
-        let event = |kind| SessionEvent {
-            session_id: 1,
-            peer: "linux".into(),
-            kind,
-        };
-        let (sender, mut events) = mpsc::channel(8);
-        let (reply, desktop) = tokio::sync::oneshot::channel();
-        sender
-            .send(event(SessionEventKind::OutboundEnded))
-            .await
-            .unwrap();
-        sender
-            .send(event(SessionEventKind::Desktop {
-                request: DesktopRequest::Snapshot,
-                reply,
-            }))
-            .await
-            .unwrap();
-        refuse_waiting_events(&mut events).unwrap();
-        assert!(matches!(
-            desktop.await.unwrap(),
-            DesktopResponse::Unavailable { .. }
-        ));
-        sender
-            .send(event(SessionEventKind::Closed {
-                reason: "lost".into(),
-            }))
-            .await
-            .unwrap();
-        assert!(refuse_waiting_events(&mut events).is_err());
-        drop(sender);
-        assert!(refuse_waiting_events(&mut events).is_err());
     }
 
     #[test]
