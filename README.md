@@ -465,7 +465,8 @@ clang -std=c11 -Wall -Wextra -Werror tests/macos_awdl_helper_test.c -o target/aw
 ./target/awdl-test
 ```
 
-See [SPEC.md](SPEC.md) for protocol and safety invariants, and
-[TESTPLAN.md](TESTPLAN.md) for the hardware and desktop validation matrix.
+See [SPEC.md](SPEC.md) for protocol and safety invariants,
+[TESTPLAN.md](TESTPLAN.md) for the hardware and desktop validation matrix, and
+[ROADMAP.md](ROADMAP.md) for the plan to make input work both ways.
 
 zflow is licensed under GPL-3.0-or-later.
