@@ -109,7 +109,7 @@ struct OnboardingView: View {
       case .accessibility:
         (
           "accessibility", "Allow Accessibility",
-          "zflow needs Accessibility access to send your keyboard and trackpad to the other computer."
+          "zflow needs Accessibility access to share your keyboard and trackpad with your other computers."
         )
       case .localNetwork:
         (
@@ -118,7 +118,7 @@ struct OnboardingView: View {
         )
       case .computers:
         (
-          "desktopcomputer", "Pair Your Linux Computer",
+          "desktopcomputer", "Pair Your Other Computer",
           "Computers running zflow on this network show up here. Pair one and type the code it shows."
         )
       case .tryIt:
@@ -179,11 +179,11 @@ struct OnboardingView: View {
         ScrollView {
           VStack(spacing: 0) {
             ForEach(nearby) { computer in
-              // Receivers list IPv4 first and advertise their input port.
+              // Computers list IPv4 first and advertise their input port.
               let address = computer.addresses.first.map(PairingView.pairingAddress)
               HStack {
                 Label(
-                  "Linux computer · \(address.map(PairingView.host) ?? "unknown address")",
+                  "Computer · \(address.map(PairingView.host) ?? "unknown address")",
                   systemImage: "desktopcomputer")
                 Spacer()
                 if let address, computer.compatible {
@@ -204,7 +204,7 @@ struct OnboardingView: View {
         status("Looking for computers on this network…", .waiting)
       } else {
         Text(
-          "Nothing found yet. Install zflow on your Linux computer; it shows up here once it runs."
+          "Nothing found yet. Install zflow on your other computer; it shows up here once it runs."
         )
         .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         HStack(alignment: .top) {

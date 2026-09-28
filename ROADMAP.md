@@ -393,7 +393,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - No GUI text names a role or an OS.
 - **Size:** about 8 files, 150 to 250 LOC. No wire change.
 - **Risk:** low.
-- **Status (2026-09-28):** done on Linux. `set_peer` also sets `receive_normal`, which is how an old record becomes two-way. The GNOME agent still takes `set_keyboard` from extensions.gnome.org copies that lag the package. Left for the Mac: the Swift wording, and a build of `src/app/pairing.rs`, whose `add_paired_peer` call lost its direction argument.
+- **Status (2026-09-28):** done on Linux. `set_peer` also sets `receive_normal`, which is how an old record becomes two-way. The GNOME agent still takes `set_keyboard` from extensions.gnome.org copies that lag the package. The Mac side is done too: the Mac build, clippy, Rust, Swift and C checks passed with no code changes. The Swift views no longer name Linux or a role, and the errors the Mac window shows say "the other computer" instead of "the receiver". The Mac still refuses input until Phase 2 (`src/macos/mod.rs:657-671`), so its copy does not claim it can be controlled.
 
 ### Phase 1: one API, one GUI
 

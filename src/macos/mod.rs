@@ -275,7 +275,7 @@ async fn cross(
             // requests, so a failure here is the session or the receiver.
             validate_prepared(
                 &handoff,
-                prepared.context("Could not prepare the receiver's desktop")?,
+                prepared.context("Could not prepare the other computer's desktop")?,
             )?;
             if stopped(stop) {
                 return Ok(None);
@@ -555,18 +555,18 @@ async fn forward<'a>(
                     ended.reason = "GNOME return edge";
                     if position < handoff.start || position > handoff.end {
                         ended.error =
-                            Some(anyhow!("receiver returned outside the configured edge range"));
+                            Some(anyhow!("the pointer came back outside the configured edge range"));
                     } else {
                         ended.returned = Some(position);
                     }
                     return ended;
                 }
                 Ok(DesktopResponse::Unavailable { reason }) => {
-                    let error = anyhow!("receiver desktop unavailable: {reason}");
+                    let error = anyhow!("the other computer's desktop is unavailable: {reason}");
                     return ended.failed("desktop unavailable", error);
                 }
                 Ok(_) => {
-                    let error = anyhow!("unexpected receiver desktop response");
+                    let error = anyhow!("unexpected desktop response from the other computer");
                     return ended.failed("unexpected desktop response", error);
                 }
                 Err(error) => return ended.failed("desktop request failed", error),
@@ -706,13 +706,15 @@ fn validate_prepared(handoff: &HandoffOptions, response: DesktopResponse) -> Res
             let bounds = geometry.bounds()?;
             if bounds.width != handoff.expected_width || bounds.height != handoff.expected_height {
                 bail!(
-                    "receiver desktop changed size; refresh and save the computer layout before sharing"
+                    "the other computer's desktop changed size; refresh and save the computer layout before sharing"
                 );
             }
             Ok(())
         }
-        DesktopResponse::Unavailable { reason } => bail!("receiver desktop unavailable: {reason}"),
-        _ => bail!("receiver did not prepare its desktop for input"),
+        DesktopResponse::Unavailable { reason } => {
+            bail!("the other computer's desktop is unavailable: {reason}")
+        }
+        _ => bail!("the other computer did not prepare its desktop for input"),
     }
 }
 
@@ -724,9 +726,9 @@ fn validate_finished(response: Result<DesktopResponse>) -> Result<()> {
     match response? {
         DesktopResponse::Finished => Ok(()),
         DesktopResponse::Unavailable { reason } => {
-            bail!("receiver could not finish desktop handoff: {reason}")
+            bail!("the other computer could not finish the desktop handoff: {reason}")
         }
-        _ => bail!("receiver did not confirm desktop handoff cleanup"),
+        _ => bail!("the other computer did not confirm the desktop handoff cleanup"),
     }
 }
 

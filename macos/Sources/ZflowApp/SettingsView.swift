@@ -121,7 +121,7 @@ struct HealthView: View {
           "Accessibility",
           detail: state.accessibility
             ? "Keyboard and pointer access allowed."
-            : "Allow zflow to send keyboard and pointer input.", ready: state.accessibility
+            : "Allow zflow to share keyboard and pointer input.", ready: state.accessibility
         ) {
           if !state.accessibility { Button("Allow…") { model.openAccessibility() } }
         }
@@ -161,13 +161,13 @@ struct HealthView: View {
           }
         }
         check(
-          "Receiver",
+          "Paired computer",
           detail: state.receiverError
             ?? (state.receiverChecked
               ? "Authenticated and checked before sharing was armed."
               : state.checking
-                ? "Checking the paired receiver…"
-                : "Pair a computer and allow access to check its receiver."),
+                ? "Checking the paired computer…"
+                : "Pair a computer and allow access to check it."),
           ready: state.receiverChecked
         ) {
           if !state.peers.isEmpty && !state.receiverChecked {
