@@ -12,7 +12,8 @@ use evdev::{
 use thiserror::Error;
 
 use crate::core::{
-    ContactId, HidUsage, MotionDelta, PointerButton, SourceDimensions, TouchContact, TouchState,
+    ContactId, HidUsage, KeyRemap, KeyboardMode, MotionDelta, PointerButton, SourceDimensions,
+    TouchContact, TouchState,
 };
 
 use super::{
@@ -102,6 +103,9 @@ fn build_virtual_device(
 #[derive(Debug)]
 pub struct VirtualKeyboard {
     device: VirtualDevice,
+    /// Turns the peer's physical key edges into the edges injected here.
+    remap: KeyRemap,
+    /// Injected usages, after the remap.
     held: BTreeSet<HidUsage>,
 }
 
@@ -114,11 +118,58 @@ impl VirtualKeyboard {
         let device = build_virtual_device(VirtualDeviceRole::Keyboard, &keys, None, None)?;
         Ok(Self {
             device,
+            remap: KeyRemap::new(KeyboardMode::Standard),
             held: BTreeSet::new(),
         })
     }
 
+    /// Starts an activation in `mode`, with nothing from the last one down.
+    pub fn begin(&mut self, mode: KeyboardMode) -> Result<(), InjectionError> {
+        self.release_all()?;
+        self.remap.reset(mode);
+        Ok(())
+    }
+
+    /// The mode the current activation started in.
+    pub fn mode(&self) -> KeyboardMode {
+        self.remap.mode()
+    }
+
+    /// Whether the focused app is a terminal. Only keys pressed after this
+    /// see it.
+    pub fn set_terminal(&mut self, terminal: bool) {
+        self.remap.set_terminal(terminal);
+    }
+
+    /// Applies one physical key edge from the peer.
     pub fn set_key(&mut self, usage: HidUsage, pressed: bool) -> Result<(), InjectionError> {
+        // Refuse a key this device cannot type before the remap records it.
+        hid_to_evdev_key(usage)?;
+        for (output, pressed) in self.remap.key(usage, pressed) {
+            self.inject(output, pressed)?;
+        }
+        Ok(())
+    }
+
+    /// Call before a button press, a scroll or a touch replacement with
+    /// contacts. `busy` says whether a button or contact is still down after
+    /// it.
+    pub fn pointer(&mut self, busy: bool) -> Result<(), InjectionError> {
+        for (output, pressed) in self.remap.pointer(busy) {
+            self.inject(output, pressed)?;
+        }
+        Ok(())
+    }
+
+    /// Call before a button release or a touch replacement with no
+    /// contacts. It presses nothing.
+    pub fn pointer_released(&mut self, busy: bool) {
+        self.remap.pointer_released(busy);
+    }
+
+    /// Each edge is its own report, so a modifier change lands before the
+    /// key it goes with.
+    fn inject(&mut self, usage: HidUsage, pressed: bool) -> Result<(), InjectionError> {
         let key = hid_to_evdev_key(usage)?;
         if self.held.contains(&usage) == pressed {
             return Ok(());
@@ -140,7 +191,10 @@ impl VirtualKeyboard {
         &self.held
     }
 
+    /// Releases every injected key and forgets the peer's held keys. The
+    /// mode stays.
     pub fn release_all(&mut self) -> Result<(), InjectionError> {
+        self.remap.reset(self.remap.mode());
         if self.held.is_empty() {
             return Ok(());
         }
@@ -656,6 +710,13 @@ impl VirtualInput {
         })
     }
 
+    /// Whether a contact is down on the virtual touchpad.
+    pub fn touching(&self) -> bool {
+        self.touchpad
+            .as_ref()
+            .is_some_and(|touchpad| !touchpad.state.contacts.is_empty())
+    }
+
     pub fn replace_touch(&mut self, touch: &TouchState) -> Result<(), InjectionError> {
         self.replace_touch_at(touch, None)
     }
@@ -764,6 +825,15 @@ mod tests {
             }
         }
         transitions
+    }
+
+    #[test]
+    fn every_keyboard_mode_output_has_an_evdev_key() {
+        let outputs = crate::core::output_usages();
+        assert!(!outputs.is_empty());
+        for usage in outputs {
+            assert!(hid_to_evdev_key(usage).is_ok(), "{usage:?}");
+        }
     }
 
     #[test]

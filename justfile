@@ -83,6 +83,7 @@ test-desktop:
 test-gtk: (_platform "linux")
     dbus-run-session -- cargo test --locked --lib app:: -- --ignored --skip native_desktop_geometry
     GTK_A11Y=none GIO_USE_VFS=local dbus-run-session -- gjs -m tests/gnome_settings_test.js
+    GSETTINGS_BACKEND=memory GTK_A11Y=none GIO_USE_VFS=local dbus-run-session -- gjs -m tests/gnome_setup_test.js
 
 # Exercise installation and recovery without changing the host (requires Python 3).
 test-install:
@@ -91,6 +92,10 @@ test-install:
 # Exercise a built Debian package in a disposable Ubuntu container.
 test-package:
     ./tests/deb_lifecycle.sh
+
+# Pack the GNOME extension for extensions.gnome.org under target/dist.
+pack-extension: (_platform "linux")
+    ./scripts/pack-extension.sh
 
 # Format Rust code.
 fmt:

@@ -2,6 +2,9 @@ import Adw from 'gi://Adw?version=1';
 import Gtk from 'gi://Gtk?version=4.0';
 import {Client, statusText} from './client.js';
 
+// src/core/keymap.rs KeyboardMode, in dropdown order.
+const KEYBOARD_MODES = ['standard', 'pc_positions', 'mac'];
+
 function button(label, action, css = []) {
     const widget = new Gtk.Button({label, valign: Gtk.Align.CENTER, css_classes: css});
     widget.connect('clicked', action);
@@ -16,6 +19,7 @@ export class Settings {
         this._disposed = false;
         this._peerKey = '';
         this._peerRows = [];
+        this._keyboards = new Map();
         this.page = new Adw.PreferencesPage({title: 'zflow', icon_name: 'input-mouse-symbolic'});
         const sharing = new Adw.PreferencesGroup();
         this._status = new Adw.ActionRow({title: 'Starting zflow…', subtitle: 'Share your keyboard, pointer, and trackpad.', subtitle_lines: 3, use_markup: false});
@@ -62,6 +66,7 @@ export class Settings {
         if (this._busy) return false;
         this._busy = true;
         this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = false;
+        for (const keyboard of this._keyboards.values()) keyboard.sensitive = false;
         this._showError(null);
         let success = false;
         try { await this.client.call(request); success = true; }
@@ -89,16 +94,27 @@ export class Settings {
         this._error.subtitle = this._actionError || snapshot.error || '';
         this._errorGroup.visible = !!this._error.subtitle;
         // Keep rows and keyboard focus stable while unchanged snapshots arrive.
-        const key = JSON.stringify([daemon?.peers, daemon?.connected, daemon?.receiving_from, daemon?.sending_to]);
+        // A keyboard mode change only moves its dropdown, below.
+        const peers = Object.entries(daemon?.peers ?? {}).map(([name, {keyboard: _, ...record}]) => [name, record]);
+        const key = JSON.stringify([peers, daemon?.connected, daemon?.receiving_from, daemon?.sending_to]);
         if (key !== this._peerKey) {
             this._peerKey = key;
             for (const row of this._peerRows) this._computers.remove(row);
             this._peerRows = [];
+            this._keyboards.clear();
             for (const [name] of Object.entries(daemon?.peers ?? {})) {
                 const detail = daemon.receiving_from === name ? 'Receiving input' : daemon.sending_to === name ? 'Controlling this computer'
                     : daemon.connected.includes(name) ? 'Connected' : 'Paired';
                 const row = new Adw.ActionRow({title: name, subtitle: detail, use_markup: false});
                 row.add_prefix(new Gtk.Image({icon_name: 'computer-symbolic'}));
+                const keyboard = Gtk.DropDown.new_from_strings(['Standard keys', 'PC key positions', 'Mac shortcuts']);
+                keyboard.valign = Gtk.Align.CENTER;
+                keyboard.tooltip_text = 'How keys from this computer act here';
+                keyboard.connect('notify::selected', () => {
+                    if (!this._updating) this._run({command: 'set_keyboard', name, mode: KEYBOARD_MODES[keyboard.selected]});
+                });
+                row.add_suffix(keyboard);
+                this._keyboards.set(name, keyboard);
                 const forget = new Gtk.Button({icon_name: 'user-trash-symbolic', tooltip_text: `Forget ${name}`, valign: Gtk.Align.CENTER, css_classes: ['flat']});
                 forget.connect('clicked', () => this._forget(name));
                 row.add_suffix(forget);
@@ -111,6 +127,12 @@ export class Settings {
                 this._peerRows.push(row);
             }
         }
+        this._updating = true;
+        for (const [name, keyboard] of this._keyboards) {
+            keyboard.selected = Math.max(0, KEYBOARD_MODES.indexOf(daemon.peers[name].keyboard ?? 'standard'));
+            keyboard.sensitive = !this._busy;
+        }
+        this._updating = false;
         // A fresh install opens pairing with its code on screen, so the Mac
         // can pair without anyone clicking through settings here.
         if (daemon && !this._checkedFirstRun) {
@@ -140,6 +162,17 @@ export class Settings {
         const page = new Adw.PreferencesPage();
         toolbar.content = page;
         dialog.child = toolbar;
+        // Knowing the code is not enough: the person here allows the computer.
+        const ask = new Adw.PreferencesGroup({visible: false});
+        const question = new Adw.ActionRow({title: '', subtitle_lines: 0, use_markup: false});
+        question.add_prefix(new Gtk.Image({icon_name: 'computer-symbolic'}));
+        ask.add(question);
+        const allow = button('Allow', () => this._respond(true), ['suggested-action']);
+        const answers = new Gtk.Box({spacing: 12, halign: Gtk.Align.END, margin_top: 12});
+        answers.append(button('Decline', () => this._respond(false)));
+        answers.append(allow);
+        ask.add(answers);
+        page.add(ask);
         const shown = new Adw.PreferencesGroup({title: 'Setup code', description: 'On your Mac, open zflow, choose this computer, and type this code.'});
         const code = new Gtk.Label({label: '', selectable: true, css_classes: ['title-1', 'numeric'], margin_top: 18, margin_bottom: 18});
         shown.add(code);
@@ -161,7 +194,7 @@ export class Settings {
         const stage = new Adw.ActionRow({title: '', visible: false, subtitle_lines: 0, use_markup: false});
         result.add(stage);
         page.add(result);
-        this._pairing = {dialog, code, renew, remote, entered, connect, stage, nearby, rows: [], nearbyKey: ''};
+        this._pairing = {dialog, ask, question, allow, shown, other, code, renew, remote, entered, connect, stage, nearby, rows: [], nearbyKey: '', asked: false};
         dialog.connect('closed', () => {
             this._pairing = null;
             if (this._pairOwned) {
@@ -178,6 +211,10 @@ export class Settings {
 
     _listen() {
         return this._startPair({command: 'pair', remote: null});
+    }
+
+    _respond(allow) {
+        return this._run({command: 'pair_respond', allow});
     }
 
     _connect(remote, code) {
@@ -208,15 +245,25 @@ export class Settings {
         if (!ui) return;
         const pairing = snapshot.pairing ?? {state: 'idle'};
         const listening = pairing.state === 'listening';
-        const connecting = pairing.state === 'connecting';
+        const confirming = pairing.state === 'confirm';
+        const connecting = pairing.state === 'connecting' || pairing.state === 'approving';
+        ui.ask.visible = confirming;
+        ui.shown.visible = ui.other.visible = !confirming;
+        if (confirming) {
+            ui.question.title = `Allow ${pairing.name ?? 'this computer'} to control this computer?`;
+            ui.question.subtitle = `It entered this computer’s code from ${pairing.address ?? 'your network'}. Allow it only if it is the computer you are setting up.`;
+            if (!ui.asked) ui.allow.grab_focus();
+        }
+        ui.asked = confirming;
         ui.code.label = listening ? (pairing.code ?? '…') : 'No code shown';
         ui.code.sensitive = listening;
-        ui.renew.visible = !listening && !connecting;
+        ui.renew.visible = !listening && !connecting && !confirming;
         ui.connect.sensitive = !connecting && !this._busy;
         const issue = pairing.error || this._actionError;
         ui.stage.visible = connecting || pairing.state === 'paired' || !!issue;
-        ui.stage.title = connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
-        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange your computers in zflow on the Mac.' : connecting ? '' : issue || '';
+        ui.stage.title = pairing.state === 'approving' ? 'Waiting for the other computer…' : connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
+        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange your computers in zflow on the Mac.'
+            : pairing.state === 'approving' ? 'Choose Allow on the other computer.' : connecting ? '' : issue || '';
         const key = JSON.stringify([snapshot.nearby, snapshot.discovery_error]);
         if (key !== ui.nearbyKey) {
             ui.nearbyKey = key;

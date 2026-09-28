@@ -309,6 +309,8 @@ Linux maps evdev codes at capture and injection boundaries. macOS maps CG virtua
 
 The target interprets physical keys through its active layout. A US physical key sent to an ABNT target behaves as if the same physical keyboard were plugged into that target. Text transfer and layout synthesis remain outside v1.
 
+The receiver may apply a keyboard mode chosen for each peer after admission and before injection, such as swapping Option and Cmd or mapping macOS shortcuts. The wire, receiver snapshots, and acknowledgements stay physical.
+
 ### Pointer
 
 Each source declares whether its deltas represent device-like unaccelerated motion or desktop-accelerated motion. A session MUST NOT mix those units without a new activation.
@@ -635,7 +637,7 @@ Pairing MUST authenticate the transcript through one reviewed method:
 
 Blind trust on first use is insufficient because it cannot detect a first-connection MITM. [RFC 7469](https://www.rfc-editor.org/rfc/rfc7469.html) documents that limitation.
 
-zflow uses SPAKE2 (`zflow-pair/4`, through the RustCrypto `spake2` crate: the magic-wormhole variant, not exactly RFC 9382). The listening peer shows a random six-digit setup code and the user types it on the initiating peer, so only someone who can see the listener's screen can pair with it. Over the unpinned pairing TLS connection, the initiator sends its offer and its SPAKE2 message; the listener answers with its own. The SPAKE2 identities are both presented SPKIs. Proof keys come from HKDF-SHA256 over the SPAKE2 secret, salted with the connection's TLS exporter value. Each proof is an HMAC-SHA256 over the exporter value, both SPKIs, both encoded offers, and both SPAKE2 messages. The initiator proves first. The listener verifies before it answers, so each connection tests one guess at the code. A listener stops after three wrong codes, which bounds an active attacker to three chances in a million per displayed code, plus one per attempt the initiator makes toward an address the attacker controls. A relay between two TLS sessions fails because the exporter values and SPKIs differ on each side. After both proofs, the listener saves the peer and then tells the initiator whether it did. The initiator saves only after a yes, so a listener that could not save is never trusted one way. Pairing a known key again only refreshes its addresses, which repairs the rare case where the initiator fails to save after the listener did.
+zflow uses SPAKE2 (`zflow-pair/4`, through the RustCrypto `spake2` crate: the magic-wormhole variant, not exactly RFC 9382). The listening peer shows a random six-digit setup code and the user types it on the initiating peer. Knowing the code is not enough: after both proofs, the listener's user allows or declines the peer, shown by its sanitized name and address, and nothing is saved before Allow. A code seen over someone's shoulder or in a screen share therefore cannot pair silently. Over the unpinned pairing TLS connection, the initiator sends its offer and its SPAKE2 message; the listener answers with its own. The SPAKE2 identities are both presented SPKIs. Proof keys come from HKDF-SHA256 over the SPAKE2 secret, salted with the connection's TLS exporter value. Each proof is an HMAC-SHA256 over the exporter value, both SPKIs, both encoded offers, and both SPAKE2 messages. The initiator proves first. The listener verifies before it answers, so each connection tests one guess at the code. A listener stops after three wrong codes, which bounds an active attacker to three chances in a million per displayed code, plus one per attempt the initiator makes toward an address the attacker controls. A relay between two TLS sessions fails because the exporter values and SPKIs differ on each side. After Allow, the listener saves the peer and then tells the initiator whether it did; the connection keeps alive while the user decides, for up to two minutes. The initiator saves only after a yes, so a listener that could not save is never trusted one way. Pairing a known key again only refreshes its addresses, which repairs the rare case where the initiator fails to save after the listener did.
 
 After confirmation, zflow pins the peer's public identity key or SPKI rather than a replaceable leaf certificate. It supports revocation and identity rotation through a new authenticated pairing.
 
@@ -735,7 +737,7 @@ Release matrices from TESTPLAN.md gate each beta along the way.
 - The receiver owns release on lease or lifecycle failure.
 - QUIC carries the first transport prototype.
 - Bulk traffic uses a separate best-effort connection.
-- Pairing proves a setup code shown on the listening computer through SPAKE2 (maintainer decision, 2026-09-27; it replaced comparing a code on both displays).
+- Pairing proves a setup code shown on the listening computer through SPAKE2, and the listening computer's user allows the result (maintainer decision, 2026-09-27; it replaced comparing a code on both displays).
 - Discovery does not publish a long-lived identity fingerprint.
 - Path changes use candidate racing and application session takeover.
 - Raw Mac trackpad contact capture ships in the signed baseline behind a feature flag with mandatory graceful degradation (maintainer decision, 2026-08-31).

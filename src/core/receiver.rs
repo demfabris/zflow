@@ -9,7 +9,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use super::{
-    ActivationId, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage,
+    ActivationId, AnchorKind, ControlSequence, CumulativeMotion, HeldState, HidUsage, HidUsagePage,
     MonotonicTimeMicros, MotionAnchor, MotionDelta, MotionSequence, PlayoutStep, PointerButton,
     ReliableControl, ReliableControlMessage, SessionCloseReason, SessionContext, SessionEpoch,
     SnapshotAck, TouchState, TransportGeneration,
@@ -577,13 +577,16 @@ fn reconcile_held(
     authoritative: &HeldState,
     effects: &mut Vec<ReceiverEffect>,
 ) {
-    for key in state
+    // Modifiers go down first and come up last, so a restored or released
+    // chord never acts as its bare key.
+    let mut released = state
         .held
         .pressed_keys
         .difference(&authoritative.pressed_keys)
         .copied()
-        .collect::<Vec<_>>()
-    {
+        .collect::<Vec<_>>();
+    released.sort_by_key(|&key| is_modifier(key));
+    for key in released {
         state.held.release_key(key);
         effects.push(ReceiverEffect::Key {
             key,
@@ -591,12 +594,13 @@ fn reconcile_held(
             synthetic: true,
         });
     }
-    for key in authoritative
+    let mut pressed = authoritative
         .pressed_keys
         .difference(&state.held.pressed_keys)
         .copied()
-        .collect::<Vec<_>>()
-    {
+        .collect::<Vec<_>>();
+    pressed.sort_by_key(|&key| !is_modifier(key));
+    for key in pressed {
         state.held.press_key(key);
         effects.push(ReceiverEffect::Key {
             key,
@@ -638,6 +642,10 @@ fn reconcile_held(
             synthetic: true,
         });
     }
+}
+
+fn is_modifier(key: HidUsage) -> bool {
+    key.page == HidUsagePage::KEYBOARD_KEYPAD && (0xe0..=0xe7).contains(&key.usage.0)
 }
 
 fn release_all(state: &mut ActivationState, effects: &mut Vec<ReceiverEffect>) {
@@ -915,6 +923,50 @@ mod tests {
         );
         assert!(receiver.active_context().is_none());
         assert_eq!(receiver.lease_deadline(), None);
+    }
+
+    #[test]
+    fn snapshot_restores_modifiers_before_keys_and_releases_them_last() {
+        let session = context(1, 1, 1);
+        let gui = HidUsage::keyboard(0xe3);
+        let c = HidUsage::keyboard(0x06);
+        let volume = HidUsage::consumer(0xe9);
+        let mut receiver = receiver(900);
+        enter(&mut receiver, session, 0);
+        let mut snapshot = |sequence, held: HeldState| {
+            let effects = receiver
+                .receive_control(
+                    ReliableControlMessage {
+                        session,
+                        sequence: ControlSequence(sequence),
+                        payload: ReliableControl::StateSnapshot(StateSnapshot {
+                            held,
+                            motion_anchor: anchor(session, 0, 0),
+                        }),
+                    },
+                    MonotonicTimeMicros(sequence),
+                )
+                .unwrap();
+            effects
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    ReceiverEffect::Key { key, pressed, .. } => Some((key, pressed)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut held = HeldState::default();
+        held.press_key(c);
+        held.press_key(gui);
+        assert_eq!(snapshot(2, held.clone()), [(gui, true), (c, true)]);
+        // A Consumer key sorts after the modifiers but still lifts first.
+        held.press_key(volume);
+        assert_eq!(snapshot(3, held), [(volume, true)]);
+        assert_eq!(
+            snapshot(4, HeldState::default()),
+            [(c, false), (volume, false), (gui, false)]
+        );
     }
 
     #[test]

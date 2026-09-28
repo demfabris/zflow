@@ -22,6 +22,8 @@ const MAX_BASE_NAME_BYTES: usize = MAX_LABEL_BYTES - 8;
 
 /// Bounds the automatic part of pairing, which never waits for a person.
 const PAIRING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the listening computer's user has to allow a pairing.
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Wrong codes one listener tolerates. Each is one online guess in a million.
 const MAX_WRONG_CODES: usize = 3;
 /// Other failed connections one listener tolerates before it gives up.
@@ -113,8 +115,9 @@ pub struct PairingObservation {
     pub peer_candidates: Vec<SocketAddr>,
 }
 
-/// A pairing that proved the setup code. A listener's session still owes the
-/// initiator an answer about whether the peer was saved.
+/// A pairing that proved the setup code. Knowing the code is not enough to be
+/// trusted: the listening computer's user still allows or declines, and the
+/// listener answers the initiator with the result.
 pub struct PairingSession {
     observation: PairingObservation,
     connection: PairingConnection,
@@ -126,9 +129,29 @@ impl PairingSession {
         &self.observation
     }
 
-    /// A listener tells the initiator whether it saved the peer; the initiator
-    /// waits for that before saving its side. An initiator's session has
-    /// already heard the answer, so finishing it only closes the connection.
+    /// The name the peer would be saved under, for asking the user.
+    pub fn display_name(&self) -> String {
+        peer_name(self.observation.peer_label.as_deref())
+    }
+
+    /// The address the peer connected from, for asking the user.
+    pub fn peer_ip(&self) -> IpAddr {
+        self.connection.remote_address().ip().to_canonical()
+    }
+
+    /// An initiator waits here until the listener's user allowed the pairing
+    /// and the listener saved this computer. Only then does it save its side.
+    pub async fn approved(&mut self) -> Result<()> {
+        let saved = tokio::time::timeout(APPROVAL_TIMEOUT, self.connection.read_saved())
+            .await
+            .context("the other computer did not allow the pairing in time")?
+            .context("the other computer ended the pairing")?;
+        ensure!(saved, "The other computer declined the pairing");
+        Ok(())
+    }
+
+    /// A listener tells the initiator whether it saved the peer. Finishing an
+    /// initiator's session only closes the connection.
     pub async fn finish(mut self, saved: bool) {
         if let Err(error) = self.connection.finish(saved).await {
             tracing::debug!("pairing answer was not delivered: {error}");
@@ -339,7 +362,7 @@ pub async fn connect(
     let endpoint = quinn::Endpoint::client(bind)
         .with_context(|| format!("could not bind a pairing client for {remote}"))?;
     let config = pairing_client_config(identity)?;
-    let (mut connection, observation) = authenticate(
+    let (connection, observation) = authenticate(
         identity,
         local_offer,
         code,
@@ -355,11 +378,6 @@ pub async fn connect(
             error
         }
     })?;
-    // The listener saves first, so this side keeps a peer only when both will.
-    let saved = tokio::time::timeout(PAIRING_EXCHANGE_TIMEOUT, connection.read_saved())
-        .await
-        .context("the other computer did not confirm the pairing in time")??;
-    ensure!(saved, "The other computer could not save the pairing");
     Ok(PairingSession {
         observation,
         connection,
@@ -486,13 +504,20 @@ mod tests {
         let listener = PairingListener::bind(&right, LOOPBACK, right_offer, code.clone()).unwrap();
         let address = listener.local_addr().unwrap();
 
-        let (seen_by_left, seen_by_right) =
-            tokio::join!(connect(&left, address, &left_offer, &code), async {
-                let session = listener.accept().await.unwrap();
-                let observation = session.observation().clone();
-                session.finish(true).await;
-                observation
-            });
+        let initiator = async {
+            let mut session = connect(&left, address, &left_offer, &code).await?;
+            session.approved().await?;
+            anyhow::Ok(session.observation().clone())
+        };
+        let (seen_by_left, seen_by_right) = tokio::join!(initiator, async {
+            let session = listener.accept().await.unwrap();
+            // What the listener's user is asked to allow.
+            assert_eq!(session.display_name(), "left");
+            assert_eq!(session.peer_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let observation = session.observation().clone();
+            session.finish(true).await;
+            observation
+        });
         let seen_by_left = seen_by_left.unwrap();
 
         assert_eq!(seen_by_left.peer_spki, right.spki());
@@ -527,7 +552,9 @@ mod tests {
                 let error = connect(&left, address, &offer, &wrong).await.err().unwrap();
                 assert!(error.to_string().contains("does not match"));
             }
-            connect(&left, address, &offer, &code).await
+            connect(&left, address, &offer, &code)
+                .await
+                .map(|session| session.observation().clone())
         };
         let (seen_by_left, ()) = tokio::join!(clients, async {
             listener.accept().await.unwrap().finish(true).await;
@@ -547,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_initiator_keeps_nothing_when_the_listener_does_not_save() {
+    async fn the_initiator_hears_when_the_listener_declines() {
         let (_left_dir, left) = identity();
         let (_right_dir, right) = identity();
         let code = SetupCode::generate().unwrap();
@@ -555,10 +582,14 @@ mod tests {
         let listener =
             PairingListener::bind(&right, LOOPBACK, offer.clone(), code.clone()).unwrap();
         let address = listener.local_addr().unwrap();
-        let (result, ()) = tokio::join!(connect(&left, address, &offer, &code), async {
+        let initiator = async {
+            let mut session = connect(&left, address, &offer, &code).await?;
+            session.approved().await
+        };
+        let (result, ()) = tokio::join!(initiator, async {
             listener.accept().await.unwrap().finish(false).await;
         });
-        assert!(result.err().unwrap().to_string().contains("could not save"));
+        assert!(result.unwrap_err().to_string().contains("declined"));
     }
 
     #[test]

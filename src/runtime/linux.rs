@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{
 
 use crate::{
     config::{Config, DeviceSelector as ConfigDeviceSelector},
-    core::{HidUsage, PointerButton, ReceiverEffect},
+    core::{HidUsage, KeyboardMode, PointerButton, ReceiverEffect},
     linux::{
         CaptureFrame, CaptureReadError, CaptureSet, CaptureSetError, CaptureTransition,
         CapturedDeviceFrame, DeviceInfo, InjectionError, KeyState, OwnershipEffect, OwnershipPhase,
@@ -84,6 +84,9 @@ pub enum RuntimeCommand {
     },
     ReceiverEffects {
         effects: Vec<ReceiverEffect>,
+        /// The sending peer's keyboard mode, only in the batch that opens an
+        /// activation.
+        keyboard: Option<KeyboardMode>,
         touch_captured_at: Option<Instant>,
         /// Sent only after every effect reaches the uinput backend.
         applied: Option<tokio::sync::oneshot::Sender<Instant>>,
@@ -91,6 +94,10 @@ pub enum RuntimeCommand {
     Reload {
         config: LinuxRuntimeConfig,
         applied: tokio::sync::oneshot::Sender<Result<(), LinuxRuntimeError>>,
+    },
+    /// Whether the focused desktop app is a terminal.
+    DesktopFocus {
+        terminal: bool,
     },
 }
 
@@ -275,6 +282,24 @@ impl LinuxRuntimeControl {
 
     fn wake(&self) -> Result<(), RuntimeCommandError> {
         self.waker.wake().map_err(|_| RuntimeCommandError::Wake)
+    }
+}
+
+#[cfg(test)]
+impl LinuxRuntimeControl {
+    /// A control whose commands wait in the returned queue, with the poll its
+    /// sends wake in place of the input thread.
+    pub(crate) fn queue(capacity: usize) -> (Self, mpsc::Receiver<RuntimeCommand>, Poll) {
+        let poll = Poll::new().unwrap();
+        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN).unwrap());
+        let (commands, receiver) = mpsc::channel(capacity);
+        let control = Self {
+            commands,
+            waker,
+            status: Arc::new(Mutex::new(LinuxRuntimeStatus::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        (control, receiver, poll)
     }
 }
 
@@ -494,6 +519,10 @@ struct RuntimeLoop {
     capture: CaptureSet,
     ownership: SourceOwnership,
     virtual_input: VirtualInput,
+    /// Mode for the next activation that opens.
+    next_keyboard: KeyboardMode,
+    /// Kept here too so a replaced virtual keyboard starts with it.
+    terminal: bool,
     activation_chord: ChordTracker,
     escape_chord: ChordTracker,
     selected_peer: Option<String>,
@@ -550,6 +579,8 @@ impl RuntimeLoop {
             capture,
             ownership: SourceOwnership::default(),
             virtual_input,
+            next_keyboard: KeyboardMode::Standard,
+            terminal: false,
             activation_chord,
             escape_chord,
             selected_peer: None,
@@ -696,9 +727,13 @@ impl RuntimeLoop {
             RuntimeCommand::TerminalSent { transport_live } => self.terminal_sent(transport_live),
             RuntimeCommand::ReceiverEffects {
                 effects,
+                keyboard,
                 touch_captured_at,
                 applied,
             } => {
+                if let Some(keyboard) = keyboard {
+                    self.next_keyboard = keyboard;
+                }
                 if self.inject(effects, touch_captured_at)
                     && let Some(applied) = applied
                 {
@@ -707,6 +742,10 @@ impl RuntimeLoop {
             }
             RuntimeCommand::Reload { config, applied } => {
                 let _ = applied.send(self.reload(config));
+            }
+            RuntimeCommand::DesktopFocus { terminal } => {
+                self.terminal = terminal;
+                self.virtual_input.keyboard.set_terminal(terminal);
             }
         }
     }
@@ -760,9 +799,12 @@ impl RuntimeLoop {
 
     fn inject(&mut self, effects: Vec<ReceiverEffect>, touch_captured_at: Option<Instant>) -> bool {
         for effect in effects {
-            if let Err(diagnostic) =
-                apply_receiver_effect(&mut self.virtual_input, effect, touch_captured_at)
-            {
+            if let Err(diagnostic) = apply_receiver_effect(
+                &mut self.virtual_input,
+                effect,
+                touch_captured_at,
+                self.next_keyboard,
+            ) {
                 self.diagnostic(diagnostic);
                 if diagnostic == RuntimeDiagnostic::InjectionRejected {
                     // Without an acknowledgement the daemon closes only the
@@ -796,7 +838,15 @@ impl RuntimeLoop {
         );
         if config.experimental_touchpad != self.config.experimental_touchpad {
             self.release_receiver_state(RuntimeCloseReason::LocalRelease);
-            let replacement = VirtualInput::create(config.experimental_touchpad)
+            // The session stays open, so its activation keeps its keyboard
+            // mode on the new devices.
+            let mode = self.virtual_input.keyboard.mode();
+            let mut replacement = VirtualInput::create(config.experimental_touchpad)
+                .map_err(LinuxRuntimeError::ReloadVirtualInput)?;
+            replacement.keyboard.set_terminal(self.terminal);
+            replacement
+                .keyboard
+                .begin(mode)
                 .map_err(LinuxRuntimeError::ReloadVirtualInput)?;
             self.virtual_input = replacement;
             self.ready_notified = false;
@@ -1254,7 +1304,46 @@ fn apply_receiver_effect(
     virtual_input: &mut VirtualInput,
     effect: ReceiverEffect,
     touch_captured_at: Option<Instant>,
+    keyboard: KeyboardMode,
 ) -> Result<(), RuntimeDiagnostic> {
+    // Keys the keyboard held back go down before a click, a scroll or a
+    // touch, so Option+click works. `pointer` is whether this effect presses
+    // something, and whether a button or contact is still down after it. A
+    // release presses nothing: a seat hold lets it through after dropping its
+    // press.
+    let pointer = match &effect {
+        ReceiverEffect::Button {
+            button, pressed, ..
+        } => Some((
+            *pressed,
+            *pressed
+                || virtual_input
+                    .pointer
+                    .held()
+                    .iter()
+                    .any(|held| held != button)
+                || virtual_input.touching(),
+        )),
+        ReceiverEffect::Motion { delta, .. } if delta.scroll_x != 0 || delta.scroll_y != 0 => {
+            Some((
+                true,
+                !virtual_input.pointer.held().is_empty() || virtual_input.touching(),
+            ))
+        }
+        ReceiverEffect::TouchReplaced { state, .. } => Some((
+            !state.is_empty(),
+            !state.is_empty() || !virtual_input.pointer.held().is_empty(),
+        )),
+        _ => None,
+    };
+    match pointer {
+        Some((true, busy)) => virtual_input
+            .keyboard
+            .pointer(busy)
+            .map_err(|error| injection_diagnostic(&error))?,
+        Some((false, busy)) => virtual_input.keyboard.pointer_released(busy),
+        None => {}
+    }
     let result: Result<(), InjectionError> = match effect {
         ReceiverEffect::Motion { delta, .. } => virtual_input.pointer.motion(delta),
         ReceiverEffect::Key { key, pressed, .. } => virtual_input.keyboard.set_key(key, pressed),
@@ -1269,9 +1358,8 @@ fn apply_receiver_effect(
                 .release_all()
                 .map_err(|_| RuntimeDiagnostic::InjectionFailed);
         }
-        ReceiverEffect::ActivationOpened(_)
-        | ReceiverEffect::SnapshotAck { .. }
-        | ReceiverEffect::Rejected { .. } => Ok(()),
+        ReceiverEffect::ActivationOpened(_) => virtual_input.keyboard.begin(keyboard),
+        ReceiverEffect::SnapshotAck { .. } | ReceiverEffect::Rejected { .. } => Ok(()),
     };
     result.map_err(|error| injection_diagnostic(&error))
 }
@@ -1334,19 +1422,6 @@ mod tests {
             .unwrap()
     }
 
-    fn queue(capacity: usize) -> (LinuxRuntimeControl, mpsc::Receiver<RuntimeCommand>, Poll) {
-        let poll = Poll::new().unwrap();
-        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN).unwrap());
-        let (commands, receiver) = mpsc::channel(capacity);
-        let control = LinuxRuntimeControl {
-            commands,
-            waker,
-            status: Arc::new(Mutex::new(LinuxRuntimeStatus::default())),
-            stop: Arc::new(AtomicBool::new(false)),
-        };
-        (control, receiver, poll)
-    }
-
     fn release() -> RuntimeCommand {
         RuntimeCommand::Release {
             transport_live: false,
@@ -1355,7 +1430,7 @@ mod tests {
 
     #[tokio::test]
     async fn critical_command_reports_a_full_queue_at_its_bound() {
-        let (control, _receiver, _poll) = queue(1);
+        let (control, _receiver, _poll) = LinuxRuntimeControl::queue(1);
         control.send(release()).unwrap();
         assert_eq!(control.send(release()), Err(RuntimeCommandError::Full));
         assert_eq!(
@@ -1366,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn critical_command_waits_for_the_input_thread_to_drain() {
-        let (control, mut receiver, mut poll) = queue(1);
+        let (control, mut receiver, mut poll) = LinuxRuntimeControl::queue(1);
         control.send(release()).unwrap();
         let drain = std::thread::spawn(move || {
             // The input thread sleeps in poll until the sender wakes it.

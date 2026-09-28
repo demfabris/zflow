@@ -57,7 +57,24 @@ fn install_agent() -> Result<()> {
         "Run desktop-agent --install as your desktop user, without sudo"
     );
     super::gnome::install()?;
-    super::desktop::install_extension()?;
-    println!("GNOME integration installed. Open zflow from Applications or run zflow settings.");
+    println!(
+        "Adding the zflow GNOME extension. GNOME may ask to download it from extensions.gnome.org."
+    );
+    let running = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let session = zbus::Connection::session().await.ok();
+            let running = super::desktop::install_extension(session.as_ref()).await?;
+            if let Some(connection) = &session {
+                super::gnome::start_agent(connection, true).await?;
+            }
+            Ok::<_, anyhow::Error>(running)
+        })?;
+    if running {
+        println!("GNOME integration is ready. Open zflow from Applications.");
+    } else {
+        println!("Log out and back in to finish setting up zflow in GNOME.");
+    }
     Ok(())
 }

@@ -16,12 +16,16 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     const seat = {warp_pointer(x, y) {pointer = {x, y};}};
     const backend = {get_default_seat: () => seat};
     const watch = {};
+    const emitted = [];
+    const display = {focus_window: null, handlers: new Map(),
+        connect(name, fn) {this.handlers.set(name, fn); return 3;}, disconnect(id) {this.disconnected = id;}};
     // GNOME 51 reaches the backend only through the stage context.
     const context = {
+        API: 1,
         Extension: class {},
         Indicator: class { destroy() {} },
         global: {backend: {capabilities: 1}, stage: {get_context: () => ({get_backend: () => backend})},
-            get_pointer: () => [pointer.x, pointer.y]},
+            display, get_pointer: () => [pointer.x, pointer.y]},
         Main: {layoutManager: {monitors, connect(name, fn) {handlers.set(name, fn); return 1;}, disconnect() {}}},
         GLib: {
             PRIORITY_DEFAULT: 0, PRIORITY_DEFAULT_IDLE: 0, SOURCE_CONTINUE: true, SOURCE_REMOVE: false,
@@ -31,16 +35,17 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
             Source: {remove(id) {timers.delete(id);}},
             Variant: class { constructor(_type, value) {this.value = value;} },
         },
-        Gio: {DBus: {session: {}}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},
+        Gio: {DBus: {session: {emit_signal(...args) {emitted.push(args);}}}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},
             BusNameOwnerFlags: {NONE: 0}, bus_own_name_on_connection: () => 1, bus_unown_name() {},
             // The desktop agent is already running as :1.7.
             BusNameWatcherFlags: {NONE: 0}, bus_unwatch_name(id) {watch.removed = id;},
             bus_watch_name_on_connection(_connection, name, _flags, appeared, vanished) {
-                Object.assign(watch, {name, vanished});
+                Object.assign(watch, {name, appeared, vanished});
                 appeared(null, name, ':1.7');
                 return 2;
             }},
         Clutter: {},
+        Shell: {WindowTracker: {get_default: () => ({get_window_app: win => win.app})}},
         Meta: {
             BackendCapabilities: {BARRIERS: 1},
             BarrierDirection: {POSITIVE_X: 1, NEGATIVE_X: 2, POSITIVE_Y: 4, NEGATIVE_Y: 8},
@@ -54,7 +59,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     vm.runInNewContext(source, context);
     const extension = new context.TestExtension();
     extension.enable();
-    return {extension, barriers, context, seat, backend, watch, handlers, timers, advance(ms) {
+    return {extension, barriers, context, seat, backend, watch, handlers, timers, display, emitted, advance(ms) {
         now += ms * 1000;
         for (const [id, timer] of timers) {
             if (timer.due > now) continue;
@@ -259,4 +264,74 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.extension.disable();
     assert.equal(d.watch.removed, 2);
 }
-console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement and caller checks passed');
+{
+    // Terminal focus reaches only the agent: once when it appears, then on each change.
+    const d = desktop();
+    const app = categories => ({get_app_info: () => categories === null ? null : {get_categories: () => categories}});
+    const terminal = {app: app('GNOME;GTK;System;TerminalEmulator;')};
+    const focus = win => {
+        d.display.focus_window = win;
+        d.display.handlers.get('notify::focus-window')();
+    };
+    const sent = () => d.emitted.splice(0).map(([to, path, bus, name, variant]) => {
+        assert.deepEqual([path, bus, name], ['/org/gnome/Shell/Extensions/Zflow', 'org.gnome.Shell.Extensions.Zflow', 'FocusChanged']);
+        return [to, variant.value[0]];
+    });
+    assert.deepEqual(sent(), [[':1.7', false]]);
+    for (const win of [terminal, {app: app('System;TerminalEmulator;')}, {app: app('Development;IDE;TerminalEmulators;')}, terminal,
+        {app: app(null)}, terminal, {app: null}, terminal, null])
+        focus(win);
+    assert.deepEqual(sent(), [[':1.7', true], [':1.7', false], [':1.7', true], [':1.7', false], [':1.7', true], [':1.7', false], [':1.7', true], [':1.7', false]],
+        'only a TerminalEmulator category counts, and only changes are sent');
+    focus(terminal);
+    sent();
+    d.context.Main.layoutManager.monitors.length = 0;
+    assert.deepEqual({...await d.extension._request({command: 'focus'})}, {status: 'focus', terminal: true}, 'focus needs no monitors');
+    const replies = [];
+    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus'})], {
+        get_sender: () => sender,
+        return_dbus_error: name => replies.push(name),
+        return_value: variant => replies.push(JSON.parse(variant.value[0]).terminal),
+    });
+    await call(':1.99');
+    await call(':1.7');
+    assert.deepEqual(replies, ['org.freedesktop.DBus.Error.AccessDenied', true]);
+    d.watch.vanished();
+    focus(null);
+    focus(terminal);
+    assert.deepEqual(sent(), [], 'nothing is sent without an agent');
+    d.watch.appeared(null, 'io.zflow.Desktop', ':1.8');
+    assert.deepEqual(sent(), [[':1.8', true]]);
+    d.extension.disable();
+    assert.equal(d.display.disconnected, 3);
+}
+{
+    // The extension and the agent update separately, so a mismatch names the older one.
+    const d = desktop();
+    const replies = [];
+    const call = request => d.extension.CallAsync([JSON.stringify(request)], {
+        get_sender: () => ':1.7',
+        return_value: variant => replies.push(JSON.parse(variant.value[0])),
+    });
+    await call({command: 'snapshot', api: 2});
+    await call({command: 'snapshot', api: 0});
+    await call({command: 'snapshot'});
+    assert.match(replies[0].reason, /^Update zflow: its GNOME extension is older/);
+    assert.match(replies[1].reason, /^Update zflow: the app is older/);
+    assert.equal(replies[2].status, 'snapshot', 'agents from before API levels speak API 1');
+    d.extension.disable();
+}
+{
+    // disable() removes the idle source of an entry still waiting for the cursor.
+    const d = desktop();
+    const idle = [];
+    const removed = [];
+    d.context.GLib.idle_add = (_priority, fn) => {idle.push(fn); return 100 + idle.length;};
+    d.context.GLib.Source.remove = id => {removed.push(id); d.timers.delete(id);};
+    d.extension._request(prepare());
+    await new Promise(setImmediate);
+    assert.equal(idle.length, 1);
+    d.extension.disable();
+    assert.ok(removed.includes(101));
+}
+console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller, terminal focus, API and cleanup checks passed');

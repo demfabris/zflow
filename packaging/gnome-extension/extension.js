@@ -1,8 +1,10 @@
+import {API} from './client.js';
 import {Indicator} from './indicator.js';
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
@@ -15,18 +17,28 @@ const LEASE_US = 2000000;
 const WARP_US = 100000;
 // src/desktop.rs mirrors this hold duration.
 const POLL_HOLD_MS = 200;
-const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>`;
+const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method><signal name="FocusChanged"><arg type="b"/></signal></interface></node>`;
 
 export default class ZflowExtension extends Extension {
     enable() {
         this._indicator = new Indicator();
         this._lease = null;
         this._barriers = [];
+        this._idles = new Set();
         // Only the desktop agent may read the pointer or move it. This skips GNOME's
         // DBusSenderChecker, whose destroy() passes array indexes to unwatch_name.
         this._agent = null;
+        // Whether the focused window is a terminal, so Mac shortcuts can use
+        // Ctrl+Shift there. Only the agent hears about it.
+        this._terminal = this._focusedTerminal();
+        this._focusId = global.display.connect('notify::focus-window', () => {
+            const terminal = this._focusedTerminal();
+            if (terminal === this._terminal) return;
+            this._terminal = terminal;
+            this._sendFocus();
+        });
         this._agentWatch = Gio.bus_watch_name_on_connection(Gio.DBus.session, AGENT, Gio.BusNameWatcherFlags.NONE,
-            (_connection, _name, owner) => { this._agent = owner; }, () => { this._agent = null; });
+            (_connection, _name, owner) => { this._agent = owner; this._sendFocus(); }, () => { this._agent = null; });
         this._object = Gio.DBusExportedObject.wrapJSObject(XML, this);
         this._object.export(Gio.DBus.session, PATH);
         this._busId = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS, Gio.BusNameOwnerFlags.NONE, null, null);
@@ -42,9 +54,13 @@ export default class ZflowExtension extends Extension {
         this._indicator?.destroy();
         this._indicator = null;
         this._clear();
+        // An entry still waiting for the cursor stops here and never answers.
+        for (const id of this._idles) GLib.Source.remove(id);
+        this._idles.clear();
         if (this._timer) GLib.Source.remove(this._timer);
         if (this._monitorsId) Main.layoutManager.disconnect(this._monitorsId);
-        this._timer = this._monitorsId = 0;
+        if (this._focusId) global.display.disconnect(this._focusId);
+        this._timer = this._monitorsId = this._focusId = 0;
         this._object?.unexport();
         this._object = null;
         if (this._busId) Gio.bus_unown_name(this._busId);
@@ -58,6 +74,18 @@ export default class ZflowExtension extends Extension {
         for (const barrier of this._barriers) barrier.destroy();
         this._barriers = [];
         this._lease = null;
+    }
+
+    _focusedTerminal() {
+        const win = global.display.focus_window;
+        const app = win && Shell.WindowTracker.get_default().get_window_app(win);
+        const categories = app?.get_app_info()?.get_categories() ?? '';
+        return categories.split(';').includes('TerminalEmulator');
+    }
+
+    _sendFocus() {
+        if (this._agent)
+            Gio.DBus.session.emit_signal(this._agent, PATH, BUS, 'FocusChanged', new GLib.Variant('(b)', [this._terminal]));
     }
 
     _snapshot() {
@@ -78,6 +106,10 @@ export default class ZflowExtension extends Extension {
         try {
             if (json.length > 4096) throw new Error('Desktop request exceeds limit');
             const request = JSON.parse(json);
+            // Agents older than API 1 did not send it and speak API 1.
+            const api = request.api ?? 1;
+            if (api > API) throw new Error('Update zflow: its GNOME extension is older than the app');
+            if (api < API) throw new Error('Update zflow: the app is older than its GNOME extension');
             response = await this._request(request);
         } catch (error) {
             response = {status: 'unavailable', reason: String(error.message).slice(0, 256)};
@@ -86,6 +118,8 @@ export default class ZflowExtension extends Extension {
     }
 
     async _request(r) {
+        // The agent asks for this when it subscribes; it needs no monitors.
+        if (r.command === 'focus') return {status: 'focus', terminal: this._terminal};
         const snapshot = this._snapshot();
         if (r.command === 'snapshot') return {status: 'snapshot', ...snapshot};
         if (!Number.isSafeInteger(r.token) || r.token <= 0) throw new Error('Invalid handoff token');
@@ -178,7 +212,14 @@ export default class ZflowExtension extends Extension {
             // delay it past the next main-loop turn. Keep checking for a while.
             const deadline = GLib.get_monotonic_time() + WARP_US;
             for (;;) {
-                await new Promise(resolve => GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {resolve(); return GLib.SOURCE_REMOVE;}));
+                await new Promise(resolve => {
+                    const id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                        this._idles.delete(id);
+                        resolve();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    this._idles.add(id);
+                });
                 if (this._lease !== lease) throw new Error('Desktop changed during entry');
                 const actual = this._snapshot();
                 if (Math.abs(actual.position.x - point.x) <= 2 && Math.abs(actual.position.y - point.y) <= 2)

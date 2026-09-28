@@ -106,25 +106,37 @@ Mac that is `universal-apple-darwin`, which requires an app built with
 ## Debian packages
 
 The package owns `/usr/bin/zflow`, `/usr/bin/zflowd`, vendor systemd/udev files
-under `/usr/lib`, and the GNOME extension, application launcher, and D-Bus entry
-under `/usr/share`. debhelper handles service lifecycle and respects
-`policy-rc.d`. Configuration and capture rules are generated only when absent;
-updates keep daemon-written settings and pairing state.
+and `/usr/lib/zflow` helper scripts under `/usr/lib`, and the GNOME extension,
+application launcher, and D-Bus activation file under `/usr/share`. It also
+ships `/etc/xdg/autostart/io.zflow.desktop-agent.desktop`, which starts the
+desktop agent in every GNOME session. debhelper handles service lifecycle and
+respects `policy-rc.d`. Configuration and capture rules are generated only when
+absent; updates keep daemon-written settings and pairing state.
 
-`apt remove zflow` stops the service and moves selected-device rules out of
-udev's active directory, retaining them for reinstallation. `apt purge zflow`
-also removes generated configuration and device selections. Both retain
-`/var/lib/zflow` identities and the locked system account. Per-user autostart
-and desktop files, if created previously, stay in that user's account.
+On configure, `/usr/lib/zflow/firewall.sh open` allows UDP 43119 and 43120 when
+ufw is active (application profile `/etc/ufw/applications.d/zflow`) or firewalld
+is running (service `/etc/firewalld/services/zflow.xml` in the default zone). It
+prints what it opened and never turns a firewall on. apt runs it again on every
+upgrade, so a removed rule comes back with the next update.
+
+`apt remove zflow` stops the service, closes those firewall rules, and moves
+selected-device rules out of udev's active directory, retaining them for
+reinstallation. dpkg keeps the autostart entry as a conffile until purge;
+`TryExec` stops it from running without `/usr/bin/zflow`. `apt purge zflow`
+also removes the autostart entry, generated configuration and device
+selections. Both retain `/var/lib/zflow` identities and the locked system
+account. Neither touches home folders, so a GNOME extension installed from
+extensions.gnome.org stays until the user removes it.
 
 An archive/source installation owns `/usr/local` binaries and `/etc` service
 files that would shadow a Debian installation. The curl installer keeps using
 archives for such a machine. To migrate deliberately, stop sharing, save
 `/etc/udev/rules.d/71-zflow-capture.rules`, run the archive/source uninstaller
 without `--purge`, install the `.deb`, then restore the capture rules and reload
-udev. Configuration and identity remain in place. Remove the old per-user
-launcher, D-Bus service and extension listed below so the package's global
-files take effect; update any autostart entry to use `/usr/bin/zflow`.
+udev. Configuration and identity remain in place. Then run
+`zflow desktop-agent --install` as each desktop user: it removes the per-user
+launcher, D-Bus file and extension copy that older versions wrote, which would
+shadow the package's files.
 The `.deb` rejects a remaining `/usr/local` installation before unpacking.
 
 ## Linux service
@@ -134,6 +146,12 @@ For development, `scripts/install.sh` builds both headless binaries and installs
 the service, udev rules, and a system-sleep hook, then starts `zflowd`. The
 account, configuration, capture-rule, and uinput steps live in
 `packaging/linux/host-setup.sh`, which the Debian package's postinst also runs.
+It also installs the launcher and D-Bus activation file under
+`/usr/local/share` and the autostart entry under `/etc/xdg/autostart`, with
+`/usr/local/bin/zflow` in place of `/usr/bin/zflow`. The session bus and GNOME
+search `/usr/local/share` through the default `XDG_DATA_DIRS`. The firewall step
+is the same `firewall.sh` the package uses, kept at
+`/usr/local/lib/zflow/firewall.sh` for the uninstaller.
 
 Binary archives contain the same installer and Linux service assets alongside
 `bin/zflow` and `bin/zflowd`. Their installer runs with `--install-built` and
@@ -174,8 +192,9 @@ before suspend and starts a fresh process after resume. This releases every
 evdev grab and discards stale sessions and clock state.
 
 The installer copies the uninstaller to `/usr/local/lib/zflow/uninstall.sh`.
-It keeps configuration, identity state, and the service account, and removes
-the capture rule to revoke event-device access:
+It keeps configuration, identity state, and the service account, removes the
+session files and firewall rules, and removes the capture rule to revoke
+event-device access:
 
 ```sh
 sudo /usr/local/lib/zflow/uninstall.sh
@@ -208,19 +227,48 @@ The build script does not install services, launch the app, or notarize it.
 
 ## Linux desktop session
 
-After installing the system service, run as the logged-in desktop user:
+Both install paths give every GNOME user the launcher, the D-Bus activation
+file for `io.zflow.Desktop`, and an autostart entry for the desktop agent. The
+curl installer then runs this as the desktop user, and so can you:
 
 ```sh
 zflow desktop-agent --install
-zflow settings
 ```
 
-The install command writes the GNOME extension, the Applications launcher,
-a D-Bus activation entry for `io.zflow.Desktop`, and
-`$XDG_CONFIG_HOME/autostart/io.zflow.desktop-agent.desktop` (falling back to
-`~/.config/autostart`). Log out and back in after installing or updating the
-extension so GNOME loads the new code. The extension adds a panel indicator with sharing and settings actions.
-Its preferences and the standalone app use the same GTK4/libadwaita controls.
+It sets up the GNOME extension and starts the agent in the current session.
+First it removes the per-user launcher and D-Bus file that older versions
+wrote, since they would shadow the system files. Then:
+
+1. If GNOME Shell has not loaded the extension this session, it calls
+   `org.gnome.Shell.Extensions.InstallRemoteExtension("zflow@demfabris")`.
+   GNOME shows its own dialog, downloads the extension from
+   extensions.gnome.org, and loads it at once. GNOME 45 and later load a new
+   extension without a logout only this way.
+2. Otherwise, or when that fails (not on extensions.gnome.org yet, offline, the
+   `allow-extension-installation` policy, no version for this GNOME, or Cancel),
+   it falls back to the bundled copy. A `.deb` already has it under
+   `/usr/share/gnome-shell/extensions`, and an older per-user copy is removed so
+   it can't shadow that one. An archive install writes it to
+   `~/.local/share/gnome-shell/extensions`, as before. A copy that came from
+   extensions.gnome.org (its `metadata.json` has `_generated`) is left to
+   GNOME's own updates in both cases.
+3. It adds the extension to `org.gnome.shell enabled-extensions` with
+   `gsettings`, because `gnome-extensions enable` refuses an extension that
+   Shell has not loaded yet. It prints "Log out and back in" when GNOME only
+   loads it at the next login.
+4. It starts the agent through D-Bus activation, or directly if the bus
+   cannot, so the Mac can connect without waiting for the next login. An agent
+   that is already running is stopped first, so an update takes effect now.
+
+Opening zflow runs `zflow settings`. Its window shows a banner until the
+extension runs: **Install** (asks the agent to do the steps above), **Turn On**
+(for an extension GNOME loaded but that is off), or **Log Out** (for files GNOME
+has not loaded yet; GNOME asks to confirm). The banner lives in `setup.js`,
+outside the extension, because extensions.gnome.org discourages extensions that
+install or enable extensions.
+
+The extension adds a panel indicator with sharing and settings actions. Its
+preferences and the standalone app use the same GTK4/libadwaita controls.
 Install GJS, GTK 4.12+ and libadwaita 1.5+ for the window. The service and agent
 remain usable without the GTK runtime.
 
@@ -229,13 +277,46 @@ without opening a window. It obtains public
 peer/discovery settings through the credential-checked desktop API. It does not
 read the protected system configuration directly. For a foreground agent, run
 `zflow desktop-agent` and stop it with Ctrl+C.
-Closing the settings window keeps the agent running. **Start at Login**
-controls the autostart entry; opening settings can still start it on demand.
-Panel status checks do not activate a stopped agent.
+Closing the settings window keeps the agent running. **Start at Login** is on
+while the system autostart entry applies. Turning it off writes
+`~/.config/autostart/io.zflow.desktop-agent.desktop` with `Hidden=true`, the
+XDG way to override a system entry; turning it on again deletes that file.
+Opening settings can still start the agent on demand. Panel status checks do
+not activate a stopped agent.
 
-The system uninstaller does not delete per-user extension or autostart files.
-Remove those from the desktop account when removing desktop integration, plus
-`$XDG_DATA_HOME/applications/io.zflow.zflow.desktop`,
-`$XDG_DATA_HOME/dbus-1/services/io.zflow.Desktop.service`, and
-`$XDG_CACHE_HOME/zflow/desktop`. The data/cache defaults are `~/.local/share`
-and `~/.cache`.
+The extension and the agent can come from different releases, since
+extensions.gnome.org updates the extension on its own schedule. Both carry an
+API level (`API` in `src/app/gnome.rs` and `packaging/gnome-extension/client.js`).
+The agent sends its level with every request, and the extension refuses a
+different one with a reason that starts with "Update zflow". The panel compares
+the level in the agent's snapshot and shows **Update zflow**. Raise both only
+when the agent and the extension stop understanding each other.
+
+The system uninstaller and package removal do not touch home folders. The
+GNOME extension, a `Hidden=true` autostart override, and the settings window
+assets in `$XDG_CACHE_HOME/zflow/desktop` (default `~/.cache`) stay in each
+account.
+
+## GNOME extension on extensions.gnome.org
+
+`scripts/pack-extension.sh` (or `just pack-extension`) runs
+`gnome-extensions pack` and writes
+`target/dist/zflow@demfabris.shell-extension.zip`. It needs GNOME Shell's
+`gnome-extensions` tool. The zip holds exactly the files that
+`desktop-agent --install` writes and the `.deb` installs: `metadata.json`,
+`extension.js`, `indicator.js`, `client.js`, `settings.js` and `prefs.js`.
+`app.js` and `setup.js` belong to the standalone window only.
+`tests/install_test.py` checks that the three lists match.
+
+`metadata.json` has no `version`: extensions.gnome.org sets it on upload. That
+also keeps GNOME's update check away from a bundled copy, which has no version
+to compare. List only released GNOME versions in `shell-version`.
+
+Upload the zip at <https://extensions.gnome.org/upload/> while signed in with
+the account that owns the `zflow@demfabris` UUID. Each upload becomes a new
+version that waits for review. Reviewers follow the
+[review guidelines](https://gjs.guide/extensions/review-guidelines/review-guidelines.html),
+and expect the author to explain the code. Upload a new zip whenever a release
+changes a file in the list above, or supports a new GNOME version. When a
+release raises the API level, get the new extension approved before publishing
+the release, so users do not see **Update zflow** in between.
