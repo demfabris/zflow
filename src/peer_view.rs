@@ -30,6 +30,7 @@ pub enum Request {
         /// Whether it may control this computer.
         allow_control: Option<bool>,
         keyboard: Option<KeyboardMode>,
+        reverse_scroll: Option<bool>,
     },
     /// Whether the focused desktop app is a terminal. The desktop agent sends
     /// this; it never leaves this computer.
@@ -157,6 +158,7 @@ pub fn set_peer(
     peer: &mut PeerConfig,
     allow_control: Option<bool>,
     keyboard: Option<KeyboardMode>,
+    reverse_scroll: Option<bool>,
 ) {
     peer.permissions.receive_normal = true;
     if let Some(allowed) = allow_control {
@@ -164,6 +166,9 @@ pub fn set_peer(
     }
     if let Some(mode) = keyboard {
         peer.keyboard = mode;
+    }
+    if let Some(reverse) = reverse_scroll {
+        peer.reverse_scroll = reverse;
     }
 }
 
@@ -397,8 +402,9 @@ mod tests {
             addresses: Vec::new(),
             permissions: one_way,
             keyboard: KeyboardMode::Standard,
+            reverse_scroll: false,
         };
-        set_peer(&mut peer, None, Some(KeyboardMode::Mac));
+        set_peer(&mut peer, None, Some(KeyboardMode::Mac), None);
         assert_eq!(peer.keyboard, KeyboardMode::Mac);
         assert_eq!(
             peer.permissions,
@@ -407,10 +413,13 @@ mod tests {
                 ..one_way
             }
         );
-        set_peer(&mut peer, Some(false), None);
+        set_peer(&mut peer, Some(false), None, None);
         assert!(!peer.permissions.send_normal && peer.permissions.inject_prelogin);
         assert_eq!(peer.keyboard, KeyboardMode::Mac);
-        set_peer(&mut peer, Some(true), None);
+        set_peer(&mut peer, Some(true), None, None);
         assert!(peer.permissions.send_normal);
+        assert!(!peer.reverse_scroll);
+        set_peer(&mut peer, None, None, Some(true));
+        assert!(peer.reverse_scroll && peer.permissions.send_normal);
     }
 }

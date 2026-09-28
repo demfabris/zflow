@@ -729,6 +729,7 @@ mod tests {
                 name: "desk".into(),
                 allow_control: Some(true),
                 keyboard: None,
+                reverse_scroll: None,
             })
             .unwrap_err();
         assert_eq!(error.to_string(), "Not available on this computer");
@@ -750,6 +751,7 @@ mod tests {
                         inject_prelogin: false,
                     },
                     keyboard: crate::core::KeyboardMode::Standard,
+                    reverse_scroll: false,
                 },
             );
         }

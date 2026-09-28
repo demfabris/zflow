@@ -467,6 +467,8 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A Mac "switch to next computer" chord.
   - Mac media keys.
   - Open logs.
+- **Status (2026-09-28):** started on Linux, on branch `linux-edge-sending`.
+  - Done: dead corners (outbound barriers stop 8 px short of the desktop's corners), and reverse scrolling per computer. `reverse_scroll` is on the peer record, in `set_peer` and in the snapshot; the Linux daemon turns that peer's scroll around, and the settings window has the switch. The Mac injector and Mac UI pick it up in Phase 2.
 - **Acceptance:**
   - Text and PNG copy/paste work both ways.
   - A 5 MiB clip is refused with a notice, without disconnecting.

@@ -187,6 +187,10 @@ pub struct PeerConfig {
     /// that never changes it still loads in older binaries.
     #[serde(default, skip_serializing_if = "KeyboardMode::is_standard")]
     pub keyboard: KeyboardMode,
+    /// Turns this peer's scrolling around here, for a Mac with natural
+    /// scrolling against a desktop without it. Left out while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reverse_scroll: bool,
 }
 
 impl PeerConfig {
@@ -201,6 +205,7 @@ impl PeerConfig {
             addresses,
             permissions,
             keyboard: KeyboardMode::Standard,
+            reverse_scroll: false,
         })
     }
 
@@ -541,6 +546,7 @@ mod tests {
                 addresses: Vec::new(),
                 permissions: PeerPermissions::default(),
                 keyboard: KeyboardMode::Standard,
+                reverse_scroll: false,
             },
         );
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));

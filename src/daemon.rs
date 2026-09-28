@@ -1403,6 +1403,17 @@ fn claim_inbound(
     true
 }
 
+/// Turns a peer's scrolling around, for a Mac with natural scrolling against
+/// a desktop without it. Pointer motion stays as it is.
+fn reverse_scrolling(effects: &mut [ReceiverEffect]) {
+    for effect in effects {
+        if let ReceiverEffect::Motion { delta, .. } = effect {
+            delta.scroll_x = -delta.scroll_x;
+            delta.scroll_y = -delta.scroll_y;
+        }
+    }
+}
+
 fn is_release(effect: &ReceiverEffect) -> bool {
     match effect {
         ReceiverEffect::Key { pressed, .. } | ReceiverEffect::Button { pressed, .. } => !pressed,
@@ -1915,13 +1926,12 @@ impl Shared {
         };
 
         let gate = *self.seat_gate.read().await;
-        let (admission, keyboard) = {
+        let (admission, keyboard, reverse_scroll) = {
             let config = self.config.read().await;
-            let keyboard = config
-                .peers
-                .get(peer)
-                .map_or(KeyboardMode::Standard, |record| record.keyboard);
-            (admit(&config, peer, gate), keyboard)
+            let record = config.peers.get(peer);
+            let keyboard = record.map_or(KeyboardMode::Standard, |record| record.keyboard);
+            let reverse_scroll = record.is_some_and(|record| record.reverse_scroll);
+            (admit(&config, peer, gate), keyboard, reverse_scroll)
         };
         let permitted = admission != Admission::Refuse;
         if opens {
@@ -1943,7 +1953,10 @@ impl Shared {
         let closed = effects
             .iter()
             .any(|effect| matches!(effect, ReceiverEffect::ActivationClosed { .. }));
-        let (deliver, mut rejected) = admitted_effects(effects, admission);
+        let (mut deliver, mut rejected) = admitted_effects(effects, admission);
+        if reverse_scroll {
+            reverse_scrolling(&mut deliver);
+        }
         if !deliver.is_empty() {
             let safety_release = deliver.iter().all(is_safety_release);
             let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
@@ -2259,6 +2272,45 @@ mod tests {
     }
 
     #[test]
+    fn reversed_scrolling_leaves_pointer_motion_alone() {
+        use crate::core::{MotionDelta, MotionSequence};
+        let motion = |dx, scroll_y| ReceiverEffect::Motion {
+            delta: MotionDelta {
+                dx,
+                dy: 0,
+                scroll_x: 3,
+                scroll_y,
+            },
+            through_sequence: MotionSequence(1),
+        };
+        let mut effects = vec![motion(5, -120), motion(-2, 0)];
+        reverse_scrolling(&mut effects);
+        assert_eq!(
+            effects,
+            vec![
+                ReceiverEffect::Motion {
+                    delta: MotionDelta {
+                        dx: 5,
+                        dy: 0,
+                        scroll_x: -3,
+                        scroll_y: 120
+                    },
+                    through_sequence: MotionSequence(1),
+                },
+                ReceiverEffect::Motion {
+                    delta: MotionDelta {
+                        dx: -2,
+                        dy: 0,
+                        scroll_x: -3,
+                        scroll_y: 0
+                    },
+                    through_sequence: MotionSequence(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn a_computer_that_is_sending_refuses_to_be_controlled() {
         for local in [
             OwnershipPhase::Arming,
@@ -2294,6 +2346,7 @@ mod tests {
                     inject_prelogin: false,
                 },
                 keyboard: KeyboardMode::Standard,
+                reverse_scroll: false,
             },
         );
         assert!(receiver_authorized(
@@ -2382,6 +2435,7 @@ mod tests {
                     inject_prelogin: false,
                 },
                 keyboard: KeyboardMode::Standard,
+                reverse_scroll: false,
             },
         );
         config

@@ -27,7 +27,7 @@ function waitFor(predicate) {
 }
 
 // src/app/api.rs Snapshot, as the agent sends it.
-const peer = (name, fields = {}) => ({name, state: 'paired', detail: 'Paired', allow_control: true, keyboard: 'standard', ...fields});
+const peer = (name, fields = {}) => ({name, state: 'paired', detail: 'Paired', allow_control: true, keyboard: 'standard', reverse_scroll: false, ...fields});
 const ready = {state: 'ready', peer: null, title: 'Ready'};
 // src/app/layout_model.rs Layout: this computer's view, where its own tile has no peer.
 const layout = {monitors: [
@@ -47,6 +47,7 @@ let failMove = false;
 let callCount = 0;
 let keyboardCalls = 0;
 let controlCalls = 0;
+let scrollCalls = 0;
 const moves = [];
 const xml = '<node><interface name="io.zflow.Desktop"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>';
 const object = Gio.DBusExportedObject.wrapJSObject(xml, {
@@ -64,13 +65,17 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
         case 'forget': snapshot.peers = snapshot.peers.filter(peer => peer.name !== request.name); break;
         case 'set_peer': {
             const peer = find(request.name);
-            assert(('keyboard' in request) !== ('allow_control' in request), 'each control changes one field');
+            const fields = ['keyboard', 'allow_control', 'reverse_scroll'].filter(field => field in request);
+            assert(fields.length === 1, 'each control changes one field');
             if ('keyboard' in request) {
                 keyboardCalls++;
                 peer.keyboard = request.keyboard;
-            } else {
+            } else if ('allow_control' in request) {
                 controlCalls++;
                 peer.allow_control = request.allow_control;
+            } else {
+                scrollCalls++;
+                peer.reverse_scroll = request.reverse_scroll;
             }
             break;
         }
@@ -195,6 +200,11 @@ app.connect('activate', () => {
         await waitFor(() => control.active);
         assert(controlCalls === 1, 'a snapshot moves the switch without sending a request');
         assert(settings._peerRows[0] === firstRow, 'a permission change keeps the row');
+        const scroll = settings._scrolls.get('MacBook');
+        assert(!scroll.active, 'scrolling starts the right way round');
+        scroll.active = true;
+        await waitFor(() => find('MacBook').reverse_scroll && !settings._busy && scroll.sensitive);
+        assert(scrollCalls === 1 && settings._peerRows[0] === firstRow, 'reversing scroll sends set_peer once and keeps the row');
         firstRow.expanded = true;
         Object.assign(find('MacBook'), {state: 'controlled_from_here', detail: 'Controlled from here'});
         await waitFor(() => settings._peerRows[0] !== firstRow);
@@ -272,7 +282,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
+        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, reverse scrolling, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

@@ -34,6 +34,7 @@ export class Settings {
         this._shortcutKey = '';
         this._keyboards = new Map();
         this._controls = new Map();
+        this._scrolls = new Map();
         // Rows are rebuilt when a computer connects, so remember which are open.
         this._expanded = new Set();
         this.page = new Adw.PreferencesPage({title: 'zflow', icon_name: 'input-mouse-symbolic'});
@@ -116,7 +117,7 @@ export class Settings {
         if (this._busy) return false;
         this._busy = true;
         this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = false;
-        for (const row of [...this._keyboards.values(), ...this._controls.values()]) row.sensitive = false;
+        for (const row of [...this._keyboards.values(), ...this._controls.values(), ...this._scrolls.values()]) row.sensitive = false;
         this._showError(null);
         let success = false;
         try { await this.client.call(request); success = true; }
@@ -287,13 +288,14 @@ export class Settings {
     _updatePeers(peers) {
         // Keep rows and keyboard focus stable while unchanged snapshots arrive.
         // A keyboard or permission change only moves its control, below.
-        const key = JSON.stringify(peers.map(({keyboard: _keyboard, allow_control: _control, ...peer}) => peer));
+        const key = JSON.stringify(peers.map(({keyboard: _keyboard, allow_control: _control, reverse_scroll: _scroll, ...peer}) => peer));
         if (key !== this._peerKey) {
             this._peerKey = key;
             for (const row of this._peerRows) this._computers.remove(row);
             this._peerRows = [];
             this._keyboards.clear();
             this._controls.clear();
+            this._scrolls.clear();
             for (const {name, detail} of peers) {
                 const row = new Adw.ExpanderRow({title: name, subtitle: detail, use_markup: false, expanded: this._expanded.has(name)});
                 row.connect('notify::expanded', () => row.expanded ? this._expanded.add(name) : this._expanded.delete(name));
@@ -310,6 +312,12 @@ export class Settings {
                 });
                 row.add_row(keyboard);
                 this._keyboards.set(name, keyboard);
+                const scroll = new Adw.SwitchRow({title: 'Reverse scrolling', subtitle: 'Turn its scrolling around here'});
+                scroll.connect('notify::active', () => {
+                    if (!this._updating) this._run({command: 'set_peer', name, reverse_scroll: scroll.active});
+                });
+                row.add_row(scroll);
+                this._scrolls.set(name, scroll);
                 const forget = new Gtk.Button({icon_name: 'user-trash-symbolic', tooltip_text: `Forget ${name}`, valign: Gtk.Align.CENTER, css_classes: ['flat']});
                 forget.connect('clicked', () => this._forget(name));
                 row.add_suffix(forget);
@@ -323,12 +331,14 @@ export class Settings {
             }
         }
         this._updating = true;
-        for (const {name, keyboard: mode, allow_control} of peers) {
+        for (const {name, keyboard: mode, allow_control, reverse_scroll} of peers) {
             const keyboard = this._keyboards.get(name);
             const control = this._controls.get(name);
+            const scroll = this._scrolls.get(name);
             keyboard.selected = Math.max(0, KEYBOARD_MODES.indexOf(mode));
             control.active = allow_control;
-            keyboard.sensitive = control.sensitive = !this._busy;
+            scroll.active = !!reverse_scroll;
+            keyboard.sensitive = control.sensitive = scroll.sensitive = !this._busy;
         }
         this._updating = false;
     }

@@ -63,11 +63,13 @@ impl Service {
                 name,
                 allow_control,
                 keyboard,
+                reverse_scroll,
             } => {
                 crate::peer_view::request(&DaemonRequest::SetPeer {
                     name,
                     allow_control,
                     keyboard,
+                    reverse_scroll,
                 })
                 .await?;
             }
@@ -535,6 +537,7 @@ mod tests {
                         inject_prelogin: false,
                     },
                     keyboard: crate::core::KeyboardMode::Standard,
+                    reverse_scroll: false,
                 },
             );
         }

@@ -140,11 +140,12 @@ async fn desktop_command(
             name,
             allow_control,
             keyboard,
+            reverse_scroll,
         } => {
             let Some(peer) = config.peers.get_mut(&name) else {
                 bail!("Unknown computer {name}");
             };
-            crate::peer_view::set_peer(peer, allow_control, keyboard);
+            crate::peer_view::set_peer(peer, allow_control, keyboard, reverse_scroll);
             shared.apply_config_locked(config, true).await?;
             Ok(DesktopReply::Ack)
         }

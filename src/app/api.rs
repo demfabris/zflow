@@ -100,6 +100,8 @@ pub(super) struct Peer {
     /// Whether it may control this computer.
     pub allow_control: bool,
     pub keyboard: KeyboardMode,
+    /// Whether its scrolling is turned around here.
+    pub reverse_scroll: bool,
 }
 
 // Linux does not see connection attempts or link errors yet.
@@ -131,6 +133,7 @@ impl Peer {
             detail: detail.into(),
             allow_control: record.permissions.send_normal,
             keyboard: record.keyboard,
+            reverse_scroll: record.reverse_scroll,
         }
     }
 }
@@ -197,6 +200,7 @@ pub(crate) enum Request {
         name: String,
         allow_control: Option<bool>,
         keyboard: Option<KeyboardMode>,
+        reverse_scroll: Option<bool>,
     },
     Forget {
         name: String,
@@ -261,6 +265,7 @@ mod tests {
                 inject_prelogin: false,
             },
             keyboard: KeyboardMode::Mac,
+            reverse_scroll: false,
         }
     }
 
@@ -312,7 +317,7 @@ mod tests {
             value,
             serde_json::json!({
                 "name": "desk", "state": "controlled_from_here", "detail": "Controlled from here",
-                "allow_control": false, "keyboard": "mac",
+                "allow_control": false, "keyboard": "mac", "reverse_scroll": false,
             })
         );
     }
