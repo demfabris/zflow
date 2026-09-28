@@ -341,7 +341,11 @@ impl NativeApp {
             self.reload();
             // Also a fallback for display and permission changes that sent no callback.
             sharing::forget_geometry();
-            self.accessibility = self.accessibility_granted();
+            let accessibility = self.accessibility_granted();
+            if accessibility != self.accessibility {
+                tracing::info!(accessibility, "Accessibility changed");
+            }
+            self.accessibility = accessibility;
             self.sync_discovery();
             if self.discovers()
                 && (self.local_network != LocalNetwork::Allowed

@@ -226,9 +226,11 @@ checks do not qualify the live workflow:
 - Mapping checks cover all four edges, partial overlaps, negative desktop
   origins, monitor gaps and changed dimensions. A return point in a Mac monitor
   gap must not warp the cursor there.
-- Native fake-capture tests cover GUI cancellation and admission: held keys or
-  buttons, movement away from the entry point during connection setup, unmatched
-  local key/button releases, and contacts collected before cursor isolation.
+- Native fake-capture tests cover GUI cancellation and admission: held buttons
+  or modifiers (a plain key held at entry is admitted; its repeats are dropped
+  and its release stays local), movement away from the entry point during
+  connection setup, unmatched local key/button releases, and contacts collected
+  before cursor isolation.
 - GUI file-pairing tests use real loopback QUIC. They verify no peer record exists
   before matching confirmation, directional permissions, mismatch rejection and
   retry without replacing an existing identity or expanding permissions.

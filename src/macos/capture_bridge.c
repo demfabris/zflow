@@ -126,9 +126,10 @@ int zflow_mac_secure_input_enabled(void) {
   return IsSecureEventInputEnabled() ? 1 : 0;
 }
 
+// Only buttons and modifiers count. macOS can report a key as down long after
+// its release, and a key held at entry is harmless: the tap keeps its release
+// on the Mac and drops its repeats.
 int zflow_mac_input_is_neutral(void) {
-  for (CGKeyCode key = 0; key < 128; key++)
-    if (CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, key)) return 0;
   for (CGMouseButton button = 0; button < 32; button++)
     if (CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, button)) return 0;
   CGEventFlags held = kCGEventFlagMaskShift | kCGEventFlagMaskControl |
@@ -361,7 +362,7 @@ static int capture_entry_allowed(void) {
     return -1;
   }
   if (!zflow_mac_input_is_neutral()) {
-    set_error("release held keys and buttons before crossing to the other computer");
+    set_error("release held buttons and modifier keys before crossing to the other computer");
     return -2;
   }
   if (!rect_contains(g_entry_region, current)) {
@@ -592,6 +593,9 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
       captured.pressed = type == kCGEventFlagsChanged
           ? zflow_mac_modifier_pressed(keycode, flags)
           : type == kCGEventKeyDown;
+      // Repeats of a key held since before capture belong to neither computer.
+      if (type == kCGEventKeyDown && keycode < 128 && !g_forwarded_keys[keycode] &&
+          CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat)) return NULL;
       if (keycode < 128 &&
           !owns_transition(&g_forwarded_keys[keycode], captured.pressed)) return event;
       return forward(&captured);

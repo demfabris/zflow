@@ -142,14 +142,15 @@ static void desktop_and_permission_tests(void) {
   assert(rectangles[1].x == -1920 && rectangles[1].y == -200);
   assert(zflow_mac_desktop_rectangles(rectangles, 1) == -1);
   assert(zflow_mac_input_is_neutral());
-  held_key = 55; assert(!zflow_mac_input_is_neutral()); held_key = -1;
+  // A key alone never blocks entry; macOS can report one long after release.
+  held_key = 0; assert(zflow_mac_input_is_neutral()); held_key = -1;
   held_button = 0; assert(!zflow_mac_input_is_neutral()); held_button = -1;
   held_flags = kCGEventFlagMaskCommand; assert(!zflow_mac_input_is_neutral());
   held_flags = kCGEventFlagMaskAlphaShift; assert(zflow_mac_input_is_neutral());
   held_flags = 0;
   g_entry_region = (ZFlowMacRect){-1200, -100, 9, 200};
   assert(capture_entry_allowed() == 0);
-  held_key = 10; assert(capture_entry_allowed() == -2); held_key = -1;
+  held_key = 10; assert(capture_entry_allowed() == 0); held_key = -1;
   held_button = 1; assert(capture_entry_allowed() == -2); held_button = -1;
   cursor_position.y -= 11; assert(capture_entry_allowed() == 0);
   cursor_position.y = 50; assert(capture_entry_allowed() == 0);
@@ -199,6 +200,14 @@ static void startup_release_tests(void) {
   assert(event_callback(NULL, kCGEventKeyDown, key, NULL) == NULL);
   assert(event_callback(NULL, kCGEventKeyUp, key, NULL) == NULL);
   CFRelease(key);
+  // A key held since before capture: repeats are dropped, the release stays local.
+  CGEventRef repeat = CGEventCreateKeyboardEvent(NULL, 4, true);
+  assert(repeat);
+  CGEventSetIntegerValueField(repeat, kCGKeyboardEventAutorepeat, 1);
+  assert(event_callback(NULL, kCGEventKeyDown, repeat, NULL) == NULL);
+  assert(!g_forwarded_keys[4]);
+  assert(event_callback(NULL, kCGEventKeyUp, repeat, NULL) == repeat);
+  CFRelease(repeat);
   CGEventRef button = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
                                              CGPointMake(0, 0), kCGMouseButtonLeft);
   assert(button);
@@ -448,7 +457,7 @@ static void admission_tests(void) {
   reset();
   held_button = 0;
   assert(zflow_mac_capture_start(0, &entry, NULL) == -2);
-  assert(strstr(g_error, "release held keys"));
+  assert(strstr(g_error, "release held buttons"));
   assert(tap_calls == taps + 1 && call_count == 0 && !g_thread_valid);
   held_button = -1;
   cursor_position.x = -1150;

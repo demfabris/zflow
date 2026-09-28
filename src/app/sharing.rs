@@ -72,6 +72,9 @@ impl Observer {
     }
 
     pub fn stop(&mut self) {
+        if self.enabled {
+            tracing::info!("edge sharing disarmed");
+        }
         self.enabled = false;
         self.previous = None;
         if let Some(running) = &self.running {
@@ -256,6 +259,7 @@ impl Observer {
         // A drag or a held modifier keeps the pointer on the Mac. The bridge
         // checks again once its tap is installed.
         if !macos::input_is_neutral() {
+            tracing::info!("edge reached with a button or modifier held; input stays on the Mac");
             return Ok(());
         }
         // Capture would refuse anyway; skip the receiver setup.
