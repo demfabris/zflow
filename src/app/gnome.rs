@@ -40,9 +40,14 @@ enum Request {
     Forget {
         name: String,
     },
-    SetKeyboard {
+    /// Extensions from extensions.gnome.org can lag the package and still
+    /// send `set_keyboard` with `mode`.
+    #[serde(alias = "set_keyboard")]
+    SetPeer {
         name: String,
-        mode: crate::core::KeyboardMode,
+        allow_control: Option<bool>,
+        #[serde(alias = "mode")]
+        keyboard: Option<crate::core::KeyboardMode>,
     },
     Pair {
         /// Absent to listen; otherwise an IP address, with the port optional.
@@ -99,8 +104,17 @@ impl Service {
             Request::Forget { name } => {
                 crate::peer_view::request(&DaemonRequest::Forget { name }).await?;
             }
-            Request::SetKeyboard { name, mode } => {
-                crate::peer_view::request(&DaemonRequest::SetKeyboard { name, mode }).await?;
+            Request::SetPeer {
+                name,
+                allow_control,
+                keyboard,
+            } => {
+                crate::peer_view::request(&DaemonRequest::SetPeer {
+                    name,
+                    allow_control,
+                    keyboard,
+                })
+                .await?;
             }
             Request::SetAutostart { enabled } => set_autostart(enabled)?,
             Request::Pair { remote, code } => {
@@ -400,6 +414,34 @@ mod tests {
             true
         );
         drop(connection);
+    }
+
+    #[test]
+    fn older_extensions_still_change_the_keyboard_mode() {
+        use crate::core::KeyboardMode;
+        let parse = |json| serde_json::from_str::<Request>(json).unwrap();
+        assert!(matches!(
+            parse(r#"{"command":"set_keyboard","name":"desk","mode":"mac"}"#),
+            Request::SetPeer {
+                allow_control: None,
+                keyboard: Some(KeyboardMode::Mac),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(r#"{"command":"set_peer","name":"desk","allow_control":false}"#),
+            Request::SetPeer {
+                allow_control: Some(false),
+                keyboard: None,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_str::<Request>(
+                r#"{"command":"set_peer","name":"desk","inject_prelogin":true}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

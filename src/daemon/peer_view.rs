@@ -130,11 +130,15 @@ async fn desktop_command(
             shared.apply_config_locked(config, true).await?;
             Ok(DesktopReply::Ack)
         }
-        Request::SetKeyboard { name, mode } => {
+        Request::SetPeer {
+            name,
+            allow_control,
+            keyboard,
+        } => {
             let Some(peer) = config.peers.get_mut(&name) else {
                 bail!("Unknown computer {name}");
             };
-            peer.keyboard = mode;
+            crate::peer_view::set_peer(peer, allow_control, keyboard);
             shared.apply_config_locked(config, true).await?;
             Ok(DesktopReply::Ack)
         }
@@ -211,7 +215,7 @@ async fn pair(
         let _mutation = shared.config_mutation.lock().await;
         authorize_peer(stream, daemon_uid, shared.active_uid())?;
         let mut config = shared.config.read().await.clone();
-        let name = crate::pairing::add_paired_peer(&mut config, session.observation(), true)?;
+        let name = crate::pairing::add_paired_peer(&mut config, session.observation())?;
         shared.apply_config_locked(config, true).await?;
         Ok::<_, anyhow::Error>(name)
     }

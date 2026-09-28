@@ -393,6 +393,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - No GUI text names a role or an OS.
 - **Size:** about 8 files, 150 to 250 LOC. No wire change.
 - **Risk:** low.
+- **Status (2026-09-28):** done on Linux. `set_peer` also sets `receive_normal`, which is how an old record becomes two-way. The GNOME agent still takes `set_keyboard` from extensions.gnome.org copies that lag the package. Left for the Mac: the Swift wording, and a build of `src/app/pairing.rs`, whose `add_paired_peer` call lost its direction argument.
 
 ### Phase 1: one API, one GUI
 

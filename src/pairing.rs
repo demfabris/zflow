@@ -286,20 +286,20 @@ pub async fn begin(
 }
 
 /// Saves the peer this pairing authenticated and returns its name, taken from
-/// the peer's host name. Pairing a known computer again only refreshes its
-/// addresses, and a new key never replaces a trusted one.
+/// the peer's host name. Either computer may control the other. Pairing a
+/// known computer again only refreshes its addresses, and a new key never
+/// replaces a trusted one.
 pub fn add_paired_peer(
     config: &mut crate::config::Config,
     observation: &PairingObservation,
-    receiver: bool,
 ) -> Result<String> {
     let record = crate::config::PeerConfig::from_spki(
         &observation.peer_spki,
         observation.peer_candidates.clone(),
         crate::config::PeerPermissions {
             connect: true,
-            send_normal: receiver,
-            receive_normal: !receiver,
+            send_normal: true,
+            receive_normal: true,
             inject_prelogin: false,
         },
     )?;
@@ -659,24 +659,29 @@ mod tests {
         };
         let mut config = crate::config::Config::default();
         assert_eq!(
-            add_paired_peer(&mut config, &observation, false).unwrap(),
+            add_paired_peer(&mut config, &observation).unwrap(),
             "ubuntu"
         );
         let permissions = config.peers["ubuntu"].permissions;
-        assert!(permissions.connect && permissions.receive_normal);
-        assert!(!permissions.send_normal && !permissions.inject_prelogin);
+        assert!(permissions.connect && permissions.send_normal && permissions.receive_normal);
+        assert!(!permissions.inject_prelogin);
 
         // Pairing the same computer again refreshes its addresses and keeps
-        // its permissions, whatever it calls itself now.
+        // its permissions, whatever it calls itself now. A record from
+        // one-way pairing stays one-way.
+        config
+            .peers
+            .get_mut("ubuntu")
+            .unwrap()
+            .permissions
+            .receive_normal = false;
+        let permissions = config.peers["ubuntu"].permissions;
         let moved = PairingObservation {
             peer_label: Some("renamed".into()),
             peer_candidates: vec!["192.0.2.9:43119".parse().unwrap()],
             ..observation.clone()
         };
-        assert_eq!(
-            add_paired_peer(&mut config, &moved, true).unwrap(),
-            "ubuntu"
-        );
+        assert_eq!(add_paired_peer(&mut config, &moved).unwrap(), "ubuntu");
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers["ubuntu"].permissions, permissions);
         assert_eq!(
@@ -692,23 +697,14 @@ mod tests {
             ..observation.clone()
         };
         let expected = format!("ubuntu ({})", &other.fingerprint_hex()[..6]);
-        assert_eq!(
-            add_paired_peer(&mut config, &twin, false).unwrap(),
-            expected
-        );
+        assert_eq!(add_paired_peer(&mut config, &twin).unwrap(), expected);
         assert_eq!(config.peers["ubuntu"].spki_der().unwrap(), known.spki());
 
-        let mut receiver = crate::config::Config::default();
+        let mut fresh = crate::config::Config::default();
         let unnamed = PairingObservation {
             peer_label: None,
             ..observation
         };
-        assert_eq!(
-            add_paired_peer(&mut receiver, &unnamed, true).unwrap(),
-            "Computer"
-        );
-        let permissions = receiver.peers["Computer"].permissions;
-        assert!(permissions.connect && permissions.send_normal);
-        assert!(!permissions.receive_normal && !permissions.inject_prelogin);
+        assert_eq!(add_paired_peer(&mut fresh, &unnamed).unwrap(), "Computer");
     }
 }

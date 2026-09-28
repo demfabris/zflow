@@ -21,9 +21,13 @@ pub enum Request {
     Forget {
         name: String,
     },
-    SetKeyboard {
+    /// Changes what a paired computer may do here; absent fields stay as
+    /// they are. See [`set_peer`].
+    SetPeer {
         name: String,
-        mode: KeyboardMode,
+        /// Whether it may control this computer.
+        allow_control: Option<bool>,
+        keyboard: Option<KeyboardMode>,
     },
     /// Whether the focused desktop app is a terminal. The desktop agent sends
     /// this; it never leaves this computer.
@@ -64,6 +68,23 @@ pub enum PairingEvent {
     Error {
         message: String,
     },
+}
+
+/// Applies a settings change to a paired computer. Any change also lets this
+/// computer send to it, which brings a record saved by one-way pairing up to
+/// two-way. Pre-login input stays a root-only setting.
+pub fn set_peer(
+    peer: &mut PeerConfig,
+    allow_control: Option<bool>,
+    keyboard: Option<KeyboardMode>,
+) {
+    peer.permissions.receive_normal = true;
+    if let Some(allowed) = allow_control {
+        peer.permissions.send_normal = allowed;
+    }
+    if let Some(mode) = keyboard {
+        peer.keyboard = mode;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -154,8 +175,12 @@ mod tests {
             r#"{"command":"snapshot"}"#,
             r#"{"command":"pair","remote":null,"identity":"attacker"}"#,
             r#"{"command":"pair","remote":null,"code":null,"name":"desk","permissions":{"inject_prelogin":true}}"#,
-            r#"{"command":"set_keyboard","name":"desk","mode":"dvorak"}"#,
-            r#"{"command":"set_keyboard","name":"desk","mode":"mac","permissions":{"inject_prelogin":true}}"#,
+            r#"{"command":"set_keyboard","name":"desk","mode":"mac"}"#,
+            r#"{"command":"set_peer","name":"desk","keyboard":"dvorak"}"#,
+            r#"{"command":"set_peer","name":"desk","keyboard":"mac","permissions":{"inject_prelogin":true}}"#,
+            r#"{"command":"set_peer","name":"desk","inject_prelogin":true}"#,
+            r#"{"command":"set_peer","name":"desk","send_normal":true}"#,
+            r#"{"command":"set_peer","name":"desk","allow_control":"yes"}"#,
             r#"{"command":"focus","terminal":true,"peer":"desk"}"#,
         ] {
             assert!(serde_json::from_str::<Request>(json).is_err());
@@ -182,11 +207,12 @@ mod tests {
         ));
         assert!(matches!(
             serde_json::from_str(
-                r#"{"command":"set_keyboard","name":"desk","mode":"pc_positions"}"#
+                r#"{"command":"set_peer","name":"desk","keyboard":"pc_positions"}"#
             )
             .unwrap(),
-            Request::SetKeyboard {
-                mode: KeyboardMode::PcPositions,
+            Request::SetPeer {
+                allow_control: None,
+                keyboard: Some(KeyboardMode::PcPositions),
                 ..
             }
         ));
@@ -194,5 +220,36 @@ mod tests {
         for field in ["focus", "terminal"] {
             assert!(value.get(field).is_none());
         }
+    }
+
+    #[test]
+    fn set_peer_makes_a_one_way_record_two_way_and_leaves_prelogin_alone() {
+        use crate::config::PeerPermissions;
+        let one_way = PeerPermissions {
+            connect: true,
+            send_normal: true,
+            receive_normal: false,
+            inject_prelogin: true,
+        };
+        let mut peer = PeerConfig {
+            spki_der_hex: "01".into(),
+            addresses: Vec::new(),
+            permissions: one_way,
+            keyboard: KeyboardMode::Standard,
+        };
+        set_peer(&mut peer, None, Some(KeyboardMode::Mac));
+        assert_eq!(peer.keyboard, KeyboardMode::Mac);
+        assert_eq!(
+            peer.permissions,
+            PeerPermissions {
+                receive_normal: true,
+                ..one_way
+            }
+        );
+        set_peer(&mut peer, Some(false), None);
+        assert!(!peer.permissions.send_normal && peer.permissions.inject_prelogin);
+        assert_eq!(peer.keyboard, KeyboardMode::Mac);
+        set_peer(&mut peer, Some(true), None);
+        assert!(peer.permissions.send_normal);
     }
 }

@@ -164,7 +164,7 @@ async fn run(
         session.finish(false).await;
         anyhow::bail!("Pairing declined");
     }
-    let saved = crate::pairing::add_paired_peer(&mut document.draft, session.observation(), false)
+    let saved = crate::pairing::add_paired_peer(&mut document.draft, session.observation())
         .and_then(|name| document.save().map(|()| name));
     session.finish(saved.is_ok()).await;
     *stage.lock().unwrap_or_else(|e| e.into_inner()) = PairingSnapshot {

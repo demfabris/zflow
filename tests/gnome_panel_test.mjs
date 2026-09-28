@@ -53,7 +53,7 @@ for (const file of ['client', 'indicator']) {
 const panel = new context.TestIndicator();
 await new Promise(setImmediate);
 assert.equal(calls[0].flags, 1, 'panel reads must not override disabled login startup');
-assert.equal(panel._status.label.text, 'Receiving from Mac');
+assert.equal(panel._status.label.text, 'Controlled by Mac');
 await panel._run({command: 'set_sharing', enabled: false});
 await new Promise(setImmediate);
 assert.equal(panel._status.label.text, 'Sharing paused');

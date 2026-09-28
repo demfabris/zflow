@@ -385,11 +385,20 @@ impl Shared {
             session.close(SessionCloseReason::PermissionRevoked);
             bail!("peer {peer} authorization changed during connection setup");
         }
+        self.require_not_controlled().await?;
         self.runtime
             .send(RuntimeCommand::Activate {
                 peer: peer.to_owned(),
             })
             .map_err(|error| anyhow!(error))
+    }
+
+    /// A computer that another one controls does not send its own input.
+    async fn require_not_controlled(&self) -> Result<()> {
+        match &*self.inbound_owner.lock().await {
+            Some((peer, _)) => bail!("{peer} is controlling this computer"),
+            None => Ok(()),
+        }
     }
 
     async fn ensure_session(
@@ -542,6 +551,8 @@ impl Shared {
             .cloned()
             .with_context(|| format!("peer {peer} was revoked before capture armed"))?;
         require_outbound_permission(&*self.config.read().await, peer, &record)?;
+        // The runtime may have been arming when a peer took control.
+        self.require_not_controlled().await?;
         let session = self
             .sessions
             .lock()
@@ -1054,8 +1065,12 @@ fn claim_inbound(
     peer: &str,
     session_id: u64,
     authorized: bool,
+    local: OwnershipPhase,
 ) -> bool {
+    // Grabbed or arming devices mean this computer is sending, and it is
+    // never controlled at the same time.
     if !authorized
+        || local != OwnershipPhase::Idle
         || owner.as_ref().is_some_and(|(current_peer, current_id)| {
             current_peer != peer || *current_id != session_id
         })
@@ -1467,7 +1482,8 @@ impl Shared {
                 return Ok(false);
             }
             let mut owner = self.inbound_owner.lock().await;
-            if !claim_inbound(&mut owner, peer, session_id, permitted) {
+            let local = self.runtime.status().ownership;
+            if !claim_inbound(&mut owner, peer, session_id, permitted, local) {
                 drop(owner);
                 self.close_session(peer, session_id, SessionCloseReason::Superseded)
                     .await;
@@ -1746,12 +1762,34 @@ mod tests {
 
     #[test]
     fn denied_activation_cannot_claim_the_inbound_owner() {
+        let idle = OwnershipPhase::Idle;
         let mut owner = None;
-        assert!(!claim_inbound(&mut owner, "denied", 1, false));
+        assert!(!claim_inbound(&mut owner, "denied", 1, false, idle));
         assert_eq!(owner, None);
-        assert!(claim_inbound(&mut owner, "authorized", 2, true));
+        assert!(claim_inbound(&mut owner, "authorized", 2, true, idle));
         assert_eq!(owner, Some(("authorized".to_owned(), 2)));
-        assert!(!claim_inbound(&mut owner, "denied", 1, true));
+        assert!(!claim_inbound(&mut owner, "denied", 1, true, idle));
+    }
+
+    #[test]
+    fn a_computer_that_is_sending_refuses_to_be_controlled() {
+        for local in [
+            OwnershipPhase::Arming,
+            OwnershipPhase::Remote,
+            OwnershipPhase::Releasing,
+        ] {
+            let mut owner = None;
+            assert!(!claim_inbound(&mut owner, "mac", 1, true, local));
+            assert_eq!(owner, None);
+        }
+        let mut owner = None;
+        assert!(claim_inbound(
+            &mut owner,
+            "mac",
+            1,
+            true,
+            OwnershipPhase::Idle
+        ));
     }
 
     #[test]

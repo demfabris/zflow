@@ -19,7 +19,7 @@ export function statusText(snapshot) {
     const daemon = snapshot.daemon;
     if (!daemon.sharing) return 'Sharing paused';
     if (!snapshot.desktop_ready) return 'Desktop needs attention';
-    if (daemon.receiving_from) return `Receiving from ${daemon.receiving_from}`;
+    if (daemon.receiving_from) return `Controlled by ${daemon.receiving_from}`;
     if (daemon.sending_to) return `Controlling ${daemon.sending_to}`;
     return Object.keys(daemon.peers).length ? 'Ready to share' : 'Pair a computer to get started';
 }

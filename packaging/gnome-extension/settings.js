@@ -20,6 +20,9 @@ export class Settings {
         this._peerKey = '';
         this._peerRows = [];
         this._keyboards = new Map();
+        this._controls = new Map();
+        // Rows are rebuilt when a computer connects, so remember which are open.
+        this._expanded = new Set();
         this.page = new Adw.PreferencesPage({title: 'zflow', icon_name: 'input-mouse-symbolic'});
         const sharing = new Adw.PreferencesGroup();
         this._status = new Adw.ActionRow({title: 'Starting zflow…', subtitle: 'Share your keyboard, pointer, and trackpad.', subtitle_lines: 3, use_markup: false});
@@ -33,7 +36,7 @@ export class Settings {
         sharing.add(this._sharing);
         this.page.add(sharing);
 
-        this._computers = new Adw.PreferencesGroup({title: 'Computers', description: 'Arrange computers in zflow on the sending Mac.'});
+        this._computers = new Adw.PreferencesGroup({title: 'Computers', description: 'Arrange computers in zflow on the other computer.'});
         this._pairButton = button('Pair Computer…', () => this._openPairing(), ['suggested-action']);
         this._computers.header_suffix = this._pairButton;
         this.page.add(this._computers);
@@ -66,7 +69,7 @@ export class Settings {
         if (this._busy) return false;
         this._busy = true;
         this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = false;
-        for (const keyboard of this._keyboards.values()) keyboard.sensitive = false;
+        for (const row of [...this._keyboards.values(), ...this._controls.values()]) row.sensitive = false;
         this._showError(null);
         let success = false;
         try { await this.client.call(request); success = true; }
@@ -94,26 +97,32 @@ export class Settings {
         this._error.subtitle = this._actionError || snapshot.error || '';
         this._errorGroup.visible = !!this._error.subtitle;
         // Keep rows and keyboard focus stable while unchanged snapshots arrive.
-        // A keyboard mode change only moves its dropdown, below.
-        const peers = Object.entries(daemon?.peers ?? {}).map(([name, {keyboard: _, ...record}]) => [name, record]);
+        // A keyboard or permission change only moves its control, below.
+        const peers = Object.entries(daemon?.peers ?? {}).map(([name, {keyboard: _keyboard, permissions: _permissions, ...record}]) => [name, record]);
         const key = JSON.stringify([peers, daemon?.connected, daemon?.receiving_from, daemon?.sending_to]);
         if (key !== this._peerKey) {
             this._peerKey = key;
             for (const row of this._peerRows) this._computers.remove(row);
             this._peerRows = [];
             this._keyboards.clear();
+            this._controls.clear();
             for (const [name] of Object.entries(daemon?.peers ?? {})) {
-                const detail = daemon.receiving_from === name ? 'Receiving input' : daemon.sending_to === name ? 'Controlling this computer'
+                const detail = daemon.receiving_from === name ? 'Controlling this computer' : daemon.sending_to === name ? 'Controlled from here'
                     : daemon.connected.includes(name) ? 'Connected' : 'Paired';
-                const row = new Adw.ActionRow({title: name, subtitle: detail, use_markup: false});
+                const row = new Adw.ExpanderRow({title: name, subtitle: detail, use_markup: false, expanded: this._expanded.has(name)});
+                row.connect('notify::expanded', () => row.expanded ? this._expanded.add(name) : this._expanded.delete(name));
                 row.add_prefix(new Gtk.Image({icon_name: 'computer-symbolic'}));
-                const keyboard = Gtk.DropDown.new_from_strings(['Standard keys', 'PC key positions', 'Mac shortcuts']);
-                keyboard.valign = Gtk.Align.CENTER;
-                keyboard.tooltip_text = 'How keys from this computer act here';
-                keyboard.connect('notify::selected', () => {
-                    if (!this._updating) this._run({command: 'set_keyboard', name, mode: KEYBOARD_MODES[keyboard.selected]});
+                const control = new Adw.SwitchRow({title: 'Can control this computer'});
+                control.connect('notify::active', () => {
+                    if (!this._updating) this._run({command: 'set_peer', name, allow_control: control.active});
                 });
-                row.add_suffix(keyboard);
+                row.add_row(control);
+                this._controls.set(name, control);
+                const keyboard = new Adw.ComboRow({title: 'Keys from this computer', subtitle: 'How its keys act here', model: Gtk.StringList.new(['Standard keys', 'PC key positions', 'Mac shortcuts'])});
+                keyboard.connect('notify::selected', () => {
+                    if (!this._updating) this._run({command: 'set_peer', name, keyboard: KEYBOARD_MODES[keyboard.selected]});
+                });
+                row.add_row(keyboard);
                 this._keyboards.set(name, keyboard);
                 const forget = new Gtk.Button({icon_name: 'user-trash-symbolic', tooltip_text: `Forget ${name}`, valign: Gtk.Align.CENTER, css_classes: ['flat']});
                 forget.connect('clicked', () => this._forget(name));
@@ -122,15 +131,18 @@ export class Settings {
                 this._peerRows.push(row);
             }
             if (!this._peerRows.length) {
-                const row = new Adw.ActionRow({title: 'No paired computers', subtitle: 'Pair your Mac or another Linux computer to get started.'});
+                const row = new Adw.ActionRow({title: 'No paired computers', subtitle: 'Pair another computer to get started.'});
                 this._computers.add(row);
                 this._peerRows.push(row);
             }
         }
         this._updating = true;
         for (const [name, keyboard] of this._keyboards) {
-            keyboard.selected = Math.max(0, KEYBOARD_MODES.indexOf(daemon.peers[name].keyboard ?? 'standard'));
-            keyboard.sensitive = !this._busy;
+            const peer = daemon.peers[name];
+            keyboard.selected = Math.max(0, KEYBOARD_MODES.indexOf(peer.keyboard ?? 'standard'));
+            const control = this._controls.get(name);
+            control.active = !!peer.permissions?.send_normal;
+            keyboard.sensitive = control.sensitive = !this._busy;
         }
         this._updating = false;
         // A fresh install opens pairing with its code on screen, so the Mac
@@ -143,7 +155,7 @@ export class Settings {
     }
 
     _forget(name) {
-        const dialog = new Adw.AlertDialog({heading: `Forget ${name}?`, body: 'This stops input from this computer and removes its trusted identity. Pair it again to reconnect.'});
+        const dialog = new Adw.AlertDialog({heading: `Forget ${name}?`, body: 'This stops input between the two computers and removes its trusted identity. Pair it again to reconnect.'});
         dialog.add_response('cancel', 'Cancel');
         dialog.add_response('forget', 'Forget Computer');
         dialog.set_response_appearance('forget', Adw.ResponseAppearance.DESTRUCTIVE);
@@ -173,7 +185,7 @@ export class Settings {
         answers.append(allow);
         ask.add(answers);
         page.add(ask);
-        const shown = new Adw.PreferencesGroup({title: 'Setup code', description: 'On your Mac, open zflow, choose this computer, and type this code.'});
+        const shown = new Adw.PreferencesGroup({title: 'Setup code', description: 'On the other computer, start pairing in zflow and type this code.'});
         const code = new Gtk.Label({label: '', selectable: true, css_classes: ['title-1', 'numeric'], margin_top: 18, margin_bottom: 18});
         shown.add(code);
         const renew = button('Show a New Code', () => this._listen());
@@ -250,8 +262,8 @@ export class Settings {
         ui.ask.visible = confirming;
         ui.shown.visible = ui.other.visible = !confirming;
         if (confirming) {
-            ui.question.title = `Allow ${pairing.name ?? 'this computer'} to control this computer?`;
-            ui.question.subtitle = `It entered this computer’s code from ${pairing.address ?? 'your network'}. Allow it only if it is the computer you are setting up.`;
+            ui.question.title = `Allow ${pairing.name ?? 'this computer'} to pair with this computer?`;
+            ui.question.subtitle = `It entered this computer’s code from ${pairing.address ?? 'your network'}. Once paired, each can control the other. Allow it only if it is the computer you are setting up.`;
             if (!ui.asked) ui.allow.grab_focus();
         }
         ui.asked = confirming;
@@ -262,7 +274,7 @@ export class Settings {
         const issue = pairing.error || this._actionError;
         ui.stage.visible = connecting || pairing.state === 'paired' || !!issue;
         ui.stage.title = pairing.state === 'approving' ? 'Waiting for the other computer…' : connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
-        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange your computers in zflow on the Mac.'
+        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange the computers in zflow on the other computer.'
             : pairing.state === 'approving' ? 'Choose Allow on the other computer.' : connecting ? '' : issue || '';
         const key = JSON.stringify([snapshot.nearby, snapshot.discovery_error]);
         if (key !== ui.nearbyKey) {
