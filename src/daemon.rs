@@ -126,6 +126,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         server_config: RwLock::new(server_config),
         runtime: runtime.control(),
         sessions: Mutex::new(BTreeMap::new()),
+        dialed: Mutex::new(BTreeMap::new()),
         metrics_history: Mutex::new(BTreeMap::new()),
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
@@ -303,6 +304,8 @@ struct Shared {
     server_config: RwLock<Option<InputServerConfig>>,
     runtime: LinuxRuntimeControl,
     sessions: Mutex<BTreeMap<String, SessionHandle>>,
+    /// Sessions this computer dialed, by id, with when the dial finished.
+    dialed: Mutex<BTreeMap<u64, Instant>>,
     metrics_history: Mutex<BTreeMap<String, crate::metrics::SessionMetricsSnapshot>>,
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
@@ -445,13 +448,33 @@ impl Shared {
             session.close(SessionCloseReason::PermissionRevoked);
             bail!("peer {peer} authorization changed during connection negotiation");
         }
+        let wins = wins_dial(&config, &self.identity_fingerprint, peer);
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get(peer).cloned() {
-            session.close(SessionCloseReason::Superseded);
-            return Ok(existing);
+            // The peer dialed while this computer did.
+            if !wins {
+                session.close(SessionCloseReason::Superseded);
+                return Ok(existing);
+            }
+            existing.close(SessionCloseReason::Superseded);
         }
         sessions.insert(peer.to_owned(), session.clone());
+        self.dialed
+            .lock()
+            .await
+            .insert(session.id(), Instant::now());
         Ok(session)
+    }
+
+    /// Whether this computer's own dial to `peer` just finished and wins
+    /// over a connection the peer dialed at the same moment.
+    async fn keeps_own_dial(&self, peer: &str) -> bool {
+        let Some(session) = self.sessions.lock().await.get(peer).cloned() else {
+            return false;
+        };
+        let dialed_at = self.dialed.lock().await.get(&session.id()).copied();
+        keeps_own_dial(dialed_at, Instant::now())
+            && wins_dial(&*self.config.read().await, &self.identity_fingerprint, peer)
     }
 
     async fn accept_connection(self: &Arc<Self>, connection: InputConnection) -> Result<()> {
@@ -461,6 +484,10 @@ impl Shared {
             let config = self.config.read().await;
             peer_name_for_spki(&config, connection.peer_spki())?
         };
+        if self.keeps_own_dial(&peer).await {
+            connection.close();
+            bail!("{peer} dialed while this computer did; keeping this computer's connection");
+        }
         // A peer that reconnects after a silent network loss would otherwise
         // wait for its old session's idle timeout. This connection is the same
         // authenticated peer, so the old session goes first, and its close
@@ -498,10 +525,15 @@ impl Shared {
                 if session.is_closed() {
                     bail!("peer {peer} input session ended during setup");
                 }
+                let own_dial = self.keeps_own_dial(&peer).await;
                 let mut sessions = self.sessions.lock().await;
                 match sessions.get(&peer) {
                     None => {
                         sessions.insert(peer, session);
+                        return Ok(());
+                    }
+                    Some(_) if own_dial => {
+                        session.close(SessionCloseReason::Superseded);
                         return Ok(());
                     }
                     Some(old) => old.close(SessionCloseReason::Superseded),
@@ -1121,6 +1153,21 @@ fn require_outbound_permission(config: &Config, peer: &str, record: &PeerConfig)
     Ok(())
 }
 
+/// A dial counts as simultaneous with the peer's while it is younger than a
+/// connection attempt. A peer that dials in later lost its connection, so its
+/// new one replaces whatever was there.
+fn keeps_own_dial(dialed_at: Option<Instant>, now: Instant) -> bool {
+    dialed_at.is_some_and(|at| now.saturating_duration_since(at) < CONNECT_TIMEOUT)
+}
+
+fn wins_dial(config: &Config, local_fingerprint: &str, peer: &str) -> bool {
+    config
+        .peers
+        .get(peer)
+        .and_then(|record| record.fingerprint_hex().ok())
+        .is_some_and(|theirs| crate::identity::wins_simultaneous_dial(local_fingerprint, &theirs))
+}
+
 fn eligible_outbound_peers(config: &Config) -> Vec<String> {
     if !config.daemon.sharing {
         return Vec::new();
@@ -1404,6 +1451,7 @@ impl Shared {
                     remove_session_if_current(&mut sessions, &event.peer, event.session_id);
                     final_metrics
                 };
+                self.dialed.lock().await.remove(&event.session_id);
                 if let Some(final_metrics) = final_metrics {
                     let mut history = self.metrics_history.lock().await;
                     if !history.contains_key(&event.peer) && history.len() == MAX_METRICS_HISTORY {
@@ -1769,6 +1817,28 @@ mod tests {
         assert!(claim_inbound(&mut owner, "authorized", 2, true, idle));
         assert_eq!(owner, Some(("authorized".to_owned(), 2)));
         assert!(!claim_inbound(&mut owner, "denied", 1, true, idle));
+    }
+
+    #[test]
+    fn only_a_fresh_dial_by_the_lower_fingerprint_is_kept() {
+        let now = Instant::now();
+        assert!(keeps_own_dial(Some(now - Duration::from_secs(1)), now));
+        assert!(!keeps_own_dial(Some(now - CONNECT_TIMEOUT), now));
+        assert!(!keeps_own_dial(None, now));
+
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Identity::load_or_create(dir.path()).unwrap();
+        let mut config = Config::default();
+        config.peers.insert(
+            "mac".into(),
+            PeerConfig::from_spki(peer.spki(), vec![], PeerPermissions::default()).unwrap(),
+        );
+        let theirs = peer.fingerprint_hex();
+        let lower = "0".repeat(theirs.len());
+        let higher = "f".repeat(theirs.len());
+        assert!(wins_dial(&config, &lower, "mac"));
+        assert!(!wins_dial(&config, &higher, "mac"));
+        assert!(!wins_dial(&config, &lower, "unknown"));
     }
 
     #[test]

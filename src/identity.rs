@@ -67,6 +67,15 @@ impl Identity {
     }
 }
 
+/// Two computers that dial each other at the same moment end up with two
+/// connections. Both keep the one dialed by the computer whose key
+/// fingerprint sorts first, so neither keeps closing the other's. Returns
+/// whether that is this computer. Fingerprints are lowercase hex, as
+/// [`Identity::fingerprint_hex`] writes them.
+pub fn wins_simultaneous_dial(local_fingerprint: &str, peer_fingerprint: &str) -> bool {
+    local_fingerprint < peer_fingerprint
+}
+
 fn ensure_private_directory(path: &Path) -> Result<(), IdentityError> {
     fs::create_dir_all(path).map_err(|source| IdentityError::Write {
         path: path.to_owned(),
@@ -165,5 +174,12 @@ mod tests {
         let second = Identity::load_or_create(directory.path()).unwrap();
         assert_eq!(second.fingerprint_hex(), fingerprint);
         assert_eq!(second.spki(), spki);
+    }
+
+    #[test]
+    fn exactly_one_side_wins_a_simultaneous_dial() {
+        let (low, high) = ("0a", "b3");
+        assert!(wins_simultaneous_dial(low, high));
+        assert!(!wins_simultaneous_dial(high, low));
     }
 }
