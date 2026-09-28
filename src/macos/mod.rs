@@ -668,7 +668,8 @@ fn refuse_inbound(kind: SessionEventKind) {
         }
         SessionEventKind::OutboundEnded
         | SessionEventKind::Closed { .. }
-        | SessionEventKind::Layout { .. } => {}
+        | SessionEventKind::Layout { .. }
+        | SessionEventKind::Clipboard { .. } => {}
     }
 }
 

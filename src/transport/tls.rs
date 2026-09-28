@@ -323,7 +323,8 @@ fn input_server_transport_config() -> quinn::TransportConfig {
 fn datagram_transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config
-        .max_concurrent_uni_streams(0_u8.into())
+        // Each clipboard transfer is one stream, and one at a time.
+        .max_concurrent_uni_streams(1_u8.into())
         .datagram_receive_buffer_size(Some(64 * 1_024))
         // A small Quinn queue bounds already-submitted stale data. The
         // application keeps one additional latest-wins slot and counts every

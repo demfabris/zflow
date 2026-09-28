@@ -138,6 +138,10 @@ pub enum SessionEventKind {
     Layout {
         layout: crate::desktop::SharedLayout,
     },
+    /// What the peer had on its clipboard when the pointer left it.
+    Clipboard {
+        clip: crate::clipboard::Clip,
+    },
     Closed {
         reason: String,
     },
@@ -169,6 +173,9 @@ pub struct SessionHandle {
     metrics: Arc<Mutex<SessionMetrics>>,
     desktop_id: Arc<std::sync::atomic::AtomicU64>,
     capabilities: InputCapabilities,
+    clipboard: crate::transport::ClipboardChannel,
+    /// The clip being sent, if any. A newer one cancels it.
+    sending_clip: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 pub(crate) fn desktop_operation(request: &crate::desktop::DesktopRequest) -> &'static str {
@@ -302,6 +309,8 @@ pub async fn start_session(
         metrics: metrics.clone(),
         desktop_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         capabilities: InputCapabilities::default(),
+        clipboard: channels.clipboard.clone(),
+        sending_clip: Arc::new(Mutex::new(None)),
     };
 
     let reporter = Reporter {
@@ -353,6 +362,10 @@ async fn run_session(
     options: SessionOptions,
     ready: oneshot::Sender<Result<InputCapabilities, String>>,
 ) -> Result<()> {
+    // Clips arrive on their own streams, apart from input, for as long as
+    // this session runs.
+    let clips = tokio::spawn(receive_clips(channels.clipboard.clone(), reporter.clone()));
+    let _clips = AbortOnDrop(clips.abort_handle());
     let setup = async {
         let negotiated = negotiate(&mut channels, &options.offer).await?;
         channels
@@ -692,6 +705,34 @@ async fn send_capture(
         channels.control_send.send_control(&message).await?;
     }
     Ok(())
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn receive_clips(clipboard: crate::transport::ClipboardChannel, reporter: Reporter) {
+    loop {
+        match clipboard.receive().await {
+            Ok(clip) => {
+                if reporter
+                    .send(SessionEventKind::Clipboard { clip })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(crate::transport::TransportError::Clipboard(reason)) => {
+                tracing::info!(peer = %reporter.peer, session_id = reporter.session_id, %reason, "clip from peer dropped");
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 /// Where one session reports events and metrics.
@@ -1689,6 +1730,8 @@ mod tests {
                 metrics: metrics.clone(),
                 desktop_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 capabilities: InputCapabilities::default(),
+                clipboard: channels.clipboard.clone(),
+                sending_clip: Arc::new(Mutex::new(None)),
             };
             tokio::spawn(async move {
                 let _ = run_session(
@@ -1711,6 +1754,22 @@ mod tests {
         a.unwrap().unwrap();
         b.unwrap().unwrap();
         (left, right, event_rx, client, server)
+    }
+
+    #[tokio::test]
+    async fn a_clip_reaches_the_peer_as_an_event() {
+        use crate::clipboard::{Clip, ClipKind};
+        let (left, _right, mut events, _client, _server) = desktop_test_pair().await;
+        let clip = Clip::new(ClipKind::Text, b"copied".to_vec()).unwrap();
+        left.send_clipboard(clip.clone());
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SessionEventKind::Clipboard { clip: received } = event.kind else {
+            panic!("expected a clip")
+        };
+        assert_eq!(received, clip);
     }
 
     #[tokio::test]

@@ -1818,6 +1818,8 @@ impl Shared {
                     }
                 }
             }
+            // Linux keeps clips once the GNOME side can write them.
+            SessionEventKind::Clipboard { .. } => {}
             SessionEventKind::Layout { layout } => {
                 self.merge_layout(&event.peer, event.session_id, layout)
                     .await;

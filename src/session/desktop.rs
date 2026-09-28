@@ -16,6 +16,26 @@ use crate::{
 };
 
 impl SessionHandle {
+    /// Sends a clip to the peer in the background, cancelling one still on
+    /// its way. Input never waits for it.
+    pub fn send_clipboard(&self, clip: crate::clipboard::Clip) {
+        let clipboard = self.clipboard.clone();
+        let (peer, id) = (self.peer.clone(), self.id);
+        let task = tokio::spawn(async move {
+            if let Err(error) = clipboard.send(&clip).await {
+                tracing::info!(%peer, session_id = id, %error, "clip not sent");
+            }
+        });
+        let previous = self
+            .sending_clip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(task.abort_handle());
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+    }
+
     /// Sends this computer's layout to the peer. Nothing answers it.
     pub fn send_layout(&self, layout: crate::desktop::SharedLayout) -> Result<()> {
         layout.validate()?;
