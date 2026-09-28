@@ -271,6 +271,13 @@ impl Links {
     /// receive changed reconnects, and so does every peer when the session
     /// settings change.
     pub fn sync(&mut self, config: Option<&Config>) {
+        // Made here once, so link tasks and the listener never race to
+        // create it.
+        if let Some(config) = config
+            && let Err(error) = Identity::load_or_create(&config.daemon.state_dir)
+        {
+            tracing::warn!(%error, "could not read this Mac's key");
+        }
         self.sync_links(config);
         match config {
             Some(config) => self.listen(config),
@@ -446,6 +453,12 @@ impl Links {
     /// Why peers cannot connect to this Mac, if they cannot.
     pub fn listen_error(&self) -> Option<&str> {
         self.listen_error.as_deref()
+    }
+
+    /// The port peers connect to, while this Mac listens.
+    pub fn listen_port(&self) -> Option<u16> {
+        let listener = self.listener.as_ref()?;
+        Some(listener.endpoint.local_addr().ok()?.port())
     }
 
     /// True when a link came, went, or changed state since the last call.

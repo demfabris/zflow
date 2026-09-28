@@ -11,7 +11,7 @@ use crate::{
     config::Config,
     desktop::{MAX_SHARED_TILES, SharedLayout, Tile},
     identity::Identity,
-    macos::{self, LinkState, Links, LocalNetwork},
+    macos::{self, Advertiser, LinkState, Links, LocalNetwork},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -83,6 +83,8 @@ pub(crate) struct NativeApp {
     // before the links wait for their sessions to close.
     observer: Observer,
     links: Links,
+    /// Tells the local network where peers connect, while this Mac listens.
+    advertiser: Option<Advertiser>,
     nearby: NearbyBrowser,
     pairing: Pairing,
     /// Receiver desktop sizes read over each peer's session.
@@ -117,6 +119,7 @@ impl NativeApp {
             shared,
             observer: Observer::default(),
             links: Links::new()?,
+            advertiser: None,
             nearby: NearbyBrowser::default(),
             pairing: Pairing::default(),
             desktops: BTreeMap::new(),
@@ -226,6 +229,7 @@ impl NativeApp {
             }
             Request::Retry => {
                 self.crossing_error = None;
+                self.advertiser = None;
                 self.links.retry();
                 self.restart();
             }
@@ -303,6 +307,17 @@ impl NativeApp {
             self.local_network = LocalNetwork::Unknown;
         }
         self.links.set_nearby(self.nearby_addresses());
+        self.sync_advertiser();
+    }
+
+    /// Advertises the port peers connect to while this Mac listens, and only
+    /// once it may use the network. One that failed waits for Retry or a new
+    /// port.
+    fn sync_advertiser(&mut self) {
+        let port = self.links.listen_port().filter(|_| self.discovers());
+        if self.advertiser.as_ref().map(Advertiser::port) != port {
+            self.advertiser = port.map(Advertiser::start);
+        }
     }
 
     fn check_local_network(&mut self) {
@@ -340,6 +355,7 @@ impl NativeApp {
         let config = self.document.saved();
         let sharing = config.macos.sharing && !self.emergency_paused;
         self.links.sync(sharing.then_some(config));
+        self.sync_advertiser();
     }
 
     fn reload(&mut self) {
@@ -1036,6 +1052,42 @@ mod tests {
         assert_eq!(row["allow_control"], true);
         assert_eq!(row["keyboard"], "pc_positions");
         assert_eq!(row["reverse_scroll"], true);
+    }
+
+    #[test]
+    fn this_mac_is_advertised_only_while_it_listens_and_may_use_the_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let desk = Identity::load_or_create(&directory.path().join("desk")).unwrap();
+        let mut config = Config::default();
+        config.daemon.state_dir = directory.path().join("state");
+        config.transport.discovery = false;
+        // A free port, since a saved configuration cannot ask for any.
+        let free = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        config.transport.listen = free.local_addr().unwrap();
+        drop(free);
+        config.macos.sharing = true;
+        let permissions = crate::config::PeerPermissions {
+            connect: true,
+            ..Default::default()
+        };
+        let record = crate::config::PeerConfig::from_spki(desk.spki(), Vec::new(), permissions);
+        config.peers.insert("desk".into(), record.unwrap());
+        config.save(&path).unwrap();
+        let mut app = NativeApp::open(path).unwrap();
+        assert_eq!(
+            app.links.listen_port(),
+            Some(config.transport.listen.port()),
+            "{:?}",
+            app.links.listen_error()
+        );
+        // Discovery is off, so nothing goes out even after setup asks.
+        assert!(app.advertiser.is_none());
+        app.request(Request::Discover).unwrap();
+        assert!(!app.discovers() && app.advertiser.is_none());
+        app.request(Request::SetSharing { enabled: false }).unwrap();
+        assert_eq!(app.links.listen_port(), None);
+        assert!(app.advertiser.is_none());
     }
 
     #[test]

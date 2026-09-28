@@ -1,5 +1,6 @@
 //! macOS input source: native capture, and crossings over a receiver's session.
 
+mod advertise;
 mod awdl;
 mod handoff_server;
 mod inject;
@@ -35,6 +36,7 @@ use crate::{
     session::{SessionEvent, SessionEventKind, SessionHandle},
 };
 
+pub use advertise::Advertiser;
 pub(crate) use inject::{install_exit_handlers, supports_key};
 pub use link::{Crossing, LinkState, Links};
 pub use local_network::{LocalNetwork, local_network_access};
