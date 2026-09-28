@@ -74,6 +74,13 @@ jobs:
             tests/macos_inject_test.c -framework ApplicationServices -framework CoreFoundation \
             -framework IOKit -o target/debug/macos-inject-test
           ./target/debug/macos-inject-test
+          xcrun --sdk macosx clang -isysroot "$sdk" -fobjc-arc -O2 -Wall -Wextra -Werror \
+            tests/macos_media_test.m -framework AppKit -framework ApplicationServices \
+            -o target/debug/macos-media-test
+          # The Main Thread Checker fails the run if AppKit wants the main thread.
+          MTC_CRASH_ON_REPORT=1 \
+            DYLD_INSERT_LIBRARIES="$(xcode-select -p)/usr/lib/libMainThreadChecker.dylib" \
+            ./target/debug/macos-media-test
       - name: Swift bridge
         run: |
           MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --locked --lib
