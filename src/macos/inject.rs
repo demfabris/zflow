@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::{CStr, c_char},
     sync::mpsc,
     thread::JoinHandle,
@@ -34,6 +34,8 @@ const LOCK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const CLICK_SLOP: f64 = 4.0;
 /// A cursor further than this from where zflow put it was moved on the Mac.
 const CURSOR_SLOP: f64 = 0.01;
+/// How many recent moves the real cursor may still be behind.
+const UNSEEN_MOVES: usize = 16;
 const CAPS_LOCK: HidUsage = HidUsage::keyboard(0x39);
 const LCTRL: HidUsage = HidUsage::keyboard(0xe0);
 const LGUI: HidUsage = HidUsage::keyboard(0xe3);
@@ -229,6 +231,9 @@ pub(crate) struct InjectorCore<B> {
     buttons: BTreeMap<u16, i64>,
     last_press: Option<Press>,
     position: Option<CursorPosition>,
+    /// Where the cursor was before each move macOS may not show yet, oldest
+    /// first. A real cursor at one of them is behind, not moved on the Mac.
+    unseen: VecDeque<CursorPosition>,
     acceleration: Acceleration,
     scroll: ScrollSplit,
     displays: Vec<DesktopRect>,
@@ -252,6 +257,7 @@ impl<B: Backend> InjectorCore<B> {
             buttons: BTreeMap::new(),
             last_press: None,
             position: None,
+            unseen: VecDeque::new(),
             acceleration: Acceleration::new(profile),
             scroll: ScrollSplit::default(),
             displays: Vec::new(),
@@ -622,11 +628,20 @@ impl<B: Backend> InjectorCore<B> {
     }
 
     /// Where zflow last put the cursor, unless something on the Mac moved it
-    /// since.
+    /// since. Read right after a post, the real cursor can still be where an
+    /// earlier move left it, which is not a move on the Mac.
     fn cursor(&mut self) -> CursorPosition {
+        let near = |a: CursorPosition, b: CursorPosition| distance(a, b) <= CURSOR_SLOP;
         let position = match (self.position, self.backend.cursor()) {
-            (Some(ours), Some(real)) if distance(ours, real) <= CURSOR_SLOP => ours,
-            (_, Some(real)) => real,
+            (Some(ours), Some(real)) if near(ours, real) => {
+                self.unseen.clear();
+                ours
+            }
+            (Some(ours), Some(real)) if self.unseen.iter().any(|&at| near(at, real)) => ours,
+            (_, Some(real)) => {
+                self.unseen.clear();
+                real
+            }
             (Some(ours), None) => ours,
             (None, None) => CursorPosition::default(),
         };
@@ -645,6 +660,10 @@ impl<B: Backend> InjectorCore<B> {
             y: from.y + dy as f64,
         };
         let to = clamp_to_displays(target, self.displays());
+        if self.unseen.len() == UNSEEN_MOVES {
+            self.unseen.pop_front();
+        }
+        self.unseen.push_back(from);
         self.position = Some(to);
         // A drag names one button: left, then right, then the lowest other.
         let drag = self
@@ -1073,6 +1092,9 @@ pub(crate) struct Fake {
     pub log: Vec<String>,
     pub environment: Environment,
     pub cursor: Option<CursorPosition>,
+    /// How many posted moves the cursor shows late, as macOS may.
+    pub lag: usize,
+    pub moves: VecDeque<CursorPosition>,
     pub displays: Vec<DesktopRect>,
     pub generation: u32,
     pub terminal: bool,
@@ -1089,6 +1111,8 @@ impl Default for Fake {
             log: Vec::new(),
             environment: Environment::default(),
             cursor: Some(CursorPosition { x: 960.0, y: 540.0 }),
+            lag: 0,
+            moves: VecDeque::new(),
             displays: vec![DesktopRect {
                 x: 0.0,
                 y: 0.0,
@@ -1124,7 +1148,10 @@ impl Backend for FakeBackend {
         let mut fake = self.state();
         ensure!(!fake.fail, "posting failed");
         if let Posted::Move { to, .. } = *event {
-            fake.cursor = Some(to);
+            fake.moves.push_back(to);
+            while fake.moves.len() > fake.lag {
+                fake.cursor = fake.moves.pop_front();
+            }
         }
         fake.log.push(describe(event));
         Ok(())
@@ -1848,6 +1875,49 @@ mod tests {
             ["move 799,599 by 1000,1000"]
         );
         assert!(apply(&mut core, &fake, vec![motion(0, 0, 0, 0)], start).is_empty());
+    }
+
+    #[test]
+    fn clicks_land_where_the_last_move_put_the_cursor_before_macos_shows_it() {
+        let start = Instant::now();
+        let (mut core, fake) = open(KeyboardMode::Standard, start);
+        fake.state().lag = 2;
+        assert_eq!(
+            apply(
+                &mut core,
+                &fake,
+                vec![
+                    motion(10, 0, 0, 0),
+                    motion(0, 5, 0, 0),
+                    button(1, true),
+                    motion(1, 0, 0, 0),
+                    button(1, false),
+                ],
+                start
+            ),
+            [
+                "move 970,540 by 10,0",
+                "move 970,545 by 0,5",
+                "button 0 down at 970,545 click 1",
+                "move 971,545 by 1,0 drag 0 click 1",
+                "button 0 up at 971,545 click 1",
+            ]
+        );
+        // A cursor anywhere else was still moved on the Mac.
+        {
+            let mut state = fake.state();
+            state.moves.clear();
+            state.cursor = Some(CursorPosition { x: 100.0, y: 100.0 });
+        }
+        assert_eq!(
+            apply(
+                &mut core,
+                &fake,
+                vec![motion(5, 0, 0, 0), button(2, true)],
+                start
+            ),
+            ["move 105,100 by 5,0", "button 1 down at 105,100 click 1"]
+        );
     }
 
     #[test]
