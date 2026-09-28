@@ -14,6 +14,7 @@ Convention: each spike lives in `spikes/<letter>-<name>/` with a `RESULT.md` rec
 | F | Do quinn datagrams stay timely under jitter vs raw UDP? | 2 | pending |
 | G | How big is the grab-on-demand arming leak? | 2 | pending |
 | H | Does QoS marking change the over-the-air access category? | 2 | pending |
+| I | Can the logged-in Mac app post input with CGEventPost well enough to be a receiver? | 1 | PASSED: 1:1 unaccelerated motion, double-click and drag, modifiers, repeat, scroll phases, media keys; own trackpad keeps working; Caps Lock needs IOHID, F14/F15 never arrive (RESULT.md) |
 
 Order: A first (zero code, calibrates everything else), then B, C, D, E in parallel. Tier 2 only as their spec questions come due; H only if A shows traffic alone is not enough.
 
@@ -60,6 +61,14 @@ Order: A first (zero code, calibrates everything else), then B, C, D, E in paral
 - **F: transport bench.** quinn datagrams vs raw UDP on the real link plus netem-induced jitter; watch whether quinn's congestion controller delays datagrams after a spike. Settles the raw-UDP reopening condition in SPEC.md. Reuse spike B's sender/receiver with a quinn transport swapped in.
 - **G: arming leak.** Monitor a mouse and keyboard, wait for neutral, EVIOCGRAB, count events that reached the session between chord detection and grab. Feeds the leakage threshold TESTPLAN.md wants frozen.
 - **H: QoS over the air.** Only if A shows traffic alone is insufficient: radiotap capture while toggling `SO_PRIORITY` / `NET_SERVICE_TYPE`, check the WMM access category actually changes on this AP.
+
+## Mac receiver (ROADMAP.md Phase 2)
+
+### Spike I: Mac injection (`spikes/i-mac-inject/`)
+
+**Question.** Can the logged-in app post keyboard, pointer and scroll input with CGEventPost well enough to be a receiver, on the actual macbook and macOS 27? Checks: the Mac's own trackpad keeps working while events are posted, raw deltas move the cursor 1:1, double-click and background focus with click state and the event number, modifier flags on clicks and keys, ISO keys, Caps Lock, media keys, scroll units, key repeat, and display wake.
+
+**Kill criteria.** If posted events stall the Mac's own input, lose modifiers, or cannot double-click, the receiver needs a virtual HID device (Karabiner's driver or the CoreHID entitlement) and decision 7 in ROADMAP.md changes.
 
 ## Explicitly not spiked
 

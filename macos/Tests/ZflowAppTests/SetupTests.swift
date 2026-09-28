@@ -70,11 +70,11 @@ private func location(_ path: String, quarantined: Bool = false, readOnly: Bool 
   var snapshot = try JSONDecoder.snake.decode(Snapshot.self, from: Data(minimalSnapshot.utf8))
   let mac = Computer(id: "local", label: "This Mac", x: 0, y: 0, width: 1512, height: 982)
   func place(_ x: Int, _ y: Int) -> String? {
-    snapshot.layout.monitors = [
+    snapshot.layout = Layout(monitors: [
       mac,
       Computer(
         id: "peer:ubuntu", label: "ubuntu", peer: "ubuntu", x: x, y: y, width: 1920, height: 1080),
-    ]
+    ])
     return snapshot.edge(toward: "ubuntu")
   }
   #expect(place(1512, 0) == "right")
@@ -95,7 +95,7 @@ private func location(_ path: String, quarantined: Bool = false, readOnly: Bool 
   // Let the worker's first maintenance tick run.
   try await Task.sleep(for: .milliseconds(200))
   let snapshot = try await core.request(CoreRequest(command: "snapshot"))
-  #expect(snapshot.localNetwork == "unknown")
+  #expect(snapshot.platform.localNetwork == "unknown")
   #expect(snapshot.nearby.isEmpty)
   await core.shutdown()
 }
@@ -109,8 +109,9 @@ extension JSONDecoder {
 }
 
 private let minimalSnapshot = """
-  {"config_path":"","layout_path":"","status":"ready","sharing":true,"block_awdl":false,
-  "accessibility":true,"notice":"","peers":["ubuntu"],"layout":{"monitors":[]},
-  "pairing":{"state":"idle"},"nearby":[],"receiver_checked":true,"checking":false,
-  "local_network":"allowed"}
+  {"status":{"state":"ready","peer":null,"title":"Ready"},"sharing":true,"health":[],
+  "layout":{"monitors":[]},"peers":[{"name":"ubuntu","state":"connected","detail":"Connected",
+  "allow_control":true,"keyboard":"standard"}],"pairing":{"state":"idle"},"nearby":[],
+  "shortcuts":[],"autostart":null,"config_path":"",
+  "platform":{"accessibility":true,"local_network":"allowed","block_awdl":false}}
   """

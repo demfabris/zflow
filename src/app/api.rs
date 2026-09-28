@@ -5,10 +5,6 @@
 //! order of the `Snapshot` fields. Each platform fills `platform` with the
 //! rows under it.
 
-// Only the GNOME agent builds its snapshot here so far. Remove this once
-// native.rs does too (ROADMAP Phase 1).
-#![cfg_attr(target_os = "macos", allow(dead_code))]
-
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -187,10 +183,11 @@ pub(super) struct Shortcut {
 
 /// Everything a window or menu may ask for. A request the platform does not
 /// have fails with an error rather than doing nothing.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+// Each platform leaves the fields of the other's requests unread.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum Request {
+pub(crate) enum Request {
     Snapshot,
     SetSharing {
         enabled: bool,
