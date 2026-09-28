@@ -412,6 +412,11 @@ impl NativeApp {
         if self.maintenance.elapsed() >= MAINTENANCE {
             self.maintenance = Instant::now();
             self.reload();
+            // The port can be held for a moment, as by a session still
+            // closing after sharing went off and on, so listen again.
+            if self.links.listen_error().is_some() {
+                self.sync_links();
+            }
             // Also a fallback for display and permission changes that sent no callback.
             macos::forget_desktop_geometry();
             let accessibility = self.accessibility_granted();

@@ -446,10 +446,14 @@ impl Links {
                 self.listen_error = None;
             }
             Err(error) => {
-                tracing::warn!(%address, %error, "could not listen for paired computers");
-                self.listen_error = Some(format!(
+                let message = format!(
                     "Other computers cannot connect to this Mac: could not listen on {address}: {error}"
-                ));
+                );
+                // The app tries again every few seconds.
+                if self.listen_error.as_ref() != Some(&message) {
+                    tracing::warn!(%address, %error, "could not listen for paired computers");
+                }
+                self.listen_error = Some(message);
             }
         }
     }
@@ -2357,6 +2361,11 @@ mod tests {
             "{error}"
         );
         assert_eq!(links.states().count(), 1, "the link still dials");
+        // Once the port is free, the next sync listens on it.
+        drop(busy);
+        links.sync(Some(&config));
+        assert_eq!(links.listen_error(), None);
+        assert!(links.listener.is_some());
         config.transport.listen = "127.0.0.1:0".parse().unwrap();
         links.sync(Some(&config));
         assert_eq!(links.listen_error(), None);
