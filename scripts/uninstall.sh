@@ -20,7 +20,11 @@ readonly ZFLOW_BIN="/usr/local/bin/zflow"
 readonly ZFLOWD_BIN="/usr/local/bin/zflowd"
 readonly LIB_DIR="/usr/local/lib/zflow"
 readonly ZFLOW_GUI_BIN="/usr/local/bin/zflow-gui"
+readonly FIREWALL_SCRIPT="$LIB_DIR/firewall.sh"
 readonly DESKTOP_FILE="/usr/local/share/applications/io.zflow.zflow.desktop"
+readonly DBUS_SERVICE_DIR="/usr/local/share/dbus-1/services"
+readonly DBUS_SERVICE_FILE="$DBUS_SERVICE_DIR/io.zflow.Desktop.service"
+readonly AUTOSTART_FILE="/etc/xdg/autostart/io.zflow.desktop-agent.desktop"
 
 purge=false
 
@@ -63,6 +67,9 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
     systemctl disable zflowd.service >/dev/null 2>&1 || true
 fi
+if [[ -f "$FIREWALL_SCRIPT" ]]; then
+    bash "$FIREWALL_SCRIPT" close
+fi
 
 rm -f -- \
     "$UNIT_FILE" \
@@ -75,9 +82,13 @@ rm -f -- \
     "$ZFLOW_BIN" \
     "$ZFLOWD_BIN" \
     "$LIB_DIR/uninstall.sh" \
+    "$FIREWALL_SCRIPT" \
     "$ZFLOW_GUI_BIN" \
-    "$DESKTOP_FILE"
+    "$DESKTOP_FILE" \
+    "$DBUS_SERVICE_FILE" \
+    "$AUTOSTART_FILE"
 rmdir -- "$LIB_DIR" "$DROPIN_DIR" 2>/dev/null || true
+rmdir -- "$DBUS_SERVICE_DIR" "${DBUS_SERVICE_DIR%/*}" 2>/dev/null || true
 
 if [[ "$purge" == true ]]; then
     for command in find getent groupdel userdel; do
@@ -107,9 +118,10 @@ fi
 if [[ "$purge" == true ]]; then
     printf 'Removed zflow binaries, service, rules, configuration, state, and service account.\n'
 else
-    printf 'Removed zflow binaries, udev rules, and service.\n'
+    printf 'Removed zflow binaries, udev rules, service, and desktop launcher.\n'
     printf 'Preserved %s, %s, and the %s account.\n' \
         "$CONFIG_DIR" "$STATE_DIR" "$SERVICE_USER"
     printf 'Removed capture rules so the account no longer gains input-device access.\n'
     printf 'Run this script with --purge to delete the preserved data.\n'
 fi
+printf 'Desktop users keep the zflow GNOME extension until they remove it in Extensions.\n'

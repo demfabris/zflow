@@ -91,6 +91,10 @@ final class AppModel {
     NSWorkspace.shared.open(
       URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
   }
+  func openLocalNetwork() {
+    NSWorkspace.shared.open(
+      URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork")!)
+  }
   func fixHelper() {
     Task {
       await services.installOrRepair()

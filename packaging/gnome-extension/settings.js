@@ -162,6 +162,17 @@ export class Settings {
         const page = new Adw.PreferencesPage();
         toolbar.content = page;
         dialog.child = toolbar;
+        // Knowing the code is not enough: the person here allows the computer.
+        const ask = new Adw.PreferencesGroup({visible: false});
+        const question = new Adw.ActionRow({title: '', subtitle_lines: 0, use_markup: false});
+        question.add_prefix(new Gtk.Image({icon_name: 'computer-symbolic'}));
+        ask.add(question);
+        const allow = button('Allow', () => this._respond(true), ['suggested-action']);
+        const answers = new Gtk.Box({spacing: 12, halign: Gtk.Align.END, margin_top: 12});
+        answers.append(button('Decline', () => this._respond(false)));
+        answers.append(allow);
+        ask.add(answers);
+        page.add(ask);
         const shown = new Adw.PreferencesGroup({title: 'Setup code', description: 'On your Mac, open zflow, choose this computer, and type this code.'});
         const code = new Gtk.Label({label: '', selectable: true, css_classes: ['title-1', 'numeric'], margin_top: 18, margin_bottom: 18});
         shown.add(code);
@@ -183,7 +194,7 @@ export class Settings {
         const stage = new Adw.ActionRow({title: '', visible: false, subtitle_lines: 0, use_markup: false});
         result.add(stage);
         page.add(result);
-        this._pairing = {dialog, code, renew, remote, entered, connect, stage, nearby, rows: [], nearbyKey: ''};
+        this._pairing = {dialog, ask, question, allow, shown, other, code, renew, remote, entered, connect, stage, nearby, rows: [], nearbyKey: '', asked: false};
         dialog.connect('closed', () => {
             this._pairing = null;
             if (this._pairOwned) {
@@ -200,6 +211,10 @@ export class Settings {
 
     _listen() {
         return this._startPair({command: 'pair', remote: null});
+    }
+
+    _respond(allow) {
+        return this._run({command: 'pair_respond', allow});
     }
 
     _connect(remote, code) {
@@ -230,15 +245,25 @@ export class Settings {
         if (!ui) return;
         const pairing = snapshot.pairing ?? {state: 'idle'};
         const listening = pairing.state === 'listening';
-        const connecting = pairing.state === 'connecting';
+        const confirming = pairing.state === 'confirm';
+        const connecting = pairing.state === 'connecting' || pairing.state === 'approving';
+        ui.ask.visible = confirming;
+        ui.shown.visible = ui.other.visible = !confirming;
+        if (confirming) {
+            ui.question.title = `Allow ${pairing.name ?? 'this computer'} to control this computer?`;
+            ui.question.subtitle = `It entered this computer’s code from ${pairing.address ?? 'your network'}. Allow it only if it is the computer you are setting up.`;
+            if (!ui.asked) ui.allow.grab_focus();
+        }
+        ui.asked = confirming;
         ui.code.label = listening ? (pairing.code ?? '…') : 'No code shown';
         ui.code.sensitive = listening;
-        ui.renew.visible = !listening && !connecting;
+        ui.renew.visible = !listening && !connecting && !confirming;
         ui.connect.sensitive = !connecting && !this._busy;
         const issue = pairing.error || this._actionError;
         ui.stage.visible = connecting || pairing.state === 'paired' || !!issue;
-        ui.stage.title = connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
-        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange your computers in zflow on the Mac.' : connecting ? '' : issue || '';
+        ui.stage.title = pairing.state === 'approving' ? 'Waiting for the other computer…' : connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
+        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange your computers in zflow on the Mac.'
+            : pairing.state === 'approving' ? 'Choose Allow on the other computer.' : connecting ? '' : issue || '';
         const key = JSON.stringify([snapshot.nearby, snapshot.discovery_error]);
         if (key !== ui.nearbyKey) {
             ui.nearbyKey = key;

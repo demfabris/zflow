@@ -259,9 +259,10 @@ async fn focus(proxy: &zbus::Proxy<'_>) -> bool {
         Focus { terminal: bool },
     }
     let reply = async {
+        let request = serde_json::json!({"command": "focus", "api": super::gnome::API}).to_string();
         let json: String = tokio::time::timeout(
             std::time::Duration::from_millis(450),
-            proxy.call("Call", &(r#"{"command":"focus"}"#,)),
+            proxy.call("Call", &(request,)),
         )
         .await??;
         let Reply::Focus { terminal } = serde_json::from_str(&json)?;
@@ -283,7 +284,10 @@ async fn call(
     let operation = crate::session::desktop_operation(request);
     tracing::trace!(operation, "GNOME desktop RPC started");
     let result = async {
-        let json = serde_json::to_string(request)?;
+        // The extension refuses an agent from another API level with "Update zflow".
+        let mut json = serde_json::to_value(request)?;
+        json["api"] = super::gnome::API.into();
+        let json = json.to_string();
         let response: String = tokio::time::timeout(
             std::time::Duration::from_millis(450),
             proxy.call("Call", &(json,)),
@@ -331,83 +335,279 @@ async fn call(
     result
 }
 
-/// Called only by the explicit Install GNOME integration action.
-pub fn install_extension() -> anyhow::Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    anyhow::bail!("The receiver integration requires Linux with GNOME");
-    #[cfg(target_os = "linux")]
+/// The extension as desktop-agent --install writes it. debian/rules installs
+/// and scripts/pack-extension.sh uploads the same files.
+const EXTENSION_FILES: [(&str, &str); 6] = [
+    (
+        "metadata.json",
+        include_str!("../../packaging/gnome-extension/metadata.json"),
+    ),
+    (
+        "extension.js",
+        include_str!("../../packaging/gnome-extension/extension.js"),
+    ),
+    (
+        "indicator.js",
+        include_str!("../../packaging/gnome-extension/indicator.js"),
+    ),
+    (
+        "client.js",
+        include_str!("../../packaging/gnome-extension/client.js"),
+    ),
+    (
+        "settings.js",
+        include_str!("../../packaging/gnome-extension/settings.js"),
+    ),
+    (
+        "prefs.js",
+        include_str!("../../packaging/gnome-extension/prefs.js"),
+    ),
+];
+// GNOME Shell's ExtensionState values.
+const ACTIVE: f64 = 1.0;
+const OUT_OF_DATE: f64 = 4.0;
+
+/// Installs and enables the GNOME extension for this user. Returns whether it
+/// runs now; otherwise GNOME loads it at the next login.
+pub async fn install_extension(shell: Option<&zbus::Connection>) -> anyhow::Result<bool> {
+    // None when GNOME Shell could not be asked, Some(None) when this login
+    // session has not loaded the extension.
+    let state = match shell {
+        Some(connection) => extension_state(connection).await.ok(),
+        None => None,
+    };
+    // Shell reads extension folders only at login, except for an extension it
+    // downloads from extensions.gnome.org itself: that one it loads at once.
+    if let (Some(connection), Some(None)) = (shell, state)
+        && let Ok(reply) = shell_call(connection, "InstallRemoteExtension").await
+        && reply
+            .body()
+            .deserialize::<String>()
+            .is_ok_and(|result| result == "successful")
     {
-        use anyhow::Context;
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".local/share"))
-            })
-            .context("HOME is not set")?;
-        let path = base
-            .join("gnome-shell/extensions")
-            .join(crate::desktop::EXTENSION_ID);
-        std::fs::create_dir_all(&path)?;
-        std::fs::write(
-            path.join("metadata.json"),
-            include_str!("../../packaging/gnome-extension/metadata.json"),
-        )?;
-        std::fs::write(
-            path.join("extension.js"),
-            include_str!("../../packaging/gnome-extension/extension.js"),
-        )?;
-        super::gnome::write_assets(&path)?;
-        std::fs::write(
-            path.join("indicator.js"),
-            include_str!("../../packaging/gnome-extension/indicator.js"),
-        )?;
-        std::fs::write(
-            path.join("prefs.js"),
-            include_str!("../../packaging/gnome-extension/prefs.js"),
-        )?;
-        let mut child = std::process::Command::new("gnome-extensions")
-            .args(["enable", crate::desktop::EXTENSION_ID])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .context(
-                "Integration installed. Log out and back in, then enable zflow in GNOME Extensions",
-            )?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            if let Some(status) = child.try_wait()? {
-                anyhow::ensure!(
-                    status.success(),
-                    "Integration installed. Log out and back in, then enable zflow in GNOME Extensions"
-                );
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "Integration installed. GNOME did not respond; enable zflow in GNOME Extensions after logging out and back in"
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        Ok(())
+        return Ok(true);
     }
+    write_extension()?;
+    enable_extension()?;
+    let (Some(connection), Some(Some(_))) = (shell, state) else {
+        return Ok(false);
+    };
+    // Shell turns on an extension it has loaded when the setting changes.
+    for _ in 0..30 {
+        match extension_state(connection).await? {
+            Some(ACTIVE) => return Ok(true),
+            Some(OUT_OF_DATE) => {
+                anyhow::bail!(
+                    "The zflow extension does not support this GNOME version. Update zflow"
+                )
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    Ok(false)
+}
+
+async fn shell_call(connection: &zbus::Connection, method: &str) -> zbus::Result<zbus::Message> {
+    connection
+        .call_method(
+            Some("org.gnome.Shell"),
+            "/org/gnome/Shell",
+            Some("org.gnome.Shell.Extensions"),
+            method,
+            &(crate::desktop::EXTENSION_ID,),
+        )
+        .await
+}
+
+async fn extension_state(connection: &zbus::Connection) -> zbus::Result<Option<f64>> {
+    let info: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+        shell_call(connection, "GetExtensionInfo")
+            .await?
+            .body()
+            .deserialize()?;
+    // Shell answers with no fields for an extension it has not loaded.
+    Ok(info
+        .get("state")
+        .and_then(|state| f64::try_from(state).ok()))
+}
+
+/// Makes this version's extension the one GNOME finds at login, unless the
+/// copy came from extensions.gnome.org, which GNOME keeps updated itself.
+fn write_extension() -> anyhow::Result<()> {
+    let path = std::path::Path::new("gnome-shell/extensions").join(crate::desktop::EXTENSION_ID);
+    let user = super::gnome::xdg("XDG_DATA_HOME", ".local/share")?.join(&path);
+    // extensions.gnome.org marks the metadata of every copy it serves.
+    if std::fs::read_to_string(user.join("metadata.json"))
+        .is_ok_and(|text| text.contains("\"_generated\""))
+    {
+        return Ok(());
+    }
+    let packaged = super::gnome::xdg_dirs("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+        .iter()
+        .any(|dir| dir.join(&path).join("metadata.json").is_file());
+    if packaged {
+        // Older versions copied the extension here too, which would shadow
+        // the package's copy.
+        if std::fs::symlink_metadata(&user).is_ok_and(|metadata| metadata.is_dir()) {
+            std::fs::remove_dir_all(&user)?;
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(&user)?;
+    for (name, contents) in EXTENSION_FILES {
+        std::fs::write(user.join(name), contents)?;
+    }
+    Ok(())
+}
+
+/// Adds the extension to GNOME's enabled list. `gnome-extensions enable`
+/// refuses an extension that Shell has not loaded yet, so this changes the
+/// setting directly, as that command does when Shell is not running.
+fn enable_extension() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let id = crate::desktop::EXTENSION_ID;
+    for (key, listed) in [("enabled-extensions", true), ("disabled-extensions", false)] {
+        let output = std::process::Command::new("gsettings")
+            .args(["get", "org.gnome.shell", key])
+            .output()
+            .context("GNOME's gsettings command is missing")?;
+        ensure!(output.status.success(), "gsettings could not read {key}");
+        let mut uuids = parse_strv(&String::from_utf8_lossy(&output.stdout))
+            .with_context(|| format!("Unexpected {key} setting"))?;
+        if uuids.iter().any(|uuid| uuid == id) == listed {
+            continue;
+        }
+        uuids.retain(|uuid| uuid != id);
+        if listed {
+            uuids.push(id.into());
+        }
+        let status = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.shell", key, &format_strv(&uuids)])
+            .status()?;
+        ensure!(status.success(), "gsettings could not change {key}");
+    }
+    Ok(())
+}
+
+/// Reads a string list as `gsettings get` prints it, like ['a', 'b'] or @as [].
+/// Escapes other than quotes and backslashes are refused, not guessed.
+fn parse_strv(text: &str) -> Option<Vec<String>> {
+    let text = text.trim();
+    let list = text.strip_prefix("@as").unwrap_or(text).trim();
+    let body = list.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let mut chars = body.chars().peekable();
+    let mut items = Vec::new();
+    while let Some(quote) = chars.next() {
+        if quote != '\'' && quote != '"' {
+            return None;
+        }
+        let mut item = String::new();
+        loop {
+            match chars.next()? {
+                '\\' => item.push(chars.next().filter(|c| matches!(c, '\\' | '\'' | '"'))?),
+                c if c == quote => break,
+                c => item.push(c),
+            }
+        }
+        items.push(item);
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        match chars.next() {
+            None => break,
+            Some(',') => while chars.next_if(|c| c.is_whitespace()).is_some() {},
+            Some(_) => return None,
+        }
+        chars.peek()?;
+    }
+    Some(items)
+}
+
+fn format_strv(items: &[String]) -> String {
+    let items: Vec<String> = items
+        .iter()
+        .map(|item| format!("'{}'", item.replace('\\', "\\\\").replace('\'', "\\'")))
+        .collect();
+    format!("[{}]", items.join(", "))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct Shell(Arc<Mutex<Vec<String>>>);
+    struct Shell(Arc<Mutex<Vec<(String, serde_json::Value)>>>);
 
     #[zbus::interface(name = "org.gnome.Shell.Extensions.Zflow")]
     impl Shell {
-        fn call(&self, #[zbus(header)] header: zbus::message::Header<'_>, _json: &str) -> String {
-            let sender = header.sender().map(|sender| sender.to_string());
-            self.0.lock().unwrap().extend(sender);
+        fn call(&self, #[zbus(header)] header: zbus::message::Header<'_>, json: &str) -> String {
+            let sender = header.sender().unwrap().to_string();
+            let request: serde_json::Value = serde_json::from_str(json).unwrap();
+            self.0
+                .lock()
+                .unwrap()
+                .push((sender, request["api"].clone()));
             r#"{"status":"unavailable","reason":"fake shell"}"#.into()
+        }
+    }
+
+    /// Tests that own org.gnome.Shell on the shared private bus take turns.
+    static SHELL_NAME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// GNOME Shell's extension API as seen over D-Bus, with the state it reports.
+    struct Extensions(Arc<Mutex<Option<f64>>>);
+
+    #[zbus::interface(name = "org.gnome.Shell.Extensions")]
+    impl Extensions {
+        fn get_extension_info(
+            &self,
+            uuid: &str,
+        ) -> std::collections::HashMap<String, zbus::zvariant::OwnedValue> {
+            assert_eq!(uuid, crate::desktop::EXTENSION_ID);
+            let state = *self.0.lock().unwrap();
+            state
+                .map(|state| {
+                    (
+                        "state".into(),
+                        zbus::zvariant::Value::from(state).try_into().unwrap(),
+                    )
+                })
+                .into_iter()
+                .collect()
+        }
+        fn install_remote_extension(&self, _uuid: &str) -> String {
+            *self.0.lock().unwrap() = Some(ACTIVE);
+            "successful".into()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
+    async fn an_extension_shell_has_not_seen_comes_from_extensions_gnome_org() {
+        let _turn = SHELL_NAME.lock().await;
+        let state = Arc::new(Mutex::new(None));
+        let _shell = zbus::connection::Builder::session()
+            .unwrap()
+            .name("org.gnome.Shell")
+            .unwrap()
+            .serve_at("/org/gnome/Shell", Extensions(state.clone()))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let agent = zbus::Connection::session().await.unwrap();
+        assert_eq!(extension_state(&agent).await.unwrap(), None);
+        // Loaded live, so neither files nor settings change.
+        assert!(install_extension(Some(&agent)).await.unwrap());
+        assert_eq!(extension_state(&agent).await.unwrap(), Some(ACTIVE));
+    }
+
+    #[test]
+    fn gsettings_lists_round_trip() {
+        assert_eq!(parse_strv("@as []\n"), Some(vec![]));
+        let list = parse_strv("['ding@rastersoft.com', \"it's@x\", 'a\\\\b']\n").unwrap();
+        assert_eq!(list, ["ding@rastersoft.com", "it's@x", "a\\b"]);
+        assert_eq!(parse_strv(&format_strv(&list)), Some(list));
+        assert_eq!(format_strv(&[]), "[]");
+        for text in ["['a', ]", "['a' 'b']", "['a\\nb']", "['open", "a, b"] {
+            assert_eq!(parse_strv(text), None, "{text}");
         }
     }
 
@@ -431,6 +631,7 @@ mod tests {
     #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
     async fn receiver_waits_for_gnome_shell_and_calls_from_its_own_connection() {
         use crate::desktop::{BUS_NAME, OBJECT_PATH};
+        let _turn = SHELL_NAME.lock().await;
         let state = Mutex::new(State::default());
         let agent = zbus::Connection::session().await.unwrap();
         // Login can start the agent before Shell enables the extension.
@@ -465,7 +666,10 @@ mod tests {
         assert_eq!(format!("{error:#}"), "fake shell");
         assert_eq!(
             *callers.lock().unwrap(),
-            [agent.unique_name().unwrap().to_string()]
+            [(
+                agent.unique_name().unwrap().to_string(),
+                serde_json::json!(crate::app::gnome::API)
+            )]
         );
     }
 
@@ -474,7 +678,11 @@ mod tests {
     #[zbus::interface(name = "org.gnome.Shell.Extensions.Zflow")]
     impl FocusShell {
         fn call(&self, json: &str) -> String {
-            assert_eq!(json, r#"{"command":"focus"}"#);
+            let request: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                request,
+                serde_json::json!({"command": "focus", "api": super::super::gnome::API})
+            );
             r#"{"status":"focus","terminal":true}"#.into()
         }
     }
@@ -483,6 +691,7 @@ mod tests {
     #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
     async fn focus_follows_shell_signals_and_owner() {
         use crate::desktop::{BUS_NAME, OBJECT_PATH};
+        let _turn = SHELL_NAME.lock().await;
         let agent = zbus::Connection::session().await.unwrap();
         let shell = zbus::connection::Builder::session()
             .unwrap()

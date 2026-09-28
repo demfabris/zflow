@@ -163,6 +163,9 @@ enum PairCommand {
         /// Extra local input address to send to the peer.
         #[arg(long = "advertise")]
         advertised: Vec<SocketAddr>,
+        /// Allow the computer that enters the code without asking.
+        #[arg(long)]
+        yes: bool,
         /// Stop waiting after this many seconds.
         #[arg(long, default_value_t = 600)]
         timeout_seconds: u64,
@@ -240,8 +243,9 @@ pub fn run(cli: Cli) -> Result<()> {
                 peer,
                 listen,
                 advertised,
+                yes,
                 timeout_seconds,
-            } => pair_listen(path, peer, listen, advertised, timeout_seconds),
+            } => pair_listen(path, peer, listen, advertised, yes, timeout_seconds),
         },
         Command::Peer { command } => match command {
             PeerCommand::Revoke { peer } => revoke_peer(path, peer),
@@ -1423,14 +1427,17 @@ fn pair_connect(
         .worker_threads(1)
         .enable_all()
         .build()?;
-    // The listener has saved this computer by the time connect returns.
     let session = runtime.block_on(async {
-        tokio::time::timeout(
+        let mut session = tokio::time::timeout(
             Duration::from_secs(timeout_seconds),
             crate::pairing::connect(&identity, address, &offer, &code),
         )
         .await
-        .context("pairing timed out")?
+        .context("pairing timed out")??;
+        println!("waiting for the other computer to allow this one");
+        // The listener has saved this computer once it approves.
+        session.approved().await?;
+        anyhow::Ok(session)
     })?;
     let stored = store_paired_peer(&path, peer, session.observation());
     runtime.block_on(session.finish(stored.is_ok()));
@@ -1442,6 +1449,7 @@ fn pair_listen(
     peer: String,
     listen: SocketAddr,
     advertised: Vec<SocketAddr>,
+    yes: bool,
     timeout_seconds: u64,
 ) -> Result<()> {
     let config = Config::load(&path)?;
@@ -1466,10 +1474,33 @@ fn pair_listen(
             .await
             .context("pairing timed out")?
     })?;
+    // Knowing the code is not enough; the person here allows the computer.
+    let question = format!(
+        "allow {} at {} to pair as {peer}? [y/N] ",
+        session.display_name(),
+        session.peer_ip()
+    );
+    if !yes && !confirm(&question)? {
+        runtime.block_on(session.finish(false));
+        bail!("pairing declined; no trust record was written");
+    }
     let stored = store_paired_peer(&path, peer, session.observation());
     // The peer saves this computer only after hearing that we kept it.
     runtime.block_on(session.finish(stored.is_ok()));
     stored
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "standard input is not interactive; pass --yes to allow the computer that enters the code"
+        );
+    }
+    print!("{question}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
 }
 
 fn store_paired_peer(

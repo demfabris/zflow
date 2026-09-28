@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 use super::model::ConfigDocument;
+#[cfg(target_os = "macos")]
+use crate::pairing::PairingSession;
 use crate::pairing::SetupCode;
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -13,22 +15,27 @@ use tokio::sync::oneshot;
 
 /// A listener's code stays on screen while the other computer is set up.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connecting includes waiting for the other computer's user to allow it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(150);
 
 #[derive(Clone, Default, Serialize)]
 pub(super) struct PairingSnapshot {
-    /// idle, listening, connecting, paired or failed.
+    /// idle, listening, confirm, connecting, approving, paired or failed.
     pub state: &'static str,
     /// The setup code this computer shows while listening.
     pub code: Option<String>,
-    /// The name the other computer was saved under.
+    /// While confirming, the computer asking to pair; once paired, its saved name.
     pub name: Option<String>,
+    /// While confirming, the address the computer connected from.
+    pub address: Option<String>,
     pub error: Option<String>,
 }
 
 pub(super) struct Pairing {
     stage: Arc<Mutex<PairingSnapshot>>,
     cancel: Option<oneshot::Sender<()>>,
+    /// Carries the user's Allow or Decline to a listener that asked for it.
+    answer: Option<oneshot::Sender<bool>>,
 }
 
 impl Default for Pairing {
@@ -39,6 +46,7 @@ impl Default for Pairing {
                 ..Default::default()
             })),
             cancel: None,
+            answer: None,
         }
     }
 }
@@ -48,12 +56,16 @@ impl Pairing {
         self.stage.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     pub fn active(&self) -> bool {
-        matches!(self.snapshot().state, "listening" | "connecting")
+        matches!(
+            self.snapshot().state,
+            "listening" | "confirm" | "connecting" | "approving"
+        )
     }
     pub fn cancel(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
         }
+        self.answer.take();
         self.stage = Arc::new(Mutex::new(PairingSnapshot {
             state: "idle",
             ..Default::default()
@@ -77,7 +89,9 @@ impl Pairing {
             "listening"
         };
         let (cancel, cancelled) = oneshot::channel();
+        let (answer, answered) = oneshot::channel();
         self.cancel = Some(cancel);
+        self.answer = Some(answer);
         let stage = self.stage.clone();
         let limit = if remote.is_some() {
             CONNECT_TIMEOUT
@@ -89,7 +103,7 @@ impl Pairing {
                 tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
                     tokio::select! {
                         _=cancelled => Ok(()),
-                        result=tokio::time::timeout(limit,run(path,remote,code,&stage)) => result.context("Pairing expired; try again")?,
+                        result=tokio::time::timeout(limit,run(path,remote,code,answered,&stage)) => result.context("Pairing expired; try again")?,
                     }
                 })
             })();
@@ -98,6 +112,18 @@ impl Pairing {
             }
         })?;
         Ok(())
+    }
+    /// Allows or declines the computer that proved this computer's setup code.
+    pub fn respond(&mut self, allow: bool) -> Result<()> {
+        anyhow::ensure!(
+            self.snapshot().state == "confirm",
+            "No computer is waiting for an answer"
+        );
+        self.answer
+            .take()
+            .context("Pairing expired")?
+            .send(allow)
+            .map_err(|_| anyhow::anyhow!("Pairing expired"))
     }
 }
 impl Drop for Pairing {
@@ -111,6 +137,7 @@ async fn run(
     path: PathBuf,
     remote: Option<SocketAddr>,
     code: Option<SetupCode>,
+    answer: oneshot::Receiver<bool>,
     stage: &Mutex<PairingSnapshot>,
 ) -> Result<()> {
     let mut document = ConfigDocument::open(path)?;
@@ -123,13 +150,20 @@ async fn run(
             code
         }
     };
-    let session = crate::pairing::begin(
+    let mut session = crate::pairing::begin(
         &identity,
         remote,
         document.draft.transport.listen.port(),
         &code,
     )
     .await?;
+    if remote.is_some() {
+        stage.lock().unwrap_or_else(|e| e.into_inner()).state = "approving";
+        session.approved().await?;
+    } else if !ask(&session, answer, stage).await {
+        session.finish(false).await;
+        anyhow::bail!("Pairing declined");
+    }
     let saved = crate::pairing::add_paired_peer(&mut document.draft, session.observation(), false)
         .and_then(|name| document.save().map(|()| name));
     session.finish(saved.is_ok()).await;
@@ -141,17 +175,39 @@ async fn run(
     Ok(())
 }
 
+/// Knowing the code is not enough: the listening computer's user allows the
+/// computer that proved it, or it is declined when nobody answers.
+#[cfg(target_os = "macos")]
+async fn ask(
+    session: &PairingSession,
+    answer: oneshot::Receiver<bool>,
+    stage: &Mutex<PairingSnapshot>,
+) -> bool {
+    *stage.lock().unwrap_or_else(|e| e.into_inner()) = PairingSnapshot {
+        state: "confirm",
+        name: Some(session.display_name()),
+        address: Some(session.peer_ip().to_string()),
+        ..Default::default()
+    };
+    matches!(
+        tokio::time::timeout(crate::pairing::APPROVAL_TIMEOUT, answer).await,
+        Ok(Ok(true))
+    )
+}
+
 #[cfg(target_os = "linux")]
 async fn run(
     _path: PathBuf,
     remote: Option<SocketAddr>,
     code: Option<SetupCode>,
+    answer: oneshot::Receiver<bool>,
     stage: &Mutex<PairingSnapshot>,
 ) -> Result<()> {
     run_stream(
         crate::peer_view::connect_service().await?,
         remote,
         code,
+        answer,
         stage,
     )
     .await
@@ -164,6 +220,7 @@ async fn run_stream(
     mut stream: tokio::net::UnixStream,
     remote: Option<SocketAddr>,
     code: Option<SetupCode>,
+    answer: oneshot::Receiver<bool>,
     stage: &Mutex<PairingSnapshot>,
 ) -> Result<()> {
     use crate::{
@@ -172,10 +229,32 @@ async fn run_stream(
     };
     let code = code.map(|code| code.digits().to_owned());
     write_message(&mut stream, &Request::Pair { remote, code }).await?;
+    let mut answer = Some(answer);
     loop {
         match read_message(&mut stream).await? {
             PairingEvent::Listening { code } => {
                 stage.lock().unwrap_or_else(|e| e.into_inner()).code = Some(code);
+            }
+            PairingEvent::Confirm { name, address } => {
+                *stage.lock().unwrap_or_else(|e| e.into_inner()) = PairingSnapshot {
+                    state: "confirm",
+                    name: Some(name),
+                    address: Some(address),
+                    ..Default::default()
+                };
+                let answer = answer.take().context("Duplicate pairing question")?;
+                // The daemon gives up on its own when nobody answers in time.
+                let allow = tokio::select! {
+                    allow = answer => allow.unwrap_or(false),
+                    event = read_message::<_, PairingEvent>(&mut stream) => match event? {
+                        PairingEvent::Error { message } => anyhow::bail!("{message}"),
+                        _ => anyhow::bail!("The service sent an unexpected pairing event"),
+                    },
+                };
+                write_message(&mut stream, &Request::PairRespond { allow }).await?;
+            }
+            PairingEvent::Approving => {
+                stage.lock().unwrap_or_else(|e| e.into_inner()).state = "approving";
             }
             PairingEvent::Paired { name } => {
                 *stage.lock().unwrap_or_else(|e| e.into_inner()) = PairingSnapshot {
@@ -225,14 +304,19 @@ mod tests {
         let stage = Mutex::new(PairingSnapshot::default());
         let (result, ()) = tokio::join!(
             async {
-                let refused = run(path.clone(), Some(address), Some(wrong), &stage).await;
+                let (_answer, unused) = oneshot::channel();
+                let refused = run(path.clone(), Some(address), Some(wrong), unused, &stage).await;
                 assert!(refused.unwrap_err().to_string().contains("does not match"));
                 assert!(Config::load(&path).unwrap().peers.is_empty());
-                run(path.clone(), Some(address), Some(code), &stage).await
+                let (_answer, unused) = oneshot::channel();
+                run(path.clone(), Some(address), Some(code), unused, &stage).await
             },
             async {
-                // The listener drops the wrong attempt and keeps waiting.
+                // The listener drops the wrong attempt and keeps waiting, and
+                // the Mac saves nothing until the listener's user allows it.
                 let session = listener.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(stage.lock().unwrap().state, "approving");
                 assert!(Config::load(&path).unwrap().peers.is_empty());
                 session.finish(true).await;
             }
@@ -289,7 +373,8 @@ mod linux_tests {
     async fn pairing_shows_the_daemon_code_and_reports_the_saved_name() {
         let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
         let stage = Mutex::new(PairingSnapshot::default());
-        let (result, ()) = tokio::join!(run_stream(client, None, None, &stage), async {
+        let (answer, answered) = oneshot::channel();
+        let (result, ()) = tokio::join!(run_stream(client, None, None, answered, &stage), async {
             assert!(matches!(
                 read_message::<_, Request>(&mut server).await.unwrap(),
                 Request::Pair {
@@ -305,7 +390,27 @@ mod linux_tests {
             )
             .await
             .unwrap();
-            tokio::task::yield_now().await;
+            write_message(
+                &mut server,
+                &PairingEvent::Confirm {
+                    name: "MacBook".into(),
+                    address: "192.0.2.9".into(),
+                },
+            )
+            .await
+            .unwrap();
+            // The question waits for the person here.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let asked = stage.lock().unwrap().clone();
+            assert_eq!(
+                (asked.state, asked.name.as_deref(), asked.address.as_deref()),
+                ("confirm", Some("MacBook"), Some("192.0.2.9"))
+            );
+            answer.send(true).unwrap();
+            assert!(matches!(
+                read_message::<_, Request>(&mut server).await.unwrap(),
+                Request::PairRespond { allow: true }
+            ));
             write_message(
                 &mut server,
                 &PairingEvent::Paired {
@@ -325,20 +430,24 @@ mod linux_tests {
         let (client, mut server) = tokio::net::UnixStream::pair().unwrap();
         let code = SetupCode::parse("482913").unwrap();
         let remote = Some("192.0.2.1:43120".parse().unwrap());
-        let (result, ()) = tokio::join!(run_stream(client, remote, Some(code), &stage), async {
-            assert!(matches!(
-                read_message::<_, Request>(&mut server).await.unwrap(),
-                Request::Pair { code: Some(code), .. } if code == "482913"
-            ));
-            write_message(
-                &mut server,
-                &PairingEvent::Error {
-                    message: "That code does not match".into(),
-                },
-            )
-            .await
-            .unwrap();
-        });
+        let (_answer, unused) = oneshot::channel();
+        let (result, ()) = tokio::join!(
+            run_stream(client, remote, Some(code), unused, &stage),
+            async {
+                assert!(matches!(
+                    read_message::<_, Request>(&mut server).await.unwrap(),
+                    Request::Pair { code: Some(code), .. } if code == "482913"
+                ));
+                write_message(
+                    &mut server,
+                    &PairingEvent::Error {
+                        message: "That code does not match".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        );
         assert!(result.unwrap_err().to_string().contains("does not match"));
     }
 

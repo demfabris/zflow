@@ -1,8 +1,7 @@
 {
   "uuid": "zflow@demfabris",
   "name": "zflow desktop input sharing",
-  "description": "Share input with paired computers. Includes a panel indicator, native settings, cursor placement and return edges.",
+  "description": "Panel menu and desktop hooks for zflow, which shares keyboard, pointer and trackpad input between paired computers. It places the cursor when another computer hands input over and hands it back at the screen edge.\n\nRequires the zflow app from https://github.com/demfabris/zflow",
   "shell-version": ["46", "47", "48", "49", "50", "51"],
-  "version": 2,
   "url": "https://github.com/demfabris/zflow"
 }

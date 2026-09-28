@@ -1,4 +1,5 @@
-Prebuilt zflow for Linux x86-64/ARM64 and macOS Intel/Apple Silicon.
+Prebuilt zflow for Linux x86-64/ARM64 and one universal macOS app for Apple silicon and Intel.
+On a Mac, open `zflow-VERSION-macos.dmg` and drag zflow to Applications, or use the command below.
 This is a prototype release; the live qualification checklist is in TESTPLAN.md.
 
 ```sh
@@ -20,6 +21,8 @@ You can install the optional AWDL helper from the app with administrator approva
 Updates preserve configuration and pairing identities. Restarting the Linux
 service interrupts active sharing. Reboot Linux hosts once after updating from
 v0.1.0: its udev rule let logind give the desktop user write access to
-`/dev/uinput`, and that access lasts until the next boot. Log out and back in after updating the
-GNOME extension. Debian packages include the application launcher and extension;
-enable zflow in GNOME Extensions and use Start at Login in Settings if desired.
+`/dev/uinput`, and that access lasts until the next boot. The installer loads
+the GNOME extension and starts the desktop agent in your current session; if
+GNOME cannot fetch the extension from extensions.gnome.org, it installs the
+bundled copy and asks you to log out once. The desktop agent starts at every
+GNOME login; turn off Start at Login in zflow's settings to stop that.

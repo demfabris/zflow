@@ -65,6 +65,9 @@ static int hide_count;
 static int tap_calls;
 static bool tap_available;
 static int tap_enables;
+// The window server's answer to the Accessibility probe's throwaway tap.
+static bool probe_allowed;
+static int probe_calls;
 static bool lose_stop;
 static _Atomic bool invalidate_tap;
 static _Atomic int loop_runs;
@@ -357,6 +360,12 @@ static CFMachPortRef fake_tap(CGEventTapLocation location,
                              CGEventTapOptions options, CGEventMask mask,
                              CGEventTapCallBack callback, void *context) {
   assert(location == kCGHIDEventTap);
+  if (callback == pass_event) {
+    assert(placement == kCGTailAppendEventTap && options == kCGEventTapOptionDefault);
+    assert(mask == CGEventMaskBit(kCGEventOtherMouseDown) && context == NULL);
+    probe_calls++;
+    return probe_allowed ? CFMachPortCreate(NULL, idle_port, NULL, NULL) : NULL;
+  }
   assert(placement == kCGHeadInsertEventTap);
   assert(options == kCGEventTapOptionDefault);
   assert(mask & CGEventMaskBit(kCGEventMouseMoved));
@@ -406,6 +415,7 @@ static void reset(void) {
   memset(g_forwarded_buttons, 0, sizeof(g_forwarded_buttons));
   held_key = held_button = -1;
   tap_available = true;
+  probe_allowed = true;
 }
 
 static void count_wake(void) { atomic_fetch_add(&wakes, 1); }
@@ -684,6 +694,16 @@ static void event_tests(void) {
   assert(zflow_mac_capture_poll(&captured) == 0);
   assert(!g_forwarded_keys[4] && g_forwarded_keys[55]);
   assert(!g_forwarded_buttons[1] && g_forwarded_buttons[2]);
+
+  // With Accessibility removed, a re-enabled tap would hold the Mac's input,
+  // so a timeout then ends remote control instead.
+  reset();
+  probe_allowed = false;
+  enables = tap_enables;
+  int probes = probe_calls;
+  assert(event_callback(NULL, kCGEventTapDisabledByTimeout, event, NULL) == event);
+  assert(probe_calls == probes + 1 && tap_enables == enables);
+  assert(zflow_mac_capture_stop_requested() == 1 && g_capture_status == -1);
   CFRelease(g_event_tap);
   g_event_tap = NULL;
 

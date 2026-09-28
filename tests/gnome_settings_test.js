@@ -52,6 +52,15 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
                 snapshot.daemon.peers['Mac mini'] = {};
             }
             break;
+        case 'pair_respond':
+            assert(snapshot.pairing.state === 'confirm', 'answers only a waiting question');
+            if (request.allow) {
+                snapshot.pairing = {state: 'paired', name: snapshot.pairing.name};
+                snapshot.daemon.peers[snapshot.pairing.name] = {};
+            } else {
+                snapshot.pairing = {state: 'failed', error: 'Pairing declined'};
+            }
+            break;
         case 'pair_cancel': snapshot.pairing = {state: 'idle'}; break;
         default: throw new Error(`Unexpected request ${request.command}`);
         }
@@ -117,6 +126,25 @@ app.connect('activate', () => {
         freshWindow.content = fresh.page;
         freshWindow.present();
         await waitFor(() => fresh._pairing !== null && snapshot.pairing.state === 'listening' && fresh._pairing.code.label === '482 913');
+        // A computer proves the code; nothing is saved until the person here allows it.
+        snapshot.pairing = {state: 'confirm', name: 'Stranger', address: '192.0.2.66'};
+        await fresh.client.refresh();
+        await waitFor(() => fresh._pairing.ask.visible && !fresh._pairing.shown.visible);
+        assert(fresh._pairing.question.title === 'Allow Stranger to control this computer?', 'the question names the computer');
+        assert(fresh._pairing.question.subtitle.includes('192.0.2.66'), 'the question shows its address');
+        await fresh._respond(false);
+        await waitFor(() => snapshot.pairing.state === 'failed' && fresh._pairing.renew.visible && !fresh._busy);
+        assert(snapshot.daemon.peers.Stranger === undefined, 'declining saves nothing');
+        await fresh._listen();
+        await waitFor(() => snapshot.pairing.state === 'listening' && !fresh._busy);
+        snapshot.pairing = {state: 'confirm', name: 'MacBook', address: '192.0.2.9'};
+        await fresh.client.refresh();
+        await waitFor(() => fresh._pairing.ask.visible);
+        fresh._pairing.allow.emit('clicked');
+        await waitFor(() => snapshot.pairing.state === 'paired' && !fresh._busy);
+        assert(snapshot.daemon.peers.MacBook !== undefined, 'allowing saves the computer');
+        await waitFor(() => fresh._pairing.stage.title === 'Paired with MacBook');
+        delete snapshot.daemon.peers.MacBook;
         fresh._pairing.dialog.close();
         await waitFor(() => snapshot.pairing.state === 'idle');
         fresh.destroy();
@@ -131,7 +159,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, focus, keyboard mode, pause, rollback, login, pairing, first-run pairing, forget, offline and cleanup passed');
+        print('GTK settings: status, focus, keyboard mode, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

@@ -3,6 +3,7 @@ set -euo pipefail
 if [[ "$1" == configure ]]; then
     /usr/lib/zflow/host-setup.sh /usr/share/zflow/zflow.toml \
         /usr/share/zflow/71-zflow-capture.rules /usr/lib/udev/rules.d/70-zflow.rules
+    /usr/lib/zflow/firewall.sh open
 fi
 # debhelper honors policy-rc.d and handles service enable/restart after setup.
 #DEBHELPER#

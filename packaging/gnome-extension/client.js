@@ -3,9 +3,18 @@ import GLib from 'gi://GLib';
 
 const BUS = 'io.zflow.Desktop';
 const PATH = '/io/zflow/Desktop';
+// src/app/gnome.rs mirrors this. The extension comes from extensions.gnome.org
+// and the agent from the zflow package, so they can be updated at different times.
+export const API = 1;
+
+// Agents older than API 1 did not report it and speak API 1.
+export function compatible(snapshot) {
+    return (snapshot?.api ?? 1) === API;
+}
 
 export function statusText(snapshot) {
     if (snapshot?.agent_error) return 'zflow is not running';
+    if (!compatible(snapshot)) return 'Update zflow';
     if (!snapshot?.daemon) return 'Service unavailable';
     const daemon = snapshot.daemon;
     if (!daemon.sharing) return 'Sharing paused';
@@ -25,13 +34,13 @@ export class Client {
         this.snapshot = null;
     }
 
-    call(request) {
+    call(request, timeout = 7000) {
         const flags = request.command === 'snapshot' && !this._activate ? Gio.DBusCallFlags.NO_AUTO_START : Gio.DBusCallFlags.NONE;
         if (request.command === 'snapshot') this._activate = false;
         return new Promise((resolve, reject) => {
             Gio.DBus.session.call(BUS, PATH, BUS, 'Call',
                 new GLib.Variant('(s)', [JSON.stringify(request)]),
-                new GLib.VariantType('(s)'), flags, 7000, this._cancel,
+                new GLib.VariantType('(s)'), flags, timeout, this._cancel,
                 (connection, result) => {
                     try { resolve(JSON.parse(connection.call_finish(result).deep_unpack()[0])); }
                     catch (error) {

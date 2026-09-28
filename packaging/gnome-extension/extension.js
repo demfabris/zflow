@@ -1,3 +1,4 @@
+import {API} from './client.js';
 import {Indicator} from './indicator.js';
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
@@ -23,6 +24,7 @@ export default class ZflowExtension extends Extension {
         this._indicator = new Indicator();
         this._lease = null;
         this._barriers = [];
+        this._idles = new Set();
         // Only the desktop agent may read the pointer or move it. This skips GNOME's
         // DBusSenderChecker, whose destroy() passes array indexes to unwatch_name.
         this._agent = null;
@@ -52,6 +54,9 @@ export default class ZflowExtension extends Extension {
         this._indicator?.destroy();
         this._indicator = null;
         this._clear();
+        // An entry still waiting for the cursor stops here and never answers.
+        for (const id of this._idles) GLib.Source.remove(id);
+        this._idles.clear();
         if (this._timer) GLib.Source.remove(this._timer);
         if (this._monitorsId) Main.layoutManager.disconnect(this._monitorsId);
         if (this._focusId) global.display.disconnect(this._focusId);
@@ -101,6 +106,10 @@ export default class ZflowExtension extends Extension {
         try {
             if (json.length > 4096) throw new Error('Desktop request exceeds limit');
             const request = JSON.parse(json);
+            // Agents older than API 1 did not send it and speak API 1.
+            const api = request.api ?? 1;
+            if (api > API) throw new Error('Update zflow: its GNOME extension is older than the app');
+            if (api < API) throw new Error('Update zflow: the app is older than its GNOME extension');
             response = await this._request(request);
         } catch (error) {
             response = {status: 'unavailable', reason: String(error.message).slice(0, 256)};
@@ -203,7 +212,14 @@ export default class ZflowExtension extends Extension {
             // delay it past the next main-loop turn. Keep checking for a while.
             const deadline = GLib.get_monotonic_time() + WARP_US;
             for (;;) {
-                await new Promise(resolve => GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {resolve(); return GLib.SOURCE_REMOVE;}));
+                await new Promise(resolve => {
+                    const id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                        this._idles.delete(id);
+                        resolve();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    this._idles.add(id);
+                });
                 if (this._lease !== lease) throw new Error('Desktop changed during entry');
                 const actual = this._snapshot();
                 if (Math.abs(actual.position.x - point.x) <= 2 && Math.abs(actual.position.y - point.y) <= 2)

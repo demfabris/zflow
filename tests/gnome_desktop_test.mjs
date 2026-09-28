@@ -21,6 +21,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
         connect(name, fn) {this.handlers.set(name, fn); return 3;}, disconnect(id) {this.disconnected = id;}};
     // GNOME 51 reaches the backend only through the stage context.
     const context = {
+        API: 1,
         Extension: class {},
         Indicator: class { destroy() {} },
         global: {backend: {capabilities: 1}, stage: {get_context: () => ({get_backend: () => backend})},
@@ -304,4 +305,33 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.extension.disable();
     assert.equal(d.display.disconnected, 3);
 }
-console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller and terminal focus checks passed');
+{
+    // The extension and the agent update separately, so a mismatch names the older one.
+    const d = desktop();
+    const replies = [];
+    const call = request => d.extension.CallAsync([JSON.stringify(request)], {
+        get_sender: () => ':1.7',
+        return_value: variant => replies.push(JSON.parse(variant.value[0])),
+    });
+    await call({command: 'snapshot', api: 2});
+    await call({command: 'snapshot', api: 0});
+    await call({command: 'snapshot'});
+    assert.match(replies[0].reason, /^Update zflow: its GNOME extension is older/);
+    assert.match(replies[1].reason, /^Update zflow: the app is older/);
+    assert.equal(replies[2].status, 'snapshot', 'agents from before API levels speak API 1');
+    d.extension.disable();
+}
+{
+    // disable() removes the idle source of an entry still waiting for the cursor.
+    const d = desktop();
+    const idle = [];
+    const removed = [];
+    d.context.GLib.idle_add = (_priority, fn) => {idle.push(fn); return 100 + idle.length;};
+    d.context.GLib.Source.remove = id => {removed.push(id); d.timers.delete(id);};
+    d.extension._request(prepare());
+    await new Promise(setImmediate);
+    assert.equal(idle.length, 1);
+    d.extension.disable();
+    assert.ok(removed.includes(101));
+}
+console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller, terminal focus, API and cleanup checks passed');

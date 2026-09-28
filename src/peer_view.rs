@@ -37,6 +37,10 @@ pub enum Request {
         remote: Option<std::net::SocketAddr>,
         code: Option<String>,
     },
+    /// Answers [`PairingEvent::Confirm`] on the same connection.
+    PairRespond {
+        allow: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +50,13 @@ pub enum PairingEvent {
     Listening {
         code: String,
     },
+    /// A computer proved the code; the person here allows it or not.
+    Confirm {
+        name: String,
+        address: String,
+    },
+    /// Connected with the code; the other computer's user has to allow it.
+    Approving,
     /// Both computers proved the code and this one saved the other as `name`.
     Paired {
         name: String,

@@ -26,7 +26,11 @@ struct SettingsView: View {
           HStack {
             Text("Your computers").font(.headline)
             Spacer()
-            Button("Pair Computer…", systemImage: "plus") { model.showingPairing = true }
+            Button("Pair Computer…", systemImage: "plus") {
+              // Browsing waits for a reason to ask macOS for Local Network access.
+              model.send(CoreRequest(command: "discover"))
+              model.showingPairing = true
+            }
           }
           ComputerLayout(
             computers: snapshot.layout.monitors,
@@ -121,19 +125,28 @@ struct HealthView: View {
         ) {
           if !state.accessibility { Button("Allow…") { model.openAccessibility() } }
         }
-        HStack(alignment: .top) {
-          Image(systemName: "network").foregroundStyle(.secondary)
-          VStack(alignment: .leading, spacing: 4) {
-            Text("Local network").fontWeight(.medium)
-            Text("Allow zflow if nearby computers do not appear.").font(.callout).foregroundStyle(
-              .secondary)
+        if state.localNetwork == "unknown" {
+          HStack(alignment: .top) {
+            Image(systemName: "network").foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+              Text("Local network").fontWeight(.medium)
+              Text("Allow zflow if nearby computers do not appear.").font(.callout).foregroundStyle(
+                .secondary)
+            }
+            Spacer()
+            Button("Settings…") { model.openLocalNetwork() }
           }
-          Spacer()
-          Button("Settings…") {
-            NSWorkspace.shared.open(
-              URL(
-                string:
-                  "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork")!)
+        } else {
+          check(
+            "Local network",
+            detail: state.localNetwork == "allowed"
+              ? "zflow can reach computers on this network."
+              : "Turn on zflow in Privacy & Security → Local Network.",
+            ready: state.localNetwork == "allowed"
+          ) {
+            if state.localNetwork != "allowed" {
+              Button("Settings…") { model.openLocalNetwork() }
+            }
           }
         }
         if state.blockAwdl {
