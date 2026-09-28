@@ -18,7 +18,7 @@ pub(super) struct Snapshot<P> {
     /// None while the part that shares input cannot be reached.
     pub sharing: Option<bool>,
     pub health: Vec<Health>,
-    /// None until this computer has a layout editor.
+    /// None while there is no layout to arrange.
     pub layout: Option<Layout>,
     pub peers: Vec<Peer>,
     pub pairing: PairingSnapshot,

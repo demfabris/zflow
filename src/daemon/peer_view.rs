@@ -121,6 +121,7 @@ async fn desktop_command(
                 .as_ref()
                 .map(|active| active.peer.clone()),
             connected: shared.sessions.lock().await.keys().cloned().collect(),
+            layout: shared.layout_status().await,
             ..DesktopStatus::from_config(&config)
         })),
         Request::SetSharing { enabled } => {
@@ -146,6 +147,15 @@ async fn desktop_command(
             };
             crate::peer_view::set_peer(peer, allow_control, keyboard);
             shared.apply_config_locked(config, true).await?;
+            Ok(DesktopReply::Ack)
+        }
+        Request::MoveTile {
+            id,
+            x,
+            y,
+            tolerance,
+        } => {
+            shared.move_tile(&id, x, y, tolerance).await?;
             Ok(DesktopReply::Ack)
         }
         _ => bail!("Unsupported desktop operation"),

@@ -116,11 +116,6 @@ impl Shared {
     pub(super) async fn local_layout(&self) -> Option<crate::app::layout_model::Layout> {
         let layout = self.layout.lock().await.clone()?;
         let keys = peer_keys(&*self.config.read().await);
-        Some(crate::app::layout_model::Layout::from_shared(
-            &layout,
-            &self.identity_fingerprint,
-            "This computer",
-            &keys,
-        ))
+        Some(layout_view(&layout, &self.identity_fingerprint, &keys))
     }
 }

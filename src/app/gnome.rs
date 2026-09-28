@@ -71,6 +71,20 @@ impl Service {
                 })
                 .await?;
             }
+            Request::MoveTile {
+                id,
+                x,
+                y,
+                tolerance,
+            } => {
+                crate::peer_view::request(&DaemonRequest::MoveTile {
+                    id,
+                    x,
+                    y,
+                    tolerance,
+                })
+                .await?;
+            }
             Request::SetAutostart { enabled } => set_autostart(enabled)?,
             Request::Pair { address, code } => {
                 let remote = address
@@ -106,10 +120,8 @@ impl Service {
                 let running = super::desktop::install_extension(Some(&connection)).await?;
                 return Ok(serde_json::json!({"ok": true, "running": running}));
             }
-            // The agent restarts the desktop connection by itself, and the
-            // layout editor comes with sending from this computer.
+            // The agent restarts the desktop connection by itself.
             Request::Retry
-            | Request::MoveTile { .. }
             | Request::Reload
             | Request::SetAwdl { .. }
             | Request::HelperReady { .. }
@@ -129,7 +141,7 @@ fn snapshot(
 ) -> Result<api::Snapshot<()>> {
     let nearby = state.nearby.snapshot();
     let mut health = Vec::new();
-    let (sharing, peers, shortcuts) = match &daemon {
+    let (sharing, peers, shortcuts, layout) = match &daemon {
         Ok(daemon) => {
             health.push(Health::new(
                 "service",
@@ -148,7 +160,12 @@ fn snapshot(
                 "GNOME desktop",
                 state.receiver.status(),
             ));
-            (Some(daemon.sharing), peers(daemon), shortcuts(daemon))
+            (
+                Some(daemon.sharing),
+                peers(daemon),
+                shortcuts(daemon),
+                daemon.layout.clone(),
+            )
         }
         Err(error) => {
             health.push(Health::new(
@@ -157,7 +174,7 @@ fn snapshot(
                 "Background service",
                 format!("{error:#}"),
             ));
-            (None, Vec::new(), Vec::new())
+            (None, Vec::new(), Vec::new(), None)
         }
     };
     if let BrowserStatus::Failed(error) = nearby.status {
@@ -172,7 +189,7 @@ fn snapshot(
         status: Status::new(sharing, &peers, &health, false),
         sharing,
         health,
-        layout: None,
+        layout,
         peers,
         pairing: state.pairing.snapshot(),
         nearby: nearby.records.into_values().collect(),
@@ -543,6 +560,27 @@ mod tests {
             "Ctrl+Super+Backspace",
             "the default escape chord"
         );
+        // The settings window arranges the layout the service keeps.
+        let layout = crate::app::layout_model::Layout {
+            monitors: vec![crate::app::layout_model::Monitor {
+                id: "local".into(),
+                label: "This computer".into(),
+                peer: None,
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            }],
+        };
+        let up = snapshot(
+            Ok(crate::peer_view::DesktopStatus {
+                layout: Some(layout.clone()),
+                ..status
+            }),
+            &State::default(),
+        )
+        .unwrap();
+        assert_eq!(up.layout, Some(layout));
 
         let down = snapshot(
             Err(anyhow::anyhow!("Start the zflow system service")),
@@ -553,7 +591,7 @@ mod tests {
         assert_eq!(down.status.state, api::State::Attention);
         assert_eq!(down.health[0].level, Level::Error);
         assert_eq!(down.health[0].detail, "Start the zflow system service");
-        assert!(down.peers.is_empty() && down.shortcuts.is_empty());
+        assert!(down.peers.is_empty() && down.shortcuts.is_empty() && down.layout.is_none());
     }
 
     #[test]
