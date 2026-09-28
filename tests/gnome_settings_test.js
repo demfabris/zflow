@@ -17,10 +17,17 @@ function waitFor(predicate) {
     });
 }
 
+// src/app/api.rs Snapshot, as the agent sends it.
+const peer = (name, fields = {}) => ({name, state: 'paired', detail: 'Paired', allow_control: true, keyboard: 'standard', ...fields});
+const ready = {state: 'ready', peer: null, title: 'Ready'};
 const snapshot = {
-    daemon: {sharing: true, peers: {MacBook: {permissions: {connect: true, send_normal: true, receive_normal: true, inject_prelogin: false}}}, connected: [], receiving_from: null, sending_to: null},
-    desktop_ready: true, desktop: 'Ready', autostart: true, pairing: {state: 'idle'}, nearby: [],
+    api: 2, status: ready, sharing: true,
+    health: [{id: 'service', level: 'ok', title: 'Background service', detail: 'Running', action: null}],
+    layout: null, peers: [peer('MacBook')], pairing: {state: 'idle'}, nearby: [],
+    shortcuts: [{title: 'Return input to this computer', keys: 'Ctrl+Super+Backspace'}],
+    autostart: true, config_path: '/etc/zflow/zflow.toml', platform: null,
 };
+const find = name => snapshot.peers.find(peer => peer.name === name);
 let failSharing = false;
 let callCount = 0;
 let keyboardCalls = 0;
@@ -34,38 +41,37 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
         case 'snapshot': return JSON.stringify(snapshot);
         case 'set_sharing':
             if (failSharing) throw new Error('Test: service refused the change');
-            snapshot.daemon.sharing = request.enabled;
+            snapshot.sharing = request.enabled;
+            snapshot.status = request.enabled ? ready : {state: 'paused', peer: null, title: 'Paused'};
             break;
         case 'set_autostart': snapshot.autostart = request.enabled; break;
-        case 'forget': delete snapshot.daemon.peers[request.name]; break;
+        case 'forget': snapshot.peers = snapshot.peers.filter(peer => peer.name !== request.name); break;
         case 'set_peer': {
-            const peer = snapshot.daemon.peers[request.name];
+            const peer = find(request.name);
             assert(('keyboard' in request) !== ('allow_control' in request), 'each control changes one field');
             if ('keyboard' in request) {
                 keyboardCalls++;
-                // The daemon leaves the default out of the peer record.
-                if (request.keyboard === 'standard') delete peer.keyboard;
-                else peer.keyboard = request.keyboard;
+                peer.keyboard = request.keyboard;
             } else {
                 controlCalls++;
-                peer.permissions.send_normal = request.allow_control;
+                peer.allow_control = request.allow_control;
             }
             break;
         }
         case 'pair':
-            if (request.remote === null) {
+            if (request.address === null) {
                 snapshot.pairing = {state: 'listening', code: '482 913'};
             } else {
-                assert(request.remote === '192.0.2.7' && request.code === '123456', 'connecting forwards the address and the typed code');
+                assert(request.address === '192.0.2.7' && request.code === '123456', 'connecting forwards the address and the typed code');
                 snapshot.pairing = {state: 'paired', name: 'Mac mini'};
-                snapshot.daemon.peers['Mac mini'] = {};
+                snapshot.peers.push(peer('Mac mini'));
             }
             break;
         case 'pair_respond':
             assert(snapshot.pairing.state === 'confirm', 'answers only a waiting question');
             if (request.allow) {
                 snapshot.pairing = {state: 'paired', name: snapshot.pairing.name};
-                snapshot.daemon.peers[snapshot.pairing.name] = {};
+                snapshot.peers.push(peer(snapshot.pairing.name));
             } else {
                 snapshot.pairing = {state: 'failed', error: 'Pairing declined'};
             }
@@ -88,7 +94,10 @@ app.connect('activate', () => {
     window.present();
     (async () => {
         await waitFor(() => owned && settings._sharing.sensitive);
-        assert(settings._status.title === 'Ready to share', 'ready status');
+        assert(settings._status.title === 'Ready', 'ready status');
+        assert(settings._healthRows[0].title === 'Background service' && settings._health.visible, 'checks that pass stay listed');
+        assert(settings._shortcutRows[0].title === 'Return input to this computer', 'shortcuts are listed');
+        assert(settings._help.description.includes('/etc/zflow/zflow.toml'), 'the advanced settings file is named');
         const firstRow = settings._peerRows[0];
         await settings.client.refresh();
         assert(settings._peerRows[0] === firstRow, 'refresh must preserve keyboard focus');
@@ -97,11 +106,11 @@ app.connect('activate', () => {
         keyboard.selected = 2;
         assert(!keyboard.sensitive, 'a request in flight locks the dropdown instead of dropping a choice');
         // Times out if the dropdown stays locked after the request.
-        await waitFor(() => snapshot.daemon.peers.MacBook.keyboard === 'mac' && !settings._busy && keyboard.sensitive);
+        await waitFor(() => find('MacBook').keyboard === 'mac' && !settings._busy && keyboard.sensitive);
         keyboard.selected = 0;
-        await waitFor(() => snapshot.daemon.peers.MacBook.keyboard === undefined && !settings._busy);
+        await waitFor(() => find('MacBook').keyboard === 'standard' && !settings._busy);
         assert(keyboardCalls === 2, 'each choice sends set_peer once');
-        snapshot.daemon.peers.MacBook.keyboard = 'pc_positions';
+        find('MacBook').keyboard = 'pc_positions';
         await waitFor(() => keyboard.selected === 1);
         assert(keyboardCalls === 2, 'a snapshot moves the dropdown without sending a request');
         assert(settings._peerRows[0] === firstRow && settings._keyboards.get('MacBook') === keyboard, 'a keyboard change keeps the row');
@@ -109,21 +118,20 @@ app.connect('activate', () => {
         assert(control.active, 'a paired computer can control this one');
         control.active = false;
         assert(!control.sensitive, 'a request in flight locks the switch');
-        await waitFor(() => !snapshot.daemon.peers.MacBook.permissions.send_normal && !settings._busy && control.sensitive);
-        snapshot.daemon.peers.MacBook.permissions.send_normal = true;
+        await waitFor(() => !find('MacBook').allow_control && !settings._busy && control.sensitive);
+        find('MacBook').allow_control = true;
         await waitFor(() => control.active);
         assert(controlCalls === 1, 'a snapshot moves the switch without sending a request');
         assert(settings._peerRows[0] === firstRow, 'a permission change keeps the row');
         firstRow.expanded = true;
-        snapshot.daemon.connected = ['MacBook'];
-        snapshot.daemon.sending_to = 'MacBook';
+        Object.assign(find('MacBook'), {state: 'controlled_from_here', detail: 'Controlled from here'});
         await waitFor(() => settings._peerRows[0] !== firstRow);
         assert(settings._peerRows[0].expanded, 'a rebuilt row stays open');
-        assert(settings._peerRows[0].subtitle === 'Controlled from here', 'the row says this computer controls it');
-        snapshot.daemon.sending_to = null;
+        assert(settings._peerRows[0].subtitle === 'Controlled from here', 'the row shows the state the agent sends');
+        Object.assign(find('MacBook'), {state: 'connected', detail: 'Connected'});
         settings._sharing.active = false;
-        await waitFor(() => !snapshot.daemon.sharing && !settings._busy);
-        assert(settings._status.title === 'Sharing paused', 'pause reaches daemon and refreshes status');
+        await waitFor(() => !snapshot.sharing && !settings._busy);
+        assert(settings._status.title === 'Paused', 'pause reaches daemon and refreshes status');
         failSharing = true;
         settings._sharing.active = true;
         await waitFor(() => !settings._busy && settings._errorGroup.visible);
@@ -139,13 +147,13 @@ app.connect('activate', () => {
         settings._pairing.entered.text = '123 456';
         settings._pairing.connect.emit('clicked');
         await waitFor(() => snapshot.pairing.state === 'paired' && !settings._busy);
-        assert(snapshot.daemon.peers['Mac mini'] !== undefined, 'pairing saves the other computer');
+        assert(find('Mac mini'), 'pairing saves the other computer');
         await waitFor(() => settings._pairing.stage.title === 'Paired with Mac mini');
         settings._pairing.dialog.close();
         await waitFor(() => settings._pairing === null && snapshot.pairing.state === 'idle');
         await settings._run({command: 'forget', name: 'MacBook'});
         await settings._run({command: 'forget', name: 'Mac mini'});
-        assert(!snapshot.daemon.peers.MacBook, 'forget uses daemon API');
+        assert(!find('MacBook'), 'forget uses daemon API');
         const freshWindow = new Adw.ApplicationWindow({application: app, default_width: 520, default_height: 640});
         const fresh = new Settings(freshWindow);
         freshWindow.content = fresh.page;
@@ -159,7 +167,7 @@ app.connect('activate', () => {
         assert(fresh._pairing.question.subtitle.includes('192.0.2.66'), 'the question shows its address');
         await fresh._respond(false);
         await waitFor(() => snapshot.pairing.state === 'failed' && fresh._pairing.renew.visible && !fresh._busy);
-        assert(snapshot.daemon.peers.Stranger === undefined, 'declining saves nothing');
+        assert(!find('Stranger'), 'declining saves nothing');
         await fresh._listen();
         await waitFor(() => snapshot.pairing.state === 'listening' && !fresh._busy);
         snapshot.pairing = {state: 'confirm', name: 'MacBook', address: '192.0.2.9'};
@@ -167,24 +175,31 @@ app.connect('activate', () => {
         await waitFor(() => fresh._pairing.ask.visible);
         fresh._pairing.allow.emit('clicked');
         await waitFor(() => snapshot.pairing.state === 'paired' && !fresh._busy);
-        assert(snapshot.daemon.peers.MacBook !== undefined, 'allowing saves the computer');
+        assert(find('MacBook'), 'allowing saves the computer');
         await waitFor(() => fresh._pairing.stage.title === 'Paired with MacBook');
-        delete snapshot.daemon.peers.MacBook;
+        snapshot.peers = [];
         fresh._pairing.dialog.close();
         await waitFor(() => snapshot.pairing.state === 'idle');
         fresh.destroy();
         freshWindow.close();
-        snapshot.daemon = null;
-        snapshot.error = 'Start the zflow system service';
+        Object.assign(snapshot, {
+            sharing: null, status: {state: 'attention', peer: null, title: 'Needs attention'}, shortcuts: [],
+            health: [{id: 'service', level: 'error', title: 'Background service', detail: 'Start the zflow system service', action: null}],
+        });
         await settings.client.refresh();
         assert(!settings._sharing.sensitive && !settings._pairButton.sensitive, 'offline controls disabled');
-        assert(statusText(snapshot) === 'Service unavailable', 'offline status');
+        assert(statusText(snapshot) === 'Needs attention', 'offline status');
+        assert(settings._healthRows[0].subtitle === 'Start the zflow system service', 'the check says what failed');
+        assert(!settings._shortcuts.visible, 'no shortcuts without the service');
+        snapshot.api = 1;
+        await settings.client.refresh();
+        assert(settings._status.title === 'Update zflow' && settings._errorGroup.visible, 'an agent from another API level asks for an update');
         settings.destroy();
         await waitFor(() => !settings.client._polling);
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, focus, keyboard mode, control permission, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
+        print('GTK settings: status, checks, shortcuts, focus, keyboard mode, control permission, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

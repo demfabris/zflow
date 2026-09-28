@@ -21,7 +21,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
         connect(name, fn) {this.handlers.set(name, fn); return 3;}, disconnect(id) {this.disconnected = id;}};
     // GNOME 51 reaches the backend only through the stage context.
     const context = {
-        API: 1,
+        API: 2,
         Extension: class {},
         Indicator: class { destroy() {} },
         global: {backend: {capabilities: 1}, stage: {get_context: () => ({get_backend: () => backend})},
@@ -256,7 +256,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     await call(':1.99', {command: 'snapshot'});
     assert.equal(d.extension._lease, null);
     assert.equal(d.barriers.length, 0);
-    await call(':1.7', {command: 'snapshot'});
+    await call(':1.7', {command: 'snapshot', api: 2});
     d.watch.vanished();
     await call(':1.7', {command: 'snapshot'});
     const denied = 'org.freedesktop.DBus.Error.AccessDenied';
@@ -288,7 +288,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.context.Main.layoutManager.monitors.length = 0;
     assert.deepEqual({...await d.extension._request({command: 'focus'})}, {status: 'focus', terminal: true}, 'focus needs no monitors');
     const replies = [];
-    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus'})], {
+    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus', api: 2})], {
         get_sender: () => sender,
         return_dbus_error: name => replies.push(name),
         return_value: variant => replies.push(JSON.parse(variant.value[0]).terminal),
@@ -313,12 +313,14 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
         get_sender: () => ':1.7',
         return_value: variant => replies.push(JSON.parse(variant.value[0])),
     });
-    await call({command: 'snapshot', api: 2});
-    await call({command: 'snapshot', api: 0});
+    await call({command: 'snapshot', api: 3});
+    await call({command: 'snapshot', api: 1});
     await call({command: 'snapshot'});
+    await call({command: 'snapshot', api: 2});
     assert.match(replies[0].reason, /^Update zflow: its GNOME extension is older/);
     assert.match(replies[1].reason, /^Update zflow: the app is older/);
-    assert.equal(replies[2].status, 'snapshot', 'agents from before API levels speak API 1');
+    assert.match(replies[2].reason, /^Update zflow: the app is older/, 'agents from before API levels speak API 1');
+    assert.equal(replies[3].status, 'snapshot');
     d.extension.disable();
 }
 {

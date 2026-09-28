@@ -404,6 +404,12 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - The `peer_view` rejection tests still pass.
 - **Size:** about 14 files, 900 to 1300 lines changed.
 - **Risk:** churn. No new features in this phase.
+- **Status (2026-09-28):** the Linux half is done on branch `one-settings-api`.
+  - `src/app/api.rs` holds `Snapshot<P>` (the platform section is a type parameter), `Status`, `Peer`, `Health` and one `Request` enum. Status titles and peer row text come from Rust.
+  - The GNOME agent, panel and settings window use it. Health rows and shortcut rows show on Linux. Nearby records carry `pair_address`, so the 43120 rewrite in `settings.js` is gone.
+  - The GNOME API level went from 1 to 2, because the snapshot changed shape. Phase 3 needs no second raise if it ships in the same release.
+  - Items 8 and 11 wait for Phase 4, since they are new features.
+  - Left for the Mac: `native.rs` builds `api::Snapshot` and matches `api::Request` (`move` becomes `move_tile`, `pair_start` becomes `pair`, `receiver_error` becomes peer states plus health rows, and the Mac-only fields go into its platform struct). Then remove the `allow(dead_code)` at the top of `api.rs`, update `Core.swift`, `SettingsView.swift` and `PairingView.swift` (use `pair_address`), and fix the FFI tests.
 
 ### Phase 2: the Mac receives (Mac)
 

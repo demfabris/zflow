@@ -115,6 +115,12 @@ pub struct DesktopStatus {
     pub connected: Vec<String>,
     pub peers: BTreeMap<String, PeerConfig>,
     pub discovery: bool,
+    /// Evdev key names, for the shortcut rows. A service from before these
+    /// fields leaves them out.
+    #[serde(default)]
+    pub activation_chord: Vec<String>,
+    #[serde(default)]
+    pub escape_chord: Vec<String>,
 }
 
 impl DesktopStatus {
@@ -126,6 +132,8 @@ impl DesktopStatus {
             connected: Vec::new(),
             peers: config.peers.clone(),
             discovery: config.transport.discovery,
+            activation_chord: config.input.activation_chord.clone(),
+            escape_chord: config.input.escape_chord.clone(),
         }
     }
 }
@@ -193,7 +201,7 @@ mod tests {
         config.daemon.state_dir = "/private/identity-location".into();
         config.transport.discovery = false;
         let value = serde_json::to_value(DesktopStatus::from_config(&config)).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 6);
+        assert_eq!(value.as_object().unwrap().len(), 8);
         assert!(value.get("peers").is_some());
         assert_eq!(value["discovery"], false);
         assert!(!value.to_string().contains("identity-location"));

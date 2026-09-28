@@ -1,9 +1,10 @@
 import Adw from 'gi://Adw?version=1';
 import Gtk from 'gi://Gtk?version=4.0';
-import {Client, statusText} from './client.js';
+import {Client, compatible, statusText} from './client.js';
 
 // src/core/keymap.rs KeyboardMode, in dropdown order.
 const KEYBOARD_MODES = ['standard', 'pc_positions', 'mac'];
+const HEALTH_ICONS = {ok: 'object-select-symbolic', warning: 'dialog-warning-symbolic', error: 'dialog-error-symbolic'};
 
 function button(label, action, css = []) {
     const widget = new Gtk.Button({label, valign: Gtk.Align.CENTER, css_classes: css});
@@ -19,6 +20,8 @@ export class Settings {
         this._disposed = false;
         this._peerKey = '';
         this._peerRows = [];
+        this._healthKey = '';
+        this._shortcutKey = '';
         this._keyboards = new Map();
         this._controls = new Map();
         // Rows are rebuilt when a computer connects, so remember which are open.
@@ -35,11 +38,21 @@ export class Settings {
         });
         sharing.add(this._sharing);
         this.page.add(sharing);
+        this._health = new Adw.PreferencesGroup({title: 'Checks', visible: false});
+        this.page.add(this._health);
+        // Requests that failed; checks that fail are in the group above.
+        this._errorGroup = new Adw.PreferencesGroup({visible: false});
+        this._error = new Adw.ActionRow({title: 'Needs attention', subtitle_lines: 0});
+        this._error.add_prefix(new Gtk.Image({icon_name: 'dialog-warning-symbolic'}));
+        this._errorGroup.add(this._error);
+        this.page.add(this._errorGroup);
 
         this._computers = new Adw.PreferencesGroup({title: 'Computers', description: 'Arrange computers in zflow on the other computer.'});
         this._pairButton = button('Pair Computer…', () => this._openPairing(), ['suggested-action']);
         this._computers.header_suffix = this._pairButton;
         this.page.add(this._computers);
+        this._shortcuts = new Adw.PreferencesGroup({title: 'Shortcuts', visible: false});
+        this.page.add(this._shortcuts);
         const preferences = new Adw.PreferencesGroup();
         this._login = new Adw.SwitchRow({title: 'Start at Login', subtitle: 'Keep zflow available after you close settings.'});
         this._login.connect('notify::active', () => {
@@ -47,13 +60,8 @@ export class Settings {
         });
         preferences.add(this._login);
         this.page.add(preferences);
-        this._errorGroup = new Adw.PreferencesGroup({visible: false});
-        this._error = new Adw.ActionRow({title: 'Needs attention', subtitle_lines: 0});
-        this._error.add_prefix(new Gtk.Image({icon_name: 'dialog-warning-symbolic'}));
-        this._errorGroup.add(this._error);
-        this.page.add(this._errorGroup);
-        const help = new Adw.PreferencesGroup({description: 'Changes save automatically. Advanced input and network settings remain in /etc/zflow/zflow.toml.'});
-        this.page.add(help);
+        this._help = new Adw.PreferencesGroup();
+        this.page.add(this._help);
         this.client = new Client(snapshot => this._update(snapshot), true);
         this.client.start();
     }
@@ -83,32 +91,61 @@ export class Settings {
 
     _update(snapshot) {
         if (this._disposed) return;
+        // An agent from another API level sends a snapshot this window cannot read.
+        const known = compatible(snapshot);
+        const online = known && snapshot.sharing !== null;
+        const state = known ? snapshot.status.state : 'attention';
         this._updating = true;
-        const daemon = snapshot.daemon;
         this._status.title = statusText(snapshot);
-        this._status.subtitle = snapshot.error || (!snapshot.desktop_ready && daemon?.sharing ? snapshot.desktop : 'Share your keyboard, pointer, and trackpad.');
-        this._statusIcon.icon_name = !daemon || (!snapshot.desktop_ready && daemon.sharing) ? 'dialog-warning-symbolic' : 'input-mouse-symbolic';
-        this._sharing.active = daemon?.sharing ?? false;
-        this._sharing.sensitive = !!daemon && !this._busy;
-        this._login.active = snapshot.autostart ?? false;
-        this._login.sensitive = snapshot.autostart !== undefined && !this._busy;
-        this._pairButton.sensitive = !!daemon && !this._busy && !this._pairing;
+        this._statusIcon.icon_name = state === 'attention' ? 'dialog-warning-symbolic'
+            : state === 'paused' ? 'media-playback-pause-symbolic' : 'input-mouse-symbolic';
+        this._sharing.active = online && snapshot.sharing;
+        this._sharing.sensitive = online && !this._busy;
+        this._login.active = (known && snapshot.autostart) ?? false;
+        this._login.sensitive = known && snapshot.autostart !== null && !this._busy;
+        this._pairButton.sensitive = online && !this._busy && !this._pairing;
         this._updating = false;
-        this._error.subtitle = this._actionError || snapshot.error || '';
+        this._error.subtitle = this._actionError || (known ? '' : snapshot?.error ?? 'Update zflow so this window and the service match.');
         this._errorGroup.visible = !!this._error.subtitle;
+        this._help.description = `Changes save automatically. Advanced settings are in ${known ? snapshot.config_path : '/etc/zflow/zflow.toml'}.`;
+        this._updateHealth(known ? snapshot.health : []);
+        this._updatePeers(known ? snapshot.peers : []);
+        this._updateShortcuts(known ? snapshot.shortcuts : []);
+        // A fresh install opens pairing with its code on screen, so the other
+        // computer can pair without anyone clicking through settings here.
+        if (online && !this._checkedFirstRun) {
+            this._checkedFirstRun = true;
+            if (!snapshot.peers.length) this._openPairing();
+        }
+        this._updatePairing(known ? snapshot : {});
+    }
+
+    _updateHealth(rows) {
+        const key = JSON.stringify(rows);
+        if (key === this._healthKey) return;
+        this._healthKey = key;
+        for (const row of this._healthRows ?? []) this._health.remove(row);
+        this._healthRows = rows.map(({level, title, detail, action}) => {
+            const row = new Adw.ActionRow({title, subtitle: detail, subtitle_lines: 0, use_markup: false});
+            row.add_prefix(new Gtk.Image({icon_name: HEALTH_ICONS[level] ?? HEALTH_ICONS.warning}));
+            if (action) row.add_suffix(button(action.label, () => this._run({command: action.command})));
+            this._health.add(row);
+            return row;
+        });
+        this._health.visible = rows.length > 0;
+    }
+
+    _updatePeers(peers) {
         // Keep rows and keyboard focus stable while unchanged snapshots arrive.
         // A keyboard or permission change only moves its control, below.
-        const peers = Object.entries(daemon?.peers ?? {}).map(([name, {keyboard: _keyboard, permissions: _permissions, ...record}]) => [name, record]);
-        const key = JSON.stringify([peers, daemon?.connected, daemon?.receiving_from, daemon?.sending_to]);
+        const key = JSON.stringify(peers.map(({keyboard: _keyboard, allow_control: _control, ...peer}) => peer));
         if (key !== this._peerKey) {
             this._peerKey = key;
             for (const row of this._peerRows) this._computers.remove(row);
             this._peerRows = [];
             this._keyboards.clear();
             this._controls.clear();
-            for (const [name] of Object.entries(daemon?.peers ?? {})) {
-                const detail = daemon.receiving_from === name ? 'Controlling this computer' : daemon.sending_to === name ? 'Controlled from here'
-                    : daemon.connected.includes(name) ? 'Connected' : 'Paired';
+            for (const {name, detail} of peers) {
                 const row = new Adw.ExpanderRow({title: name, subtitle: detail, use_markup: false, expanded: this._expanded.has(name)});
                 row.connect('notify::expanded', () => row.expanded ? this._expanded.add(name) : this._expanded.delete(name));
                 row.add_prefix(new Gtk.Image({icon_name: 'computer-symbolic'}));
@@ -137,21 +174,28 @@ export class Settings {
             }
         }
         this._updating = true;
-        for (const [name, keyboard] of this._keyboards) {
-            const peer = daemon.peers[name];
-            keyboard.selected = Math.max(0, KEYBOARD_MODES.indexOf(peer.keyboard ?? 'standard'));
+        for (const {name, keyboard: mode, allow_control} of peers) {
+            const keyboard = this._keyboards.get(name);
             const control = this._controls.get(name);
-            control.active = !!peer.permissions?.send_normal;
+            keyboard.selected = Math.max(0, KEYBOARD_MODES.indexOf(mode));
+            control.active = allow_control;
             keyboard.sensitive = control.sensitive = !this._busy;
         }
         this._updating = false;
-        // A fresh install opens pairing with its code on screen, so the Mac
-        // can pair without anyone clicking through settings here.
-        if (daemon && !this._checkedFirstRun) {
-            this._checkedFirstRun = true;
-            if (!Object.keys(daemon.peers ?? {}).length) this._openPairing();
-        }
-        this._updatePairing(snapshot);
+    }
+
+    _updateShortcuts(shortcuts) {
+        const key = JSON.stringify(shortcuts);
+        if (key === this._shortcutKey) return;
+        this._shortcutKey = key;
+        for (const row of this._shortcutRows ?? []) this._shortcuts.remove(row);
+        this._shortcutRows = shortcuts.map(({title, keys}) => {
+            const row = new Adw.ActionRow({title, use_markup: false});
+            row.add_suffix(new Gtk.Label({label: keys, css_classes: ['dim-label', 'monospace']}));
+            this._shortcuts.add(row);
+            return row;
+        });
+        this._shortcuts.visible = shortcuts.length > 0;
     }
 
     _forget(name) {
@@ -222,7 +266,7 @@ export class Settings {
     }
 
     _listen() {
-        return this._startPair({command: 'pair', remote: null});
+        return this._startPair({command: 'pair', address: null});
     }
 
     _respond(allow) {
@@ -232,7 +276,7 @@ export class Settings {
     _connect(remote, code) {
         remote = remote.trim();
         if (!remote) { this._showError('Enter the other computer’s IP address.'); return Promise.resolve(false); }
-        return this._startPair({command: 'pair', remote, code: code.replace(/[\s-]/g, '')});
+        return this._startPair({command: 'pair', address: remote, code: code.replace(/[\s-]/g, '')});
     }
 
     async _startPair(request) {
@@ -276,7 +320,8 @@ export class Settings {
         ui.stage.title = pairing.state === 'approving' ? 'Waiting for the other computer…' : connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
         ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange the computers in zflow on the other computer.'
             : pairing.state === 'approving' ? 'Choose Allow on the other computer.' : connecting ? '' : issue || '';
-        const key = JSON.stringify([snapshot.nearby, snapshot.discovery_error]);
+        const discovery = snapshot.health?.find(row => row.id === 'discovery')?.detail;
+        const key = JSON.stringify([snapshot.nearby, discovery]);
         if (key !== ui.nearbyKey) {
             ui.nearbyKey = key;
             for (const row of ui.rows) ui.nearby.remove(row);
@@ -286,17 +331,16 @@ export class Settings {
                 const separator = address.lastIndexOf(':');
                 const row = new Adw.ActionRow({title: address.slice(0, separator), subtitle: record.compatible ? 'Available on your network' : 'Update zflow on this computer', use_markup: false});
                 const use = button('Use', () => {
-                    // Receivers advertise their input port; pairing listens on 43120.
-                    ui.remote.text = `${address.slice(0, separator)}:43120`;
+                    ui.remote.text = record.pair_address;
                     ui.entered.grab_focus();
                 });
-                use.sensitive = record.compatible;
+                use.sensitive = record.compatible && !!record.pair_address;
                 row.add_suffix(use);
                 ui.nearby.add(row);
                 ui.rows.push(row);
             }
             if (!ui.rows.length) {
-                const row = new Adw.ActionRow({title: 'No other computers found', subtitle: snapshot.discovery_error || 'You can enter an address instead.', subtitle_lines: 0});
+                const row = new Adw.ActionRow({title: 'No other computers found', subtitle: discovery || 'You can enter an address instead.', subtitle_lines: 0});
                 ui.nearby.add(row);
                 ui.rows.push(row);
             }

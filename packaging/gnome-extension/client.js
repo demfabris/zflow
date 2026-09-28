@@ -5,7 +5,7 @@ const BUS = 'io.zflow.Desktop';
 const PATH = '/io/zflow/Desktop';
 // src/app/gnome.rs mirrors this. The extension comes from extensions.gnome.org
 // and the agent from the zflow package, so they can be updated at different times.
-export const API = 1;
+export const API = 2;
 
 // Agents older than API 1 did not report it and speak API 1.
 export function compatible(snapshot) {
@@ -15,13 +15,12 @@ export function compatible(snapshot) {
 export function statusText(snapshot) {
     if (snapshot?.agent_error) return 'zflow is not running';
     if (!compatible(snapshot)) return 'Update zflow';
-    if (!snapshot?.daemon) return 'Service unavailable';
-    const daemon = snapshot.daemon;
-    if (!daemon.sharing) return 'Sharing paused';
-    if (!snapshot.desktop_ready) return 'Desktop needs attention';
-    if (daemon.receiving_from) return `Controlled by ${daemon.receiving_from}`;
-    if (daemon.sending_to) return `Controlling ${daemon.sending_to}`;
-    return Object.keys(daemon.peers).length ? 'Ready to share' : 'Pair a computer to get started';
+    return snapshot.status.title;
+}
+
+// Whether something has to be fixed before input can move.
+export function needsAttention(snapshot) {
+    return !compatible(snapshot) || snapshot.health.some(row => row.level === 'error');
 }
 
 export class Client {

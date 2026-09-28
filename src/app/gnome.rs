@@ -1,11 +1,11 @@
 //! Session service shared by the GNOME panel and GTK settings window.
 use super::{
+    api::{self, Health, Level, Peer, PeerState, Request, Shortcut, Status},
     desktop::DesktopReceiver,
     nearby::{BrowserStatus, NearbyBrowser},
     pairing::Pairing,
 };
-use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -15,8 +15,10 @@ pub const BUS: &str = "io.zflow.Desktop";
 const PATH: &str = "/io/zflow/Desktop";
 /// packaging/gnome-extension/client.js mirrors this. Raise both when the agent
 /// and the extension stop understanding each other.
-pub(super) const API: u32 = 1;
+pub(super) const API: u32 = 2;
 const AUTOSTART: &str = "autostart/io.zflow.desktop-agent.desktop";
+/// Where the package keeps the service's settings.
+const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";
 
 #[derive(Default)]
 pub(super) struct State {
@@ -26,42 +28,6 @@ pub(super) struct State {
 }
 
 pub(super) struct Service(pub Arc<Mutex<State>>);
-
-#[derive(Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-enum Request {
-    Snapshot,
-    SetSharing {
-        enabled: bool,
-    },
-    SetAutostart {
-        enabled: bool,
-    },
-    Forget {
-        name: String,
-    },
-    /// Extensions from extensions.gnome.org can lag the package and still
-    /// send `set_keyboard` with `mode`.
-    #[serde(alias = "set_keyboard")]
-    SetPeer {
-        name: String,
-        allow_control: Option<bool>,
-        #[serde(alias = "mode")]
-        keyboard: Option<crate::core::KeyboardMode>,
-    },
-    Pair {
-        /// Absent to listen; otherwise an IP address, with the port optional.
-        remote: Option<String>,
-        /// The code shown on the other computer, when connecting.
-        code: Option<String>,
-    },
-    PairRespond {
-        allow: bool,
-    },
-    PairCancel,
-    OpenSettings,
-    InstallExtension,
-}
 
 #[zbus::interface(name = "io.zflow.Desktop")]
 impl Service {
@@ -82,21 +48,10 @@ impl Service {
             Request::Snapshot => {
                 let daemon = crate::peer_view::status().await;
                 let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-                let nearby = state.nearby.snapshot();
-                let (daemon, error) = match daemon {
-                    Ok(value) => (Some(value), None),
-                    Err(error) => (None, Some(format!("{error:#}"))),
-                };
-                return Ok(serde_json::json!({
-                    "api": API,
-                    "daemon": daemon, "error": error,
-                    "desktop": state.receiver.status(),
-                    "desktop_ready": state.receiver.is_ready(),
-                    "pairing": state.pairing.snapshot(),
-                    "nearby": nearby.records.values().collect::<Vec<_>>(),
-                    "discovery_error": match nearby.status { BrowserStatus::Failed(error) => Some(error), _ => None },
-                    "autostart": autostart_enabled()?,
-                }));
+                let mut value = serde_json::to_value(snapshot(daemon, &state)?)?;
+                // The panel reads the level before anything else.
+                value["api"] = API.into();
+                return Ok(value);
             }
             Request::SetSharing { enabled } => {
                 crate::peer_view::request(&DaemonRequest::SetSharing { enabled }).await?;
@@ -117,8 +72,8 @@ impl Service {
                 .await?;
             }
             Request::SetAutostart { enabled } => set_autostart(enabled)?,
-            Request::Pair { remote, code } => {
-                let remote = remote
+            Request::Pair { address, code } => {
+                let remote = address
                     .as_deref()
                     .map(crate::pairing::parse_pairing_address)
                     .transpose()?;
@@ -151,9 +106,140 @@ impl Service {
                 let running = super::desktop::install_extension(Some(&connection)).await?;
                 return Ok(serde_json::json!({"ok": true, "running": running}));
             }
+            // The agent restarts the desktop connection by itself, and the
+            // layout editor comes with sending from this computer.
+            Request::Retry
+            | Request::MoveTile { .. }
+            | Request::Reload
+            | Request::SetAwdl { .. }
+            | Request::HelperReady { .. }
+            | Request::AllowAccessibility
+            | Request::CheckAccessibility
+            | Request::Discover => bail!("Not available on this computer"),
         }
         Ok(serde_json::json!({"ok": true}))
     }
+}
+
+/// What the settings window and the panel show. Linux has no rows of its
+/// own under the shared ones yet.
+fn snapshot(
+    daemon: Result<crate::peer_view::DesktopStatus>,
+    state: &State,
+) -> Result<api::Snapshot<()>> {
+    let nearby = state.nearby.snapshot();
+    let mut health = Vec::new();
+    let (sharing, peers, shortcuts) = match &daemon {
+        Ok(daemon) => {
+            health.push(Health::new(
+                "service",
+                Level::Ok,
+                "Background service",
+                "Running",
+            ));
+            let ready = state.receiver.is_ready();
+            health.push(Health::new(
+                "desktop",
+                if ready || !daemon.sharing {
+                    Level::Ok
+                } else {
+                    Level::Error
+                },
+                "GNOME desktop",
+                state.receiver.status(),
+            ));
+            (Some(daemon.sharing), peers(daemon), shortcuts(daemon))
+        }
+        Err(error) => {
+            health.push(Health::new(
+                "service",
+                Level::Error,
+                "Background service",
+                format!("{error:#}"),
+            ));
+            (None, Vec::new(), Vec::new())
+        }
+    };
+    if let BrowserStatus::Failed(error) = nearby.status {
+        health.push(Health::new(
+            "discovery",
+            Level::Warning,
+            "Nearby computers",
+            error,
+        ));
+    }
+    Ok(api::Snapshot {
+        status: Status::new(sharing, &peers, &health, false),
+        sharing,
+        health,
+        layout: None,
+        peers,
+        pairing: state.pairing.snapshot(),
+        nearby: nearby.records.into_values().collect(),
+        shortcuts,
+        autostart: Some(autostart_enabled()?),
+        config_path: CONFIG_PATH.into(),
+        platform: (),
+    })
+}
+
+fn peers(daemon: &crate::peer_view::DesktopStatus) -> Vec<Peer> {
+    let is = |peer: &Option<String>, name: &str| peer.as_deref() == Some(name);
+    daemon
+        .peers
+        .iter()
+        .map(|(name, record)| {
+            let state = if is(&daemon.receiving_from, name) {
+                PeerState::ControllingThis
+            } else if is(&daemon.sending_to, name) {
+                PeerState::ControlledFromHere
+            } else if daemon.connected.contains(name) {
+                PeerState::Connected
+            } else {
+                PeerState::Paired
+            };
+            Peer::new(name, record, state)
+        })
+        .collect()
+}
+
+fn shortcuts(daemon: &crate::peer_view::DesktopStatus) -> Vec<Shortcut> {
+    [
+        ("Switch to the other computer", &daemon.activation_chord),
+        ("Return input to this computer", &daemon.escape_chord),
+    ]
+    .into_iter()
+    .map(|(title, keys)| Shortcut {
+        title: title.into(),
+        keys: chord_label(keys),
+    })
+    .collect()
+}
+
+/// Evdev key names as people read them: KEY_LEFTMETA is the Super key.
+fn chord_label(keys: &[String]) -> String {
+    keys.iter()
+        .map(|key| {
+            let key = key.trim_start_matches("KEY_");
+            let key = key
+                .strip_prefix("LEFT")
+                .or_else(|| key.strip_prefix("RIGHT"))
+                .unwrap_or(key);
+            match key {
+                "CTRL" => "Ctrl".into(),
+                "META" => "Super".into(),
+                "ALT" => "Alt".into(),
+                "SHIFT" => "Shift".into(),
+                key => {
+                    let mut chars = key.chars();
+                    chars.next().map_or_else(String::new, |first| {
+                        first.to_string() + &chars.as_str().to_lowercase()
+                    })
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 pub(super) async fn connect(state: Arc<Mutex<State>>) -> Result<zbus::Connection> {
@@ -417,30 +503,74 @@ mod tests {
     }
 
     #[test]
-    fn older_extensions_still_change_the_keyboard_mode() {
-        use crate::core::KeyboardMode;
-        let parse = |json| serde_json::from_str::<Request>(json).unwrap();
-        assert!(matches!(
-            parse(r#"{"command":"set_keyboard","name":"desk","mode":"mac"}"#),
-            Request::SetPeer {
-                allow_control: None,
-                keyboard: Some(KeyboardMode::Mac),
-                ..
-            }
-        ));
-        assert!(matches!(
-            parse(r#"{"command":"set_peer","name":"desk","allow_control":false}"#),
-            Request::SetPeer {
-                allow_control: Some(false),
-                keyboard: None,
-                ..
-            }
-        ));
-        assert!(
-            serde_json::from_str::<Request>(
-                r#"{"command":"set_peer","name":"desk","inject_prelogin":true}"#
-            )
-            .is_err()
+    fn the_service_state_becomes_peer_and_health_rows() {
+        let mut config = crate::config::Config::default();
+        for name in ["desk", "mac", "old"] {
+            config.peers.insert(
+                name.into(),
+                crate::config::PeerConfig {
+                    spki_der_hex: "01".into(),
+                    addresses: Vec::new(),
+                    permissions: crate::config::PeerPermissions {
+                        connect: true,
+                        send_normal: name != "old",
+                        receive_normal: true,
+                        inject_prelogin: false,
+                    },
+                    keyboard: crate::core::KeyboardMode::Standard,
+                },
+            );
+        }
+        let status = crate::peer_view::DesktopStatus {
+            receiving_from: Some("mac".into()),
+            connected: vec!["desk".into(), "mac".into()],
+            ..crate::peer_view::DesktopStatus::from_config(&config)
+        };
+        let rows: Vec<_> = peers(&status)
+            .into_iter()
+            .map(|peer| (peer.name, peer.state, peer.allow_control))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("desk".into(), PeerState::Connected, true),
+                ("mac".into(), PeerState::ControllingThis, true),
+                ("old".into(), PeerState::Paired, false),
+            ]
+        );
+        assert_eq!(
+            shortcuts(&status)[1].keys,
+            "Ctrl+Super+Backspace",
+            "the default escape chord"
+        );
+
+        let down = snapshot(
+            Err(anyhow::anyhow!("Start the zflow system service")),
+            &State::default(),
+        )
+        .unwrap();
+        assert_eq!(down.sharing, None);
+        assert_eq!(down.status.state, api::State::Attention);
+        assert_eq!(down.health[0].level, Level::Error);
+        assert_eq!(down.health[0].detail, "Start the zflow system service");
+        assert!(down.peers.is_empty() && down.shortcuts.is_empty());
+    }
+
+    #[test]
+    fn chords_read_like_keys() {
+        let keys = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            chord_label(&keys(&["KEY_LEFTCTRL", "KEY_LEFTMETA", "KEY_F12"])),
+            "Ctrl+Super+F12"
+        );
+        assert_eq!(
+            chord_label(&keys(&["KEY_RIGHTALT", "KEY_LEFTSHIFT", "KEY_BACKSPACE"])),
+            "Alt+Shift+Backspace"
         );
     }
 
