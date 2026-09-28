@@ -439,6 +439,13 @@ impl Desk for MacDesk {
         self.sessions
             .close(peer, Some(session_id), SessionCloseReason::LeaseExpired);
     }
+
+    fn current(&self, peer: &str, session_id: u64) -> bool {
+        self.sessions
+            .lock()
+            .get(peer)
+            .is_some_and(|session| session.id() == session_id)
+    }
 }
 
 /// Who may control this Mac, and how.
@@ -802,14 +809,18 @@ impl Drop for Inbound {
     fn drop(&mut self) {
         self.release();
         let id = self.session.id();
-        self.receiving.handoff.closed(&self.peer, id);
-        let mut sessions = self.receiving.sessions.lock();
-        if sessions
-            .get(&self.peer)
-            .is_some_and(|session| session.id() == id)
         {
-            sessions.remove(&self.peer);
+            let mut sessions = self.receiving.sessions.lock();
+            if sessions
+                .get(&self.peer)
+                .is_some_and(|session| session.id() == id)
+            {
+                sessions.remove(&self.peer);
+            }
         }
+        // After the session is gone, so a Prepare still on its way either
+        // started its handoff before this ends it, or finds the session gone.
+        self.receiving.handoff.closed(&self.peer, id);
     }
 }
 

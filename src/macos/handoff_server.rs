@@ -52,6 +52,8 @@ pub(crate) trait Desk: Send + Sync + 'static {
     fn wake(&self);
     /// Ends a session whose handoff lapsed.
     fn close(&self, peer: &str, session_id: u64);
+    /// Whether `session_id` is still `peer`'s open session.
+    fn current(&self, peer: &str, session_id: u64) -> bool;
 }
 
 /// A stretch of an edge with a display behind it, in points along the edge.
@@ -360,6 +362,11 @@ impl<D: Desk> HandoffServer<D> {
         };
         {
             let mut lease = self.lease();
+            // A request can outlive its session, whose close ended any
+            // handoff before this one could start.
+            if !self.desk.current(peer, session_id) {
+                return DesktopResponse::unavailable(ENDED);
+            }
             let guard = match self.ownership.begin_lease(peer, session_id) {
                 Ok(guard) => guard,
                 Err(reason) => return DesktopResponse::unavailable(reason),
@@ -695,6 +702,8 @@ mod tests {
         releases: usize,
         wakes: usize,
         closed: Vec<(String, u64)>,
+        /// Sessions that ended before their request was answered.
+        ended: Vec<(String, u64)>,
     }
 
     #[derive(Clone)]
@@ -742,6 +751,10 @@ mod tests {
 
         fn close(&self, peer: &str, session_id: u64) {
             self.state().closed.push((peer.to_owned(), session_id));
+        }
+
+        fn current(&self, peer: &str, session_id: u64) -> bool {
+            !self.state().ended.contains(&(peer.to_owned(), session_id))
         }
     }
 
@@ -973,6 +986,22 @@ mod tests {
         assert_eq!(ownership.controller(), None);
         assert_eq!(desk.state().releases, 1);
         assert!(desk.state().closed.is_empty(), "it is closed already");
+    }
+
+    #[tokio::test]
+    async fn a_prepare_that_outlives_its_session_takes_nothing() {
+        let (server, desk, ownership) = setup(single());
+        desk.state().ended.push(("linux".to_owned(), 1));
+        assert_eq!(
+            server.request("linux", 1, prepare(7)).await,
+            unavailable(ENDED)
+        );
+        assert_eq!(ownership.controller(), None);
+        assert!(desk.state().moves.is_empty());
+        assert!(matches!(
+            server.request("linux", 2, prepare(8)).await,
+            DesktopResponse::Prepared { .. }
+        ));
     }
 
     #[tokio::test]
