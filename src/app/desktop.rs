@@ -169,7 +169,10 @@ async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Res
     awake.set(connection, false).await;
     for request in [
         crate::peer_view::LocalRequest::Sending { active: false },
-        crate::peer_view::LocalRequest::Edges { edges: Vec::new() },
+        crate::peer_view::LocalRequest::Edges {
+            edges: Vec::new(),
+            pause_ms: 0,
+        },
     ] {
         let _ = call(&proxy, &crate::peer_view::AgentRequest::Local(request)).await;
     }

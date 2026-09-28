@@ -23,6 +23,8 @@ pub(super) struct Snapshot<P> {
     pub peers: Vec<Peer>,
     pub pairing: PairingSnapshot,
     pub nearby: Vec<NearbyRecord>,
+    /// None where crossings cannot pause yet.
+    pub pause_at_edges: Option<bool>,
     pub shortcuts: Vec<Shortcut>,
     /// None where the app keeps it, as the Mac app does with its login item.
     pub autostart: Option<bool>,
@@ -224,6 +226,9 @@ pub(crate) enum Request {
     PairCancel,
     /// Checks the other computers again now.
     Retry,
+    SetSwitching {
+        pause_at_edges: bool,
+    },
     SetAutostart {
         enabled: bool,
     },
@@ -358,6 +363,7 @@ mod tests {
             peers: Vec::new(),
             pairing: PairingSnapshot::default(),
             nearby: Vec::new(),
+            pause_at_edges: None,
             shortcuts: Vec::new(),
             autostart: None,
             config_path: "/etc/zflow/zflow.toml".into(),
@@ -373,6 +379,7 @@ mod tests {
             "peers",
             "pairing",
             "nearby",
+            "pause_at_edges",
             "shortcuts",
             "autostart",
             "config_path",

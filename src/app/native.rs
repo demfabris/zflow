@@ -185,6 +185,7 @@ impl NativeApp {
             // accepts input (ROADMAP Phase 2). The app keeps the login item.
             Request::SetPeer { .. }
             | Request::SetAutostart { .. }
+            | Request::SetSwitching { .. }
             | Request::OpenSettings
             | Request::InstallExtension => bail!("Not available on this computer"),
         }
@@ -526,6 +527,7 @@ impl NativeApp {
             peers,
             pairing: self.pairing.snapshot(),
             nearby: nearby.records.into_values().collect(),
+            pause_at_edges: None,
             shortcuts: vec![Shortcut {
                 title: "Return input to this computer".into(),
                 keys: "⌃⌘⌫".into(),

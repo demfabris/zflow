@@ -37,7 +37,7 @@ const layout = {monitors: [
 const snapshot = {
     api: 2, status: ready, sharing: true,
     health: [{id: 'service', level: 'ok', title: 'Background service', detail: 'Running', action: null}],
-    layout, peers: [peer('MacBook')], pairing: {state: 'idle'}, nearby: [],
+    layout, peers: [peer('MacBook')], pairing: {state: 'idle'}, nearby: [], pause_at_edges: false,
     shortcuts: [{title: 'Return input to this computer', keys: 'Ctrl+Super+Backspace'}],
     autostart: true, config_path: '/etc/zflow/zflow.toml', platform: null,
 };
@@ -62,6 +62,7 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
             snapshot.status = request.enabled ? ready : {state: 'paused', peer: null, title: 'Paused'};
             break;
         case 'set_autostart': snapshot.autostart = request.enabled; break;
+        case 'set_switching': snapshot.pause_at_edges = request.pause_at_edges; break;
         case 'forget': snapshot.peers = snapshot.peers.filter(peer => peer.name !== request.name); break;
         case 'set_peer': {
             const peer = find(request.name);
@@ -200,6 +201,9 @@ app.connect('activate', () => {
         await waitFor(() => control.active);
         assert(controlCalls === 1, 'a snapshot moves the switch without sending a request');
         assert(settings._peerRows[0] === firstRow, 'a permission change keeps the row');
+        assert(!settings._pause.active && settings._pause.sensitive, 'crossings do not pause by default');
+        settings._pause.active = true;
+        await waitFor(() => snapshot.pause_at_edges && !settings._busy && settings._pause.sensitive);
         const scroll = settings._scrolls.get('MacBook');
         assert(!scroll.active, 'scrolling starts the right way round');
         scroll.active = true;
@@ -282,7 +286,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, reverse scrolling, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
+        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, reverse scrolling, pause at edges, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

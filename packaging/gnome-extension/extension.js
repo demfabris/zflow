@@ -64,7 +64,10 @@ export default class ZflowExtension extends Extension {
         this._barriers = [];
         // Edges that lead to another computer, and their barriers.
         this._edges = [];
+        this._pauseMs = 0;
         this._outbound = [];
+        // Pushes waiting out the pause before they cross.
+        this._waits = new Set();
         this._hidden = false;
         this._idles = new Set();
         // Only the desktop agent may read the pointer or move it. This skips GNOME's
@@ -134,6 +137,8 @@ export default class ZflowExtension extends Extension {
     _placeEdges() {
         for (const barrier of this._outbound) barrier.destroy();
         this._outbound = [];
+        for (const id of this._waits) GLib.Source.remove(id);
+        this._waits.clear();
         const ms = Main.layoutManager.monitors;
         if (!this._edges.length || !ms.length || (global.backend.capabilities & Meta.BackendCapabilities.BARRIERS) === 0)
             return;
@@ -150,12 +155,36 @@ export default class ZflowExtension extends Extension {
                 // each push once. While another computer controls this one, its
                 // own return barrier on this edge answers instead.
                 let push = null;
+                let latest = 0;
+                let waiting = 0;
+                const report = position => {
+                    if (!this._lease && this._agent)
+                        Gio.DBus.session.emit_signal(this._agent, PATH, BUS, 'EdgeHit', new GLib.Variant('(su)', [edge, position]));
+                };
                 barrier.connect('hit', (_barrier, event) => {
-                    if (this._lease || !this._agent || event.event_id === push) return;
-                    push = event.event_id;
+                    if (this._lease || !this._agent) return;
                     const axis = g.vertical ? event.y : event.x;
-                    const position = Math.max(start, Math.min(end, Math.round((axis - g.origin) * MAX / g.span)));
-                    Gio.DBus.session.emit_signal(this._agent, PATH, BUS, 'EdgeHit', new GLib.Variant('(su)', [edge, position]));
+                    latest = Math.max(start, Math.min(end, Math.round((axis - g.origin) * MAX / g.span)));
+                    if (event.event_id === push) return;
+                    push = event.event_id;
+                    if (!this._pauseMs) {
+                        report(latest);
+                        return;
+                    }
+                    // The pointer has to rest here a moment; leaving cancels it.
+                    waiting = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._pauseMs, () => {
+                        this._waits.delete(waiting);
+                        waiting = 0;
+                        report(latest);
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    this._waits.add(waiting);
+                });
+                barrier.connect('left', () => {
+                    if (!waiting) return;
+                    GLib.Source.remove(waiting);
+                    this._waits.delete(waiting);
+                    waiting = 0;
                 });
                 this._outbound.push(barrier);
             }
@@ -222,14 +251,17 @@ export default class ZflowExtension extends Extension {
             return {status: 'finished'};
         }
         if (r.command === 'edges') {
+            const pauseMs = r.pause_ms ?? 0;
             if (!Array.isArray(r.edges) || r.edges.length > 64
-                || !r.edges.every(e => EDGES.includes(e?.edge) && validRange(e.start, e.end)))
+                || !r.edges.every(e => EDGES.includes(e?.edge) && validRange(e.start, e.end))
+                || !Number.isSafeInteger(pauseMs) || pauseMs < 0 || pauseMs > 2000)
                 throw new Error('Invalid outbound edges');
             const edges = r.edges.map(({edge, start, end}) => ({edge, start, end}));
             // Rebuilding would forget the push in progress, so a pointer still
             // resting on the barrier after a return would cross again.
-            if (JSON.stringify(edges) !== JSON.stringify(this._edges)) {
+            if (JSON.stringify(edges) !== JSON.stringify(this._edges) || pauseMs !== this._pauseMs) {
                 this._edges = edges;
+                this._pauseMs = pauseMs;
                 this._placeEdges();
             }
             return {status: 'finished'};

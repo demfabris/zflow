@@ -477,7 +477,8 @@ impl Shared {
             .map(|layout| desktop::outbound_edges(&layout))
             .unwrap_or_default();
         tracing::info!(edges = edges.len(), "outbound edges placed");
-        desktop::set_edges(self, edges);
+        let pause = self.config.read().await.switching.pause_at_edges;
+        desktop::set_edges(self, edges, pause);
     }
 
     /// Sends a peer the layout this computer keeps, if it has one.

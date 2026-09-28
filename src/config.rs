@@ -27,6 +27,16 @@ pub struct Config {
     pub playout: PlayoutConfig,
     pub peers: BTreeMap<String, PeerConfig>,
     pub macos: MacosConfig,
+    pub switching: SwitchingConfig,
+}
+
+/// How crossings start, the same on every platform.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SwitchingConfig {
+    /// The pointer has to rest against an edge for a moment before it
+    /// crosses, so reaching for something at the screen edge stays here.
+    pub pause_at_edges: bool,
 }
 
 impl Default for Config {
@@ -39,6 +49,7 @@ impl Default for Config {
             playout: PlayoutConfig::default(),
             peers: BTreeMap::new(),
             macos: MacosConfig::default(),
+            switching: SwitchingConfig::default(),
         }
     }
 }

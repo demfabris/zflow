@@ -48,6 +48,9 @@ pub enum Request {
     PairRespond {
         allow: bool,
     },
+    SetSwitching {
+        pause_at_edges: bool,
+    },
     /// The pointer pushed against an edge that leads to another computer.
     /// `position` is a fraction of the desktop along that edge, out of
     /// [`FRACTION_MAX`].
@@ -81,7 +84,12 @@ pub enum AgentRequest {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LocalRequest {
     /// Where the pointer leaves for another computer. Replaces the last set.
-    Edges { edges: Vec<OutboundEdge> },
+    /// With `pause_ms`, the pointer has to rest against an edge that long.
+    Edges {
+        edges: Vec<OutboundEdge>,
+        #[serde(default)]
+        pause_ms: u32,
+    },
     /// Hides the pointer and keeps the session awake while this computer's
     /// input goes to another one.
     Sending { active: bool },
@@ -113,7 +121,7 @@ impl AgentRequest {
     pub fn validate(&self) -> anyhow::Result<()> {
         match self {
             Self::Handoff(request) => request.validate(),
-            Self::Local(LocalRequest::Edges { edges }) => {
+            Self::Local(LocalRequest::Edges { edges, .. }) => {
                 anyhow::ensure!(
                     edges.len() <= 64
                         && edges
@@ -202,6 +210,9 @@ pub struct DesktopStatus {
     pub discovery: bool,
     /// Evdev key names, for the shortcut rows. A service from before these
     /// fields leaves them out.
+    /// Whether the pointer has to rest against an edge before it crosses.
+    #[serde(default)]
+    pub pause_at_edges: bool,
     #[serde(default)]
     pub activation_chord: Vec<String>,
     #[serde(default)]
@@ -221,6 +232,7 @@ impl DesktopStatus {
             connected: Vec::new(),
             peers: config.peers.clone(),
             discovery: config.transport.discovery,
+            pause_at_edges: config.switching.pause_at_edges,
             activation_chord: config.input.activation_chord.clone(),
             escape_chord: config.input.escape_chord.clone(),
             layout: None,
@@ -322,7 +334,7 @@ mod tests {
     fn a_peer_cannot_send_local_desktop_requests() {
         for json in [
             r#"{"command":"warp","position":{"x":1,"y":2}}"#,
-            r#"{"command":"edges","edges":[]}"#,
+            r#"{"command":"edges","edges":[],"pause_ms":0}"#,
             r#"{"command":"sending","active":true}"#,
         ] {
             assert!(
@@ -346,6 +358,7 @@ mod tests {
                     start,
                     end,
                 }],
+                pause_ms: 0,
             })
         };
         assert!(edges(0, FRACTION_MAX).validate().is_ok());
@@ -359,7 +372,7 @@ mod tests {
         config.daemon.state_dir = "/private/identity-location".into();
         config.transport.discovery = false;
         let value = serde_json::to_value(DesktopStatus::from_config(&config)).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 9);
+        assert_eq!(value.as_object().unwrap().len(), 10);
         assert!(value.get("peers").is_some());
         assert_eq!(value["discovery"], false);
         assert!(!value.to_string().contains("identity-location"));

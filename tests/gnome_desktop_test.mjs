@@ -51,7 +51,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
             BarrierDirection: {POSITIVE_X: 1, NEGATIVE_X: 2, POSITIVE_Y: 4, NEGATIVE_Y: 8},
             Barrier: class {
                 constructor(properties) {this.properties = properties; barriers.push(this);}
-                connect(_name, fn) {this.hit = fn;}
+                connect(name, fn) {this[name] = fn;}
                 destroy() {this.destroyed = true;}
             },
         },
@@ -386,4 +386,27 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     assert.equal(tracker.count, 0, 'disable shows the pointer again');
     assert.ok(d.barriers.every(b => b.destroyed));
 }
-console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller, terminal focus, outbound edges, pointer hiding, warp, API and cleanup checks passed');
+{
+    // With a pause, a push crosses only after the pointer rests against the edge.
+    const d = desktop();
+    await d.extension._request({command: 'edges', edges: [{edge: 'left', start: 0, end: 1000000}], pause_ms: 250});
+    await assert.rejects(d.extension._request({command: 'edges', edges: [], pause_ms: 5000}), /Invalid outbound edges/);
+    const barrier = d.barriers[0];
+    const hits = () => d.emitted.filter(args => args[3] === 'EdgeHit').map(args => [...args[4].value]);
+    barrier.hit(barrier, {x: 0, y: 270, event_id: 1});
+    d.advance(200);
+    barrier.hit(barrier, {x: 0, y: 540, event_id: 1});
+    assert.deepEqual(hits(), [], 'still resting');
+    d.advance(50);
+    assert.deepEqual(hits(), [['left', 500000]], 'crosses where the pointer rests after the pause');
+    barrier.hit(barrier, {x: 0, y: 100, event_id: 2});
+    barrier.left();
+    d.advance(300);
+    assert.equal(hits().length, 1, 'leaving the edge cancels the crossing');
+    barrier.hit(barrier, {x: 0, y: 100, event_id: 3});
+    d.extension.disable();
+    d.advance(300);
+    assert.equal(hits().length, 1, 'disable drops a waiting push');
+    assert.equal(d.timers.size, 0);
+}
+console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller, terminal focus, outbound edges, pause at edges, pointer hiding, warp, API and cleanup checks passed');

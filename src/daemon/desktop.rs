@@ -37,6 +37,8 @@ impl Lease {
 pub(super) struct LocalState {
     /// Edges that lead to another computer, with that computer's name.
     edges: Vec<(OutboundEdge, String)>,
+    /// Whether the pointer has to rest against an edge before it crosses.
+    pause: bool,
     sending: bool,
 }
 
@@ -237,11 +239,15 @@ pub(super) fn outbound_edges(layout: &Layout) -> Vec<(OutboundEdge, String)> {
         .collect()
 }
 
-pub(super) fn set_edges(shared: &Shared, edges: Vec<(OutboundEdge, String)>) {
-    shared
-        .desktop
-        .local
-        .send_modify(|state| state.edges = edges);
+/// How long the pointer rests against an edge when crossings pause there,
+/// as Deskflow's switch delay does.
+const PAUSE_MS: u32 = 250;
+
+pub(super) fn set_edges(shared: &Shared, edges: Vec<(OutboundEdge, String)>, pause: bool) {
+    shared.desktop.local.send_modify(|state| {
+        state.edges = edges;
+        state.pause = pause;
+    });
 }
 
 pub(super) fn set_sending(shared: &Shared, sending: bool) {
@@ -257,17 +263,18 @@ pub(super) fn start_local_sync(shared: Arc<Shared>) {
     let mut changes = shared.desktop.local.subscribe();
     tokio::spawn(async move {
         loop {
-            let (edges, active) = {
+            let (edges, pause_ms, active) = {
                 let state = changes.borrow_and_update();
                 (
                     state.edges.iter().map(|(range, _)| *range).collect(),
+                    if state.pause { PAUSE_MS } else { 0 },
                     state.sending,
                 )
             };
             // Showing the pointer again matters more than the barriers.
             for request in [
                 LocalRequest::Sending { active },
-                LocalRequest::Edges { edges },
+                LocalRequest::Edges { edges, pause_ms },
             ] {
                 let response = shared
                     .desktop

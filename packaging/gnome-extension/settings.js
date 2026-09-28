@@ -91,6 +91,13 @@ export class Settings {
         this._layout = new Adw.PreferencesRow({title: 'Layout', child: canvas, activatable: false, focusable: false, visible: false});
         this._computers.add(this._layout);
         this.page.add(this._computers);
+        const switching = new Adw.PreferencesGroup();
+        this._pause = new Adw.SwitchRow({title: 'Pause at Edges', subtitle: 'Rest the pointer against an edge for a moment before it crosses.', sensitive: false});
+        this._pause.connect('notify::active', () => {
+            if (!this._updating) this._run({command: 'set_switching', pause_at_edges: this._pause.active});
+        });
+        switching.add(this._pause);
+        this.page.add(switching);
         this._shortcuts = new Adw.PreferencesGroup({title: 'Shortcuts', visible: false});
         this.page.add(this._shortcuts);
         const preferences = new Adw.PreferencesGroup();
@@ -116,7 +123,7 @@ export class Settings {
     async _run(request) {
         if (this._busy) return false;
         this._busy = true;
-        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = false;
+        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = this._pause.sensitive = false;
         for (const row of [...this._keyboards.values(), ...this._controls.values(), ...this._scrolls.values()]) row.sensitive = false;
         this._showError(null);
         let success = false;
@@ -141,6 +148,8 @@ export class Settings {
             : state === 'paused' ? 'media-playback-pause-symbolic' : 'input-mouse-symbolic';
         this._sharing.active = online && snapshot.sharing;
         this._sharing.sensitive = online && !this._busy;
+        this._pause.active = (known && snapshot.pause_at_edges) ?? false;
+        this._pause.sensitive = online && snapshot.pause_at_edges !== null && !this._busy;
         this._login.active = (known && snapshot.autostart) ?? false;
         this._login.sensitive = known && snapshot.autostart !== null && !this._busy;
         this._pairButton.sensitive = online && !this._busy && !this._pairing;

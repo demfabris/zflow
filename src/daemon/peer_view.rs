@@ -129,6 +129,11 @@ async fn desktop_command(
             shared.apply_config_locked(config, true).await?;
             Ok(DesktopReply::Ack)
         }
+        Request::SetSwitching { pause_at_edges } => {
+            config.switching.pause_at_edges = pause_at_edges;
+            shared.apply_config_locked(config, true).await?;
+            Ok(DesktopReply::Ack)
+        }
         Request::Forget { name } => {
             if config.peers.remove(&name).is_none() {
                 bail!("Unknown computer {name}");

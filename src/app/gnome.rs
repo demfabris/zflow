@@ -88,6 +88,9 @@ impl Service {
                 .await?;
             }
             Request::SetAutostart { enabled } => set_autostart(enabled)?,
+            Request::SetSwitching { pause_at_edges } => {
+                crate::peer_view::request(&DaemonRequest::SetSwitching { pause_at_edges }).await?;
+            }
             Request::Pair { address, code } => {
                 let remote = address
                     .as_deref()
@@ -195,6 +198,7 @@ fn snapshot(
         peers,
         pairing: state.pairing.snapshot(),
         nearby: nearby.records.into_values().collect(),
+        pause_at_edges: daemon.as_ref().ok().map(|daemon| daemon.pause_at_edges),
         shortcuts,
         autostart: Some(autostart_enabled()?),
         config_path: CONFIG_PATH.into(),
