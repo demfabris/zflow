@@ -58,6 +58,8 @@ const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAX_LOCAL_CLIENTS: usize = 64;
 /// Nearby zflow computers kept as extra dial candidates, like the Mac app's list.
 const MAX_NEARBY: usize = 64;
+/// The shared layout this computer keeps, in its state directory.
+const LAYOUT_FILE: &str = "layout.json";
 /// Logind answers Unknown when a reply is slow or races a property change.
 /// Such a short Unknown holds injection and keeps the last definite state for
 /// authorization, so it does not end a live crossing.
@@ -132,6 +134,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         sessions: Mutex::new(BTreeMap::new()),
         dialed: Mutex::new(BTreeMap::new()),
         nearby: Mutex::new(BTreeMap::new()),
+        layout: Mutex::new(None),
         metrics_history: Mutex::new(BTreeMap::new()),
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
@@ -144,7 +147,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     if let Err(error) = peer_view::start(shared.clone()) {
         tracing::warn!(%error, "desktop metadata API unavailable");
     }
-    shared.load_layout();
+    shared.restore_layout().await;
     let mut discovery = start_discovery(&config, shared.endpoint.local_addr()?);
     let daemon_uid = nix::unistd::geteuid().as_raw();
     let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
@@ -347,6 +350,8 @@ struct Shared {
     /// instance. A dial also tries these, with the peer's pinned key, so a
     /// peer whose address changed is still found.
     nearby: Mutex<BTreeMap<String, Vec<SocketAddr>>>,
+    /// The newest layout this computer has seen from any peer.
+    layout: Mutex<Option<crate::desktop::SharedLayout>>,
     metrics_history: Mutex<BTreeMap<String, crate::metrics::SessionMetricsSnapshot>>,
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
@@ -437,19 +442,102 @@ impl Shared {
             .map_err(|error| anyhow!(error))
     }
 
-    /// Reads the layout saved beside the configuration, in the Mac app's
-    /// format, and places a barrier on each edge that touches a paired
-    /// computer. Without a layout, crossings start only from the chord.
-    fn load_layout(self: &Arc<Self>) {
-        let edges = match crate::app::layout_model::LayoutDocument::beside(&self.config_path) {
-            Ok(layout) => desktop::outbound_edges(layout.saved()),
-            Err(error) => {
-                tracing::warn!(error = %format_args!("{error:#}"), "layout not loaded");
-                Vec::new()
+    /// Reads the layout this computer kept last time.
+    async fn restore_layout(self: &Arc<Self>) {
+        let path = self.config.read().await.daemon.state_dir.join(LAYOUT_FILE);
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<crate::desktop::SharedLayout>(&bytes)
+                .map_err(anyhow::Error::from)
+                .and_then(|layout| layout.validate().map(|()| layout))
+            {
+                Ok(layout) => *self.layout.lock().await = Some(layout),
+                Err(error) => tracing::warn!(%error, "saved layout ignored"),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(%error, "saved layout not read"),
+        }
+        self.apply_layout().await;
+    }
+
+    /// Places a barrier on each edge of this computer's tile that touches a
+    /// paired computer. Without a layout, crossings start only from the chord.
+    async fn apply_layout(self: &Arc<Self>) {
+        // Never hold the layout while waiting for another lock.
+        let layout = self.layout.lock().await.clone();
+        let edges = match layout {
+            Some(layout) => {
+                let keys = peer_keys(&*self.config.read().await);
+                desktop::outbound_edges(&crate::app::layout_model::Layout::from_shared(
+                    &layout,
+                    &self.identity_fingerprint,
+                    "This computer",
+                    &keys,
+                ))
             }
+            None => Vec::new(),
         };
-        tracing::info!(edges = edges.len(), "outbound edges loaded");
+        tracing::info!(edges = edges.len(), "outbound edges placed");
         desktop::set_edges(self, edges);
+    }
+
+    /// Sends a peer the layout this computer keeps, if it has one.
+    async fn offer_layout(&self, session: &SessionHandle) {
+        let layout = self.layout.lock().await.clone();
+        if let Some(layout) = layout
+            && let Err(error) = session.send_layout(layout)
+        {
+            tracing::debug!(%error, peer = %session.peer(), "layout not sent");
+        }
+    }
+
+    /// Keeps whichever of this computer's layout and a peer's is newer. A
+    /// newer one is saved and passed to the other peers; a peer with an older
+    /// one gets this computer's back.
+    async fn merge_layout(
+        self: &Arc<Self>,
+        from: &str,
+        session_id: u64,
+        layout: crate::desktop::SharedLayout,
+    ) {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(from)
+            .filter(|session| session.id() == session_id)
+            .cloned();
+        let current = self.layout.lock().await.clone();
+        if let Some(current) = &current
+            && !layout.is_newer_than(current)
+        {
+            if current.is_newer_than(&layout)
+                && let Some(session) = session
+            {
+                self.offer_layout(&session).await;
+            }
+            return;
+        }
+        let path = self.config.read().await.daemon.state_dir.join(LAYOUT_FILE);
+        let saved = serde_json::to_string(&layout)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| crate::config::save_text(&path, &text).map_err(Into::into));
+        if let Err(error) = saved {
+            tracing::warn!(%error, "layout not saved; still using it until restart");
+        }
+        tracing::info!(peer = %from, version = layout.version, "layout adopted");
+        *self.layout.lock().await = Some(layout);
+        self.apply_layout().await;
+        let others: Vec<_> = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter(|session| session.id() != session_id)
+            .cloned()
+            .collect();
+        for session in others {
+            self.offer_layout(&session).await;
+        }
     }
 
     /// Starts a crossing toward the computer behind the edge the pointer
@@ -535,6 +623,8 @@ impl Shared {
             .lock()
             .await
             .insert(session.id(), Instant::now());
+        drop(sessions);
+        self.offer_layout(&session).await;
         Ok(session)
     }
 
@@ -601,7 +691,9 @@ impl Shared {
                 let mut sessions = self.sessions.lock().await;
                 match sessions.get(&peer) {
                     None => {
-                        sessions.insert(peer, session);
+                        sessions.insert(peer, session.clone());
+                        drop(sessions);
+                        self.offer_layout(&session).await;
                         return Ok(());
                     }
                     Some(_) if own_dial => {
@@ -801,7 +893,7 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
             shared
                 .apply_config_locked(Config::load(&shared.config_path)?, false)
                 .await?;
-            shared.load_layout();
+            shared.apply_layout().await;
             Ok(Response::Ack)
         }
         Request::ListPeers => Ok(Response::Peers {
@@ -1243,6 +1335,15 @@ fn wins_dial(config: &Config, local_fingerprint: &str, peer: &str) -> bool {
         .is_some_and(|theirs| crate::identity::wins_simultaneous_dial(local_fingerprint, &theirs))
 }
 
+/// Each paired computer's key fingerprint, by its name here.
+fn peer_keys(config: &Config) -> BTreeMap<String, String> {
+    config
+        .peers
+        .iter()
+        .filter_map(|(name, peer)| Some((name.clone(), peer.fingerprint_hex().ok()?)))
+        .collect()
+}
+
 fn eligible_outbound_peers(config: &Config) -> Vec<String> {
     if !config.daemon.sharing {
         return Vec::new();
@@ -1503,6 +1604,10 @@ impl Shared {
                         return Err(error);
                     }
                 }
+            }
+            SessionEventKind::Layout { layout } => {
+                self.merge_layout(&event.peer, event.session_id, layout)
+                    .await;
             }
             SessionEventKind::OutboundEnded => {
                 let active = self.active_outbound.lock().await.clone();

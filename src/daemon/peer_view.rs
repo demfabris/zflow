@@ -133,6 +133,7 @@ async fn desktop_command(
                 bail!("Unknown computer {name}");
             }
             shared.apply_config_locked(config, true).await?;
+            shared.apply_layout().await;
             Ok(DesktopReply::Ack)
         }
         Request::SetPeer {

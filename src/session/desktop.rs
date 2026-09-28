@@ -16,6 +16,14 @@ use crate::{
 };
 
 impl SessionHandle {
+    /// Sends this computer's layout to the peer. Nothing answers it.
+    pub fn send_layout(&self, layout: crate::desktop::SharedLayout) -> Result<()> {
+        layout.validate()?;
+        self.commands
+            .try_send(SessionCommand::Layout(layout))
+            .map_err(|error| anyhow::anyhow!("layout not queued: {error}"))
+    }
+
     /// One scoped desktop operation. A timeout closes transport so a late warp cannot
     /// leave the source believing that a cancelled handoff completed.
     pub async fn desktop_request(
@@ -161,6 +169,9 @@ impl DesktopRelay {
                     self.waiter.take().context("Unexpected desktop response")?;
                 anyhow::ensure!(id == expected, "Desktop response ID does not match request");
                 let _ = reply.send(response);
+            }
+            DesktopMessage::Layout { layout } => {
+                reporter.emit(SessionEventKind::Layout { layout })?;
             }
         }
         Ok(())

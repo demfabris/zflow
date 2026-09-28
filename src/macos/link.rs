@@ -662,7 +662,7 @@ mod tests {
                             SessionEventKind::Closed { .. } => {
                                 let _ = closed_tx.send(event.session_id);
                             }
-                            SessionEventKind::OutboundEnded => {}
+                            SessionEventKind::OutboundEnded | SessionEventKind::Layout { .. } => {}
                         }
                     }
                 });

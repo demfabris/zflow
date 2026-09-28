@@ -666,7 +666,9 @@ fn refuse_inbound(kind: SessionEventKind) {
                 "the Mac does not accept input from other computers".into()
             ));
         }
-        SessionEventKind::OutboundEnded | SessionEventKind::Closed { .. } => {}
+        SessionEventKind::OutboundEnded
+        | SessionEventKind::Closed { .. }
+        | SessionEventKind::Layout { .. } => {}
     }
 }
 

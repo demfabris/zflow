@@ -134,6 +134,10 @@ pub enum SessionEventKind {
         applied: oneshot::Sender<Result<(), String>>,
     },
     OutboundEnded,
+    /// The peer's layout. It has been validated but may be older than ours.
+    Layout {
+        layout: crate::desktop::SharedLayout,
+    },
     Closed {
         reason: String,
     },
@@ -146,6 +150,7 @@ enum SessionCommand {
         reply: oneshot::Sender<crate::desktop::DesktopResponse>,
     },
     BeginOutbound(SessionContext),
+    Layout(crate::desktop::SharedLayout),
     Capture(CapturedDeviceFrame),
     EndOutbound {
         reason: SessionCloseReason,
@@ -407,6 +412,12 @@ async fn run_session(
                 match command {
                     SessionCommand::Desktop { id, request, reply } => {
                         desktop.request(&reporter, &mut channels, id, request, reply).await?;
+                    }
+                    SessionCommand::Layout(layout) => {
+                        channels
+                            .control_send
+                            .send_desktop(crate::desktop::DesktopMessage::Layout { layout })
+                            .await?;
                     }
                     SessionCommand::BeginOutbound(context) => {
                         if sender.is_some() {
@@ -1700,6 +1711,37 @@ mod tests {
         a.unwrap().unwrap();
         b.unwrap().unwrap();
         (left, right, event_rx, client, server)
+    }
+
+    #[tokio::test]
+    async fn a_layout_reaches_the_peer_as_an_event() {
+        use crate::desktop::{SharedLayout, Tile};
+        let (left, _right, mut events, _client, _server) = desktop_test_pair().await;
+        let layout = SharedLayout {
+            version: 3,
+            editor: format!("{:064x}", 1),
+            tiles: vec![Tile {
+                key: format!("{:064x}", 1),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+        };
+        left.send_layout(layout.clone()).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SessionEventKind::Layout { layout: received } = event.kind else {
+            panic!("expected a layout")
+        };
+        assert_eq!(received, layout);
+        let invalid = SharedLayout {
+            editor: "not a key".into(),
+            ..layout
+        };
+        assert!(left.send_layout(invalid).is_err(), "checked before it is sent");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
