@@ -18,6 +18,7 @@ use tokio::{
 };
 
 use crate::{
+    app::handoff::Handoff,
     config::{Config, PeerConfig},
     core::{
         ActivationId, InputCapability, SessionCloseReason, SessionContext, SessionEpoch,
@@ -30,7 +31,7 @@ use crate::{
 };
 
 use super::{
-    Activation, HandoffOptions, SourceStatus,
+    Activation, CursorPosition, SourceStatus,
     receive::{self, OutboundGuard, Ownership},
     run_crossing,
 };
@@ -67,7 +68,8 @@ pub struct Crossing {
 
 enum Command {
     Cross {
-        handoff: HandoffOptions,
+        handoff: Handoff,
+        entry_position: CursorPosition,
         reduce_wifi_latency: bool,
         stop: watch::Receiver<bool>,
         status: mpsc::UnboundedSender<SourceStatus>,
@@ -189,15 +191,16 @@ impl Links {
             .map(|(name, link)| (name.as_str(), link.state.borrow().clone()))
     }
 
-    /// Hands a crossing to `peer`'s link, if that link is ready and no peer
-    /// controls this Mac.
-    pub fn cross(
+    /// Hands a crossing to its peer's link, if that link is ready and no
+    /// peer controls this Mac. `entry_position` is where the cursor reached
+    /// the edge.
+    pub(crate) fn cross(
         &self,
-        peer: &str,
-        handoff: HandoffOptions,
+        handoff: Handoff,
+        entry_position: CursorPosition,
         reduce_wifi_latency: bool,
     ) -> Option<Crossing> {
-        let link = self.links.get(peer)?;
+        let link = self.links.get(&handoff.peer)?;
         if !matches!(*link.state.borrow(), LinkState::Ready(_)) {
             return None;
         }
@@ -207,6 +210,7 @@ impl Links {
         link.commands
             .send(Command::Cross {
                 handoff,
+                entry_position,
                 reduce_wifi_latency,
                 stop: stopped,
                 status,
@@ -479,7 +483,14 @@ impl Session {
                     None => return None,
                     Some(Command::Retry) => ready = self.snapshot(state).await,
                     Some(command) if !ready => refuse(command, "the other computer is not ready"),
-                    Some(Command::Cross { handoff, reduce_wifi_latency, stop, status, guard }) => {
+                    Some(Command::Cross {
+                        handoff,
+                        entry_position,
+                        reduce_wifi_latency,
+                        stop,
+                        status,
+                        guard,
+                    }) => {
                         let context = self.next_context();
                         let activation = Activation {
                             session: &self.handle,
@@ -487,9 +498,15 @@ impl Session {
                             context,
                             raw_touch: self.raw_touch,
                         };
-                        let failed =
-                            run_crossing(activation, handoff, reduce_wifi_latency, stop, status.clone())
-                                .await;
+                        let failed = run_crossing(
+                            activation,
+                            handoff,
+                            entry_position,
+                            reduce_wifi_latency,
+                            stop,
+                            status.clone(),
+                        )
+                        .await;
                         // Input is back on the Mac. Let a peer take control
                         // before the observer hears the crossing ended.
                         drop(guard);
@@ -831,6 +848,8 @@ mod tests {
         }
     }
 
+    const ENTRY: CursorPosition = CursorPosition { x: 0.0, y: 50.0 };
+
     fn wait_until(links: &mut Links, done: impl Fn(&Links) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done(links) {
@@ -846,9 +865,9 @@ mod tests {
             .any(|(name, state)| name == "linux" && state == LinkState::Ready(geometry()))
     }
 
-    fn handoff() -> HandoffOptions {
-        HandoffOptions {
-            entry_position: super::super::CursorPosition { x: 0.0, y: 50.0 },
+    fn handoff(peer: &str) -> Handoff {
+        Handoff {
+            peer: peer.into(),
             entry_region: Rect {
                 x: 0,
                 y: 0,
@@ -888,7 +907,7 @@ mod tests {
         let mut receiver = server.block_on(receiver(linux.path(), &spki, false));
         let mut config = mac_config(mac.path(), linux.path(), receiver.address);
         let mut links = Links::new().unwrap();
-        assert!(links.cross("linux", handoff(), false).is_none());
+        assert!(links.cross(handoff("linux"), ENTRY, false).is_none());
         links.sync(Some(&config));
         assert!(links.changed());
         wait_until(&mut links, ready);
@@ -910,12 +929,12 @@ mod tests {
             .unwrap();
         assert_ne!(first.id(), second.id());
         wait_until(&mut links, ready);
-        assert!(links.cross("other", handoff(), false).is_none());
+        assert!(links.cross(handoff("other"), ENTRY, false).is_none());
 
         // While a peer controls this Mac, nothing crosses.
         let claim = links.ownership.claim_inbound("linux", 1).unwrap();
         assert_eq!(links.controller().as_deref(), Some("linux"));
-        assert!(links.cross("linux", handoff(), false).is_none());
+        assert!(links.cross(handoff("linux"), ENTRY, false).is_none());
         drop(claim);
         assert_eq!(links.controller(), None);
         assert!(
@@ -945,7 +964,8 @@ mod tests {
         let ownership = Ownership::default();
         let (status, mut statuses) = mpsc::unbounded_channel();
         let command = Command::Cross {
-            handoff: handoff(),
+            handoff: handoff("linux"),
+            entry_position: ENTRY,
             reduce_wifi_latency: false,
             stop: watch::channel(false).1,
             status,

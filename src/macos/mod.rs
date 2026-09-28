@@ -22,6 +22,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::{
+    app::handoff::{self, Handoff},
     capture::{
         CaptureFrame, CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS,
     },
@@ -29,7 +30,7 @@ use crate::{
         ContactId, MotionDelta, PointerButton, SessionCloseReason, SessionContext,
         SourceDimensions, TouchContact, TouchState, TouchTool,
     },
-    desktop::{DesktopRequest, DesktopResponse, Edge, Point, Rect, ReturnMapping},
+    desktop::{DesktopRequest, DesktopResponse, Point, Rect},
     session::{SessionEvent, SessionEventKind, SessionHandle},
 };
 
@@ -175,19 +176,6 @@ pub fn secure_input_enabled() -> bool {
     unsafe { zflow_mac_secure_input_enabled() == 1 }
 }
 
-#[derive(Clone, Debug)]
-pub struct HandoffOptions {
-    pub entry_position: CursorPosition,
-    pub entry_region: Rect,
-    pub return_mapping: ReturnMapping,
-    pub edge: Edge,
-    pub start: u32,
-    pub end: u32,
-    pub position: u32,
-    pub expected_width: u32,
-    pub expected_height: u32,
-}
-
 /// What one crossing borrows from its link.
 struct Activation<'a> {
     session: &'a SessionHandle,
@@ -200,16 +188,26 @@ type DesktopPoll<'a> = Pin<Box<dyn Future<Output = Result<DesktopResponse>> + Se
 
 /// Runs one crossing and reports how it ended. The status sender drops only
 /// after cleanup, so the observer rearms once the Mac owns input again.
+/// `entry_position` is where the cursor was when it reached the edge.
 /// Returns true when the crossing failed.
 async fn run_crossing(
     activation: Activation<'_>,
-    handoff: HandoffOptions,
+    handoff: Handoff,
+    entry_position: CursorPosition,
     reduce_wifi_latency: bool,
     mut stop: watch::Receiver<bool>,
     status: mpsc::UnboundedSender<SourceStatus>,
 ) -> bool {
     let started = Instant::now();
-    let result = cross(activation, handoff, reduce_wifi_latency, &mut stop, &status).await;
+    let result = cross(
+        activation,
+        handoff,
+        entry_position,
+        reduce_wifi_latency,
+        &mut stop,
+        &status,
+    )
+    .await;
     let outcome = match &result {
         Ok(returned) => {
             if let Some(position) = returned {
@@ -244,7 +242,8 @@ async fn run_crossing(
 /// request is awaited: dropping one closes the transport.
 async fn cross(
     mut activation: Activation<'_>,
-    mut handoff: HandoffOptions,
+    mut handoff: Handoff,
+    entry_position: CursorPosition,
     reduce_wifi_latency: bool,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
@@ -254,11 +253,8 @@ async fn cross(
         return Ok(None);
     }
     let local_desktop = active_desktop_rectangles()?;
-    let mut random = [0_u8; 8];
-    getrandom::fill(&mut random)
-        .map_err(|error| anyhow!("could not create a desktop handoff token: {error}"))?;
-    let token = handoff_token(random);
-    let prepare = prepare_request(&mut handoff, token)?;
+    let token = handoff::token()?;
+    let prepare = prepare_request(&mut handoff, entry_position, token)?;
     let preparing = Instant::now();
     // Await Prepare even after Stop so Finish can use the same session.
     let (lease, prepared) = tokio::join!(
@@ -277,8 +273,7 @@ async fn cross(
         result = async {
             // The link's snapshot already showed the receiver handles desktop
             // requests, so a failure here is the session or the receiver.
-            validate_prepared(
-                &handoff,
+            handoff.check_prepared(
                 prepared.context("Could not prepare the other computer's desktop")?,
             )?;
             if stopped(stop) {
@@ -302,7 +297,7 @@ async fn cross(
         .await;
     }
     let finishing = Instant::now();
-    let finished = validate_finished(
+    let finished = handoff::check_finished(
         activation
             .session
             .desktop_request(DesktopRequest::Finish { token })
@@ -332,7 +327,11 @@ async fn acquire_lease(reduce_wifi_latency: bool) -> Result<Option<awdl::HeldLea
 }
 
 /// Samples the cursor again, since it kept moving after the edge was detected.
-fn prepare_request(handoff: &mut HandoffOptions, token: u64) -> Result<DesktopRequest> {
+fn prepare_request(
+    handoff: &mut Handoff,
+    entry_position: CursorPosition,
+    token: u64,
+) -> Result<DesktopRequest> {
     let current = cursor_position()?;
     let point = Point {
         x: current.x.floor() as i32,
@@ -349,17 +348,11 @@ fn prepare_request(handoff: &mut HandoffOptions, token: u64) -> Result<DesktopRe
         refreshed,
         current_x = current.x,
         current_y = current.y,
-        displacement_x = current.x - handoff.entry_position.x,
-        displacement_y = current.y - handoff.entry_position.y,
+        displacement_x = current.x - entry_position.x,
+        displacement_y = current.y - entry_position.y,
         "entry fraction sampled before desktop preparation"
     );
-    let request = DesktopRequest::Prepare {
-        token,
-        edge: handoff.edge,
-        start: handoff.start,
-        end: handoff.end,
-        position: handoff.position,
-    };
+    let request = handoff.prepare(token);
     request.validate()?;
     Ok(request)
 }
@@ -367,7 +360,7 @@ fn prepare_request(handoff: &mut HandoffOptions, token: u64) -> Result<DesktopRe
 /// Owns input on the receiver: activation, native capture, and release.
 async fn remote(
     activation: &mut Activation<'_>,
-    handoff: &HandoffOptions,
+    handoff: &Handoff,
     local_desktop: &[DesktopRect],
     token: u64,
     lease: &mut Option<awdl::HeldLease>,
@@ -436,7 +429,7 @@ impl Ended {
 #[allow(clippy::too_many_arguments)]
 async fn capture<'a>(
     activation: &mut Activation<'a>,
-    handoff: &HandoffOptions,
+    handoff: &Handoff,
     local_desktop: &[DesktopRect],
     token: u64,
     poll: &mut Option<DesktopPoll<'a>>,
@@ -509,7 +502,7 @@ async fn capture<'a>(
 }
 
 fn return_point(
-    handoff: &HandoffOptions,
+    handoff: &Handoff,
     local_desktop: &[DesktopRect],
     position: u32,
 ) -> Result<CursorPosition> {
@@ -529,7 +522,7 @@ fn return_point(
 async fn forward<'a>(
     capture: &mut MacCapture,
     activation: &mut Activation<'a>,
-    handoff: &HandoffOptions,
+    handoff: &Handoff,
     token: u64,
     poll: &mut Option<DesktopPoll<'a>>,
     lease: &mut Option<awdl::HeldLease>,
@@ -666,39 +659,6 @@ async fn stop_requested(stop: &mut watch::Receiver<bool>) {
         if *stop.borrow_and_update() || stop.changed().await.is_err() {
             return;
         }
-    }
-}
-
-fn validate_prepared(handoff: &HandoffOptions, response: DesktopResponse) -> Result<()> {
-    response.validate()?;
-    match response {
-        DesktopResponse::Prepared { geometry, .. } => {
-            let bounds = geometry.bounds()?;
-            if bounds.width != handoff.expected_width || bounds.height != handoff.expected_height {
-                bail!(
-                    "the other computer's desktop changed size; refresh and save the computer layout before sharing"
-                );
-            }
-            Ok(())
-        }
-        DesktopResponse::Unavailable { reason } => {
-            bail!("the other computer's desktop is unavailable: {reason}")
-        }
-        _ => bail!("the other computer did not prepare its desktop for input"),
-    }
-}
-
-fn handoff_token(random: [u8; 8]) -> u64 {
-    (u64::from_ne_bytes(random) & crate::desktop::MAX_TOKEN).max(1)
-}
-
-fn validate_finished(response: Result<DesktopResponse>) -> Result<()> {
-    match response? {
-        DesktopResponse::Finished => Ok(()),
-        DesktopResponse::Unavailable { reason } => {
-            bail!("the other computer could not finish the desktop handoff: {reason}")
-        }
-        _ => bail!("the other computer did not confirm the desktop handoff cleanup"),
     }
 }
 
@@ -1024,83 +984,6 @@ mod tests {
         let mut kept = cancelled();
         keep_first_failure(&mut kept, Ok(()), "cleanup");
         assert!(kept.unwrap_err().is::<AdmissionCancelled>());
-    }
-
-    #[test]
-    fn handoff_tokens_fit_the_receiver_javascript_integer_range() {
-        assert_eq!(handoff_token([0; 8]), 1);
-        assert_eq!(handoff_token([u8::MAX; 8]), crate::desktop::MAX_TOKEN);
-        assert!(handoff_token([0x80; 8]) <= crate::desktop::MAX_TOKEN);
-    }
-
-    #[test]
-    fn handoff_requires_prepared_geometry_to_match_saved_target() {
-        let handoff = HandoffOptions {
-            return_mapping: crate::desktop::ReturnMapping {
-                geometry: crate::desktop::Geometry {
-                    monitors: vec![Rect {
-                        x: -100,
-                        y: 0,
-                        width: 100,
-                        height: 100,
-                    }],
-                },
-                edge: Edge::Right,
-                local_start: 0.0,
-                local_end: 1.0,
-                remote_start: 0.0,
-                remote_end: 1.0,
-            },
-            entry_position: CursorPosition { x: -1.0, y: 50.0 },
-            entry_region: Rect {
-                x: -9,
-                y: 0,
-                width: 9,
-                height: 100,
-            },
-            edge: Edge::Left,
-            start: 0,
-            end: crate::desktop::FRACTION_MAX,
-            position: 500_000,
-            expected_width: 2880,
-            expected_height: 1620,
-        };
-        let prepared = DesktopResponse::Prepared {
-            geometry: crate::desktop::Geometry {
-                monitors: vec![Rect {
-                    x: -2880,
-                    y: -200,
-                    width: 2880,
-                    height: 1620,
-                }],
-            },
-            position: Point { x: -2879, y: 610 },
-        };
-        assert!(validate_prepared(&handoff, prepared.clone()).is_ok());
-        assert!(
-            validate_prepared(
-                &HandoffOptions {
-                    expected_width: 3840,
-                    ..handoff.clone()
-                },
-                prepared
-            )
-            .is_err()
-        );
-        assert!(validate_prepared(&handoff, DesktopResponse::Active).is_err());
-        assert!(
-            validate_prepared(&handoff, DesktopResponse::unavailable("missing extension")).is_err()
-        );
-    }
-
-    #[test]
-    fn handoff_return_requires_explicit_finish_acknowledgement() {
-        assert!(validate_finished(Ok(DesktopResponse::Finished)).is_ok());
-        assert!(validate_finished(Ok(DesktopResponse::Active)).is_err());
-        assert!(
-            validate_finished(Ok(DesktopResponse::unavailable("receiver still active"))).is_err()
-        );
-        assert!(validate_finished(Err(anyhow!("disconnected"))).is_err());
     }
 
     #[tokio::test]

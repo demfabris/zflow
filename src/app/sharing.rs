@@ -309,19 +309,9 @@ impl Observer {
             start = handoff.start, end = handoff.end, position = handoff.position,
             remote_width = handoff.expected_width, remote_height = handoff.expected_height,
             entry_region = ?handoff.entry_region, "crossing geometry");
-        let options = macos::HandoffOptions {
-            return_mapping: handoff.return_mapping.clone(),
-            entry_region: handoff.entry_region,
-            edge: handoff.edge,
-            start: handoff.start,
-            end: handoff.end,
-            position: handoff.position,
-            expected_width: handoff.expected_width,
-            expected_height: handoff.expected_height,
-            entry_position: position,
-        };
         // The receiver status already says why a link is not ready.
-        let Some(crossing) = links.cross(&handoff.peer, options, self.reduce_wifi_latency) else {
+        let Some(crossing) = links.cross(handoff.clone(), position, self.reduce_wifi_latency)
+        else {
             tracing::info!(parent: &span, "receiver not ready; input stays on the Mac");
             return Ok(());
         };
