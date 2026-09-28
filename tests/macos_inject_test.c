@@ -10,6 +10,7 @@
 #include <math.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -36,6 +37,7 @@ static OSType fake_layout_type(SInt16);
 static UInt8 fake_keyboard_type(void);
 static bool fake_post_access(void);
 static IOReturn fake_user_activity(CFStringRef, IOPMUserActiveType, IOPMAssertionID *);
+static sig_t fake_signal(int, sig_t);
 
 // Every call that posts, touches IOKit or reads the session is faked. Events
 // are still built by CoreGraphics, so the tests read back real fields. These
@@ -58,7 +60,9 @@ static IOReturn fake_user_activity(CFStringRef, IOPMUserActiveType, IOPMAssertio
 #define LMGetKbdType fake_keyboard_type
 #define CGPreflightPostEventAccess fake_post_access
 #define IOPMAssertionDeclareUserActivity fake_user_activity
+#define signal(number, handler) fake_signal(number, handler)
 #include "../src/macos/inject.c"
+#undef signal
 
 #define FAKE_SERVICE 0x51
 #define FAKE_CONNECTION 0x52
@@ -71,6 +75,7 @@ static size_t posted_count;
 // The spawned child prints what it posts, so the parent can check the
 // signal handler's releases.
 static bool print_posts;
+static atomic_bool handler_posted;
 static int interval_calls;
 static double last_interval = -1;
 static int filter_calls;
@@ -95,6 +100,7 @@ static CGEventFlags live_flags;
 static void fake_post(CGEventTapLocation tap, CGEventRef event) {
   assert(tap == kCGHIDEventTap);
   if (print_posts) {
+    atomic_store(&handler_posted, true);
     CGEventType type = CGEventGetType(event);
     bool mouse = type == kCGEventLeftMouseUp || type == kCGEventRightMouseUp ||
                  type == kCGEventOtherMouseUp;
@@ -227,6 +233,17 @@ static IOReturn fake_user_activity(CFStringRef name, IOPMUserActiveType type,
   *assertion = 7;
   activity_calls++;
   return kIOReturnSuccess;
+}
+
+// The exit handler restores the default action just before it re-raises.
+// A post from the input thread at that moment must not press anything.
+static sig_t fake_signal(int number, sig_t handler) {
+  if (print_posts && handler == SIG_DFL) {
+    ZFlowMacPosted key = {.kind = ZFLOW_POST_KEY, .code = 41, .down = 1};
+    printf("late post %d\n", zflow_mac_inject_post(&key));
+    fflush(stdout);
+  }
+  return signal(number, handler);
 }
 
 static void clear_posted(void) {
@@ -503,7 +520,7 @@ static void session_tests(void) {
 }
 
 // Runs in a spawned copy: hold input, then take SIGTERM. The handler must
-// release everything before the process dies of the signal.
+// release everything, then die of the signal it raises itself.
 static int signal_child(void) {
   alarm(10);
   assert(zflow_mac_inject_open() == 0);
@@ -514,11 +531,13 @@ static int signal_child(void) {
   zflow_mac_inject_install_exit_handlers();
   print_posts = true;
   // Dispatch arms its sources asynchronously, and an ignored signal that
-  // arrives first is lost, so keep sending until the handler runs.
-  for (;;) {
+  // arrives first is lost, so keep sending until the handler posts. After
+  // that, only its own raise may end the process before the alarm does.
+  while (!atomic_load(&handler_posted)) {
     kill(getpid(), SIGTERM);
     usleep(20000);
   }
+  for (;;) pause();
 }
 
 static void signal_tests(void) {
@@ -546,9 +565,9 @@ static void signal_tests(void) {
   int status = 0;
   assert(waitpid(child, &status, 0) == child);
   assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
-  // Key up 40, flagsChanged 56, right button up.
+  // Key up 40, flagsChanged 56, right button up, then nothing goes down.
   char expected[64];
-  snprintf(expected, sizeof(expected), "%d 40\n%d 56\n%d 1\n",
+  snprintf(expected, sizeof(expected), "%d 40\n%d 56\n%d 1\nlate post -1\n",
            (int)kCGEventKeyUp, (int)kCGEventFlagsChanged, (int)kCGEventRightMouseUp);
   assert(strcmp(text, expected) == 0);
 }

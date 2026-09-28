@@ -63,6 +63,8 @@ static io_connect_t g_hid_system;
 static bool g_held_keys[ZFLOW_HELD_KEYS];
 static bool g_held_modifiers[ZFLOW_HELD_KEYS];
 static bool g_held_buttons[ZFLOW_HELD_BUTTONS];
+// Set by the exit handler. Nothing posts after it has released everything.
+static bool g_exiting;
 
 // The source takes its state from the HID system, like a real device. With
 // no suppression interval and local events permitted, the Mac's own keyboard
@@ -174,7 +176,7 @@ static void track(const ZFlowMacPosted *posted) {
 int zflow_mac_inject_post(const ZFlowMacPosted *posted) {
   if (!posted) return -1;
   pthread_mutex_lock(&g_inject_lock);
-  CGEventRef event = g_source ? create_event(posted) : NULL;
+  CGEventRef event = g_source && !g_exiting ? create_event(posted) : NULL;
   if (!event) {
     pthread_mutex_unlock(&g_inject_lock);
     return -1;
@@ -356,9 +358,14 @@ int zflow_mac_declare_user_activity(void) {
   return result == kIOReturnSuccess ? 0 : -1;
 }
 
+// The input thread keeps running until the signal ends the process, so it
+// must not press anything again once the table is released.
 static void release_and_exit(void *context) {
   int number = (int)(intptr_t)context;
-  zflow_mac_inject_release_all();
+  pthread_mutex_lock(&g_inject_lock);
+  g_exiting = true;
+  release_held();
+  pthread_mutex_unlock(&g_inject_lock);
   signal(number, SIG_DFL);
   raise(number);
 }
