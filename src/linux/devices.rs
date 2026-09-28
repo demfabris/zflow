@@ -3,7 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use evdev::{BusType, Device};
+use evdev::{
+    AbsoluteAxisCode, AttributeSetRef, BusType, Device, KeyCode, PropType, RelativeAxisCode,
+};
 
 pub const ZFLOW_VENDOR_ID: u16 = 0x1209;
 pub const ZFLOW_KEYBOARD_PRODUCT_ID: u16 = 0x5a01;
@@ -50,6 +52,60 @@ impl VirtualDeviceRole {
     }
 }
 
+/// What an event node is, for capturing every keyboard and pointer when no
+/// devices are configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceClass {
+    Keyboard,
+    /// A mouse, pointing stick or trackball.
+    Pointer,
+    Touchpad,
+}
+
+/// Classifies a node from its capabilities close to how udev's input_id does,
+/// so the daemon wants the same nodes the packaged udev rule lets it read.
+/// Anything else, such as a power button, a pen tablet, a touchscreen or a
+/// gamepad, is left alone.
+pub fn classify_device(
+    keys: Option<&AttributeSetRef<KeyCode>>,
+    relative: Option<&AttributeSetRef<RelativeAxisCode>>,
+    absolute: Option<&AttributeSetRef<AbsoluteAxisCode>>,
+    properties: &AttributeSetRef<PropType>,
+) -> Option<DeviceClass> {
+    let has_key = |key| keys.is_some_and(|keys| keys.contains(key));
+    let has_relative = |axis| relative.is_some_and(|axes| axes.contains(axis));
+    let has_absolute = |axis| absolute.is_some_and(|axes| axes.contains(axis));
+
+    // udev's keyboard test is every key from Esc to D: the digits, the Q row
+    // and A, S, D. Media keys and power buttons fail it. Space is required
+    // too, so the node can type text.
+    let keyboard = (KeyCode::KEY_ESC.code()..=KeyCode::KEY_D.code())
+        .all(|code| has_key(KeyCode::new(code)))
+        && has_key(KeyCode::KEY_SPACE);
+    if keyboard {
+        return Some(DeviceClass::Keyboard);
+    }
+    // udev's mouse buttons run from BTN_LEFT up to the first joystick button.
+    let mouse_button = (KeyCode::BTN_LEFT.code()..KeyCode::BTN_TRIGGER.code())
+        .any(|code| has_key(KeyCode::new(code)));
+    if has_relative(RelativeAxisCode::REL_X)
+        && has_relative(RelativeAxisCode::REL_Y)
+        && mouse_button
+    {
+        return Some(DeviceClass::Pointer);
+    }
+    let pen = has_key(KeyCode::BTN_TOOL_PEN) || has_key(KeyCode::BTN_STYLUS);
+    if has_absolute(AbsoluteAxisCode::ABS_X)
+        && has_absolute(AbsoluteAxisCode::ABS_Y)
+        && has_key(KeyCode::BTN_TOOL_FINGER)
+        && !pen
+        && !properties.contains(PropType::DIRECT)
+    {
+        return Some(DeviceClass::Touchpad);
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub path: PathBuf,
@@ -60,6 +116,7 @@ pub struct DeviceInfo {
     pub vendor: u16,
     pub product: u16,
     pub version: u16,
+    pub class: Option<DeviceClass>,
 }
 
 impl DeviceInfo {
@@ -74,6 +131,12 @@ impl DeviceInfo {
             vendor: id.vendor(),
             product: id.product(),
             version: id.version(),
+            class: classify_device(
+                device.supported_keys(),
+                device.supported_relative_axes(),
+                device.supported_absolute_axes(),
+                device.properties(),
+            ),
         }
     }
 
@@ -157,6 +220,8 @@ pub fn enumerate_devices_in(input_dir: &Path) -> io::Result<DeviceScan> {
 
 #[cfg(test)]
 mod tests {
+    use evdev::AttributeSet;
+
     use super::*;
 
     fn info(path: &str, name: &str) -> DeviceInfo {
@@ -169,6 +234,153 @@ mod tests {
             vendor: 1,
             product: 2,
             version: 3,
+            class: None,
+        }
+    }
+
+    fn classify(
+        keys: &[KeyCode],
+        relative: &[RelativeAxisCode],
+        absolute: &[AbsoluteAxisCode],
+        properties: &[PropType],
+    ) -> Option<DeviceClass> {
+        let key_set = keys.iter().collect::<AttributeSet<_>>();
+        let relative_set = relative.iter().collect::<AttributeSet<_>>();
+        let absolute_set = absolute.iter().collect::<AttributeSet<_>>();
+        let properties = properties.iter().collect::<AttributeSet<_>>();
+        // evdev reports no set for an event type the node lacks.
+        classify_device(
+            (!keys.is_empty()).then_some(&*key_set),
+            (!relative.is_empty()).then_some(&*relative_set),
+            (!absolute.is_empty()).then_some(&*absolute_set),
+            &properties,
+        )
+    }
+
+    fn full_keyboard() -> Vec<KeyCode> {
+        (KeyCode::KEY_ESC.code()..=KeyCode::KEY_KPDOT.code())
+            .map(KeyCode::new)
+            .collect()
+    }
+
+    #[test]
+    fn keyboards_pointers_and_touchpads_are_classified_like_udev() {
+        use AbsoluteAxisCode as Abs;
+        use KeyCode as Key;
+        use RelativeAxisCode as Rel;
+
+        // keyd's virtual keyboard carries every key, like a real keyboard.
+        assert_eq!(
+            classify(&full_keyboard(), &[], &[], &[]),
+            Some(DeviceClass::Keyboard)
+        );
+        let mouse_buttons = [Key::BTN_LEFT, Key::BTN_RIGHT, Key::BTN_MIDDLE];
+        // A mouse, such as OpenLogi's virtual one.
+        assert_eq!(
+            classify(
+                &mouse_buttons,
+                &[Rel::REL_X, Rel::REL_Y, Rel::REL_WHEEL],
+                &[],
+                &[]
+            ),
+            Some(DeviceClass::Pointer)
+        );
+        // A pointing stick, and a trackball with only side buttons.
+        assert_eq!(
+            classify(
+                &mouse_buttons,
+                &[Rel::REL_X, Rel::REL_Y],
+                &[],
+                &[PropType::POINTER, PropType::POINTING_STICK]
+            ),
+            Some(DeviceClass::Pointer)
+        );
+        assert_eq!(
+            classify(&[Key::BTN_SIDE], &[Rel::REL_X, Rel::REL_Y], &[], &[]),
+            Some(DeviceClass::Pointer)
+        );
+        let touchpad_axes = [
+            Abs::ABS_X,
+            Abs::ABS_Y,
+            Abs::ABS_MT_SLOT,
+            Abs::ABS_MT_POSITION_X,
+            Abs::ABS_MT_POSITION_Y,
+            Abs::ABS_MT_TRACKING_ID,
+        ];
+        assert_eq!(
+            classify(
+                &[Key::BTN_LEFT, Key::BTN_TOOL_FINGER, Key::BTN_TOUCH],
+                &[],
+                &touchpad_axes,
+                &[PropType::POINTER, PropType::BUTTONPAD]
+            ),
+            Some(DeviceClass::Touchpad)
+        );
+    }
+
+    #[test]
+    fn other_input_nodes_are_not_captured() {
+        use AbsoluteAxisCode as Abs;
+        use KeyCode as Key;
+        use RelativeAxisCode as Rel;
+
+        let touch_axes = [
+            Abs::ABS_X,
+            Abs::ABS_Y,
+            Abs::ABS_MT_POSITION_X,
+            Abs::ABS_MT_POSITION_Y,
+        ];
+        let mut no_digits = full_keyboard();
+        no_digits.retain(|key| !(Key::KEY_1.code()..=Key::KEY_0.code()).contains(&key.code()));
+        let mut no_space = full_keyboard();
+        no_space.retain(|&key| key != Key::KEY_SPACE);
+        for (what, class) in [
+            ("power button", classify(&[Key::KEY_POWER], &[], &[], &[])),
+            (
+                "media keys",
+                classify(
+                    &[Key::KEY_VOLUMEUP, Key::KEY_PLAYPAUSE, Key::KEY_SPACE],
+                    &[Rel::REL_HWHEEL],
+                    &[],
+                    &[],
+                ),
+            ),
+            // udev does not call this a keyboard, so it would stay unreadable.
+            ("keys without digits", classify(&no_digits, &[], &[], &[])),
+            ("keys without space", classify(&no_space, &[], &[], &[])),
+            (
+                "motion without a mouse button",
+                classify(&[], &[Rel::REL_X, Rel::REL_Y], &[], &[]),
+            ),
+            (
+                "touchscreen",
+                classify(
+                    &[Key::BTN_TOUCH, Key::BTN_TOOL_FINGER],
+                    &[],
+                    &touch_axes,
+                    &[PropType::DIRECT],
+                ),
+            ),
+            (
+                "pen tablet",
+                classify(
+                    &[Key::BTN_TOOL_PEN, Key::BTN_TOOL_FINGER, Key::BTN_STYLUS],
+                    &[],
+                    &touch_axes,
+                    &[PropType::POINTER],
+                ),
+            ),
+            (
+                "gamepad",
+                classify(
+                    &[Key::BTN_SOUTH, Key::BTN_EAST, Key::BTN_TRIGGER],
+                    &[],
+                    &[Abs::ABS_X, Abs::ABS_Y],
+                    &[],
+                ),
+            ),
+        ] {
+            assert_eq!(class, None, "{what}");
         }
     }
 
