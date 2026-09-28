@@ -1943,6 +1943,37 @@ mod tests {
     }
 
     #[test]
+    fn locking_this_mac_ends_control() {
+        let Pair {
+            links,
+            mut receiver,
+            fake,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|_| {});
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        linux.begin_outbound(activation(&linux)).unwrap();
+        linux.capture(left_alt(KeyState::Pressed)).unwrap();
+        posted(
+            &fake,
+            "modifier 58 down flags 0x80020",
+            Duration::from_secs(2),
+        );
+        // The peer holds Option and sends nothing more, so no batch finds
+        // the lock.
+        fake.state().locked = true;
+        posted(&fake, "modifier 58 up", Duration::from_secs(1));
+        closed(&server, &mut receiver, linux.id());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while links.controller().is_some() {
+            assert!(Instant::now() < deadline, "the peer kept control");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(links);
+    }
+
+    #[test]
     fn a_peer_may_not_control_this_mac_without_leave_or_while_it_sends() {
         // Not allowed to control this Mac.
         let Pair {

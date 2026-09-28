@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, bail};
@@ -32,6 +32,8 @@ pub(crate) const HANDOFF_ACTIVE: &str = "A desktop handoff is already active";
 const NOT_ALLOWED: &str =
     "Desktop control requires the active unlocked local session and an authorized paired peer";
 const REJECTED: &str = "receiver effects were rejected before backend application";
+/// How often the screen lock is checked while a peer controls this Mac.
+const LOCK_CHECK: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct State {
@@ -575,10 +577,31 @@ impl Receiving {
         }
     }
 
-    /// Ends handoffs whose peer stopped polling or whose displays changed.
-    /// Runs until dropped.
+    /// Ends handoffs whose peer stopped polling or whose displays changed,
+    /// and control when the screen locks. Runs until dropped.
     pub async fn watch(&self) {
-        self.handoff.watch().await;
+        tokio::join!(self.handoff.watch(), self.watch_lock());
+    }
+
+    /// Ends control when the screen locks, as the Linux daemon does when its
+    /// seat changes. A modifier the peer holds would otherwise stay down on
+    /// the lock screen, and a peer that sends nothing would keep control
+    /// through it.
+    async fn watch_lock(&self) {
+        let mut check = tokio::time::interval(LOCK_CHECK);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            check.tick().await;
+            let Some(peer) = self.ownership.controller() else {
+                continue;
+            };
+            if self.screen.locked() {
+                tracing::info!(%peer, "this Mac locked; ending control");
+                self.injector.release_all();
+                self.sessions
+                    .close(&peer, None, SessionCloseReason::PermissionRevoked);
+            }
+        }
     }
 
     async fn desktop(
