@@ -28,6 +28,7 @@ pub struct Config {
     pub peers: BTreeMap<String, PeerConfig>,
     pub macos: MacosConfig,
     pub switching: SwitchingConfig,
+    pub clipboard: ClipboardConfig,
 }
 
 /// How crossings start, the same on every platform.
@@ -37,6 +38,16 @@ pub struct SwitchingConfig {
     /// The pointer has to rest against an edge for a moment before it
     /// crosses, so reaching for something at the screen edge stays here.
     pub pause_at_edges: bool,
+}
+
+/// Whether the clipboard goes along with the pointer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClipboardConfig {
+    /// Sends this computer's clipboard to the computer the pointer enters,
+    /// and keeps what a computer the pointer leaves sends here. Each
+    /// computer turns this on for itself.
+    pub share: bool,
 }
 
 impl Default for Config {
@@ -50,6 +61,7 @@ impl Default for Config {
             peers: BTreeMap::new(),
             macos: MacosConfig::default(),
             switching: SwitchingConfig::default(),
+            clipboard: ClipboardConfig::default(),
         }
     }
 }
@@ -472,6 +484,14 @@ mod tests {
         let decoded: Config = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, Config::default());
         decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn the_clipboard_is_shared_only_once_turned_on() {
+        assert!(!Config::default().clipboard.share);
+        let on: Config = toml::from_str("version = 1\n[clipboard]\nshare = true\n").unwrap();
+        assert!(on.clipboard.share);
+        assert!(toml::from_str::<Config>("version = 1\n[clipboard]\nfiles = true\n").is_err());
     }
 
     #[test]

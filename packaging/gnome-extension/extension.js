@@ -5,6 +5,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
@@ -17,7 +18,16 @@ const LEASE_US = 2000000;
 const WARP_US = 100000;
 // src/desktop.rs mirrors this hold duration.
 const POLL_HOLD_MS = 200;
-const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method><signal name="FocusChanged"><arg type="b"/></signal><signal name="EdgeHit"><arg type="s"/><arg type="u"/></signal></interface></node>`;
+// ReadClipboard answers one kind: "text", "png", "empty", or
+// "too_large:<bytes>" for a clip over MAX_CLIP_BYTES, whose data stays here.
+const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method><method name="ReadClipboard"><arg name="kind" type="s" direction="out"/><arg name="data" type="ay" direction="out"/></method><method name="WriteClipboard"><arg name="kind" type="s" direction="in"/><arg name="data" type="ay" direction="in"/></method><signal name="FocusChanged"><arg type="b"/></signal><signal name="EdgeHit"><arg type="s"/><arg type="u"/></signal></interface></node>`;
+// src/clipboard.rs mirrors this limit.
+const MAX_CLIP_BYTES = 3 * 1024 * 1024;
+// The app that copied hands the clipboard over, and a stuck one never does.
+const CLIP_WAIT_MS = 1000;
+// One kind per clip: text if the clipboard has any, else a PNG.
+const CLIP_TYPES = [['text/plain;charset=utf-8', 'text'], ['text/plain', 'text'], ['image/png', 'png']];
+const NO_BYTES = new Uint8Array();
 const EDGES = ['left', 'right', 'top', 'bottom'];
 // Outbound barriers stop this far from the desktop's corners, so a push into
 // a corner, such as GNOME's hot corner, never crosses.
@@ -70,6 +80,8 @@ export default class ZflowExtension extends Extension {
         this._waits = new Set();
         this._hidden = false;
         this._idles = new Set();
+        // Clipboard reads waiting for the app that copied.
+        this._reads = new Set();
         // Only the desktop agent may read the pointer or move it. This skips GNOME's
         // DBusSenderChecker, whose destroy() passes array indexes to unwatch_name.
         this._agent = null;
@@ -115,6 +127,7 @@ export default class ZflowExtension extends Extension {
         // An entry still waiting for the cursor stops here and never answers.
         for (const id of this._idles) GLib.Source.remove(id);
         this._idles.clear();
+        for (const read of [...this._reads]) read.finish(null, new Error('The zflow extension turned off'));
         if (this._timer) GLib.Source.remove(this._timer);
         if (this._monitorsId) Main.layoutManager.disconnect(this._monitorsId);
         if (this._focusId) global.display.disconnect(this._focusId);
@@ -221,11 +234,77 @@ export default class ZflowExtension extends Extension {
         return {geometry: {monitors}, position: {x, y}};
     }
 
-    async CallAsync([json], invocation) {
-        if (invocation.get_sender() !== this._agent) {
-            invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied', 'Only the zflow desktop agent may call this');
-            return;
+    // Only the desktop agent may call in.
+    _fromAgent(invocation) {
+        if (invocation.get_sender() === this._agent) return true;
+        invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied', 'Only the zflow desktop agent may call this');
+        return false;
+    }
+
+    async ReadClipboardAsync(_params, invocation) {
+        if (!this._fromAgent(invocation)) return;
+        try {
+            const [kind, data] = await this._readClipboard();
+            invocation.return_value(new GLib.Variant('(say)', [kind, data]));
+        } catch (error) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed', String(error.message).slice(0, 256));
         }
+    }
+
+    async WriteClipboardAsync([kind, data], invocation) {
+        if (!this._fromAgent(invocation)) return;
+        try {
+            this._writeClipboard(kind, data);
+            invocation.return_value(null);
+        } catch (error) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.InvalidArgs', String(error.message).slice(0, 256));
+        }
+    }
+
+    async _readClipboard() {
+        const offered = St.Clipboard.get_default().get_mimetypes(St.ClipboardType.CLIPBOARD) ?? [];
+        const [mimetype, kind] = CLIP_TYPES.find(([type]) => offered.includes(type)) ?? [];
+        const bytes = mimetype ? await this._clipboardContent(mimetype) : null;
+        const size = bytes?.get_size() ?? 0;
+        if (!size) return ['empty', NO_BYTES];
+        if (size > MAX_CLIP_BYTES) return [`too_large:${size}`, NO_BYTES];
+        return [kind, bytes.toArray()];
+    }
+
+    // St hands the bytes over once the app that copied sends them all.
+    _clipboardContent(mimetype) {
+        return new Promise((resolve, reject) => {
+            const read = {
+                finish: (bytes, error) => {
+                    if (!this._reads.delete(read)) return;
+                    if (read.timer) GLib.Source.remove(read.timer);
+                    if (error) reject(error);
+                    else resolve(bytes);
+                },
+            };
+            read.timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CLIP_WAIT_MS, () => {
+                read.timer = 0;
+                read.finish(null, new Error('The app that copied did not hand the clipboard over'));
+                return GLib.SOURCE_REMOVE;
+            });
+            this._reads.add(read);
+            St.Clipboard.get_default().get_content(St.ClipboardType.CLIPBOARD, mimetype, (_clipboard, bytes) => read.finish(bytes));
+        });
+    }
+
+    _writeClipboard(kind, data) {
+        if (!data?.length || data.length > MAX_CLIP_BYTES) throw new Error('Invalid clip');
+        const clipboard = St.Clipboard.get_default();
+        if (kind === 'text')
+            clipboard.set_text(St.ClipboardType.CLIPBOARD, new TextDecoder('utf-8', {fatal: true}).decode(data));
+        else if (kind === 'png')
+            clipboard.set_content(St.ClipboardType.CLIPBOARD, 'image/png', new GLib.Bytes(data));
+        else
+            throw new Error('Unknown clip kind');
+    }
+
+    async CallAsync([json], invocation) {
+        if (!this._fromAgent(invocation)) return;
         let response;
         try {
             if (json.length > 4096) throw new Error('Desktop request exceeds limit');
@@ -264,6 +343,11 @@ export default class ZflowExtension extends Extension {
                 this._pauseMs = pauseMs;
                 this._placeEdges();
             }
+            return {status: 'finished'};
+        }
+        if (r.command === 'notify') {
+            if (typeof r.message !== 'string' || !r.message) throw new Error('Invalid notice');
+            Main.notify('zflow', r.message.slice(0, 256));
             return {status: 'finished'};
         }
         const snapshot = this._snapshot();

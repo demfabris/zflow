@@ -45,6 +45,7 @@ use crate::{
 };
 
 const SESSION_EVENT_CAPACITY: usize = 1_024;
+mod clipboard;
 mod crossing;
 mod desktop;
 mod peer_view;
@@ -145,6 +146,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
         inbound_owner: Mutex::new(None),
+        clipboard_echo: Mutex::new(BTreeMap::new()),
         desktop: desktop::Hub::default(),
         seat,
         seat_gate: RwLock::new(initial_seat),
@@ -365,6 +367,8 @@ struct Shared {
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
     inbound_owner: Mutex<Option<(String, u64)>>,
+    /// Per peer, the clip last sent to it and the one it last gave here.
+    clipboard_echo: Mutex<BTreeMap<String, crate::clipboard::Echo>>,
     desktop: desktop::Hub,
     seat: watch::Receiver<SeatState>,
     /// The inbound injection gate, kept current by `watch_seat`.
@@ -465,7 +469,30 @@ impl Shared {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => tracing::warn!(%error, "saved layout not read"),
         }
+        self.place_new_peers().await;
         self.apply_layout().await;
+    }
+
+    /// Gives each paired computer the layout lacks a tile beside this one,
+    /// such as one paired after the computers were arranged, and tells the
+    /// other computers. Without a layout there is nothing to add to: the
+    /// first one places every paired computer.
+    async fn place_new_peers(&self) {
+        let keys = peer_keys(&*self.config.read().await);
+        let current = self.layout.lock().await.clone();
+        let Some(placed) = current.and_then(|layout| {
+            layout.with_tiles_for(
+                &self.identity_fingerprint,
+                keys.values().map(String::as_str),
+                PEER_TILE_SIZE,
+            )
+        }) else {
+            return;
+        };
+        let version = placed.version;
+        if self.keep_layout(placed, None).await {
+            tracing::info!(version, "paired computer placed in the layout");
+        }
     }
 
     /// Places a barrier on each edge of this computer's tile that touches a
@@ -523,6 +550,8 @@ impl Shared {
             return;
         }
         tracing::info!(peer = %from, version, "layout adopted");
+        // A computer paired here but not there has no tile in it yet.
+        self.place_new_peers().await;
         // The other computer may not know this desktop's size yet.
         let shared = self.clone();
         tokio::spawn(async move {
@@ -1129,18 +1158,22 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
                 session.record_switch_time_leakage(arming_leakage_events);
             }
             desktop::set_sending(shared, true);
-            if let Err(error) = shared.begin_outbound(&peer).await {
-                tracing::warn!(%error, %peer, "outbound session could not start");
-                shared
-                    .runtime
-                    .send_critical(
-                        RuntimeCommand::Release {
-                            transport_live: false,
-                        },
-                        TERMINAL_SEND_TIMEOUT,
-                    )
-                    .await
-                    .map_err(|error| anyhow!(error))?;
+            match shared.begin_outbound(&peer).await {
+                // The pointer left for `peer`, so the clipboard goes along.
+                Ok(()) => shared.share_clipboard(&peer),
+                Err(error) => {
+                    tracing::warn!(%error, %peer, "outbound session could not start");
+                    shared
+                        .runtime
+                        .send_critical(
+                            RuntimeCommand::Release {
+                                transport_live: false,
+                            },
+                            TERMINAL_SEND_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                }
             }
         }
         RuntimeEvent::OwnershipChanged {
@@ -1818,8 +1851,7 @@ impl Shared {
                     }
                 }
             }
-            // Linux keeps clips once the GNOME side can write them.
-            SessionEventKind::Clipboard { .. } => {}
+            SessionEventKind::Clipboard { clip } => self.keep_clipboard(event.peer, clip),
             SessionEventKind::Layout { layout } => {
                 self.merge_layout(&event.peer, event.session_id, layout)
                     .await;
@@ -1906,7 +1938,7 @@ impl Shared {
     }
 
     async fn route_receiver_effects(
-        &self,
+        self: &Arc<Self>,
         peer: &str,
         session_id: u64,
         effects: Vec<ReceiverEffect>,
@@ -2010,6 +2042,8 @@ impl Shared {
                 .is_some_and(|(owner_peer, owner_id)| owner_peer == peer && *owner_id == session_id)
             {
                 *owner = None;
+                // The pointer went back to `peer`, so the clipboard goes along.
+                self.share_clipboard(peer);
             }
         }
         if rejected {
@@ -2107,6 +2141,7 @@ impl Shared {
         }
         // Pairing, forgetting or renaming a computer changes which tiles have
         // a computer behind them here.
+        self.place_new_peers().await;
         self.apply_layout().await;
         Ok(())
     }

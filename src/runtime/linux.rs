@@ -762,6 +762,9 @@ impl RuntimeLoop {
         if self.ownership.request_activation().is_err() {
             return;
         }
+        // Nothing is grabbed yet, so an event read after this only brings
+        // the tracked state closer to the kernel's.
+        self.capture.resync_held();
         self.arming_leakage_events = 0;
         self.selected_peer = Some(peer);
         self.emit_ownership();

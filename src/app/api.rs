@@ -26,6 +26,8 @@ pub(super) struct Snapshot<P> {
     /// None where crossings cannot pause yet.
     pub pause_at_edges: Option<bool>,
     pub shortcuts: Vec<Shortcut>,
+    /// None where clipboards are not shared yet.
+    pub share_clipboard: Option<bool>,
     /// None where the app keeps it, as the Mac app does with its login item.
     pub autostart: Option<bool>,
     /// The file with the advanced settings.
@@ -229,6 +231,9 @@ pub(crate) enum Request {
     SetSwitching {
         pause_at_edges: bool,
     },
+    SetClipboard {
+        share: bool,
+    },
     SetAutostart {
         enabled: bool,
     },
@@ -343,6 +348,10 @@ mod tests {
             parse(r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":8}"#).unwrap(),
             Request::MoveTile { .. }
         ));
+        assert!(matches!(
+            parse(r#"{"command":"set_clipboard","share":true}"#).unwrap(),
+            Request::SetClipboard { share: true }
+        ));
         for old in [
             r#"{"command":"pair_start","address":null}"#,
             r#"{"command":"pair","remote":null}"#,
@@ -350,6 +359,8 @@ mod tests {
             r#"{"command":"set_keyboard","name":"desk","mode":"mac"}"#,
             r#"{"command":"set_peer","name":"desk","inject_prelogin":true}"#,
             r#"{"command":"set_sharing","enabled":true,"permissions":{"inject_prelogin":true}}"#,
+            r#"{"command":"set_clipboard","share":"yes"}"#,
+            r#"{"command":"set_clipboard","share":true,"files":true}"#,
         ] {
             assert!(parse(old).is_err(), "{old}");
         }
@@ -367,6 +378,7 @@ mod tests {
             nearby: Vec::new(),
             pause_at_edges: None,
             shortcuts: Vec::new(),
+            share_clipboard: None,
             autostart: None,
             config_path: "/etc/zflow/zflow.toml".into(),
             platform: (),
@@ -383,6 +395,7 @@ mod tests {
             "nearby",
             "pause_at_edges",
             "shortcuts",
+            "share_clipboard",
             "autostart",
             "config_path",
             "platform",

@@ -204,10 +204,15 @@ while the last valid configuration stays in use. Conflicting writes fail instead
 of overwriting an external edit.
 
 The GNOME window exposes sharing, pairing, keyboard modes, forgetting
-computers, and **Start at Login**. Its panel menu shows the current sender or
-receiver and a sharing switch. The extension preferences show the same GTK
-settings. Closing either window leaves the desktop agent running. Pairing
-closes when its dialog closes.
+computers, **Share Clipboard**, and **Start at Login**. Its panel menu shows
+the current sender or receiver and a sharing switch. The extension
+preferences show the same GTK settings. Closing either window leaves the
+desktop agent running. Pairing closes when its dialog closes.
+
+With **Share Clipboard** on at both ends, the clipboard goes with the
+pointer: the computer the pointer leaves sends its text, or one PNG image,
+to the computer it enters. Files never go, and a clip over 3 MB stays put
+with a notice. The switch is stored in `[clipboard].share`.
 
 Linux stores the sharing switch in `[daemon].sharing`; pausing closes active
 input sessions and blocks sending and receiving, including pre-login input,

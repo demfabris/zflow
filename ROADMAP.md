@@ -109,8 +109,8 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 
 | Feature | Deskflow | Mac | Linux | Verdict | Why |
 |---|---|---|---|---|---|
-| Clipboard text | yes | missing (`SPEC.md:71`) | missing | build (Phase 4) | Sync it only when the pointer crosses. |
-| Clipboard images | yes, 3 MiB cap | missing | missing | build after text | Capped, no UI. |
+| Clipboard text | yes | missing (`SPEC.md:71`) | exists (Phase 4) | build (Phase 4) | Sync it only when the pointer crosses. |
+| Clipboard images | yes, 3 MiB cap | missing | exists: PNG, 3 MiB cap (Phase 4) | build after text | Capped, no UI. |
 | Primary selection | yes | n/a | missing | skip | |
 | Files | Removed in v1.22 ([PR #8569](https://github.com/deskflow/deskflow/pull/8569)) | no | no | skip | |
 | Screensaver sync | always on | Locking the Mac turns on Secure Input, which ends the crossing (`src/macos/mod.rs:46`) | The seat gate refuses input while locked (`src/daemon.rs:1033-1050`) | have (partial) | |
@@ -324,7 +324,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 | 11 | Pause at edges | Switch | `set_switching` (new) | no | no |
 | 12 | Shortcuts | Read-only rows | `snapshot.shortcuts` | hint only (`SettingsView.swift:186`) | no |
 | 13 | Start at login | Switch | Mac: Swift SMAppService (`Services.swift:106-126`); Linux: `set_autostart` (`gnome.rs:240-262`) | yes | yes |
-| 14 | Share clipboard (Phase 4) | Switch | `set_clipboard` | no | no |
+| 14 | Share clipboard (Phase 4) | Switch | `set_clipboard` | no | yes |
 | 15 | Advanced configuration | Mac: button; Linux: path text (the file is root-owned) | none | yes | text only (`settings.js:52`) |
 
 ### Bottom section, Mac
@@ -466,15 +466,14 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - Each computer writes its own tile size into the shared layout. A resize keeps the sides that touch a neighbour.
     - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
     - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
+    - A computer paired after the layout exists gets a tile beside this one (`SharedLayout::with_tiles_for`), and so does one missing from a layout a peer sent.
   - Left:
     - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
     - The live checks in TESTPLAN.md, "Two-way input sitting".
-    - A computer paired after a layout exists gets no tile until someone adds it.
   - Known limits:
-    - A key held on a remapper-grabbed device at the moment zflow opens it blocks arming until the daemon restarts.
     - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
     - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
-    - With three or more computers where not every pair is paired, an edit on one computer drops the tiles of computers it has not paired. SPEC's rule against resurrecting forgotten computers causes this; peer-to-peer hops (Phase 4) need a rule that keeps third-party tiles.
+    - With three or more computers where not every pair is paired, an edit on one computer drops the tiles of computers it has not paired. A computer that paired them puts them back beside itself, but not where they were. SPEC's rule against resurrecting forgotten computers causes this; peer-to-peer hops (Phase 4) need a rule that keeps third-party tiles.
 
 ### Phase 4: the Deskflow extras
 
@@ -489,6 +488,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - Open logs.
 - **Status (2026-09-28):** started on Linux, on branch `linux-edge-sending`.
   - Done: dead corners (outbound barriers stop 8 px short of the desktop's corners), pause at edges (`[switching] pause_at_edges`, `set_switching`, 250 ms rest against a barrier on Linux), and reverse scrolling per computer. `reverse_scroll` is on the peer record, in `set_peer` and in the snapshot; the Linux daemon turns that peer's scroll around, and the settings window has the switch. The Mac injector and Mac UI pick it up in Phase 2.
+  - Clipboard on Linux: done, merged into `linux-edge-sending`. The computer the pointer leaves sends its clipboard to the one it enters, as SPEC.md's Clipboard section says. `[clipboard] share` and the Share Clipboard switch (`set_clipboard`) turn it on for one computer. The GNOME extension reads and writes the clipboard through `St.Clipboard` in two D-Bus methods only the agent may call, and shows the over-limit notice. The agent carries clips to the service as base64 on its own stream, which alone allows messages that large. The Mac side (`NSPasteboard` and its switch) is pending.
 - **Acceptance:**
   - Text and PNG copy/paste work both ways.
   - A 5 MiB clip is refused with a notice, without disconnecting.

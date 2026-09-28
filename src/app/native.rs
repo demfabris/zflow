@@ -262,6 +262,7 @@ impl NativeApp {
             // The app keeps the login item.
             Request::SetAutostart { .. }
             | Request::SetSwitching { .. }
+            | Request::SetClipboard { .. }
             | Request::OpenSettings
             | Request::OpenLogs
             | Request::InstallExtension => bail!("Not available on this computer"),
@@ -755,6 +756,7 @@ impl NativeApp {
                 title: "Return input to this computer".into(),
                 keys: "⌃⌘⌫".into(),
             }],
+            share_clipboard: None,
             autostart: None,
             config_path: self.document.path.clone(),
             platform: MacPlatform {
@@ -1023,6 +1025,7 @@ mod tests {
             "nearby",
             "pause_at_edges",
             "shortcuts",
+            "share_clipboard",
             "autostart",
             "config_path",
             "platform",

@@ -228,6 +228,13 @@ impl AggregateInputState {
         self.devices.remove(path).is_some()
     }
 
+    /// Replaces what `path` holds with what the kernel reports it holds.
+    pub fn resync_held(&mut self, path: &std::path::Path, held: impl IntoIterator<Item = KeyCode>) {
+        if let Some(device) = self.devices.get_mut(path) {
+            device.held = held.into_iter().collect();
+        }
+    }
+
     pub fn observe(&mut self, path: &std::path::Path, event: InputEvent) -> bool {
         let Some(device) = self.devices.get_mut(path) else {
             return false;
@@ -289,6 +296,21 @@ mod tests {
             SynchronizationCode::SYN_REPORT.0,
             0,
         )
+    }
+
+    #[test]
+    fn the_kernel_clears_a_key_whose_release_never_arrived() {
+        // A node keyd grabbed sends zflow no events, so a key held when
+        // zflow opened it only comes up in the kernel's state.
+        let one = std::path::Path::new("/dev/input/event1");
+        let mut aggregate = AggregateInputState::default();
+        aggregate.add_device(one, [KeyCode::KEY_A]);
+        aggregate.resync_held(std::path::Path::new("/dev/input/event9"), []);
+        assert!(!aggregate.is_neutral(), "another node changes nothing");
+        aggregate.resync_held(one, []);
+        assert!(aggregate.is_neutral());
+        aggregate.resync_held(one, [KeyCode::KEY_B]);
+        assert!(!aggregate.is_neutral());
     }
 
     #[test]

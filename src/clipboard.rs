@@ -102,28 +102,28 @@ pub fn too_large(bytes: usize) -> String {
     )
 }
 
-/// Keeps a clip from going back and forth: a computer does not send what it
-/// just sent, nor what a peer just gave it.
+/// Keeps a clip from going back and forth. It remembers the clip the peer
+/// last had from this computer or gave it, whichever came last, and a clip
+/// goes only when it differs from that one.
 #[derive(Debug, Default)]
 pub struct Echo {
-    sent: Option<[u8; 32]>,
-    written: Option<[u8; 32]>,
+    peer_has: Option<[u8; 32]>,
 }
 
 impl Echo {
     /// Whether `clip` is news to the peer, and if so remembers sending it.
     pub fn should_send(&mut self, clip: &Clip) -> bool {
-        let digest = clip.digest();
-        if self.sent == Some(digest) || self.written == Some(digest) {
+        let digest = Some(clip.digest());
+        if self.peer_has == digest {
             return false;
         }
-        self.sent = Some(digest);
+        self.peer_has = digest;
         true
     }
 
     /// Remembers a clip a peer gave this computer.
     pub fn written(&mut self, clip: &Clip) {
-        self.written = Some(clip.digest());
+        self.peer_has = Some(clip.digest());
     }
 }
 
@@ -161,6 +161,10 @@ mod tests {
         assert!(!echo.should_send(&clip("one")), "already sent");
         echo.written(&clip("two"));
         assert!(!echo.should_send(&clip("two")), "the peer gave it to us");
+        assert!(
+            echo.should_send(&clip("one")),
+            "the peer copied something else since"
+        );
         assert!(echo.should_send(&clip("three")));
     }
 }

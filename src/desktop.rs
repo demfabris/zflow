@@ -377,12 +377,6 @@ impl SharedLayout {
         if (old.width, old.height) == (width, height) {
             return None;
         }
-        let span = |start: i32, size: u32| (i64::from(start), i64::from(start) + i64::from(size));
-        let overlaps = |a: &Tile, b: &Tile| {
-            let ((al, ar), (at, ab)) = (span(a.x, a.width), span(a.y, a.height));
-            let ((bl, br), (bt, bb)) = (span(b.x, b.width), span(b.y, b.height));
-            al < br && ar > bl && at < bb && ab > bt
-        };
         let others = || {
             self.tiles
                 .iter()
@@ -426,6 +420,79 @@ impl SharedLayout {
         }
         next.validate().ok().map(|()| next)
     }
+
+    /// A new version, edited by `own`, with a tile of `size` for each of
+    /// `keys` the layout lacks, such as a computer paired after the layout
+    /// was arranged. Each goes beside `own`'s tile where there is room: to
+    /// the right, left, below or above, else to the right of all the rest.
+    /// None when no tile is missing or the layout is full.
+    pub fn with_tiles_for<'a>(
+        &self,
+        own: &str,
+        keys: impl IntoIterator<Item = &'a str>,
+        (width, height): (u32, u32),
+    ) -> Option<Self> {
+        use crate::app::layout_model::MAX_COORDINATE;
+        let mut next = self.clone();
+        for key in keys {
+            if key == own || next.tiles.iter().any(|tile| tile.key == key) {
+                continue;
+            }
+            if next.tiles.len() >= MAX_SHARED_TILES {
+                break;
+            }
+            let tile = |x: i64, y: i64| {
+                let bounds = -i64::from(MAX_COORDINATE)..=i64::from(MAX_COORDINATE);
+                (bounds.contains(&x) && bounds.contains(&y)).then(|| Tile {
+                    key: key.to_owned(),
+                    x: x as i32,
+                    y: y as i32,
+                    width,
+                    height,
+                })
+            };
+            let (w, h) = (i64::from(width), i64::from(height));
+            let anchor = next.tiles.iter().find(|tile| tile.key == own);
+            let beside = anchor.map_or_else(Vec::new, |a| {
+                let ((left, right), (top, bottom)) = (span(a.x, a.width), span(a.y, a.height));
+                vec![
+                    (right, top),
+                    (left - w, top),
+                    (left, bottom),
+                    (left, top - h),
+                ]
+            });
+            let past_all = next
+                .tiles
+                .iter()
+                .map(|tile| span(tile.x, tile.width).1)
+                .max()
+                .unwrap_or(0);
+            let row = anchor.map_or(0, |a| i64::from(a.y));
+            let placed = beside
+                .into_iter()
+                .chain([(past_all, row)])
+                .filter_map(|(x, y)| tile(x, y))
+                .find(|tile| !next.tiles.iter().any(|other| overlaps(tile, other)))?;
+            next.tiles.push(placed);
+        }
+        if next.tiles.len() == self.tiles.len() {
+            return None;
+        }
+        next.version = self.version.checked_add(1)?;
+        next.editor = own.to_owned();
+        next.validate().ok().map(|()| next)
+    }
+}
+
+fn span(start: i32, size: u32) -> (i64, i64) {
+    (i64::from(start), i64::from(start) + i64::from(size))
+}
+
+fn overlaps(a: &Tile, b: &Tile) -> bool {
+    let ((al, ar), (at, ab)) = (span(a.x, a.width), span(a.y, a.height));
+    let ((bl, br), (bt, bb)) = (span(b.x, b.width), span(b.y, b.height));
+    al < br && ar > bl && at < bb && ab > bt
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +532,68 @@ impl DesktopMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_computer_paired_later_gets_a_tile_beside_this_one() {
+        let key = |n: usize| format!("{n:064x}");
+        let tile = |n, x, y, width, height| Tile {
+            key: key(n),
+            x,
+            y,
+            width,
+            height,
+        };
+        let size = (1920, 1080);
+        let alone = SharedLayout {
+            version: 3,
+            editor: key(9),
+            tiles: vec![tile(1, 0, 0, 1000, 800)],
+        };
+        let keys = [key(1), key(2), key(2)];
+        let placed = alone
+            .with_tiles_for(&key(1), keys.iter().map(String::as_str), size)
+            .unwrap();
+        assert_eq!((placed.version, &placed.editor), (4, &key(1)));
+        assert_eq!(placed.tiles[1..], [tile(2, 1000, 0, 1920, 1080)]);
+        assert!(
+            placed
+                .with_tiles_for(&key(1), keys.iter().map(String::as_str), size)
+                .is_none(),
+            "nothing missing"
+        );
+        // The right is taken, so the next one goes left. Below would overlap
+        // the tall tile on the right, so the one after goes above.
+        let keys = [key(3), key(4)];
+        let more = placed
+            .with_tiles_for(&key(1), keys.iter().map(String::as_str), size)
+            .unwrap();
+        assert_eq!(
+            more.tiles[2..],
+            [tile(3, -1920, 0, 1920, 1080), tile(4, 0, -1080, 1920, 1080)]
+        );
+        // Without this computer's own tile, it goes right of the rest.
+        let foreign = SharedLayout {
+            tiles: vec![tile(2, 0, 0, 1000, 800)],
+            ..alone.clone()
+        };
+        let keys = [key(3)];
+        let past = foreign
+            .with_tiles_for(&key(1), keys.iter().map(String::as_str), size)
+            .unwrap();
+        assert_eq!(past.tiles[1..], [tile(3, 1000, 0, 1920, 1080)]);
+        let full = SharedLayout {
+            tiles: (0..MAX_SHARED_TILES)
+                .map(|n| tile(n + 10, n as i32 * 2000, 0, 1000, 800))
+                .collect(),
+            ..alone
+        };
+        let keys = [key(3)];
+        assert!(
+            full.with_tiles_for(&key(10), keys.iter().map(String::as_str), size)
+                .is_none(),
+            "no room for another computer"
+        );
+    }
 
     #[test]
     fn a_full_shared_layout_fits_one_desktop_message_and_orders_versions() {

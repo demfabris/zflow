@@ -15,6 +15,14 @@ function controller(widget, type) {
     }
     throw new Error(`No ${type.name} on the widget`);
 }
+// The page's groups, top to bottom.
+function groups(widget, found = []) {
+    for (let child = widget.get_first_child(); child; child = child.get_next_sibling()) {
+        if (child instanceof Adw.PreferencesGroup) found.push(child);
+        else groups(child, found);
+    }
+    return found;
+}
 function waitFor(predicate) {
     return new Promise((resolve, reject) => {
         let attempts = 0;
@@ -39,7 +47,7 @@ const snapshot = {
     health: [{id: 'service', level: 'ok', title: 'Background service', detail: 'Running', action: null}],
     layout, peers: [peer('MacBook')], pairing: {state: 'idle'}, nearby: [], pause_at_edges: false,
     shortcuts: [{title: 'Return input to this computer', keys: 'Ctrl+Super+Backspace'}],
-    autostart: true, config_path: '/etc/zflow/zflow.toml', platform: null,
+    share_clipboard: false, autostart: true, config_path: '/etc/zflow/zflow.toml', platform: null,
 };
 const find = name => snapshot.peers.find(peer => peer.name === name);
 let failSharing = false;
@@ -48,6 +56,7 @@ let callCount = 0;
 let keyboardCalls = 0;
 let controlCalls = 0;
 let scrollCalls = 0;
+let clipboardCalls = 0;
 let logsOpened = 0;
 const moves = [];
 const xml = '<node><interface name="io.zflow.Desktop"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>';
@@ -64,6 +73,11 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
             break;
         case 'set_autostart': snapshot.autostart = request.enabled; break;
         case 'set_switching': snapshot.pause_at_edges = request.pause_at_edges; break;
+        case 'set_clipboard':
+            assert(Object.keys(request).join() === 'command,share', 'the switch sends only whether to share');
+            clipboardCalls++;
+            snapshot.share_clipboard = request.share;
+            break;
         case 'open_logs': logsOpened++; break;
         case 'forget': snapshot.peers = snapshot.peers.filter(peer => peer.name !== request.name); break;
         case 'set_peer': {
@@ -206,6 +220,19 @@ app.connect('activate', () => {
         assert(!settings._pause.active && settings._pause.sensitive, 'crossings do not pause by default');
         settings._pause.active = true;
         await waitFor(() => snapshot.pause_at_edges && !settings._busy && settings._pause.sensitive);
+        // Share Clipboard comes after the shortcuts and before Start at Login.
+        const order = groups(settings.page);
+        const at = widget => order.indexOf(widget instanceof Adw.PreferencesGroup ? widget : widget.get_ancestor(Adw.PreferencesGroup.$gtype));
+        assert(at(settings._shortcuts) < at(settings._clipboard) && at(settings._clipboard) < at(settings._login), 'the clipboard switch sits between shortcuts and login');
+        assert(settings._clipboard.title === 'Share Clipboard' && settings._clipboard.subtitle.includes('Never files'), 'the switch says what it shares');
+        assert(!settings._clipboard.active && settings._clipboard.sensitive, 'the clipboard stays here until turned on');
+        settings._clipboard.active = true;
+        assert(!settings._clipboard.sensitive, 'a request in flight locks the switch');
+        await waitFor(() => snapshot.share_clipboard && !settings._busy && settings._clipboard.sensitive);
+        assert(clipboardCalls === 1, 'turning it on sends set_clipboard once');
+        snapshot.share_clipboard = false;
+        await waitFor(() => !settings._clipboard.active);
+        assert(clipboardCalls === 1, 'a snapshot moves the switch without sending a request');
         settings._logs.emit('clicked');
         await waitFor(() => logsOpened === 1 && !settings._busy);
         const scroll = settings._scrolls.get('MacBook');
@@ -273,11 +300,11 @@ app.connect('activate', () => {
         fresh.destroy();
         freshWindow.close();
         Object.assign(snapshot, {
-            sharing: null, status: {state: 'attention', peer: null, title: 'Needs attention'}, shortcuts: [], layout: null,
+            sharing: null, status: {state: 'attention', peer: null, title: 'Needs attention'}, shortcuts: [], layout: null, share_clipboard: null,
             health: [{id: 'service', level: 'error', title: 'Background service', detail: 'Start the zflow system service', action: null}],
         });
         await settings.client.refresh();
-        assert(!settings._sharing.sensitive && !settings._pairButton.sensitive, 'offline controls disabled');
+        assert(!settings._sharing.sensitive && !settings._pairButton.sensitive && !settings._clipboard.sensitive, 'offline controls disabled');
         assert(!settings._layout.visible && settings._computers.description === 'Arrange computers in zflow on the other computer.', 'without a layout, the hint comes back');
         assert(statusText(snapshot) === 'Needs attention', 'offline status');
         assert(settings._healthRows[0].subtitle === 'Start the zflow system service', 'the check says what failed');
@@ -290,7 +317,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, reverse scrolling, pause at edges, logs, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
+        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, reverse scrolling, pause at edges, share clipboard, logs, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

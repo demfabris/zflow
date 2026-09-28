@@ -268,6 +268,18 @@ impl CaptureSet {
         self.grabbed
     }
 
+    /// Takes every node's held keys from the kernel. A node another program
+    /// grabbed, as keyd grabs its source keyboard, sends zflow no events, so
+    /// a key held on it when zflow opened it would otherwise stay held here
+    /// and block every activation.
+    pub fn resync_held(&mut self) {
+        for node in &self.nodes {
+            if let Ok(held) = node.device.get_key_state() {
+                self.aggregate.resync_held(&node.path, held.iter());
+            }
+        }
+    }
+
     /// Performs fresh EVIOCGKEY checks over every node. Unlike the tracked
     /// state this closes the arming gap after startup or a dropped frame.
     pub fn kernel_is_neutral(&self) -> Result<bool, CaptureSetError> {

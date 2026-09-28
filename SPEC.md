@@ -69,7 +69,8 @@ zflow MUST:
 | AWDL suppression during sessions (macOS, opt-in) | planned, mechanism proven | Consent flow + re-apply loop |
 | QoS marking | provisional | Radio and energy matrix |
 | Automatic path failover | planned | Candidate-racing failure matrix |
-| Clipboard and file transfer | deferred | Separate bulk transport |
+| Clipboard text and PNG images, with the pointer | Linux built; macOS planned | Phase 4 acceptance in ROADMAP.md |
+| File transfer | deferred | Separate bulk transport |
 
 Linux pre-login scope begins in real-root userspace once zflowd is active. Graphical-greeter support begins when the display manager starts; VT keyboard support may begin earlier. Firmware, initramfs, LUKS, macOS FileVault preboot, and other environments where zflow code cannot run remain excluded.
 
@@ -198,7 +199,7 @@ Payloads are the core model types in postcard behind a three-byte header (magic 
 
 ### Shared layout
 
-Every paired computer keeps one arrangement of all their desktops. Tiles are keyed by key fingerprint, because each computer names the others differently, and hold at most 16 computers so one desktop message carries the whole layout. Each edit raises the layout's version and records its editor's fingerprint; the higher (version, editor) wins, so both ends keep the same layout without a coordinator. A computer sends its layout when a session starts and after each change, keeps a newer one it receives, passes it on to its other peers, and answers an older one with its own. A computer drops tiles for keys it has not paired, so a forgotten computer never returns through a peer's copy, and it computes its own crossing edges from its own tile.
+Every paired computer keeps one arrangement of all their desktops. Tiles are keyed by key fingerprint, because each computer names the others differently, and hold at most 16 computers so one desktop message carries the whole layout. Each edit raises the layout's version and records its editor's fingerprint; the higher (version, editor) wins, so both ends keep the same layout without a coordinator. A computer sends its layout when a session starts and after each change, keeps a newer one it receives, passes it on to its other peers, and answers an older one with its own. A computer drops tiles for keys it has not paired, so a forgotten computer never returns through a peer's copy, and it computes its own crossing edges from its own tile. A computer paired after the layout exists gets a tile beside the tile of the computer that paired it, to the right, left, below or above, whichever is free, as a new version from that computer.
 
 Authenticated session negotiation selects the maximum datagram size, input capabilities, pointer units, scroll fields, contact limit, receiver lease, and checkpoint bound. A required capability mismatch prevents activation.
 
@@ -215,9 +216,14 @@ The receiver MUST release state from the prior epoch before accepting a new epoc
 | Input control | One reliable ordered bidirectional stream | key and button transitions, ownership, touch lifecycle, state snapshots, acknowledgements, terminal anchors |
 | Motion state | QUIC datagrams | cumulative pointer and scroll state, complete touch snapshots |
 | Probe | QUIC datagrams | application probe and echo data |
-| Bulk | separate best-effort QUIC connection and socket | clipboard or file data after v1 |
+| Clipboard | one unidirectional QUIC stream per transfer, below the control stream's priority | one clip |
+| Bulk | separate best-effort QUIC connection and socket | file data after v1 |
 
 Input control MUST NOT share a stream with clipboard or file data. If zflow applies a socket service class, bulk traffic MUST use an unmarked endpoint.
+
+### Clipboard
+
+The clipboard goes with the pointer and moves at no other time. The computer the pointer leaves sends its clipboard to the one it enters: a sender reads its own clipboard once its crossing reaches the other computer, by edge or chord, and a computer that was being controlled reads its clipboard when that control ends, by return, escape chord or lease end. Nothing reads the clipboard while the pointer stays put, and a crossing never waits for a clip. A clip is one representation: UTF-8 text if the clipboard has text, else one PNG image. Files never go. A clip holds at most 3 MiB (`MAX_CLIP_BYTES`); a larger clipboard stays where it is, and that computer shows a notice. Each computer opts in for itself with `[clipboard] share`, off by default: it sends only with its own switch on and keeps what arrives only with its own switch on. Each transfer is its own stream on the input connection, and QUIC sends datagrams ahead of stream data, so a large clip does not hold up input. A newer clip cancels one still on its way, and a bad or oversized clip ends only its own stream. Each computer remembers, per peer, the last clip that peer had from it or gave it, and sends only a different one, so a clip never bounces back. Logs name only a clip's kind and size.
 
 QUIC retransmission cannot deliver an event after connection death. The receiver owns failure recovery.
 
@@ -689,10 +695,9 @@ Each peer has revocable capabilities:
 - connect;
 - receive normal-session input;
 - send normal-session input;
-- inject before login;
-- use clipboard when that feature exists.
+- inject before login.
 
-Pre-login injection defaults off. A local logged-in user must grant it.
+Clipboard sharing is a setting of each computer, not of each peer (see Clipboard). Pre-login injection defaults off. A local logged-in user must grant it.
 
 QUIC 0-RTT MUST NOT carry pairing, input, control, permission, or session-takeover messages because an attacker can replay 0-RTT application data. See [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html#section-9.2).
 
@@ -757,7 +762,7 @@ As of 2026-08-31, implementation steps 0 through 5 are code-complete and pass th
 8. Add portal/EIS capture and test desktop edge switching.
 9. Build the signed macOS daemon and Aqua agent for logged-in capture/injection, including flagged raw-contact capture.
 10. Run CoreHID, LoginWindow, touch, and path-failover experiments as separate gates.
-11. Add a best-effort bulk connection before clipboard work.
+11. Add a best-effort bulk connection before file transfer work.
 
 Release matrices from TESTPLAN.md gate each beta along the way.
 
