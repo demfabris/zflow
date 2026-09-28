@@ -58,6 +58,7 @@ Setup on the Mac:
    survive rebuilds. Grant the app Accessibility.
 2. Launch it with logs, keeping zflow.app as its own Accessibility process:
    `osascript -e 'quit app id "io.zflow.zflow"'`, then
+   `mkdir -p target/logs; log=target/logs/zflow-mac-$(date -u +%Y%m%dT%H%M%SZ).log`, then
    `open -n --stderr "$PWD/$log" --stdout "$PWD/$log" --env RUST_LOG=warn,zflow=debug target/debug/zflow.app`.
    Running the binary from a shell makes the terminal the responsible process.
 3. On Ubuntu, `just debug-daemon`.
@@ -101,7 +102,8 @@ Checks:
 11. **Local devices while controlled.** The Mac's trackpad and keyboard work
     with no stall.
 12. **Exclusion.** While controlled, remote and local motion into the Mac's
-    edge toward Ubuntu starts nothing, and the log shows the observer skipped.
+    edge toward Ubuntu starts nothing, and the log shows "edge crossings
+    skipped while controlled" once.
     After the escape chord, a Mac-to-Ubuntu edge crossing works. With the Mac
     crossed to Ubuntu, the Ubuntu chord is refused.
 13. **Release safety.** Hold Shift+A remotely, then
@@ -109,23 +111,32 @@ Checks:
     1 s (compare log timestamps). Repeat mid-drag with a button held.
 14. **Exit paths.** Quit the Mac app while a key is held remotely: nothing
     stays stuck. Turn off **Can control this computer** while controlled:
-    control ends at once. Lock the Mac while controlled: control ends, and the
-    chord is refused while locked.
+    control ends at once. Lock the Mac while controlled with Shift held
+    remotely: Shift comes up and control ends within 250 ms ("this Mac locked;
+    ending control"), and the chord is refused while locked.
 15. **Wake.** With the password delay above 0, run `pmset displaysleepnow`.
-    The chord plus a move wakes the display.
+    The chord plus a move wakes the display. Sleep it again: an Ubuntu edge
+    push enters the Mac and wakes it, with no "desktop handoff expired" line.
 16. **AWDL.** With **Reduce Wi-Fi lag** on, `ifconfig awdl0` shows it down
     while controlled and back up afterwards.
-17. **Duplicates.** Restart zflowd and, within 1 s, turn Mac sharing off and
-    on. After 10 s there is one session on each side (`zflow status`, and one
-    "superseded" line), and the chord still works.
-18. **Mac to Linux regression.** A full Mac-to-Linux crossing: type, then
+17. **Duplicates.** Turn Mac sharing off, then press Ctrl+Super+F12 on Ubuntu
+    at the moment you turn it back on: zflowd only dials the Mac from the chord
+    or an edge push, so restarting it makes no second dial. After 10 s there is
+    one session on each side (`zflow status`; zero or one "superseded" line),
+    and the chord still works. The link tests cover both dial orders.
+18. **One way only.** Turn off Ubuntu's **Can control this computer** for the
+    Mac. The Mac shows a "Paired computers" warning that ubuntu takes no input
+    from this Mac, not "Needs attention", and the chord still controls the Mac.
+    Turn it back on: within 5 s the warning goes and a Mac-to-Ubuntu crossing
+    works.
+19. **Mac to Linux regression.** A full Mac-to-Linux crossing: type, then
     return. Horizontal scroll now goes the same way as vertical in both
     directions; check it Mac to Linux and Linux to Mac.
-19. **Shared layout.** The Mac log shows "layout adopted" or "layout updated on
+20. **Shared layout.** The Mac log shows "layout adopted" or "layout updated on
     this Mac" once Ubuntu connects. A tile moved on either computer shows up
     on the other within 2 s, and an Ubuntu edge push enters the Mac at the
     matching point and returns at the matching point.
-20. **Clipboard**, once the Mac half lands: note whether macOS shows its paste
+21. **Clipboard**, once the Mac half lands: note whether macOS shows its paste
     privacy alert.
 
 Known before the sitting: the Mac reads every sender's scroll as 120 units per

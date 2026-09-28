@@ -615,7 +615,7 @@ Logged-in v1 uses CGEventPost for keyboard, pointer, and scroll. The Mac app pos
 - macOS does not repeat a posted key, so the receiver repeats the last pressed key at this Mac's repeat rate.
 - Caps Lock flips the real lock through `IOHIDSetModifierLockState`; a posted keycode 57 only sets the flag.
 - Each peer has a keyboard mode. Mac shortcuts means Ctrl and Cmd trade places on this Mac, except in terminals.
-- A peer may inject when sharing is on, its record may connect and send, Accessibility lets zflow post, and the console session is unlocked. An injecting batch on a locked screen closes the session.
+- A peer may inject when sharing is on, its record may connect and send, Accessibility lets zflow post, and the console session is unlocked. An injecting batch on a locked screen closes the session. Locking the screen while a peer controls this Mac releases its input and closes its session within 250 ms.
 - Held input is released when an activation closes, its session or lease ends, the peer is revoked or replaced, the app quits, or the app receives SIGTERM, SIGINT, or SIGHUP. Nothing can release it after SIGKILL of the app.
 - A desktop handoff places the cursor at the requested entry point, reports where the pointer leaves through the handoff edge, and wakes the display. Taking control also wakes it, since the chord sends no Prepare. With AWDL suppression enabled, the Mac holds an AWDL lease while a peer controls it.
 

@@ -140,7 +140,8 @@ While Ubuntu controls the Mac, the Mac's own keyboard and trackpad still work,
 and the Mac starts no crossing of its own. The Mac listens on UDP port 43119
 for computers that connect first. If macOS asks whether zflow may accept
 incoming connections, choose **Allow**; if it can't listen, a health row says
-so and Ubuntu still controls the Mac over the connection the Mac opens.
+so, the Mac tries again every 2 seconds, and Ubuntu still controls the Mac
+over the connection the Mac opens.
 
 Closing Settings leaves sharing running. **Pause Sharing** returns input to
 the Mac; **Quit zflow** stops the engine and finishes cleanup. While sharing is
