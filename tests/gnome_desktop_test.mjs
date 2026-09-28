@@ -347,7 +347,8 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     assert.equal(d.barriers.length, 1, 'only the monitor on the outer right edge');
     const barrier = d.barriers[0];
     assert.equal(barrier.properties.x1, 3200);
-    assert.equal(barrier.properties.y2, 1024);
+    assert.equal(barrier.properties.y1, 8, 'the top corner of the desktop stays dead');
+    assert.equal(barrier.properties.y2, 1024, 'this monitor ends above the desktop corner');
     assert.equal(barrier.properties.directions, 2, 'the pointer may come back in');
     const hits = () => d.emitted.filter(args => args[3] === 'EdgeHit').map(args => [args[0], ...args[4].value]);
     barrier.hit(barrier, {x: 3200, y: 540, event_id: 1});

@@ -19,6 +19,9 @@ const WARP_US = 100000;
 const POLL_HOLD_MS = 200;
 const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method><signal name="FocusChanged"><arg type="b"/></signal><signal name="EdgeHit"><arg type="s"/><arg type="u"/></signal></interface></node>`;
 const EDGES = ['left', 'right', 'top', 'bottom'];
+// Outbound barriers stop this far from the desktop's corners, so a push into
+// a corner, such as GNOME's hot corner, never crosses.
+const DEAD_CORNER = 8;
 
 // The monitors along one outer edge of the desktop, cut to a range given as
 // fractions of MAX along that edge.
@@ -129,7 +132,12 @@ export default class ZflowExtension extends Extension {
             return;
         for (const {edge, start, end} of this._edges) {
             const g = edgeGeometry(ms, edge, start, end);
-            for (const segment of g.segments) {
+            const [low, high] = g.vertical ? [g.top, g.bottom] : [g.left, g.right];
+            const segments = g.segments.map(s => ({...s,
+                start: s.start === low ? s.start + DEAD_CORNER : s.start,
+                end: s.end === high ? s.end - DEAD_CORNER : s.end,
+            })).filter(s => s.end > s.start);
+            for (const segment of segments) {
                 const barrier = edgeBarrier(edge, g, segment);
                 // Shell sends a hit for every motion against the barrier; report
                 // each push once. While another computer controls this one, its
