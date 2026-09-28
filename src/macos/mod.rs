@@ -1,6 +1,7 @@
 //! macOS input source: native capture, and crossings over a receiver's session.
 
 mod awdl;
+mod keys;
 mod link;
 mod local_network;
 
@@ -22,7 +23,7 @@ use crate::{
         CaptureFrame, CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS,
     },
     core::{
-        ContactId, HidUsage, MotionDelta, PointerButton, SessionCloseReason, SessionContext,
+        ContactId, MotionDelta, PointerButton, SessionCloseReason, SessionContext,
         SourceDimensions, TouchContact, TouchState, TouchTool,
     },
     desktop::{DesktopRequest, DesktopResponse, Edge, Point, Rect, ReturnMapping},
@@ -767,7 +768,7 @@ fn native_frame(event: NativeEvent) -> Result<Option<CapturedDeviceFrame>> {
             ..CaptureFrame::default()
         },
         kind if kind == NativeEventKind::Key as u32 => {
-            let Some(usage) = mac_keycode_to_hid(event.code) else {
+            let Some(usage) = keys::mac_keycode_to_hid(event.code) else {
                 return Ok(None);
             };
             CaptureFrame {
@@ -864,129 +865,6 @@ fn pressed_state(pressed: u8) -> KeyState {
     } else {
         KeyState::Pressed
     }
-}
-
-fn mac_keycode_to_hid(code: u16) -> Option<HidUsage> {
-    let usage = match code {
-        0 => 0x04,
-        1 => 0x16,
-        2 => 0x07,
-        3 => 0x09,
-        4 => 0x0b,
-        5 => 0x0a,
-        6 => 0x1d,
-        7 => 0x1b,
-        8 => 0x06,
-        9 => 0x19,
-        10 => 0x64, // left of Z; capture_bridge.c swaps 10 and 50 on ISO keyboards
-        11 => 0x05,
-        12 => 0x14,
-        13 => 0x1a,
-        14 => 0x08,
-        15 => 0x15,
-        16 => 0x1c,
-        17 => 0x17,
-        18 => 0x1e,
-        19 => 0x1f,
-        20 => 0x20,
-        21 => 0x21,
-        22 => 0x23,
-        23 => 0x22,
-        24 => 0x2e,
-        25 => 0x26,
-        26 => 0x24,
-        27 => 0x2d,
-        28 => 0x25,
-        29 => 0x27,
-        30 => 0x30,
-        31 => 0x12,
-        32 => 0x18,
-        33 => 0x2f,
-        34 => 0x0c,
-        35 => 0x13,
-        36 => 0x28,
-        37 => 0x0f,
-        38 => 0x0d,
-        39 => 0x34,
-        40 => 0x0e,
-        41 => 0x33,
-        42 => 0x31,
-        43 => 0x36,
-        44 => 0x38,
-        45 => 0x11,
-        46 => 0x10,
-        47 => 0x37,
-        48 => 0x2b,
-        49 => 0x2c,
-        50 => 0x35, // left of 1; capture_bridge.c swaps 10 and 50 on ISO keyboards
-        51 => 0x2a,
-        53 => 0x29,
-        54 => 0xe7,
-        55 => 0xe3,
-        56 => 0xe1,
-        57 => 0x39,
-        58 => 0xe2,
-        59 => 0xe0,
-        60 => 0xe5,
-        61 => 0xe6,
-        62 => 0xe4,
-        64 => 0x6c, // F17
-        65 => 0x63,
-        67 => 0x55,
-        69 => 0x57,
-        71 => 0x53,
-        75 => 0x54,
-        76 => 0x58,
-        78 => 0x56,
-        79 => 0x6d, // F18
-        80 => 0x6e, // F19
-        81 => 0x67,
-        82 => 0x62,
-        83 => 0x59,
-        84 => 0x5a,
-        85 => 0x5b,
-        86 => 0x5c,
-        87 => 0x5d,
-        88 => 0x5e,
-        89 => 0x5f,
-        90 => 0x6f, // F20
-        91 => 0x60,
-        92 => 0x61,
-        93 => 0x89, // JIS yen
-        94 => 0x87, // JIS underscore (ro)
-        95 => 0x85, // JIS keypad comma
-        96 => 0x3e,
-        97 => 0x3f,
-        98 => 0x40,
-        99 => 0x3c,
-        100 => 0x41,
-        101 => 0x42,
-        102 => 0x91, // JIS eisu
-        103 => 0x44,
-        104 => 0x90, // JIS kana
-        105 => 0x68,
-        106 => 0x6b,
-        107 => 0x69,
-        109 => 0x43,
-        110 => 0x65, // context menu
-        111 => 0x45,
-        113 => 0x6a,
-        114 => 0x49,
-        115 => 0x4a,
-        116 => 0x4b,
-        117 => 0x4c,
-        118 => 0x3d,
-        119 => 0x4d,
-        120 => 0x3b,
-        121 => 0x4e,
-        122 => 0x3a,
-        123 => 0x50,
-        124 => 0x4f,
-        125 => 0x51,
-        126 => 0x52,
-        _ => return None,
-    };
-    Some(HidUsage::keyboard(usage))
 }
 
 #[repr(u32)]
@@ -1364,30 +1242,6 @@ mod tests {
                 height: 1,
             }
         );
-    }
-
-    #[test]
-    fn maps_main_return_to_hid_return() {
-        assert_eq!(mac_keycode_to_hid(36), Some(HidUsage::keyboard(0x28)));
-    }
-
-    #[test]
-    fn maps_iso_jis_context_menu_and_high_function_keys() {
-        for (code, usage) in [
-            (10, 0x64),
-            (64, 0x6c),
-            (79, 0x6d),
-            (80, 0x6e),
-            (90, 0x6f),
-            (93, 0x89),
-            (94, 0x87),
-            (95, 0x85),
-            (102, 0x91),
-            (104, 0x90),
-            (110, 0x65),
-        ] {
-            assert_eq!(mac_keycode_to_hid(code), Some(HidUsage::keyboard(usage)));
-        }
     }
 
     #[test]
