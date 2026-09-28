@@ -137,7 +137,8 @@ void zflow_mac_pasteboard_free(uint8_t *data) {
 // Puts `length` bytes of `kind`, text or PNG, on the pasteboard `name`, or the
 // general one when it is NULL, beside zflow's marker. Sets `change_count` to
 // the count after the write. Returns 0, or -1 when the main thread did not
-// answer in time or the pasteboard refused.
+// answer in time, the pasteboard refused, or another app wrote at the same
+// moment.
 int zflow_mac_pasteboard_write(const char *name, uint32_t kind, const uint8_t *data, size_t length,
                                int64_t *change_count) {
   if (!data || length == 0 || !change_count) return -1;
@@ -154,9 +155,12 @@ int zflow_mac_pasteboard_write(const char *name, uint32_t kind, const uint8_t *d
           ![item setData:[NSData data] forType:ZFLOW_CLIP_MARKER])
         return;
       NSPasteboard *board = pasteboard_named(board_name);
-      [board clearContents];
-      written = [board writeObjects:@[ item ]];
-      count = board.changeCount;
+      // Writing does not move the count past the one clearing returns. Any
+      // other count means another app wrote in between, and its copy must
+      // not pass for this one.
+      NSInteger cleared = [board clearContents];
+      written = [board writeObjects:@[ item ]] && board.changeCount == cleared;
+      count = cleared;
     });
     if (!answered || !written) return -1;
     *change_count = count;

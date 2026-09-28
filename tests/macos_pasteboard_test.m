@@ -86,8 +86,14 @@ static void *checks(void *unused) {
 
     // Text goes on with the marker, and reads back byte for byte.
     NSData *text = [@"zflow ✓ text" dataUsingEncoding:NSUTF8StringEncoding];
+    __block NSInteger before = 0;
+    on_main_thread(^{
+      before = board.changeCount;
+    });
     int64_t written = write_board(ZFLOW_CLIP_TEXT, text);
     on_main_thread(^{
+      // Clearing moved the count once, and writing did not move it again.
+      assert(written == before + 1);
       assert(board.changeCount == written);
       assert([board.types containsObject:NSPasteboardTypeString]);
       assert([board.types containsObject:ZFLOW_CLIP_MARKER]);
