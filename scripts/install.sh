@@ -155,17 +155,14 @@ systemctl enable zflowd.service
 systemctl restart zflowd.service
 
 printf '\nzflow is installed and zflowd is running. This computer can receive input now.\n'
-printf 'To also send input from it to another Linux computer, select its devices:\n'
-printf '  1. List input devices:\n'
+printf 'It also sends from every keyboard and pointer, unless capture_devices lists some.\n'
+printf 'To send from only some devices:\n'
+printf '  1. List input devices (* marks the ones zflow captures):\n'
 printf '     sudo %s/zflow devices\n' "$BIN_DIR"
-printf '  2. Select the physical devices in one command (repeat --device):\n'
+printf '  2. Select them in one command (repeat --device):\n'
 printf '     sudo %s/zflow setup --device /dev/input/eventX --udev-rules %s\n' \
     "$BIN_DIR" "$CAPTURE_RULE_FILE"
-printf '  3. Apply permissions (the daemon rescans automatically):\n'
-printf '     sudo udevadm control --reload-rules\n'
-printf '     sudo udevadm trigger --action=change --subsystem-match=input\n'
-printf '  4. Check the host:\n'
-printf '     sudo %s/zflow doctor\n' "$BIN_DIR"
+printf 'Check the host with: sudo %s/zflow doctor\n' "$BIN_DIR"
 printf 'Inspect logs with: journalctl -u zflowd.service -f\n'
 printf 'Remove zflow with: sudo %s\n' "$UNINSTALLER"
 printf 'Pre-login input stays disabled until you grant it during setup.\n'

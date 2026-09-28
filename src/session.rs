@@ -1741,7 +1741,10 @@ mod tests {
             editor: "not a key".into(),
             ..layout
         };
-        assert!(left.send_layout(invalid).is_err(), "checked before it is sent");
+        assert!(
+            left.send_layout(invalid).is_err(),
+            "checked before it is sent"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
