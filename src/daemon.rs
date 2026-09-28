@@ -28,7 +28,9 @@ use crate::{
         ActivationId, InputCapability, KeyboardMode, ReceiverEffect, SessionCloseReason,
         SessionContext, SessionEpoch, TransportGeneration,
     },
-    discovery::{Advertisement, Discovery, DiscoveryError},
+    discovery::{
+        Advertisement, Discovery, DiscoveryError, DiscoveryEvent, local_unicast_addresses,
+    },
     identity::{Identity, encode_hex},
     linux::{InjectionGate, OwnershipPhase, SeatState, watch_primary_seat},
     runtime::{
@@ -54,6 +56,8 @@ const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_METRICS_HISTORY: usize = 128;
 const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAX_LOCAL_CLIENTS: usize = 64;
+/// Nearby zflow computers kept as extra dial candidates, like the Mac app's list.
+const MAX_NEARBY: usize = 64;
 /// Logind answers Unknown when a reply is slow or races a property change.
 /// Such a short Unknown holds injection and keeps the last definite state for
 /// authorization, so it does not end a live crossing.
@@ -127,6 +131,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         runtime: runtime.control(),
         sessions: Mutex::new(BTreeMap::new()),
         dialed: Mutex::new(BTreeMap::new()),
+        nearby: Mutex::new(BTreeMap::new()),
         metrics_history: Mutex::new(BTreeMap::new()),
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
@@ -261,6 +266,37 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                     Err(error) => tracing::warn!(%error, "mDNS monitoring stopped"),
                 }
                 stop_discovery(&mut discovery).await;
+                shared.nearby.lock().await.clear();
+            }
+            event = next_discovery_event(discovery.as_ref()), if discovery.is_some() => {
+                match event {
+                    Ok(DiscoveryEvent::Candidate(candidate)) => {
+                        let Some(instance) = candidate.ephemeral_instance_id() else {
+                            continue;
+                        };
+                        let local = local_unicast_addresses().unwrap_or_default();
+                        let addresses = if candidate.is_compatible() {
+                            remote_addresses(candidate.socket_addresses(), &local)
+                        } else {
+                            Vec::new()
+                        };
+                        let mut nearby = shared.nearby.lock().await;
+                        let instance = instance.to_string();
+                        if addresses.is_empty() {
+                            nearby.remove(&instance);
+                        } else if nearby.len() < MAX_NEARBY || nearby.contains_key(&instance) {
+                            nearby.insert(instance, addresses);
+                        }
+                    }
+                    Ok(DiscoveryEvent::Removed(instance)) => {
+                        shared.nearby.lock().await.remove(&instance.to_string());
+                    }
+                    Ok(DiscoveryEvent::Stopped) | Err(_) => {
+                        tracing::warn!("mDNS browsing stopped");
+                        stop_discovery(&mut discovery).await;
+                        shared.nearby.lock().await.clear();
+                    }
+                }
             }
             _ = discovery_retry.tick(), if discovery.is_none() => {
                 let config = shared.config.read().await.clone();
@@ -306,6 +342,10 @@ struct Shared {
     sessions: Mutex<BTreeMap<String, SessionHandle>>,
     /// Sessions this computer dialed, by id, with when the dial finished.
     dialed: Mutex<BTreeMap<u64, Instant>>,
+    /// Addresses of compatible zflow computers on the network, by mDNS
+    /// instance. A dial also tries these, with the peer's pinned key, so a
+    /// peer whose address changed is still found.
+    nearby: Mutex<BTreeMap<String, Vec<SocketAddr>>>,
     metrics_history: Mutex<BTreeMap<String, crate::metrics::SessionMetricsSnapshot>>,
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
@@ -412,15 +452,17 @@ impl Shared {
         if let Some(existing) = self.sessions.lock().await.get(peer).cloned() {
             return Ok(existing);
         }
-        if record.addresses.is_empty() {
-            bail!("peer {peer} has no configured input address");
+        let mut addresses = record.addresses.clone();
+        addresses.extend(self.nearby.lock().await.values().flatten());
+        if addresses.is_empty() {
+            bail!("peer {peer} has no configured input address and none was found nearby");
         }
         let policy_generation = self.policy_generation.load(Ordering::Acquire);
         let connection = race_connect(
             &self.endpoint,
             &self.identity,
             record.spki_der()?,
-            &record.addresses,
+            &addresses,
         )
         .await?;
         let generation = self.allocate_generation()?;
@@ -1286,13 +1328,14 @@ fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {
     if !config.transport.discovery {
         return None;
     }
-    // Advertise only: the daemon has no use for other computers' records.
+    // Browsing finds a paired computer whose address changed.
     let result = (|| {
         let mut discovery = Discovery::new()?;
         discovery.register(Advertisement::new(
             listen.port(),
             advertised_capabilities(config),
         )?)?;
+        discovery.browse()?;
         Ok::<_, anyhow::Error>(discovery)
     })();
     match result {
@@ -1324,6 +1367,25 @@ async fn stop_discovery(discovery: &mut Option<Discovery>) {
             Err(_) => tracing::warn!("mDNS shutdown timed out"),
         }
     }
+}
+
+async fn next_discovery_event(
+    discovery: Option<&Discovery>,
+) -> Result<DiscoveryEvent, DiscoveryError> {
+    discovery
+        .expect("select guard requires discovery")
+        .next_event()
+        .await
+}
+
+/// A record's addresses without this computer's own, which include its own
+/// advertisement coming back.
+fn remote_addresses(addresses: &[SocketAddr], local: &[std::net::IpAddr]) -> Vec<SocketAddr> {
+    addresses
+        .iter()
+        .filter(|address| !address.ip().is_loopback() && !local.contains(&address.ip()))
+        .copied()
+        .collect()
 }
 
 async fn next_discovery_error(
@@ -1817,6 +1879,19 @@ mod tests {
         assert!(claim_inbound(&mut owner, "authorized", 2, true, idle));
         assert_eq!(owner, Some(("authorized".to_owned(), 2)));
         assert!(!claim_inbound(&mut owner, "denied", 1, true, idle));
+    }
+
+    #[test]
+    fn nearby_records_drop_this_computers_own_addresses() {
+        let own = "192.0.2.5".parse().unwrap();
+        let addresses: Vec<SocketAddr> = ["192.0.2.5:43119", "127.0.0.1:43119", "192.0.2.9:43119"]
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        assert_eq!(
+            remote_addresses(&addresses, &[own]),
+            ["192.0.2.9:43119".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     #[test]
