@@ -262,6 +262,11 @@ impl NativeApp {
                 // so a crossing in progress carries on.
                 self.sync_links();
             }
+            Request::SetSwitching { pause_at_edges } => {
+                self.document.draft.switching.pause_at_edges = pause_at_edges;
+                self.save_config()?;
+                // The observer reads it on its next tick, so nothing restarts.
+            }
             Request::SetClipboard { share } => {
                 self.document.draft.clipboard.share = share;
                 self.save_config()?;
@@ -270,7 +275,6 @@ impl NativeApp {
             }
             // The app keeps the login item.
             Request::SetAutostart { .. }
-            | Request::SetSwitching { .. }
             | Request::OpenSettings
             | Request::OpenLogs
             | Request::InstallExtension => bail!("Not available on this computer"),
@@ -484,6 +488,7 @@ impl NativeApp {
         // A missing helper only costs Wi-Fi latency, so it never holds sharing back.
         // Crossings read this when they start, so a later helper needs no restart.
         self.observer.reduce_wifi_latency = config.macos.block_awdl && self.helper_ready;
+        self.observer.pause_at_edges = config.switching.pause_at_edges;
         if !self.observer.is_enabled() && Instant::now() >= self.retry_at && self.any_ready() {
             match self.observer.enable(config, &self.layout.draft) {
                 Ok(()) => self.crossing_error = None,
@@ -795,7 +800,7 @@ impl NativeApp {
             peers,
             pairing: self.pairing.snapshot(),
             nearby: nearby.records.into_values().collect(),
-            pause_at_edges: None,
+            pause_at_edges: Some(config.switching.pause_at_edges),
             shortcuts: vec![Shortcut {
                 title: "Return input to this computer".into(),
                 keys: "⌃⌘⌫".into(),
@@ -1065,6 +1070,7 @@ mod tests {
         assert_eq!(value["sharing"], false);
         assert_eq!(value["health"][0]["id"], "sharing");
         assert_eq!(value["shortcuts"][0]["keys"], "⌃⌘⌫");
+        assert_eq!(value["pause_at_edges"], false);
         assert_eq!(value["share_clipboard"], false);
         assert_eq!(value["autostart"], Value::Null);
         assert_eq!(value["config_path"], path.to_str().unwrap());
@@ -1123,11 +1129,18 @@ mod tests {
         assert_eq!(row["keyboard"], "pc_positions");
         assert_eq!(row["reverse_scroll"], true);
 
-        // The clipboard switch reaches the links without a restart too.
+        // The clipboard and pause switches apply without a restart too.
         let value = app.request(Request::SetClipboard { share: true }).unwrap();
         assert_eq!(app.retry_at, armed_at, "sharing did not restart");
         assert_eq!(value["share_clipboard"], true);
         assert!(Config::load(&path).unwrap().clipboard.share);
+        let pause = Request::SetSwitching {
+            pause_at_edges: true,
+        };
+        let value = app.request(pause).unwrap();
+        assert_eq!(app.retry_at, armed_at, "sharing did not restart");
+        assert_eq!(value["pause_at_edges"], true);
+        assert!(Config::load(&path).unwrap().switching.pause_at_edges);
     }
 
     #[test]

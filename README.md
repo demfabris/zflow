@@ -118,8 +118,10 @@ and moves on, and **Back** returns to an earlier one:
    helper described below.
 
 To pair another computer later, use **Pair Computer…** in **Settings…**. Move
-through a touching edge with keys and mouse buttons released. Cross back from
-Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses sharing.
+through a touching edge with keys and mouse buttons released. With **Pause at
+edges** on in Settings, the pointer has to rest against the edge for 250 ms
+before it crosses, and moving away first cancels. Cross back from Ubuntu to
+return. **Ctrl+Cmd+Backspace** returns input and pauses sharing.
 Resume from the menu-bar menu when you are ready. Later problems, such as
 Accessibility or Local Network access being turned off, show on the health
 badge in Settings.

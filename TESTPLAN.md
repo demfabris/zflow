@@ -149,6 +149,12 @@ Checks:
     macOS 27 shows its paste privacy alert when the Mac reads the clipboard at
     a crossing, and what the alert says. Turn the switch off on the Mac: a clip
     from Ubuntu is dropped ("clipboard from peer dropped: sharing is off").
+22. **Pause at edges.** Turn on **Pause at edges** on the Mac. A quick flick
+    through the edge toward Ubuntu stays on the Mac; resting against it for a
+    moment crosses at the point where the pointer rests. Leaving the edge
+    before then starts nothing, and nothing reconnects when the switch
+    changes (no "input link connected" line). Turn it off: the next push
+    crosses at once.
 
 Known before the sitting: the Mac reads every sender's scroll as 120 units per
 detent, so a Mac trackpad sending to a Mac receiver scrolls slowly. Only Mac to

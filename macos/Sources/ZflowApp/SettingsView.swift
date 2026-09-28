@@ -126,6 +126,18 @@ struct SettingsView: View {
           .disabled(snapshot.sharing == nil)
         }
       }
+      if let pause = snapshot.pauseAtEdges {
+        Section {
+          Toggle(
+            isOn: Binding(
+              get: { pause },
+              set: { model.send(CoreRequest(command: "set_switching", pauseAtEdges: $0)) })
+          ) {
+            Text("Pause at edges")
+            Text("Rest the pointer against an edge for a moment before it crosses.")
+          }
+        }
+      }
       if !snapshot.shortcuts.isEmpty {
         Section("Shortcuts") {
           ForEach(snapshot.shortcuts, id: \.title) { shortcut in

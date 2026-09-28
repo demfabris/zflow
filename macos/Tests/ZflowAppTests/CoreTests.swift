@@ -132,7 +132,7 @@ import Testing
   await core.shutdown()
 }
 
-@Test func theClipboardSwitchReachesTheEngine() async throws {
+@Test func theClipboardAndPauseSwitchesReachTheEngine() async throws {
   let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
   try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
   defer { try? FileManager.default.removeItem(at: directory) }
@@ -145,5 +145,10 @@ import Testing
   let changed = try await core.request(CoreRequest(command: "set_clipboard", share: true))
   #expect(changed.shareClipboard == true)
   #expect(try String(contentsOf: file, encoding: .utf8).contains("[clipboard]\nshare = true"))
+  #expect(initial.pauseAtEdges == false)
+  let paused = try await core.request(CoreRequest(command: "set_switching", pauseAtEdges: true))
+  #expect(paused.pauseAtEdges == true)
+  #expect(
+    try String(contentsOf: file, encoding: .utf8).contains("[switching]\npause_at_edges = true"))
   await core.shutdown()
 }
