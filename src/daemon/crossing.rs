@@ -29,6 +29,7 @@ impl Shared {
             DesktopResponse::Unavailable { reason } => bail!("{reason}"),
             _ => bail!("GNOME did not describe this desktop"),
         };
+        self.fit_own_tile(&geometry).await;
         let layout = self
             .local_layout()
             .await

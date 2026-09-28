@@ -520,6 +520,25 @@ impl Shared {
             tracing::warn!(%error, "layout not saved; still using it until restart");
         }
         tracing::info!(peer = %from, version = layout.version, "layout adopted");
+        self.keep_layout(layout, Some(session_id)).await;
+        // The other computer may not know this desktop's size yet.
+        let shared = self.clone();
+        tokio::spawn(async move {
+            if let crate::desktop::DesktopResponse::Snapshot { geometry, .. } =
+                shared.desktop.snapshot().await
+            {
+                shared.fit_own_tile(&geometry).await;
+            }
+        });
+    }
+
+    /// Uses `layout` from now on, and sends it to every peer except the
+    /// session it came from.
+    async fn keep_layout(
+        self: &Arc<Self>,
+        layout: crate::desktop::SharedLayout,
+        origin: Option<u64>,
+    ) {
         *self.layout.lock().await = Some(layout);
         self.apply_layout().await;
         let others: Vec<_> = self
@@ -527,12 +546,40 @@ impl Shared {
             .lock()
             .await
             .values()
-            .filter(|session| session.id() != session_id)
+            .filter(|session| Some(session.id()) != origin)
             .cloned()
             .collect();
         for session in others {
             self.offer_layout(&session).await;
         }
+    }
+
+    /// Writes this computer's own tile size, from its GNOME desktop, into
+    /// the shared layout, and tells the other computers.
+    pub(super) async fn fit_own_tile(self: &Arc<Self>, geometry: &crate::desktop::Geometry) {
+        let Ok(bounds) = geometry.bounds() else {
+            return;
+        };
+        let current = self.layout.lock().await.clone();
+        let Some(resized) = current.and_then(|layout| {
+            layout.with_own_size(&self.identity_fingerprint, bounds.width, bounds.height)
+        }) else {
+            return;
+        };
+        let path = self.config.read().await.daemon.state_dir.join(LAYOUT_FILE);
+        let saved = serde_json::to_string(&resized)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| crate::config::save_text(&path, &text).map_err(Into::into));
+        if let Err(error) = saved {
+            tracing::warn!(%error, "layout not saved; still using it until restart");
+        }
+        tracing::info!(
+            width = bounds.width,
+            height = bounds.height,
+            version = resized.version,
+            "this computer's tile resized"
+        );
+        self.keep_layout(resized, None).await;
     }
 
     /// Starts a crossing toward the computer behind the edge the pointer

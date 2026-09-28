@@ -361,6 +361,50 @@ impl SharedLayout {
     pub fn is_newer_than(&self, other: &Self) -> bool {
         (self.version, &self.editor) > (other.version, &other.editor)
     }
+
+    /// A new version in which the computer `key` gives its own tile the size
+    /// of its desktop. Each computer writes only its own size, so two never
+    /// edit the same tile. A tile that would overlap another moves to the
+    /// right of the rest. None when the size is already right or the tile is
+    /// missing.
+    pub fn with_own_size(&self, key: &str, width: u32, height: u32) -> Option<Self> {
+        let index = self.tiles.iter().position(|tile| tile.key == key)?;
+        let tile = &self.tiles[index];
+        if (tile.width, tile.height) == (width, height) {
+            return None;
+        }
+        let mut next = self.clone();
+        next.version = self.version.saturating_add(1);
+        next.editor = key.to_owned();
+        let overlaps = |a: &Tile, b: &Tile| {
+            let span =
+                |start: i32, size: u32| (i64::from(start), i64::from(start) + i64::from(size));
+            let ((al, ar), (at, ab)) = (span(a.x, a.width), span(a.y, a.height));
+            let ((bl, br), (bt, bb)) = (span(b.x, b.width), span(b.y, b.height));
+            al < br && ar > bl && at < bb && ab > bt
+        };
+        next.tiles[index].width = width;
+        next.tiles[index].height = height;
+        let resized = next.tiles[index].clone();
+        if next
+            .tiles
+            .iter()
+            .enumerate()
+            .any(|(i, other)| i != index && overlaps(&resized, other))
+        {
+            let right = next
+                .tiles
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .map(|(_, other)| other.x.saturating_add(other.width as i32))
+                .max()
+                .unwrap_or(0);
+            next.tiles[index].x = right;
+            next.tiles[index].y = 0;
+        }
+        next.validate().ok().map(|()| next)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +478,42 @@ mod tests {
         let mut invalid = layout.clone();
         invalid.editor = "ABC".into();
         assert!(invalid.validate().is_err(), "not a fingerprint");
+
+        // A computer writes its own size, as a new version it edited.
+        let small = SharedLayout {
+            version: 5,
+            editor: key(9),
+            tiles: vec![
+                Tile {
+                    key: key(1),
+                    x: 0,
+                    y: 0,
+                    width: 1000,
+                    height: 800,
+                },
+                Tile {
+                    key: key(2),
+                    x: 1000,
+                    y: 0,
+                    width: 500,
+                    height: 500,
+                },
+            ],
+        };
+        assert!(
+            small.with_own_size(&key(1), 1000, 800).is_none(),
+            "already right"
+        );
+        assert!(
+            small.with_own_size(&key(3), 1000, 800).is_none(),
+            "not in the layout"
+        );
+        let taller = small.with_own_size(&key(2), 500, 900).unwrap();
+        assert_eq!((taller.version, &taller.editor), (6, &key(2)));
+        assert_eq!((taller.tiles[1].x, taller.tiles[1].height), (1000, 900));
+        // Growing into a neighbour moves the tile past the others.
+        let wider = small.with_own_size(&key(1), 1200, 800).unwrap();
+        assert_eq!((wider.tiles[0].x, wider.tiles[0].width), (1500, 1200));
 
         let older = SharedLayout {
             version: 3,

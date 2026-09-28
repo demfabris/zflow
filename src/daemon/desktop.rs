@@ -402,6 +402,15 @@ pub(super) async fn serve(
     tracing::info!(broker_id = id, "desktop agent connected");
     // A new agent starts from a clean Shell: no barriers, pointer shown.
     sync_local(&shared);
+    // The desktop may have changed size while no agent was connected.
+    tokio::spawn({
+        let shared = shared.clone();
+        async move {
+            if let DesktopResponse::Snapshot { geometry, .. } = shared.desktop.snapshot().await {
+                shared.fit_own_tile(&geometry).await;
+            }
+        }
+    });
     let mut latest = shared.seat.clone();
     let mut seat = SeatGrace::new(latest.borrow_and_update().clone(), Instant::now());
     let result = async {
