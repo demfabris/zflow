@@ -107,6 +107,13 @@ export class Settings {
         });
         preferences.add(this._login);
         this.page.add(preferences);
+        // Rows only this computer has, under the shared ones.
+        const local = new Adw.PreferencesGroup({title: 'This Computer'});
+        const logs = new Adw.ActionRow({title: 'Service Log', subtitle: 'Follow what zflow’s background service is doing.'});
+        this._logs = button('Open', () => this._run({command: 'open_logs'}));
+        logs.add_suffix(this._logs);
+        local.add(logs);
+        this.page.add(local);
         this._help = new Adw.PreferencesGroup();
         this.page.add(this._help);
         this.client = new Client(snapshot => this._update(snapshot), true);

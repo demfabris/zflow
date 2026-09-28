@@ -187,6 +187,7 @@ impl NativeApp {
             | Request::SetAutostart { .. }
             | Request::SetSwitching { .. }
             | Request::OpenSettings
+            | Request::OpenLogs
             | Request::InstallExtension => bail!("Not available on this computer"),
         }
         Ok(serde_json::to_value(self.snapshot())?)

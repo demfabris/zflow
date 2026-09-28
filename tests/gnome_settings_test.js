@@ -48,6 +48,7 @@ let callCount = 0;
 let keyboardCalls = 0;
 let controlCalls = 0;
 let scrollCalls = 0;
+let logsOpened = 0;
 const moves = [];
 const xml = '<node><interface name="io.zflow.Desktop"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>';
 const object = Gio.DBusExportedObject.wrapJSObject(xml, {
@@ -63,6 +64,7 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
             break;
         case 'set_autostart': snapshot.autostart = request.enabled; break;
         case 'set_switching': snapshot.pause_at_edges = request.pause_at_edges; break;
+        case 'open_logs': logsOpened++; break;
         case 'forget': snapshot.peers = snapshot.peers.filter(peer => peer.name !== request.name); break;
         case 'set_peer': {
             const peer = find(request.name);
@@ -204,6 +206,8 @@ app.connect('activate', () => {
         assert(!settings._pause.active && settings._pause.sensitive, 'crossings do not pause by default');
         settings._pause.active = true;
         await waitFor(() => snapshot.pause_at_edges && !settings._busy && settings._pause.sensitive);
+        settings._logs.emit('clicked');
+        await waitFor(() => logsOpened === 1 && !settings._busy);
         const scroll = settings._scrolls.get('MacBook');
         assert(!scroll.active, 'scrolling starts the right way round');
         scroll.active = true;
@@ -286,7 +290,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, reverse scrolling, pause at edges, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
+        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, reverse scrolling, pause at edges, logs, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

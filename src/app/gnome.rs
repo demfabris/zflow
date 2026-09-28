@@ -120,6 +120,20 @@ impl Service {
                     let _ = child.wait().await;
                 });
             }
+            Request::OpenLogs => {
+                let mut child = log_viewers()
+                    .iter()
+                    .find_map(|(program, arguments)| {
+                        tokio::process::Command::new(program)
+                            .args(*arguments)
+                            .spawn()
+                            .ok()
+                    })
+                    .context("Install a terminal or GNOME Logs to read zflow's log")?;
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
             Request::InstallExtension => {
                 let connection = zbus::Connection::session().await?;
                 let running = super::desktop::install_extension(Some(&connection)).await?;
@@ -204,6 +218,20 @@ fn snapshot(
         config_path: CONFIG_PATH.into(),
         platform: (),
     })
+}
+
+/// Ways to show the service's log, best first: the default terminal
+/// following it, Debian's terminal alternative, then GNOME Logs.
+fn log_viewers() -> [(&'static str, &'static [&'static str]); 3] {
+    const FOLLOW: &[&str] = &["journalctl", "--unit=zflowd.service", "--follow"];
+    [
+        ("xdg-terminal-exec", FOLLOW),
+        (
+            "x-terminal-emulator",
+            &["-e", "journalctl", "--unit=zflowd.service", "--follow"],
+        ),
+        ("gnome-logs", &[]),
+    ]
 }
 
 fn peers(daemon: &crate::peer_view::DesktopStatus) -> Vec<Peer> {

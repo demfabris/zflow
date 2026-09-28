@@ -250,6 +250,8 @@ pub(crate) enum Request {
     Discover,
     /// Linux: opens the settings window.
     OpenSettings,
+    /// Linux: follows the service's log in a terminal.
+    OpenLogs,
     /// Linux: installs and turns on the GNOME extension.
     InstallExtension,
 }
