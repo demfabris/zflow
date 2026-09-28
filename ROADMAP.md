@@ -451,7 +451,6 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
     - The live checks in TESTPLAN.md, "Two-way input sitting".
   - Known limits:
-    - A key held on a remapper-grabbed device at the moment zflow opens it blocks arming until the daemon restarts.
     - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
     - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
     - With three or more computers where not every pair is paired, an edit on one computer drops the tiles of computers it has not paired. A computer that paired them puts them back beside itself, but not where they were. SPEC's rule against resurrecting forgotten computers causes this; peer-to-peer hops (Phase 4) need a rule that keeps third-party tiles.
