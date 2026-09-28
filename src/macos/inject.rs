@@ -1061,8 +1061,6 @@ pub(crate) fn post_allowed() -> bool {
 }
 
 /// Wakes the display as local input would.
-// A handoff's Prepare wakes the display once the Wi-Fi lease work lands.
-#[allow(dead_code)]
 pub(crate) fn declare_user_activity() -> Result<()> {
     // SAFETY: this only declares an IOKit power assertion.
     ensure!(
@@ -1120,7 +1118,6 @@ unsafe extern "C" {
     fn zflow_mac_key_repeat_ns(initial: *mut u64, interval: *mut u64) -> i32;
     fn zflow_mac_session_locked() -> i32;
     fn zflow_mac_post_allowed() -> i32;
-    #[allow(dead_code)]
     fn zflow_mac_declare_user_activity() -> i32;
     fn zflow_mac_inject_install_exit_handlers();
     fn zflow_mac_post_media_key(key: u32, down: i32, mark: i64) -> i32;
@@ -1153,6 +1150,8 @@ pub(crate) struct Fake {
     pub fail: bool,
     pub focus_reads: usize,
     pub lock_reads: usize,
+    /// How often the display was woken.
+    pub wakes: usize,
 }
 
 #[cfg(test)]
@@ -1177,6 +1176,7 @@ impl Default for Fake {
             fail: false,
             focus_reads: 0,
             lock_reads: 0,
+            wakes: 0,
         }
     }
 }

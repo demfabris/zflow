@@ -48,6 +48,8 @@ pub(crate) trait Desk: Send + Sync + 'static {
     fn move_to(&self, point: Point);
     /// Lets go of whatever the peer holds on this Mac.
     fn release_all(&self);
+    /// Wakes the display, as local input would.
+    fn wake(&self);
     /// Ends a session whose handoff lapsed.
     fn close(&self, peer: &str, session_id: u64);
 }
@@ -374,6 +376,7 @@ impl<D: Desk> HandoffServer<D> {
             });
         }
         self.changed.notify_waiters();
+        self.desk.wake();
         self.desk.move_to(entry);
         let deadline = Instant::now() + ENTRY_WAIT;
         loop {
@@ -690,6 +693,7 @@ mod tests {
         follows: bool,
         moves: Vec<Point>,
         releases: usize,
+        wakes: usize,
         closed: Vec<(String, u64)>,
     }
 
@@ -730,6 +734,10 @@ mod tests {
 
         fn release_all(&self) {
             self.state().releases += 1;
+        }
+
+        fn wake(&self) {
+            self.state().wakes += 1;
         }
 
         fn close(&self, peer: &str, session_id: u64) {
@@ -782,6 +790,7 @@ mod tests {
             }
         );
         assert_eq!(desk.state().moves, [Point { x: 3, y: 540 }]);
+        assert_eq!(desk.state().wakes, 1, "Prepare wakes the display");
         assert_eq!(ownership.controller().as_deref(), Some("linux"));
 
         // With the pointer inside, a Poll holds, then answers Active.

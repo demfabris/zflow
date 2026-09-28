@@ -387,7 +387,10 @@ impl NativeApp {
     }
 
     pub fn tick(&mut self) {
-        self.links.set_receive_policy(self.accessibility);
+        // A missing helper only costs Wi-Fi latency, as when sending.
+        let reduce_wifi_latency = self.document.saved().macos.block_awdl && self.helper_ready;
+        self.links
+            .set_receive_policy(self.accessibility, reduce_wifi_latency);
         let adopted = self.take_layouts();
         let was_enabled = self.observer.is_enabled();
         self.observer.tick(&self.links);

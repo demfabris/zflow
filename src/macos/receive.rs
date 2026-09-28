@@ -4,6 +4,7 @@
 
 use std::{
     collections::BTreeMap,
+    future::Future,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Instant,
 };
@@ -13,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     CursorPosition,
+    awdl::HeldLease,
     handoff_server::{Desk, HandoffServer},
     inject::{self, Injector},
 };
@@ -301,6 +303,8 @@ pub(crate) trait Screen: Send + Sync + 'static {
     fn post_allowed(&self) -> bool;
     /// The screen lock is up, or another user has the console.
     fn locked(&self) -> bool;
+    /// Wakes the display, as local input would.
+    fn wake(&self);
 }
 
 pub(crate) struct MacScreen;
@@ -324,6 +328,12 @@ impl Screen for MacScreen {
 
     fn locked(&self) -> bool {
         inject::session_locked()
+    }
+
+    fn wake(&self) {
+        if let Err(error) = inject::declare_user_activity() {
+            tracing::debug!(%error, "display not woken");
+        }
     }
 }
 
@@ -360,6 +370,10 @@ impl Screen for inject::FakeBackend {
 
     fn locked(&self) -> bool {
         self.state().locked
+    }
+
+    fn wake(&self) {
+        self.state().wakes += 1;
     }
 }
 
@@ -415,6 +429,10 @@ impl Desk for MacDesk {
         self.injector.release_all();
     }
 
+    fn wake(&self) {
+        self.screen.wake();
+    }
+
     fn close(&self, peer: &str, session_id: u64) {
         self.sessions
             .close(peer, Some(session_id), SessionCloseReason::LeaseExpired);
@@ -428,6 +446,8 @@ struct Policy {
     peers: BTreeMap<String, PeerConfig>,
     /// Accessibility, as the app last saw it.
     accessibility: bool,
+    /// AWDL goes down while a peer controls this Mac.
+    reduce_wifi_latency: bool,
 }
 
 /// Lets paired computers control this Mac. The links share one, with the
@@ -501,6 +521,11 @@ impl Receiving {
         }
     }
 
+    /// Takes effect the next time a peer takes control.
+    pub fn set_reduce_wifi_latency(&self, reduce: bool) {
+        self.policy().reduce_wifi_latency = reduce;
+    }
+
     /// Ends the session of a controlling peer the policy no longer admits.
     fn revoke(&self, policy: &Policy) {
         let Some(peer) = self.ownership.controller() else {
@@ -546,6 +571,7 @@ impl Receiving {
             peer: peer.to_owned(),
             session: session.clone(),
             claim: None,
+            wifi: None,
         }
     }
 
@@ -575,6 +601,8 @@ pub(crate) struct Inbound {
     peer: String,
     session: SessionHandle,
     claim: Option<InboundClaim>,
+    /// Keeps AWDL down while the claim lasts.
+    wifi: Option<WifiLease>,
 }
 
 impl Inbound {
@@ -618,6 +646,7 @@ impl Inbound {
                 Ok(claim) => {
                     if self.claim.replace(claim).is_none() {
                         tracing::info!(peer = %self.peer, "peer took control of this Mac");
+                        self.take_control();
                     }
                 }
                 Err(reason) => {
@@ -651,12 +680,23 @@ impl Inbound {
             self.release();
         } else if closes && self.claim.take().is_some() {
             // Closing the activation already let go of everything.
+            self.wifi = None;
             tracing::info!(peer = %self.peer, "peer let go of this Mac");
         }
         if refused {
             return Err(REJECTED.into());
         }
         applied
+    }
+
+    /// Wakes the display, since the chord sends no Prepare that would,
+    /// and takes AWDL down when the app asks for less Wi-Fi lag.
+    fn take_control(&mut self) {
+        self.receiving.screen.wake();
+        if self.receiving.policy().reduce_wifi_latency {
+            let lease = super::acquire_lease(true);
+            self.wifi = Some(WifiLease::hold(self.peer.clone(), lease));
+        }
     }
 
     /// Lets go of whatever the peer holds, and of its claim on this Mac.
@@ -666,8 +706,55 @@ impl Inbound {
             // of the next peer's input.
             self.receiving.injector.release_all();
             drop(claim);
+            self.wifi = None;
             tracing::info!(peer = %self.peer, "peer lost control of this Mac");
         }
+    }
+}
+
+/// Holds the AWDL helper's lease on its own task while a peer controls
+/// this Mac. Dropping it gives AWDL back, and so does a lease that comes
+/// after control ended. A lease that cannot be had or renewed only costs
+/// Wi-Fi lag, so it is logged.
+struct WifiLease {
+    _release: oneshot::Sender<()>,
+}
+
+impl WifiLease {
+    fn hold(
+        peer: String,
+        acquire: impl Future<Output = Result<Option<HeldLease>>> + Send + 'static,
+    ) -> Self {
+        let (release, mut released) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let acquired = tokio::select! {
+                acquired = acquire => acquired,
+                _ = &mut released => return,
+            };
+            let mut lease = match acquired {
+                Ok(Some(lease)) => lease,
+                Ok(None) => return,
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    tracing::warn!(%peer, %error, "AWDL stays on while controlled");
+                    return;
+                }
+            };
+            tracing::info!(%peer, "AWDL off while controlled");
+            tokio::select! {
+                _ = released => {
+                    if let Err(error) = lease.release().await {
+                        let error = format!("{error:#}");
+                        tracing::warn!(%peer, %error, "AWDL restoration failed");
+                    }
+                }
+                error = lease.failed() => {
+                    let error = format!("{error:#}");
+                    tracing::warn!(%peer, %error, "AWDL lease lapsed while controlled");
+                }
+            }
+        });
+        Self { _release: release }
     }
 }
 
@@ -852,6 +939,36 @@ mod tests {
             Err(SENDING.into()),
             "an activation cannot open, which closes the session"
         );
+    }
+
+    async fn restored(marker: &std::path::Path) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "AWDL never came back");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn control_keeps_awdl_down_until_it_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("restored");
+        let lease = super::super::awdl::fake_held_lease(&marker).await;
+        let wifi = WifiLease::hold("linux".into(), async move { Ok(Some(lease)) });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!marker.exists(), "AWDL stays down while controlled");
+        drop(wifi);
+        restored(&marker).await;
+
+        // A lease that comes after control ended goes straight back.
+        let marker = directory.path().join("late");
+        let lease = super::super::awdl::fake_held_lease(&marker).await;
+        let wifi = WifiLease::hold("linux".into(), async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(Some(lease))
+        });
+        drop(wifi);
+        restored(&marker).await;
     }
 
     #[tokio::test]

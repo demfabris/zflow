@@ -516,10 +516,12 @@ impl Links {
         self.receiving.ownership().controller()
     }
 
-    /// Whether Accessibility lets peers control this Mac. The app sets it
-    /// on every tick; turning it off ends control at once.
-    pub fn set_receive_policy(&self, accessibility: bool) {
+    /// Whether Accessibility lets peers control this Mac, and whether AWDL
+    /// goes down while one does. The app sets both on every tick; turning
+    /// Accessibility off ends control at once.
+    pub fn set_receive_policy(&self, accessibility: bool, reduce_wifi_latency: bool) {
         self.receiving.set_accessibility(accessibility);
+        self.receiving.set_reduce_wifi_latency(reduce_wifi_latency);
     }
 
     /// Reconnects waiting links now and rechecks connected receivers.
@@ -1611,7 +1613,7 @@ mod tests {
         record(peer);
         let fake = FakeBackend::default();
         let mut links = Links::with_backend(fake.clone()).unwrap();
-        links.set_receive_policy(true);
+        links.set_receive_policy(true, false);
         links.sync(Some(&config));
         wait_until(&mut links, |links| {
             links
@@ -1795,6 +1797,7 @@ mod tests {
         linux.capture(key(KeyState::Pressed)).unwrap();
         posted(&fake, "key 0 down", Duration::from_secs(2));
         assert_eq!(links.controller().as_deref(), Some("linux"));
+        assert_eq!(fake.state().wakes, 1, "taking control wakes the display");
         // The peer stops without a word, as when its process is killed.
         let vanished = Instant::now();
         drop(linux);
