@@ -63,6 +63,17 @@ impl Observer {
         self.running.is_some()
     }
 
+    /// The computer that input goes to during a crossing.
+    pub fn session_peer(&self) -> Option<&str> {
+        let running = self.running.as_ref()?;
+        Some(&running.handoff.peer)
+    }
+
+    /// The notice says Secure Input keeps input on the Mac.
+    pub fn waiting_for_secure_input(&self) -> bool {
+        self.secure_input_notice && self.notice == SECURE_INPUT_ON
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }

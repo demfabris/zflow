@@ -7,7 +7,6 @@ final class AppModel {
   var snapshot: Snapshot?
   var error: String?
   var showingPairing = false
-  var showingHealth = false
   var busy = false
   let services = Services()
   let configPath: String
@@ -53,8 +52,10 @@ final class AppModel {
     }
   }
 
-  var title: String { snapshot?.title ?? "Needs attention" }
-  var healthy: Bool { ["ready", "sharing"].contains(snapshot?.status ?? "") }
+  var title: String { snapshot?.status.title ?? "Needs attention" }
+  var healthy: Bool {
+    ["ready", "controlling", "controlled"].contains(snapshot?.status.state ?? "")
+  }
 
   func send(_ request: CoreRequest) {
     Task { await perform(request) }
@@ -65,7 +66,7 @@ final class AppModel {
       let result = try await core.request(request)
       if !quiet || snapshot == nil { error = nil }
       snapshot = result
-      holdActivity(result.sharing)
+      holdActivity(result.sharing == true)
       if snapshot?.pairing.state == "paired", showingPairing {
         showingPairing = false
         send(CoreRequest(command: "pair_cancel"))
@@ -83,6 +84,14 @@ final class AppModel {
     } else if !sharing, let activity {
       ProcessInfo.processInfo.endActivity(activity)
       self.activity = nil
+    }
+  }
+  /// A health row's fix button. The app handles the ones that open something here.
+  func fix(_ action: HealthAction) {
+    switch action.command {
+    case "allow_accessibility": openAccessibility()
+    case "open_config": openConfig()
+    default: send(CoreRequest(command: action.command))
     }
   }
   func openConfig() { NSWorkspace.shared.open(URL(fileURLWithPath: configPath)) }

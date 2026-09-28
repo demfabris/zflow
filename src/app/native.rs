@@ -1,15 +1,19 @@
 use super::{
+    api::{self, Action, Health, Level, Peer, PeerState, Request, Shortcut, Status},
     handoff,
     layout_model::{self, LayoutDocument, Monitor},
     model::ConfigDocument,
-    nearby::NearbyBrowser,
+    nearby::{BrowserStatus, NearbyBrowser},
     pairing::Pairing,
     sharing::{self, Observer},
 };
-use crate::macos::{LinkState, Links, LocalNetwork};
-use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use crate::{
+    config::Config,
+    macos::{LinkState, Links, LocalNetwork},
+};
+use anyhow::{Context, Result, bail, ensure};
+use serde::Serialize;
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -25,46 +29,13 @@ const LOCAL_NETWORK_RECHECK: Duration = Duration::from_secs(60);
 /// Each refused tap leaks a Mach port inside CoreGraphics.
 const TAP_RECHECK: Duration = Duration::from_secs(10);
 
-#[derive(Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum Request {
-    Snapshot,
-    Reload,
-    SetSharing {
-        enabled: bool,
-    },
-    SetAwdl {
-        enabled: bool,
-    },
-    HelperReady {
-        ready: bool,
-    },
-    Move {
-        id: String,
-        x: i32,
-        y: i32,
-        tolerance: u32,
-    },
-    PairStart {
-        /// Absent to listen; otherwise an IP address, with the port optional.
-        address: Option<String>,
-        /// The code shown on the other computer, when connecting.
-        code: Option<String>,
-    },
-    /// Allows or declines the computer that proved this Mac's code.
-    PairRespond {
-        allow: bool,
-    },
-    PairCancel,
-    Forget {
-        name: String,
-    },
-    AllowAccessibility,
-    Retry,
-    /// Rechecks Accessibility now instead of at the next maintenance tick.
-    CheckAccessibility,
-    /// Starts looking for computers and checks Local Network access now.
-    Discover,
+/// The rows under the shared ones in the Mac settings window. The app adds
+/// what only it knows: the helper, the login item and where it runs from.
+#[derive(Serialize)]
+pub(super) struct MacPlatform {
+    accessibility: bool,
+    local_network: LocalNetwork,
+    block_awdl: bool,
 }
 
 pub(crate) struct NativeApp {
@@ -148,7 +119,7 @@ impl NativeApp {
             // Readiness only gates the next arming in tick(). One failed
             // helper check must not pull input back from a live session.
             Request::HelperReady { ready } => self.helper_ready = ready,
-            Request::Move {
+            Request::MoveTile {
                 id,
                 x,
                 y,
@@ -175,7 +146,7 @@ impl NativeApp {
                 }
                 self.restart();
             }
-            Request::PairStart { address, code } => {
+            Request::Pair { address, code } => {
                 let remote = address
                     .as_deref()
                     .map(crate::pairing::parse_pairing_address)
@@ -210,8 +181,14 @@ impl NativeApp {
                     self.check_local_network();
                 }
             }
+            // Who may control this Mac, and how its keys act, wait until it
+            // accepts input (ROADMAP Phase 2). The app keeps the login item.
+            Request::SetPeer { .. }
+            | Request::SetAutostart { .. }
+            | Request::OpenSettings
+            | Request::InstallExtension => bail!("Not available on this computer"),
         }
-        Ok(self.snapshot())
+        Ok(serde_json::to_value(self.snapshot())?)
     }
 
     /// AXIsProcessTrusted can stay true after zflow is removed from the
@@ -492,64 +469,170 @@ impl NativeApp {
         Ok(())
     }
 
-    fn snapshot(&self) -> Value {
+    /// What the settings window and the menu show.
+    fn snapshot(&self) -> api::Snapshot<MacPlatform> {
         let config = self.document.saved();
+        let sharing = config.macos.sharing && !self.emergency_paused;
+        let peers = peer_rows(config, self.links.states(), self.observer.session_peer());
+        let nearby = self.nearby.snapshot();
+        let connected = peers.iter().any(|p| {
+            matches!(
+                p.state,
+                PeerState::Connected | PeerState::ControlledFromHere
+            )
+        });
+        let checking = !connected && peers.iter().any(|p| p.state == PeerState::Connecting);
+        let mut health = vec![self.sharing_health(sharing)];
+        if sharing {
+            health.extend(link_health(&peers));
+        }
+        // A computer gets its tile once it connects, so until then there is
+        // nothing to drag.
         let layout_issue = sharing::local_geometry()
             .and_then(|g| handoff::validate(&self.layout.draft, &g))
             .err()
+            .filter(|_| connected)
             .map(|e| e.to_string());
-        let mut ready = false;
-        let mut connecting = false;
-        let mut link_errors = Vec::new();
-        for (name, state) in self.links.states() {
-            match state {
-                LinkState::Ready(_) => ready = true,
-                LinkState::Connecting => connecting = true,
-                LinkState::Down(error) => link_errors.push(format!("{name}: {error}")),
-            }
+        if let Some(error) = self.layout_error.clone().or(layout_issue) {
+            health.push(Health::new(
+                "layout",
+                Level::Error,
+                "Computer layout",
+                error,
+            ));
         }
-        let receiver_error = self
-            .crossing_error
-            .clone()
-            .or_else(|| (!link_errors.is_empty()).then(|| link_errors.join("\n")));
-        let checking = !ready && connecting;
-        let sharing = config.macos.sharing && !self.emergency_paused;
-        let notice = if sharing && !self.observer.is_active() {
-            "Sharing starts when the checks above pass."
-        } else {
-            &self.observer.notice
-        };
-        let status = if !sharing {
-            "paused"
-        } else if config.peers.is_empty() {
-            "setup"
-        } else if !self.accessibility
-            || (config.macos.block_awdl && !self.helper_ready)
-            || receiver_error.is_some()
-            || self.config_error.is_some()
-            || self.layout_error.is_some()
-        {
-            "attention"
-        } else if self.observer.has_session() {
-            "sharing"
-        } else if self.observer.is_enabled() && ready {
-            "ready"
-        } else if checking {
-            "checking"
-        } else {
-            "attention"
-        };
-        json!({
-            "config_path":self.document.path,"layout_path":self.layout.path,"status":status,
-            "sharing":sharing,"block_awdl":config.macos.block_awdl,"accessibility":self.accessibility,
-            "notice":notice,"peers":config.peers.keys().collect::<Vec<_>>(),
-            "layout":self.layout.draft,"pairing":self.pairing.snapshot(),
-            "nearby":self.nearby.snapshot().records.values().collect::<Vec<_>>(),
-            "config_error":self.config_error,"layout_error":self.layout_error.as_ref().or(layout_issue.as_ref()),
-            "receiver_error":receiver_error,"receiver_checked":ready && receiver_error.is_none(),"checking":checking,
-            "local_network":self.local_network,
-        })
+        if let Some(error) = &self.config_error {
+            health.push(Health {
+                action: Some(Action {
+                    label: "Open Configuration…".into(),
+                    command: "open_config".into(),
+                }),
+                ..Health::new("config", Level::Error, "Configuration", error.clone())
+            });
+        }
+        if let BrowserStatus::Failed(error) = nearby.status {
+            health.push(Health::new(
+                "discovery",
+                Level::Warning,
+                "Nearby computers",
+                error,
+            ));
+        }
+        api::Snapshot {
+            status: Status::new(Some(sharing), &peers, &health, checking),
+            sharing: Some(sharing),
+            health,
+            layout: Some(self.layout.draft.clone()),
+            peers,
+            pairing: self.pairing.snapshot(),
+            nearby: nearby.records.into_values().collect(),
+            shortcuts: vec![Shortcut {
+                title: "Return input to this computer".into(),
+                keys: "⌃⌘⌫".into(),
+            }],
+            autostart: None,
+            config_path: self.document.path.clone(),
+            platform: MacPlatform {
+                accessibility: self.accessibility,
+                local_network: self.local_network,
+                block_awdl: config.macos.block_awdl,
+            },
+        }
     }
+
+    /// Whether this Mac can send its input right now. The Allow button for
+    /// Accessibility is in the window's own Mac section, so this row has none.
+    fn sharing_health(&self, sharing: bool) -> Health {
+        let row = |level, detail: &str| Health::new("sharing", level, "Sharing", detail);
+        if !self.accessibility {
+            return row(
+                Level::Error,
+                "Allow Accessibility below so zflow can share the keyboard and pointer.",
+            );
+        }
+        if let Some(error) = self.crossing_error.as_ref().filter(|_| sharing) {
+            return Health {
+                action: Some(retry()),
+                ..row(Level::Error, error)
+            };
+        }
+        if sharing && !self.observer.is_active() {
+            return row(Level::Ok, "Sharing starts once a paired computer is ready.");
+        }
+        let level = if sharing && self.observer.waiting_for_secure_input() {
+            Level::Warning
+        } else {
+            Level::Ok
+        };
+        row(level, &self.observer.notice)
+    }
+}
+
+fn retry() -> Action {
+    Action {
+        label: "Retry".into(),
+        command: "retry".into(),
+    }
+}
+
+/// Each paired computer, from its link and the crossing in progress. A
+/// computer without a link does not take input from this Mac, or sharing is off.
+fn peer_rows<'a>(
+    config: &Config,
+    links: impl Iterator<Item = (&'a str, LinkState)>,
+    controlled: Option<&str>,
+) -> Vec<Peer> {
+    let mut links: BTreeMap<_, _> = links.collect();
+    config
+        .peers
+        .iter()
+        .map(|(name, record)| {
+            let (state, error) = match links.remove(name.as_str()) {
+                _ if controlled == Some(name) => (PeerState::ControlledFromHere, None),
+                Some(LinkState::Ready(_)) => (PeerState::Connected, None),
+                Some(LinkState::Connecting) => (PeerState::Connecting, None),
+                Some(LinkState::Down(error)) => (PeerState::Unreachable, Some(error)),
+                None => (PeerState::Paired, None),
+            };
+            let mut peer = Peer::new(name, record, state);
+            if let Some(error) = error {
+                peer.detail = error;
+            }
+            peer
+        })
+        .collect()
+}
+
+/// One row for the links to paired computers, with a retry when one is down.
+/// Called only while sharing is on, so a computer without a link is one that
+/// does not take input from this Mac.
+fn link_health(peers: &[Peer]) -> Option<Health> {
+    if peers.is_empty() {
+        return None;
+    }
+    let down: Vec<_> = peers
+        .iter()
+        .filter(|peer| peer.state == PeerState::Unreachable)
+        .map(|peer| format!("{}: {}", peer.name, peer.detail))
+        .collect();
+    let title = "Paired computers";
+    Some(if !down.is_empty() {
+        Health {
+            action: Some(retry()),
+            ..Health::new("computers", Level::Error, title, down.join("\n"))
+        }
+    } else if peers.iter().all(|peer| peer.state == PeerState::Paired) {
+        Health::new(
+            "computers",
+            Level::Error,
+            title,
+            "No paired computer takes input from this Mac. Pair again to fix this.",
+        )
+    } else if peers.iter().any(|peer| peer.state == PeerState::Connecting) {
+        Health::new("computers", Level::Ok, title, "Checking…")
+    } else {
+        Health::new("computers", Level::Ok, title, "No problems found.")
+    })
 }
 
 #[cfg(test)]
@@ -591,6 +674,134 @@ mod tests {
         let snapshot = app.request(Request::Discover).unwrap();
         assert!(app.discover && !app.discovers());
         assert!(!app.nearby.is_running());
-        assert_eq!(snapshot["local_network"], "unknown");
+        assert_eq!(snapshot["platform"]["local_network"], "unknown");
+    }
+
+    #[test]
+    fn the_mac_snapshot_lists_the_shared_rows_in_window_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        std::fs::write(
+            &path,
+            "[transport]\ndiscovery = false\n[macos]\nsharing = false\n",
+        )
+        .unwrap();
+        let mut app = NativeApp::open(path.clone()).unwrap();
+        let text = serde_json::to_string(&app.snapshot()).unwrap();
+        let at = |key| text.find(&format!("\"{key}\":")).unwrap();
+        let order = [
+            "status",
+            "sharing",
+            "health",
+            "layout",
+            "peers",
+            "pairing",
+            "nearby",
+            "shortcuts",
+            "autostart",
+            "config_path",
+            "platform",
+        ];
+        assert!(
+            order.windows(2).all(|pair| at(pair[0]) < at(pair[1])),
+            "{text}"
+        );
+        let value = app.request(Request::Snapshot).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), order.len());
+        assert_eq!(value["status"]["state"], "paused");
+        assert_eq!(value["status"]["title"], "Paused");
+        assert_eq!(value["sharing"], false);
+        assert_eq!(value["health"][0]["id"], "sharing");
+        assert_eq!(value["shortcuts"][0]["keys"], "⌃⌘⌫");
+        assert_eq!(value["autostart"], Value::Null);
+        assert_eq!(value["config_path"], path.to_str().unwrap());
+        assert_eq!(
+            value["platform"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["accessibility", "block_awdl", "local_network"]
+        );
+        // Controls for being controlled wait until this Mac accepts input.
+        let error = app
+            .request(Request::SetPeer {
+                name: "desk".into(),
+                allow_control: Some(true),
+                keyboard: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Not available on this computer");
+    }
+
+    #[test]
+    fn links_become_peer_states_and_one_health_row() {
+        let mut config = Config::default();
+        for name in ["busy", "desk", "down", "new", "off"] {
+            config.peers.insert(
+                name.into(),
+                crate::config::PeerConfig {
+                    spki_der_hex: "01".into(),
+                    addresses: Vec::new(),
+                    permissions: crate::config::PeerPermissions {
+                        connect: true,
+                        send_normal: false,
+                        receive_normal: name != "off",
+                        inject_prelogin: false,
+                    },
+                    keyboard: crate::core::KeyboardMode::Standard,
+                },
+            );
+        }
+        let ready = || {
+            LinkState::Ready(crate::desktop::Geometry {
+                monitors: vec![crate::desktop::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                }],
+            })
+        };
+        let links = [
+            ("busy", ready()),
+            ("desk", ready()),
+            ("down", LinkState::Down("connection refused".into())),
+            ("new", LinkState::Connecting),
+        ];
+        let peers = peer_rows(&config, links.into_iter(), Some("busy"));
+        let rows: Vec<_> = peers
+            .iter()
+            .map(|peer| (peer.name.as_str(), peer.state, peer.detail.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "busy",
+                    PeerState::ControlledFromHere,
+                    "Controlled from here"
+                ),
+                ("desk", PeerState::Connected, "Connected"),
+                ("down", PeerState::Unreachable, "connection refused"),
+                ("new", PeerState::Connecting, "Connecting…"),
+                ("off", PeerState::Paired, "Paired"),
+            ]
+        );
+        let row = link_health(&peers).unwrap();
+        assert_eq!(
+            (row.level, row.detail.as_str()),
+            (Level::Error, "down: connection refused")
+        );
+        assert_eq!(row.action.as_ref().unwrap().command, "retry");
+        let status = Status::new(Some(true), &peers, &[row], false);
+        assert_eq!(status.title, "Controlling busy");
+        let fine = &peers[..2];
+        assert_eq!(link_health(fine).unwrap().level, Level::Ok);
+        assert!(link_health(&[]).is_none());
+        // Sharing is on, but no computer takes input from this Mac.
+        let unlinked = link_health(&peers[4..]).unwrap();
+        assert_eq!(unlinked.level, Level::Error);
+        assert!(unlinked.action.is_none());
     }
 }

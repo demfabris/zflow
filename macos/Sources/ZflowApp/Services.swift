@@ -39,7 +39,7 @@ final class Services {
       helperReady = false
       helperTitle = "Signed build required"
       helperDetail =
-        "Installing the AWDL helper requires an Apple-signed build. Sharing works with AWDL blocking off."
+        "Installing the Wi-Fi helper requires an Apple-signed build. Sharing works without it."
       helperAction = "Install…"
       return
     }
@@ -57,7 +57,7 @@ final class Services {
     case .enabled:
       let result = await Self.checkHelper()
       helperReady = result
-      helperTitle = result ? "AWDL helper ready" : "AWDL helper unavailable"
+      helperTitle = result ? "Wi-Fi helper ready" : "Wi-Fi helper unavailable"
       helperDetail =
         result
         ? "Only active while controlling another computer."

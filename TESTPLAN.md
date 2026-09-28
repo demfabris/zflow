@@ -387,8 +387,8 @@ drops a session, and a prompt close. These need live checks on real hardware:
 - Turn Wi-Fi off for 30 seconds while idle, and again while controlling
   Ubuntu. Expect `input link lost`, a reconnect after Wi-Fi returns, and a
   working crossing. Repeat with a zflowd restart and a one-minute Mac sleep.
-- With a signed build, install the AWDL helper, confirm Settings reports it
-  ready, and cross with **Block AWDL while sharing** on. `ifconfig awdl0` must
+- With a signed build, install the Wi-Fi helper, confirm Settings reports it
+  ready, and cross with **Reduce Wi-Fi lag** on. `ifconfig awdl0` must
   show it down during capture and restored after return.
 
 ## Historical configuration GUI observations

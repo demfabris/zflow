@@ -13,16 +13,17 @@ import Testing
   try original.write(to: file, atomically: true, encoding: .utf8)
   let core = CoreBridge(path: file.path)
   let initial = try await core.request(CoreRequest(command: "snapshot"))
-  #expect(initial.status == "paused")
+  #expect(initial.status.state == "paused")
   let changed = try await core.request(CoreRequest(command: "set_awdl", enabled: true))
-  #expect(changed.blockAwdl)
+  #expect(changed.platform.blockAwdl)
   #expect(
     try String(contentsOf: file, encoding: .utf8)
       == original.replacingOccurrences(of: "block_awdl = false", with: "block_awdl = true"))
   try "[broken".write(to: file, atomically: true, encoding: .utf8)
   let invalid = try await core.request(CoreRequest(command: "reload"))
-  #expect(invalid.blockAwdl)
-  #expect(invalid.configError != nil)
+  #expect(invalid.platform.blockAwdl)
+  #expect(invalid.health.contains { $0.id == "config" && $0.level == "error" })
+  #expect(invalid.status.state == "paused")
   await core.shutdown()
 }
 
@@ -34,15 +35,15 @@ import Testing
   try "[transport]\ndiscovery = false\n".write(to: file, atomically: true, encoding: .utf8)
   let core = CoreBridge(path: file.path)
   let initial = try await core.request(CoreRequest(command: "snapshot"))
-  #expect(initial.sharing)
+  #expect(initial.sharing == true)
   try "[broken".write(to: file, atomically: true, encoding: .utf8)
   do {
     _ = try await core.request(CoreRequest(command: "set_sharing", enabled: false))
     Issue.record("Saving over an external edit should fail")
   } catch {}
   let paused = try await core.request(CoreRequest(command: "snapshot"))
-  #expect(!paused.sharing)
-  #expect(paused.status == "paused")
+  #expect(paused.sharing == false)
+  #expect(paused.status.state == "paused")
   await core.shutdown()
 }
 
@@ -75,7 +76,35 @@ import Testing
   // No UI requests occur while the worker observes the edit.
   try await Task.sleep(for: .milliseconds(2200))
   let snapshot = try await core.request(CoreRequest(command: "snapshot"))
-  #expect(snapshot.blockAwdl)
-  #expect(snapshot.status == "paused")
+  #expect(snapshot.platform.blockAwdl)
+  #expect(snapshot.status.state == "paused")
+  await core.shutdown()
+}
+
+@Test func theSnapshotCarriesTheSharedRowsAndRequestNames() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let file = directory.appendingPathComponent("zflow.toml")
+  try "[transport]\ndiscovery = false\n".write(to: file, atomically: true, encoding: .utf8)
+  let core = CoreBridge(path: file.path)
+  let snapshot = try await core.request(CoreRequest(command: "snapshot"))
+  #expect(snapshot.status.state == "setup")
+  #expect(snapshot.status.title == "Pair a computer")
+  #expect(snapshot.health.first?.id == "sharing")
+  #expect(snapshot.layout != nil)
+  #expect(snapshot.peers.isEmpty)
+  #expect(snapshot.shortcuts.map(\.keys) == ["⌃⌘⌫"])
+  #expect(snapshot.autostart == nil)
+  #expect(snapshot.configPath == file.path)
+  // The old names are gone; the shared ones reach the engine.
+  for old in ["move", "pair_start"] {
+    await #expect(throws: AppError.self) { try await core.request(CoreRequest(command: old)) }
+  }
+  do {
+    _ = try await core.request(
+      CoreRequest(command: "move_tile", id: "nowhere", x: 0, y: 0, tolerance: 8))
+    Issue.record("An unknown tile cannot move")
+  } catch { #expect(error.localizedDescription == "Unknown computer") }
   await core.shutdown()
 }
