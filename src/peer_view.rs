@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -178,16 +179,17 @@ impl std::fmt::Debug for ClipData {
 
 impl Serialize for ClipData {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&base64::encode(&self.0))
+        serializer.serialize_str(&BASE64.encode(&self.0))
     }
 }
 
 impl<'de> Deserialize<'de> for ClipData {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
-        base64::decode(&text)
+        BASE64
+            .decode(text)
             .map(Self)
-            .ok_or_else(|| serde::de::Error::custom("clipboard data is not base64"))
+            .map_err(|_| serde::de::Error::custom("clipboard data is not base64"))
     }
 }
 
@@ -376,68 +378,6 @@ pub async fn status() -> anyhow::Result<DesktopStatus> {
     }
 }
 
-/// Standard base64 with padding (RFC 4648), which is all the clipboard
-/// needs from it.
-mod base64 {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    pub fn encode(bytes: &[u8]) -> String {
-        let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        for chunk in bytes.chunks(3) {
-            let group = chunk.iter().enumerate().fold(0_u32, |group, (at, &byte)| {
-                group | (u32::from(byte) << (16 - 8 * at))
-            });
-            for at in 0..4 {
-                text.push(if at <= chunk.len() {
-                    char::from(ALPHABET[(group >> (18 - 6 * at)) as usize & 63])
-                } else {
-                    '='
-                });
-            }
-        }
-        text
-    }
-
-    /// None for anything that is not exactly what [`encode`] writes.
-    pub fn decode(text: &str) -> Option<Vec<u8>> {
-        let text = text.as_bytes();
-        if !text.len().is_multiple_of(4) {
-            return None;
-        }
-        let groups = text.len() / 4;
-        let mut bytes = Vec::with_capacity(groups * 3);
-        for (index, chunk) in text.chunks(4).enumerate() {
-            let padding = chunk.iter().rev().take_while(|&&c| c == b'=').count();
-            if padding > 2 || (padding > 0 && index + 1 != groups) {
-                return None;
-            }
-            let group = chunk[..4 - padding]
-                .iter()
-                .try_fold(0_u32, |group, &c| Some((group << 6) | sextet(c)?))?
-                << (6 * padding);
-            let [_, decoded @ ..] = group.to_be_bytes();
-            let (kept, dropped) = decoded.split_at(3 - padding);
-            if dropped.iter().any(|&byte| byte != 0) {
-                return None;
-            }
-            bytes.extend_from_slice(kept);
-        }
-        Some(bytes)
-    }
-
-    fn sextet(c: u8) -> Option<u32> {
-        let value = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        Some(value.into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,7 +520,10 @@ mod tests {
         for text in [
             "Zg=", "Zg", "Z===", "Zg==Zg==", "Zm9v\n", "Zm-v", "Zh==", "Zm9=", "====",
         ] {
-            assert!(base64::decode(text).is_none(), "{text}");
+            assert!(
+                serde_json::from_value::<ClipData>(text.into()).is_err(),
+                "{text}"
+            );
         }
         assert_eq!(
             format!("{:?}", ClipData(b"secret".to_vec())),
@@ -664,15 +607,6 @@ mod tests {
             .unwrap(),
             r#"{"clipboard":"clip","kind":"png","data":"iVA="}"#
         );
-    }
-
-    proptest::proptest! {
-        #[test]
-        fn base64_round_trips(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)) {
-            let text = base64::encode(&bytes);
-            proptest::prop_assert_eq!(text.len(), bytes.len().div_ceil(3) * 4);
-            proptest::prop_assert_eq!(base64::decode(&text), Some(bytes));
-        }
     }
 
     #[test]

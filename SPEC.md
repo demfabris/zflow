@@ -222,7 +222,7 @@ Input control MUST NOT share a stream with clipboard or file data. If zflow appl
 
 ### Clipboard
 
-The clipboard goes with the pointer and moves at no other time. The computer the pointer leaves sends its clipboard to the one it enters: a sender reads its own clipboard once its crossing reaches the other computer, by edge or chord, and a computer that was being controlled reads its clipboard when that control ends, by return, escape chord or lease end. Nothing reads the clipboard while the pointer stays put, and a crossing never waits for a clip. A clip is one representation: UTF-8 text if the clipboard has text, else one PNG image. Files never go. A clip holds at most 3 MiB (`MAX_CLIP_BYTES`); a larger clipboard stays where it is, and that computer shows a notice. Each computer opts in for itself with `[clipboard] share`, off by default: it sends only with its own switch on and keeps what arrives only with its own switch on. Each transfer is its own stream on the input connection, and QUIC sends datagrams ahead of stream data, so a large clip does not hold up input. A newer clip cancels one still on its way, and a bad or oversized clip ends only its own stream. Each computer remembers, per peer, the last clip it sent there and the last one that peer gave it, so a clip never bounces back. Logs name only a clip's kind and size.
+The clipboard goes with the pointer and moves at no other time. The computer the pointer leaves sends its clipboard to the one it enters: a sender reads its own clipboard once its crossing reaches the other computer, by edge or chord, and a computer that was being controlled reads its clipboard when that control ends, by return, escape chord or lease end. Nothing reads the clipboard while the pointer stays put, and a crossing never waits for a clip. A clip is one representation: UTF-8 text if the clipboard has text, else one PNG image. Files never go. A clip holds at most 3 MiB (`MAX_CLIP_BYTES`); a larger clipboard stays where it is, and that computer shows a notice. Each computer opts in for itself with `[clipboard] share`, off by default: it sends only with its own switch on and keeps what arrives only with its own switch on. Each transfer is its own stream on the input connection, and QUIC sends datagrams ahead of stream data, so a large clip does not hold up input. A newer clip cancels one still on its way, and a bad or oversized clip ends only its own stream. Each computer remembers, per peer, the last clip that peer had from it or gave it, and sends only a different one, so a clip never bounces back. Logs name only a clip's kind and size.
 
 QUIC retransmission cannot deliver an event after connection death. The receiver owns failure recovery.
 
@@ -664,10 +664,9 @@ Each peer has revocable capabilities:
 - connect;
 - receive normal-session input;
 - send normal-session input;
-- inject before login;
-- use clipboard when that feature exists.
+- inject before login.
 
-Pre-login injection defaults off. A local logged-in user must grant it.
+Clipboard sharing is a setting of each computer, not of each peer (see Clipboard). Pre-login injection defaults off. A local logged-in user must grant it.
 
 QUIC 0-RTT MUST NOT carry pairing, input, control, permission, or session-takeover messages because an attacker can replay 0-RTT application data. See [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html#section-9.2).
 
@@ -732,7 +731,7 @@ As of 2026-08-31, implementation steps 0 through 5 are code-complete and pass th
 8. Add portal/EIS capture and test desktop edge switching.
 9. Build the signed macOS daemon and Aqua agent for logged-in capture/injection, including flagged raw-contact capture.
 10. Run CoreHID, LoginWindow, touch, and path-failover experiments as separate gates.
-11. Add a best-effort bulk connection before clipboard work.
+11. Add a best-effort bulk connection before file transfer work.
 
 Release matrices from TESTPLAN.md gate each beta along the way.
 
