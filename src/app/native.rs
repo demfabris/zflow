@@ -510,6 +510,15 @@ impl NativeApp {
         let mut health = vec![self.sharing_health(sharing)];
         if sharing {
             health.extend(link_health(&peers));
+            // The Mac still dials, so peers can control it over that.
+            if let Some(error) = self.links.listen_error() {
+                health.push(Health::new(
+                    "listen",
+                    Level::Warning,
+                    "Incoming connections",
+                    error,
+                ));
+            }
         }
         // A computer gets its tile once it connects, so until then there is
         // nothing to drag.
