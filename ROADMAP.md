@@ -441,13 +441,15 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - Done:
     - Capture-all: an empty `capture_devices` list captures every keyboard and pointer, and a device another program grabbed (EBUSY) is skipped.
     - The daemon half of change 9, and the rule for two computers dialing each other at once (`identity::wins_simultaneous_dial`).
-    - GNOME edge barriers: a push sends `edge_hit`, and the daemon activates that peer. While sending, the pointer is hidden and an idle inhibitor is held.
+    - GNOME edge barriers: a push sends `edge_hit`. While sending, the pointer is hidden and an idle inhibitor is held. The barriers come back after unlocking, and they stop 8 px short of the desktop's corners (Phase 4's dead corners).
+    - Change 10: the pure handoff parts are shared in `src/app/handoff.rs`, and `src/daemon/crossing.rs` drives a crossing: Prepare at the matching entry point, arm, Poll until the pointer leaves the other computer, warp back and Finish. A push made with a key or button held gives up after 400 ms instead of crossing later.
+    - Each computer writes its own tile size into the shared layout. A resize keeps the sides that touch a neighbour.
     - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
-    - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, it shows this computer with each paired one to its right; the first move saves that layout, and edges cross only after it.
+    - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
   - Left:
-    - Change 10: entry placement and return through Prepare, Poll and Finish.
-    - Linux writing its own tile size.
-    - The Mac sending and merging layouts (Phase 2 side).
+    - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
+    - The live checks in TESTPLAN.md, "Two-way input sitting".
+    - A computer paired after a layout exists gets no tile until someone adds it.
   - Known limit: a key held on a remapper-grabbed device at the moment zflow opens it blocks arming until the daemon restarts.
 
 ### Phase 4: the Deskflow extras

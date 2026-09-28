@@ -9,6 +9,10 @@ use anyhow::ensure;
 
 /// How long activation may take to start arming before the crossing gives up.
 const ARMING_START: Duration = Duration::from_millis(500);
+/// Arming waits for every key and button to be up. A push made while one is
+/// held, such as dragging a window to the edge, is not a crossing, so give up
+/// rather than cross when it is dropped later somewhere else.
+const ARMING_LIMIT: Duration = Duration::from_millis(400);
 /// Receivers from before the poll hold answer at once; this paces their polls.
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -48,12 +52,23 @@ impl Shared {
         let session = self.ensure_session(&handoff.peer, &record).await?;
         let token = handoff::token()?;
         let prepared = session.desktop_request(handoff.prepare(token)).await;
-        let result = async {
+        let entered = async {
             handoff.check_prepared(prepared?)?;
-            self.activate(&handoff.peer).await?;
-            self.until_returned(&session, &handoff, token).await
+            self.activate(&handoff.peer).await
         }
         .await;
+        let result = match entered {
+            Ok(()) => {
+                let result = self.until_returned(&session, &handoff, token).await;
+                // However it failed, input must not stay armed or grabbed for
+                // a crossing that is over. Finish below ends the other side.
+                if result.is_err() {
+                    self.release_own_input().await;
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
         let finished = handoff::check_finished(
             session
                 .desktop_request(DesktopRequest::Finish { token })
@@ -81,6 +96,13 @@ impl Shared {
                     started.elapsed() < ARMING_START,
                     "the crossing did not start arming; check `zflow doctor`"
                 ),
+                OwnershipPhase::Arming => {
+                    armed = true;
+                    ensure!(
+                        started.elapsed() < ARMING_LIMIT,
+                        "a key or button stayed down, so the pointer stays here"
+                    );
+                }
                 _ => armed = true,
             }
             let polled = Instant::now();
@@ -97,11 +119,7 @@ impl Shared {
                     {
                         tracing::warn!(%reason, "pointer not put back after a crossing");
                     }
-                    self.runtime
-                        .send(RuntimeCommand::Release {
-                            transport_live: true,
-                        })
-                        .map_err(|error| anyhow!(error))?;
+                    self.release_own_input().await;
                     return Ok(());
                 }
                 DesktopResponse::Unavailable { reason } => {
@@ -109,6 +127,23 @@ impl Shared {
                 }
                 _ => bail!("the other computer answered a poll unexpectedly"),
             }
+        }
+    }
+
+    /// Gives this computer's input back to it. Releasing while idle does
+    /// nothing, so this is safe whatever state the crossing reached.
+    async fn release_own_input(&self) {
+        let released = self
+            .runtime
+            .send_critical(
+                RuntimeCommand::Release {
+                    transport_live: true,
+                },
+                TERMINAL_SEND_TIMEOUT,
+            )
+            .await;
+        if let Err(error) = released {
+            tracing::warn!(%error, "input release after a crossing not delivered");
         }
     }
 

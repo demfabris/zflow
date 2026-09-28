@@ -336,6 +336,9 @@ impl SharedLayout {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         };
         ensure!(fingerprint(&self.editor), "Invalid layout editor");
+        // Kept to what JSON carries exactly, which also stops two computers
+        // from pinning it at the maximum and trading edits forever.
+        ensure!(self.version <= MAX_TOKEN, "Invalid layout version");
         ensure!(
             self.tiles.len() <= MAX_SHARED_TILES,
             "A shared layout holds at most {MAX_SHARED_TILES} computers"
@@ -364,40 +367,58 @@ impl SharedLayout {
 
     /// A new version in which the computer `key` gives its own tile the size
     /// of its desktop. Each computer writes only its own size, so two never
-    /// edit the same tile. A tile that would overlap another moves to the
-    /// right of the rest. None when the size is already right or the tile is
-    /// missing.
+    /// edit the same tile. The sides that touch a neighbour stay where they
+    /// are, so the crossings stay; a tile that would still overlap another
+    /// moves to the right of the rest. None when the size is already right or
+    /// the tile is missing.
     pub fn with_own_size(&self, key: &str, width: u32, height: u32) -> Option<Self> {
         let index = self.tiles.iter().position(|tile| tile.key == key)?;
-        let tile = &self.tiles[index];
-        if (tile.width, tile.height) == (width, height) {
+        let old = &self.tiles[index];
+        if (old.width, old.height) == (width, height) {
             return None;
         }
-        let mut next = self.clone();
-        next.version = self.version.saturating_add(1);
-        next.editor = key.to_owned();
+        let span = |start: i32, size: u32| (i64::from(start), i64::from(start) + i64::from(size));
         let overlaps = |a: &Tile, b: &Tile| {
-            let span =
-                |start: i32, size: u32| (i64::from(start), i64::from(start) + i64::from(size));
             let ((al, ar), (at, ab)) = (span(a.x, a.width), span(a.y, a.height));
             let ((bl, br), (bt, bb)) = (span(b.x, b.width), span(b.y, b.height));
             al < br && ar > bl && at < bb && ab > bt
         };
-        next.tiles[index].width = width;
-        next.tiles[index].height = height;
-        let resized = next.tiles[index].clone();
-        if next
-            .tiles
-            .iter()
-            .enumerate()
-            .any(|(i, other)| i != index && overlaps(&resized, other))
-        {
-            let right = next
-                .tiles
+        let others = || {
+            self.tiles
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| *i != index)
-                .map(|(_, other)| other.x.saturating_add(other.width as i32))
+                .filter(move |(i, _)| *i != index)
+                .map(|(_, other)| other)
+        };
+        let ((left, right), (top, bottom)) = (span(old.x, old.width), span(old.y, old.height));
+        let beside = |other: &Tile| {
+            let (other_top, other_bottom) = span(other.y, other.height);
+            other_top < bottom && other_bottom > top
+        };
+        let above_or_below = |other: &Tile| {
+            let (other_left, other_right) = span(other.x, other.width);
+            other_left < right && other_right > left
+        };
+        let touches_left = others().any(|o| beside(o) && span(o.x, o.width).1 == left);
+        let touches_right = others().any(|o| beside(o) && i64::from(o.x) == right);
+        let touches_top = others().any(|o| above_or_below(o) && span(o.y, o.height).1 == top);
+        let touches_bottom = others().any(|o| above_or_below(o) && i64::from(o.y) == bottom);
+        let mut next = self.clone();
+        next.version = self.version.checked_add(1)?;
+        next.editor = key.to_owned();
+        let tile = &mut next.tiles[index];
+        if touches_right && !touches_left {
+            tile.x = i32::try_from(right - i64::from(width)).ok()?;
+        }
+        if touches_bottom && !touches_top {
+            tile.y = i32::try_from(bottom - i64::from(height)).ok()?;
+        }
+        tile.width = width;
+        tile.height = height;
+        let resized = next.tiles[index].clone();
+        if others().any(|other| overlaps(&resized, other)) {
+            let right = others()
+                .map(|other| other.x.saturating_add(other.width as i32))
                 .max()
                 .unwrap_or(0);
             next.tiles[index].x = right;
@@ -456,7 +477,7 @@ mod tests {
             height: crate::app::layout_model::MAX_DIMENSION,
         };
         let layout = SharedLayout {
-            version: u64::MAX,
+            version: MAX_TOKEN,
             editor: key(99),
             tiles: (0..MAX_SHARED_TILES).map(tile).collect(),
         };
@@ -511,9 +532,30 @@ mod tests {
         let taller = small.with_own_size(&key(2), 500, 900).unwrap();
         assert_eq!((taller.version, &taller.editor), (6, &key(2)));
         assert_eq!((taller.tiles[1].x, taller.tiles[1].height), (1000, 900));
-        // Growing into a neighbour moves the tile past the others.
+        // The side touching a neighbour stays, whether the tile grows or shrinks.
         let wider = small.with_own_size(&key(1), 1200, 800).unwrap();
-        assert_eq!((wider.tiles[0].x, wider.tiles[0].width), (1500, 1200));
+        assert_eq!((wider.tiles[0].x, wider.tiles[0].width), (-200, 1200));
+        let narrower = small.with_own_size(&key(1), 600, 800).unwrap();
+        assert_eq!((narrower.tiles[0].x, narrower.tiles[0].width), (400, 600));
+        // Squeezed between two neighbours, a grown tile moves past the others.
+        let mut middle = small.clone();
+        middle.tiles.push(Tile {
+            key: key(3),
+            x: -300,
+            y: 0,
+            width: 300,
+            height: 800,
+        });
+        let crowded = middle.with_own_size(&key(1), 1200, 800).unwrap();
+        assert_eq!((crowded.tiles[0].x, crowded.tiles[0].y), (1500, 0));
+        let mut maxed = small.clone();
+        maxed.version = MAX_TOKEN;
+        assert!(
+            maxed.with_own_size(&key(1), 1200, 800).is_none(),
+            "the version cannot grow"
+        );
+        maxed.version = MAX_TOKEN + 1;
+        assert!(maxed.validate().is_err());
 
         let older = SharedLayout {
             version: 3,

@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use quinn::Endpoint;
 use tokio::{
     net::UnixListener,
@@ -150,6 +150,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         seat_gate: RwLock::new(initial_seat),
         session_events,
     });
+    desktop::start_local_sync(shared.clone());
     if let Err(error) = peer_view::start(shared.clone()) {
         tracing::warn!(%error, "desktop metadata API unavailable");
     }
@@ -469,7 +470,7 @@ impl Shared {
 
     /// Places a barrier on each edge of this computer's tile that touches a
     /// paired computer. Without a layout, crossings start only from the chord.
-    async fn apply_layout(self: &Arc<Self>) {
+    async fn apply_layout(&self) {
         let edges = self
             .local_layout()
             .await
@@ -516,9 +517,11 @@ impl Shared {
             }
             return;
         }
-        self.save_layout(&layout).await;
-        tracing::info!(peer = %from, version = layout.version, "layout adopted");
-        self.keep_layout(layout, Some(session_id)).await;
+        let version = layout.version;
+        if !self.keep_layout(layout, Some(session_id)).await {
+            return;
+        }
+        tracing::info!(peer = %from, version, "layout adopted");
         // The other computer may not know this desktop's size yet.
         let shared = self.clone();
         tokio::spawn(async move {
@@ -530,14 +533,21 @@ impl Shared {
         });
     }
 
-    /// Uses `layout` from now on, and sends it to every peer except the
-    /// session it came from.
-    async fn keep_layout(
-        self: &Arc<Self>,
-        layout: crate::desktop::SharedLayout,
-        origin: Option<u64>,
-    ) {
-        *self.layout.lock().await = Some(layout);
+    /// Uses `layout` from now on if it is newer than the one kept, saves it,
+    /// and sends it to every peer except the session it came from. Returns
+    /// whether it was kept: another task may have kept a newer one first.
+    async fn keep_layout(&self, layout: crate::desktop::SharedLayout, origin: Option<u64>) -> bool {
+        {
+            let mut current = self.layout.lock().await;
+            if current
+                .as_ref()
+                .is_some_and(|current| !layout.is_newer_than(current))
+            {
+                return false;
+            }
+            *current = Some(layout.clone());
+        }
+        self.save_layout(&layout).await;
         self.apply_layout().await;
         let others: Vec<_> = self
             .sessions
@@ -550,11 +560,12 @@ impl Shared {
         for session in others {
             self.offer_layout(&session).await;
         }
+        true
     }
 
     /// Writes this computer's own tile size, from its GNOME desktop, into
     /// the shared layout, and tells the other computers.
-    pub(super) async fn fit_own_tile(self: &Arc<Self>, geometry: &crate::desktop::Geometry) {
+    pub(super) async fn fit_own_tile(&self, geometry: &crate::desktop::Geometry) {
         let Ok(bounds) = geometry.bounds() else {
             return;
         };
@@ -564,14 +575,15 @@ impl Shared {
         }) else {
             return;
         };
-        self.save_layout(&resized).await;
-        tracing::info!(
-            width = bounds.width,
-            height = bounds.height,
-            version = resized.version,
-            "this computer's tile resized"
-        );
-        self.keep_layout(resized, None).await;
+        let version = resized.version;
+        if self.keep_layout(resized, None).await {
+            tracing::info!(
+                width = bounds.width,
+                height = bounds.height,
+                version,
+                "this computer's tile resized"
+            );
+        }
     }
 
     /// Writes `layout` to the state directory, so it outlives a restart.
@@ -598,12 +610,20 @@ impl Shared {
             _ => bail!("GNOME did not describe this desktop"),
         };
         let bounds = geometry.bounds()?;
-        initial_layout(
+        let initial = initial_layout(
             &self.identity_fingerprint,
             bounds.width,
             bounds.height,
             &peer_keys(&*self.config.read().await),
-        )
+        )?;
+        // Keep it, so later requests do not ask GNOME again. Version 0 gives
+        // way to any layout a peer arranged.
+        self.keep_layout(initial, None).await;
+        self.layout
+            .lock()
+            .await
+            .clone()
+            .context("the layout was not kept")
     }
 
     /// What the settings window arranges. None while there is no layout and
@@ -633,9 +653,12 @@ impl Shared {
             (x, y),
             tolerance,
         )?;
-        self.save_layout(&moved).await;
-        tracing::info!(%id, version = moved.version, "tile moved");
-        self.keep_layout(moved, None).await;
+        let version = moved.version;
+        ensure!(
+            self.keep_layout(moved, None).await,
+            "The layout changed on another computer; try again"
+        );
+        tracing::info!(%id, version, "tile moved");
         Ok(())
     }
 
@@ -710,8 +733,10 @@ impl Shared {
         let wins = wins_dial(&config, &self.identity_fingerprint, peer);
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get(peer).cloned() {
-            // The peer dialed while this computer did.
-            if !wins {
+            // Either this computer dialed twice at once, or the peer dialed
+            // while this computer did.
+            let own = self.dialed.lock().await.contains_key(&existing.id());
+            if own || !wins {
                 session.close(SessionCloseReason::Superseded);
                 return Ok(existing);
             }
@@ -992,7 +1017,6 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
             shared
                 .apply_config_locked(Config::load(&shared.config_path)?, false)
                 .await?;
-            shared.apply_layout().await;
             Ok(Response::Ack)
         }
         Request::ListPeers => Ok(Response::Peers {
@@ -2065,6 +2089,9 @@ impl Shared {
                 session.close(SessionCloseReason::PermissionRevoked);
             }
         }
+        // Pairing, forgetting or renaming a computer changes which tiles have
+        // a computer behind them here.
+        self.apply_layout().await;
         Ok(())
     }
 
