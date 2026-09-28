@@ -446,15 +446,15 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - Each computer writes its own tile size into the shared layout. A resize keeps the sides that touch a neighbour.
     - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
     - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
+    - A computer paired after the layout exists gets a tile beside this one (`SharedLayout::with_tiles_for`), and so does one missing from a layout a peer sent.
   - Left:
     - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
     - The live checks in TESTPLAN.md, "Two-way input sitting".
-    - A computer paired after a layout exists gets no tile until someone adds it.
   - Known limits:
     - A key held on a remapper-grabbed device at the moment zflow opens it blocks arming until the daemon restarts.
     - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
     - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
-    - With three or more computers where not every pair is paired, an edit on one computer drops the tiles of computers it has not paired. SPEC's rule against resurrecting forgotten computers causes this; peer-to-peer hops (Phase 4) need a rule that keeps third-party tiles.
+    - With three or more computers where not every pair is paired, an edit on one computer drops the tiles of computers it has not paired. A computer that paired them puts them back beside itself, but not where they were. SPEC's rule against resurrecting forgotten computers causes this; peer-to-peer hops (Phase 4) need a rule that keeps third-party tiles.
 
 ### Phase 4: the Deskflow extras
 

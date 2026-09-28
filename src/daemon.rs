@@ -469,7 +469,30 @@ impl Shared {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => tracing::warn!(%error, "saved layout not read"),
         }
+        self.place_new_peers().await;
         self.apply_layout().await;
+    }
+
+    /// Gives each paired computer the layout lacks a tile beside this one,
+    /// such as one paired after the computers were arranged, and tells the
+    /// other computers. Without a layout there is nothing to add to: the
+    /// first one places every paired computer.
+    async fn place_new_peers(&self) {
+        let keys = peer_keys(&*self.config.read().await);
+        let current = self.layout.lock().await.clone();
+        let Some(placed) = current.and_then(|layout| {
+            layout.with_tiles_for(
+                &self.identity_fingerprint,
+                keys.values().map(String::as_str),
+                PEER_TILE_SIZE,
+            )
+        }) else {
+            return;
+        };
+        let version = placed.version;
+        if self.keep_layout(placed, None).await {
+            tracing::info!(version, "paired computer placed in the layout");
+        }
     }
 
     /// Places a barrier on each edge of this computer's tile that touches a
@@ -527,6 +550,8 @@ impl Shared {
             return;
         }
         tracing::info!(peer = %from, version, "layout adopted");
+        // A computer paired here but not there has no tile in it yet.
+        self.place_new_peers().await;
         // The other computer may not know this desktop's size yet.
         let shared = self.clone();
         tokio::spawn(async move {
@@ -2116,6 +2141,7 @@ impl Shared {
         }
         // Pairing, forgetting or renaming a computer changes which tiles have
         // a computer behind them here.
+        self.place_new_peers().await;
         self.apply_layout().await;
         Ok(())
     }
