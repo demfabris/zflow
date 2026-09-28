@@ -152,6 +152,9 @@ const CONTROL: u64 = 0x0004_0000;
 const OPTION: u64 = 0x0008_0000;
 const COMMAND: u64 = 0x0010_0000;
 const CAPS_LOCK: u64 = 0x0001_0000;
+const NUMERIC_PAD: u64 = 0x0020_0000;
+const HELP: u64 = 0x0040_0000;
+const FUNCTION: u64 = 0x0080_0000;
 
 /// Modifier keycodes with their aggregate flag and device bit, the masks
 /// `zflow_mac_modifier_pressed` in capture_bridge.c reads back.
@@ -231,6 +234,20 @@ pub fn modifier_flags(held: impl IntoIterator<Item = u16>, caps_lock: bool) -> u
         }
     }
     flags
+}
+
+/// Flags a key carries of its own, as CGEventCreateKeyboardEvent sets them
+/// on macOS 27: keypad keys are on the numeric pad, function and navigation
+/// keys carry Fn, and arrows carry both. Setting an event's flags replaces
+/// them, so they go back in.
+pub fn key_flags(code: u16) -> u64 {
+    match code {
+        123..=126 => NUMERIC_PAD | FUNCTION,
+        114 => HELP | FUNCTION,
+        65 | 67 | 69 | 75 | 76 | 78 | 81..=89 | 91 | 92 => NUMERIC_PAD,
+        64 | 71 | 79 | 80 | 96..=101 | 103 | 105..=107 | 109 | 111 | 113 | 115..=122 => FUNCTION,
+        _ => 0,
+    }
 }
 
 pub fn is_terminal(bundle_id: &str) -> bool {
@@ -349,6 +366,21 @@ mod tests {
         assert_eq!(modifier_flags([0, 57], false), 0);
         assert_eq!(modifier_flags([], true), 0x0001_0000);
         assert!(!is_modifier(0) && !is_modifier(57));
+    }
+
+    #[test]
+    fn keys_keep_the_flags_macos_gives_them() {
+        assert_eq!(key_flags(0), 0);
+        assert_eq!(key_flags(36), 0);
+        assert_eq!(key_flags(55), 0);
+        assert_eq!(key_flags(123), 0x00a0_0000);
+        assert_eq!(key_flags(126), 0x00a0_0000);
+        assert_eq!(key_flags(82), 0x0020_0000);
+        assert_eq!(key_flags(76), 0x0020_0000);
+        assert_eq!(key_flags(122), 0x0080_0000);
+        assert_eq!(key_flags(105), 0x0080_0000);
+        assert_eq!(key_flags(117), 0x0080_0000);
+        assert_eq!(key_flags(114), 0x00c0_0000);
     }
 
     #[test]
