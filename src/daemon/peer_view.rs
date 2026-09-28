@@ -98,6 +98,11 @@ async fn desktop_command(
         shared.desktop.focus(&shared.runtime, terminal).await;
         return Ok(DesktopReply::Ack);
     }
+    if let Request::EdgeHit { edge, position } = request {
+        authorize_peer(stream, daemon_uid, shared.active_uid())?;
+        shared.edge_hit(edge, position);
+        return Ok(DesktopReply::Ack);
+    }
     let _mutation = shared.config_mutation.lock().await;
     authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();

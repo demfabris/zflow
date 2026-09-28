@@ -113,9 +113,12 @@ async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Res
         crate::desktop::BUS_NAME,
     )
     .await?;
-    let snapshot = call(&proxy, &DesktopRequest::Snapshot)
-        .await
-        .context(ENABLE)?;
+    let snapshot = call(
+        &proxy,
+        &crate::peer_view::AgentRequest::Handoff(DesktopRequest::Snapshot),
+    )
+    .await
+    .context(ENABLE)?;
     if let DesktopResponse::Unavailable { reason } = snapshot {
         anyhow::bail!("{reason}");
     }
@@ -151,16 +154,63 @@ async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Res
     };
     tracing::info!("desktop agent ready");
 
-    let report = async |terminal| {
-        let request = crate::peer_view::Request::Focus { terminal };
+    let report = async |request: crate::peer_view::Request| {
         if let Err(error) = crate::peer_view::request(&request).await {
-            tracing::debug!(error = %format_args!("{error:#}"), "desktop focus not sent");
+            tracing::debug!(error = %format_args!("{error:#}"), "desktop report not sent");
         }
     };
+    let mut awake = IdleInhibitor::default();
     // The daemon forgets the focus when this stream closes, however this ends.
-    tokio::select! {
-        result = serve(&mut stream, &proxy, &bus, &owner) => result,
-        result = forward_focus(connection, &proxy, owner.as_str(), report) => result,
+    let result = tokio::select! {
+        result = serve(&mut stream, &proxy, &bus, &owner, &mut awake) => result,
+        result = forward_signals(connection, &proxy, owner.as_str(), report) => result,
+    };
+    awake.set(connection, false).await;
+    result
+}
+
+/// Keeps GNOME from treating the session as idle while this computer's
+/// input goes to another one. Grabbed devices send GNOME nothing, so it
+/// would otherwise blank and lock the screen. gnome-session drops the
+/// inhibitor if the agent exits.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct IdleInhibitor(Option<u32>);
+
+#[cfg(target_os = "linux")]
+impl IdleInhibitor {
+    const IDLE: u32 = 8;
+
+    async fn set(&mut self, connection: &zbus::Connection, active: bool) {
+        let result = async {
+            let proxy = zbus::Proxy::new(
+                connection,
+                "org.gnome.SessionManager",
+                "/org/gnome/SessionManager",
+                "org.gnome.SessionManager",
+            )
+            .await?;
+            match (active, self.0) {
+                (true, None) => {
+                    let reason = "Controlling another computer";
+                    self.0 = Some(
+                        proxy
+                            .call("Inhibit", &("zflow", 0_u32, reason, Self::IDLE))
+                            .await?,
+                    );
+                }
+                (false, Some(cookie)) => {
+                    self.0 = None;
+                    proxy.call::<_, _, ()>("Uninhibit", &(cookie,)).await?;
+                }
+                _ => {}
+            }
+            Ok::<_, zbus::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%error, active, "GNOME idle inhibitor not changed");
+        }
     }
 }
 
@@ -171,11 +221,16 @@ async fn serve(
     proxy: &zbus::Proxy<'_>,
     bus: &zbus::fdo::DBusProxy<'_>,
     owner: &zbus::names::OwnedUniqueName,
+    awake: &mut IdleInhibitor,
 ) -> anyhow::Result<()> {
-    use crate::desktop::{DesktopRequest, DesktopResponse};
+    use crate::desktop::DesktopResponse;
+    use crate::peer_view::{AgentRequest, LocalRequest};
     loop {
-        let request: DesktopRequest = crate::control::read_message(stream).await?;
+        let request: AgentRequest = crate::control::read_message(stream).await?;
         request.validate()?;
+        if let AgentRequest::Local(LocalRequest::Sending { active }) = request {
+            awake.set(proxy.connection(), active).await;
+        }
         let response = match call(proxy, &request).await {
             Ok(response) => response,
             Err(error) => {
@@ -192,25 +247,34 @@ async fn serve(
 }
 
 /// Reports whether a terminal has focus, first as it is now and then on every
-/// change, so Mac shortcuts can use Ctrl+Shift there. Returns only on error.
+/// change, so Mac shortcuts can use Ctrl+Shift there. Also reports the pointer
+/// pushing against an edge that leads to another computer. Returns only on
+/// error.
 #[cfg(target_os = "linux")]
-async fn forward_focus(
+async fn forward_signals(
     connection: &zbus::Connection,
     proxy: &zbus::Proxy<'_>,
     owner: &str,
-    mut report: impl AsyncFnMut(bool),
+    mut report: impl AsyncFnMut(crate::peer_view::Request),
 ) -> anyhow::Result<()> {
+    use crate::peer_view::Request;
     use anyhow::Context;
     use zbus::{MatchRule, MessageStream, message::Type};
-    // The extension sends this only to the agent. Anyone can address the
-    // agent, so accept it only from Shell.
-    let changes = MatchRule::builder()
-        .msg_type(Type::Signal)
-        .sender(owner)?
-        .path(crate::desktop::OBJECT_PATH)?
-        .interface(crate::desktop::BUS_NAME)?
-        .member("FocusChanged")?
-        .build();
+    // The extension sends these only to the agent. Anyone can address the
+    // agent, so accept them only from Shell.
+    let from_shell = |member| {
+        Ok::<_, zbus::Error>(
+            MatchRule::builder()
+                .msg_type(Type::Signal)
+                .sender(owner)?
+                .path(crate::desktop::OBJECT_PATH)?
+                .interface(crate::desktop::BUS_NAME)?
+                .member(member)?
+                .build(),
+        )
+    };
+    let changes = from_shell("FocusChanged")?;
+    let hits = from_shell("EdgeHit")?;
     let owners = MatchRule::builder()
         .msg_type(Type::Signal)
         .sender("org.freedesktop.DBus")?
@@ -220,13 +284,26 @@ async fn forward_focus(
         .build();
     // Subscribe before asking, so no change falls in between.
     let mut changes = MessageStream::for_match_rule(changes, connection, None).await?;
+    let mut hits = MessageStream::for_match_rule(hits, connection, None).await?;
     let mut owners = MessageStream::for_match_rule(owners, connection, None).await?;
-    let mut terminal = focus(proxy).await;
+    // None after an edge hit, which leaves the focus as it was.
+    let mut terminal = Some(focus(proxy).await);
     loop {
-        report(terminal).await;
+        if let Some(terminal) = terminal {
+            report(Request::Focus { terminal }).await;
+        }
         terminal = tokio::select! {
             message = next_message(&mut changes) => {
-                message.context("The session bus closed")??.body().deserialize::<bool>()?
+                Some(message.context("The session bus closed")??.body().deserialize::<bool>()?)
+            }
+            message = next_message(&mut hits) => {
+                let message = message.context("The session bus closed")??;
+                let (edge, position): (String, u32) = message.body().deserialize()?;
+                match serde_json::from_value(edge.into()) {
+                    Ok(edge) => report(Request::EdgeHit { edge, position }).await,
+                    Err(error) => tracing::debug!(%error, "unknown edge from GNOME"),
+                }
+                None
             }
             message = next_message(&mut owners) => {
                 let message = message.context("The session bus closed")??;
@@ -234,11 +311,11 @@ async fn forward_focus(
                 let (_, _, new): (&str, &str, &str) = body.deserialize()?;
                 // Shell drops the name while the extension is off, such as
                 // on the lock screen, and takes it again after.
-                match new {
+                Some(match new {
                     "" => false,
                     new if new == owner => focus(proxy).await,
                     _ => anyhow::bail!("GNOME Shell restarted"),
-                }
+                })
             }
         };
     }
@@ -278,10 +355,10 @@ async fn focus(proxy: &zbus::Proxy<'_>) -> bool {
 #[cfg(target_os = "linux")]
 async fn call(
     proxy: &zbus::Proxy<'_>,
-    request: &crate::desktop::DesktopRequest,
+    request: &crate::peer_view::AgentRequest,
 ) -> anyhow::Result<crate::desktop::DesktopResponse> {
     let started = std::time::Instant::now();
-    let operation = crate::session::desktop_operation(request);
+    let operation = request.operation();
     tracing::trace!(operation, "GNOME desktop RPC started");
     let result = async {
         // The extension refuses an agent from another API level with "Update zflow".
@@ -704,6 +781,7 @@ mod tests {
         let owner = shell.unique_name().unwrap().to_owned();
         let impostor = zbus::Connection::session().await.unwrap();
         let (sent, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let (hit, mut hits) = tokio::sync::mpsc::unbounded_channel();
         let forward = tokio::spawn({
             let agent = agent.clone();
             let owner = owner.clone();
@@ -713,11 +791,19 @@ mod tests {
                     .unwrap();
                 // Not an async closure: its future would borrow `sent`, and
                 // tokio::spawn cannot prove that Send.
-                let report = move |terminal| {
-                    sent.send(terminal).unwrap();
+                let report = move |request| {
+                    match request {
+                        crate::peer_view::Request::Focus { terminal } => {
+                            sent.send(terminal).unwrap()
+                        }
+                        crate::peer_view::Request::EdgeHit { edge, position } => {
+                            hit.send((edge, position)).unwrap()
+                        }
+                        other => panic!("unexpected report {other:?}"),
+                    }
                     std::future::ready(())
                 };
-                forward_focus(&agent, &proxy, owner.as_str(), report).await
+                forward_signals(&agent, &proxy, owner.as_str(), report).await
             }
         });
         let emit = async |from: &zbus::Connection, terminal: bool| {
@@ -744,6 +830,28 @@ mod tests {
             .unwrap();
         emit(&shell, false).await;
         assert_eq!(reports.recv().await, Some(false), "only Shell is heard");
+        let push = async |from: &zbus::Connection, edge: &str, position: u32| {
+            from.emit_signal(
+                agent.unique_name(),
+                OBJECT_PATH,
+                BUS_NAME,
+                "EdgeHit",
+                &(edge, position),
+            )
+            .await
+            .unwrap();
+        };
+        push(&impostor, "left", 1).await;
+        push(&shell, "right", 500_000).await;
+        assert_eq!(
+            hits.recv().await,
+            Some((crate::desktop::Edge::Right, 500_000)),
+            "only Shell's edge hits reach the service"
+        );
+        assert!(
+            reports.try_recv().is_err(),
+            "an edge hit is not a focus change"
+        );
         emit(&shell, true).await;
         assert_eq!(reports.recv().await, Some(true));
         shell.release_name(BUS_NAME).await.unwrap();

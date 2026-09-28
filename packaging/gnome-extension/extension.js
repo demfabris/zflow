@@ -17,13 +17,52 @@ const LEASE_US = 2000000;
 const WARP_US = 100000;
 // src/desktop.rs mirrors this hold duration.
 const POLL_HOLD_MS = 200;
-const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method><signal name="FocusChanged"><arg type="b"/></signal></interface></node>`;
+const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method><signal name="FocusChanged"><arg type="b"/></signal><signal name="EdgeHit"><arg type="s"/><arg type="u"/></signal></interface></node>`;
+const EDGES = ['left', 'right', 'top', 'bottom'];
+
+// The monitors along one outer edge of the desktop, cut to a range given as
+// fractions of MAX along that edge.
+function edgeGeometry(ms, edge, start, end) {
+    const left = Math.min(...ms.map(m => m.x));
+    const top = Math.min(...ms.map(m => m.y));
+    const right = Math.max(...ms.map(m => m.x + m.width));
+    const bottom = Math.max(...ms.map(m => m.y + m.height));
+    const vertical = edge === 'left' || edge === 'right';
+    const origin = vertical ? top : left;
+    const span = vertical ? bottom - top : right - left;
+    const boundary = {left, right, top, bottom}[edge];
+    const segments = ms.filter(m => ({left: m.x, right: m.x + m.width, top: m.y, bottom: m.y + m.height}[edge]) === boundary)
+        .map(m => ({
+            start: Math.max(vertical ? m.y : m.x, origin + Math.ceil(start * span / MAX)),
+            end: Math.min(vertical ? m.y + m.height : m.x + m.width, origin + Math.floor(end * span / MAX)),
+            monitor: m,
+        })).filter(s => s.end > s.start);
+    return {left, top, right, bottom, vertical, origin, span, boundary, segments};
+}
+
+// A barrier on an outer edge that lets the pointer back in but not out, so
+// Shell reports each push against it.
+function edgeBarrier(edge, g, segment) {
+    const directions = {left: Meta.BarrierDirection.POSITIVE_X, right: Meta.BarrierDirection.NEGATIVE_X,
+        top: Meta.BarrierDirection.POSITIVE_Y, bottom: Meta.BarrierDirection.NEGATIVE_Y};
+    return new Meta.Barrier({backend: global.backend, directions: directions[edge],
+        x1: g.vertical ? g.boundary : segment.start, x2: g.vertical ? g.boundary : segment.end,
+        y1: g.vertical ? segment.start : g.boundary, y2: g.vertical ? segment.end : g.boundary});
+}
+
+function validRange(start, end) {
+    return [start, end].every(Number.isSafeInteger) && start >= 0 && start < end && end <= MAX;
+}
 
 export default class ZflowExtension extends Extension {
     enable() {
         this._indicator = new Indicator();
         this._lease = null;
         this._barriers = [];
+        // Edges that lead to another computer, and their barriers.
+        this._edges = [];
+        this._outbound = [];
+        this._hidden = false;
         this._idles = new Set();
         // Only the desktop agent may read the pointer or move it. This skips GNOME's
         // DBusSenderChecker, whose destroy() passes array indexes to unwatch_name.
@@ -47,13 +86,19 @@ export default class ZflowExtension extends Extension {
                 this._clear();
             return GLib.SOURCE_CONTINUE;
         });
-        this._monitorsId = Main.layoutManager.connect('monitors-changed', () => this._clear());
+        this._monitorsId = Main.layoutManager.connect('monitors-changed', () => {
+            this._clear();
+            this._placeEdges();
+        });
     }
 
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
         this._clear();
+        this._edges = [];
+        this._placeEdges();
+        this._setHidden(false);
         // An entry still waiting for the cursor stops here and never answers.
         for (const id of this._idles) GLib.Source.remove(id);
         this._idles.clear();
@@ -74,6 +119,41 @@ export default class ZflowExtension extends Extension {
         for (const barrier of this._barriers) barrier.destroy();
         this._barriers = [];
         this._lease = null;
+    }
+
+    _placeEdges() {
+        for (const barrier of this._outbound) barrier.destroy();
+        this._outbound = [];
+        const ms = Main.layoutManager.monitors;
+        if (!this._edges.length || !ms.length || (global.backend.capabilities & Meta.BackendCapabilities.BARRIERS) === 0)
+            return;
+        for (const {edge, start, end} of this._edges) {
+            const g = edgeGeometry(ms, edge, start, end);
+            for (const segment of g.segments) {
+                const barrier = edgeBarrier(edge, g, segment);
+                // Shell sends a hit for every motion against the barrier; report
+                // each push once. While another computer controls this one, its
+                // own return barrier on this edge answers instead.
+                let push = null;
+                barrier.connect('hit', (_barrier, event) => {
+                    if (this._lease || !this._agent || event.event_id === push) return;
+                    push = event.event_id;
+                    const axis = g.vertical ? event.y : event.x;
+                    const position = Math.max(start, Math.min(end, Math.round((axis - g.origin) * MAX / g.span)));
+                    Gio.DBus.session.emit_signal(this._agent, PATH, BUS, 'EdgeHit', new GLib.Variant('(su)', [edge, position]));
+                });
+                this._outbound.push(barrier);
+            }
+        }
+    }
+
+    // Balanced with the Shell's cursor tracker, which counts inhibitions.
+    _setHidden(hidden) {
+        if (hidden === this._hidden) return;
+        const tracker = global.backend.get_cursor_tracker();
+        if (hidden) tracker.inhibit_cursor_visibility();
+        else tracker.uninhibit_cursor_visibility();
+        this._hidden = hidden;
     }
 
     _focusedTerminal() {
@@ -120,7 +200,28 @@ export default class ZflowExtension extends Extension {
     async _request(r) {
         // The agent asks for this when it subscribes; it needs no monitors.
         if (r.command === 'focus') return {status: 'focus', terminal: this._terminal};
+        // This computer's own input; only the service sends these.
+        if (r.command === 'sending') {
+            if (typeof r.active !== 'boolean') throw new Error('Invalid sending state');
+            this._setHidden(r.active);
+            return {status: 'finished'};
+        }
+        if (r.command === 'edges') {
+            if (!Array.isArray(r.edges) || r.edges.length > 64
+                || !r.edges.every(e => EDGES.includes(e?.edge) && validRange(e.start, e.end)))
+                throw new Error('Invalid outbound edges');
+            this._edges = r.edges.map(({edge, start, end}) => ({edge, start, end}));
+            this._placeEdges();
+            return {status: 'finished'};
+        }
         const snapshot = this._snapshot();
+        if (r.command === 'warp') {
+            const {x, y} = r.position ?? {};
+            if (!snapshot.geometry.monitors.some(m => x >= m.x && y >= m.y && x < m.x + m.width && y < m.y + m.height))
+                throw new Error('The pointer cannot go outside the monitors');
+            (global.stage.get_context?.().get_backend() ?? Clutter.get_default_backend()).get_default_seat().warp_pointer(x, y);
+            return {status: 'finished'};
+        }
         if (r.command === 'snapshot') return {status: 'snapshot', ...snapshot};
         if (!Number.isSafeInteger(r.token) || r.token <= 0) throw new Error('Invalid handoff token');
         if (this._lease && GLib.get_monotonic_time() - this._lease.renewed >= LEASE_US)
@@ -155,26 +256,13 @@ export default class ZflowExtension extends Extension {
 
     async _prepare(r, snapshot) {
         if (this._lease) throw new Error('A desktop handoff is already active');
-        if (![r.start, r.end, r.position].every(Number.isSafeInteger) || r.start < 0 || r.start >= r.end || r.end > MAX || r.position < r.start || r.position > r.end)
+        if (!validRange(r.start, r.end) || !Number.isSafeInteger(r.position) || r.position < r.start || r.position > r.end)
             throw new Error('Invalid crossing range');
-        if (!['left', 'right', 'top', 'bottom'].includes(r.edge)) throw new Error('Invalid edge');
+        if (!EDGES.includes(r.edge)) throw new Error('Invalid edge');
         if ((global.backend.capabilities & Meta.BackendCapabilities.BARRIERS) === 0)
             throw new Error('This GNOME session does not provide pointer barriers');
-        const ms = snapshot.geometry.monitors;
-        const left = Math.min(...ms.map(m => m.x));
-        const top = Math.min(...ms.map(m => m.y));
-        const right = Math.max(...ms.map(m => m.x + m.width));
-        const bottom = Math.max(...ms.map(m => m.y + m.height));
-        const vertical = r.edge === 'left' || r.edge === 'right';
-        const origin = vertical ? top : left;
-        const span = vertical ? bottom - top : right - left;
-        const boundary = {left, right, top, bottom}[r.edge];
-        const segments = ms.filter(m => ({left: m.x, right: m.x + m.width, top: m.y, bottom: m.y + m.height}[r.edge]) === boundary)
-            .map(m => ({
-                start: Math.max(vertical ? m.y : m.x, origin + Math.ceil(r.start * span / MAX)),
-                end: Math.min(vertical ? m.y + m.height : m.x + m.width, origin + Math.floor(r.end * span / MAX)),
-                monitor: m,
-            })).filter(s => s.end > s.start);
+        const g = edgeGeometry(snapshot.geometry.monitors, r.edge, r.start, r.end);
+        const {left, top, right, bottom, vertical, origin, span, segments} = g;
         // The Mac tile is this desktop's bounding box, so the entry can fall where no
         // monitor touches the edge, or a rounding pixel outside the range. Enter at
         // the nearest pixel that has a monitor behind it.
@@ -194,12 +282,8 @@ export default class ZflowExtension extends Extension {
             // GNOME 51 removed Clutter.get_default_backend().
             const backend = global.stage.get_context?.().get_backend() ?? Clutter.get_default_backend();
             backend.get_default_seat().warp_pointer(point.x, point.y);
-            const directions = {left: Meta.BarrierDirection.POSITIVE_X, right: Meta.BarrierDirection.NEGATIVE_X,
-                top: Meta.BarrierDirection.POSITIVE_Y, bottom: Meta.BarrierDirection.NEGATIVE_Y};
             for (const s of segments) {
-                const barrier = new Meta.Barrier({backend: global.backend, directions: directions[r.edge],
-                    x1: vertical ? boundary : s.start, x2: vertical ? boundary : s.end,
-                    y1: vertical ? s.start : boundary, y2: vertical ? s.end : boundary});
+                const barrier = edgeBarrier(r.edge, g, s);
                 barrier.connect('hit', (_barrier, event) => {
                     if (this._lease !== lease || lease.returned !== null) return;
                     const axis = vertical ? event.y : event.x;

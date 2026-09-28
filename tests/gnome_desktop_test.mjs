@@ -336,4 +336,45 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.extension.disable();
     assert.ok(removed.includes(101));
 }
-console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller, terminal focus, API and cleanup checks passed');
+{
+    // This computer's own edges: barriers that report each push once.
+    const d = desktop([{x: 0, y: 0, width: 1920, height: 1080}, {x: 1920, y: 0, width: 1280, height: 1024}]);
+    const tracker = {count: 0, inhibit_cursor_visibility() {this.count++;}, uninhibit_cursor_visibility() {this.count--;}};
+    d.context.global.backend.get_cursor_tracker = () => tracker;
+    await assert.rejects(d.extension._request({command: 'edges', edges: [{edge: 'right', start: 5, end: 5}]}), /Invalid outbound edges/);
+    await assert.rejects(d.extension._request({command: 'edges', edges: [{edge: 'middle', start: 0, end: 5}]}), /Invalid outbound edges/);
+    assert.equal((await d.extension._request({command: 'edges', edges: [{edge: 'right', start: 0, end: 1000000}]})).status, 'finished');
+    assert.equal(d.barriers.length, 1, 'only the monitor on the outer right edge');
+    const barrier = d.barriers[0];
+    assert.equal(barrier.properties.x1, 3200);
+    assert.equal(barrier.properties.y2, 1024);
+    assert.equal(barrier.properties.directions, 2, 'the pointer may come back in');
+    const hits = () => d.emitted.filter(args => args[3] === 'EdgeHit').map(args => [args[0], ...args[4].value]);
+    barrier.hit(barrier, {x: 3200, y: 540, event_id: 1});
+    barrier.hit(barrier, {x: 3200, y: 541, event_id: 1});
+    assert.deepEqual(hits(), [[':1.7', 'right', 500000]], 'one report per push, to the agent only');
+    barrier.hit(barrier, {x: 3200, y: 0, event_id: 2});
+    assert.deepEqual(hits().at(-1), [':1.7', 'right', 0]);
+    // While another computer controls this one, its return barrier answers.
+    await d.extension._request(prepare('right'));
+    barrier.hit(barrier, {x: 3200, y: 100, event_id: 3});
+    assert.equal(hits().length, 2);
+    await d.extension._request({command: 'finish', token: 7});
+    d.handlers.get('monitors-changed')();
+    assert.ok(barrier.destroyed && !d.barriers.at(-1).destroyed, 'a monitor change places the edges again');
+    // Sending hides the pointer once, and shows it again after.
+    await d.extension._request({command: 'sending', active: true});
+    await d.extension._request({command: 'sending', active: true});
+    assert.equal(tracker.count, 1);
+    await d.extension._request({command: 'sending', active: false});
+    assert.equal(tracker.count, 0);
+    await assert.rejects(d.extension._request({command: 'sending', active: 'yes'}), /Invalid sending state/);
+    assert.equal((await d.extension._request({command: 'warp', position: {x: 2000, y: 900}})).status, 'finished');
+    assert.deepEqual({...d.extension._snapshot().position}, {x: 2000, y: 900});
+    await assert.rejects(d.extension._request({command: 'warp', position: {x: 2000, y: 1050}}), /outside the monitors/);
+    await d.extension._request({command: 'sending', active: true});
+    d.extension.disable();
+    assert.equal(tracker.count, 0, 'disable shows the pointer again');
+    assert.ok(d.barriers.every(b => b.destroyed));
+}
+console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller, terminal focus, outbound edges, pointer hiding, warp, API and cleanup checks passed');

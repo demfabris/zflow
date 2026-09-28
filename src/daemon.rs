@@ -144,6 +144,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     if let Err(error) = peer_view::start(shared.clone()) {
         tracing::warn!(%error, "desktop metadata API unavailable");
     }
+    shared.load_layout();
     let mut discovery = start_discovery(&config, shared.endpoint.local_addr()?);
     let daemon_uid = nix::unistd::geteuid().as_raw();
     let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
@@ -434,6 +435,35 @@ impl Shared {
                 peer: peer.to_owned(),
             })
             .map_err(|error| anyhow!(error))
+    }
+
+    /// Reads the layout saved beside the configuration, in the Mac app's
+    /// format, and places a barrier on each edge that touches a paired
+    /// computer. Without a layout, crossings start only from the chord.
+    fn load_layout(self: &Arc<Self>) {
+        let edges = match crate::app::layout_model::LayoutDocument::beside(&self.config_path) {
+            Ok(layout) => desktop::outbound_edges(layout.saved()),
+            Err(error) => {
+                tracing::warn!(error = %format_args!("{error:#}"), "layout not loaded");
+                Vec::new()
+            }
+        };
+        tracing::info!(edges = edges.len(), "outbound edges loaded");
+        desktop::set_edges(self, edges);
+    }
+
+    /// Starts a crossing toward the computer behind the edge the pointer
+    /// pushed against. The usual activation checks apply.
+    fn edge_hit(self: &Arc<Self>, edge: crate::desktop::Edge, position: u32) {
+        let Some(peer) = self.desktop.edge_peer(edge, position) else {
+            return;
+        };
+        let shared = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = shared.activate(&peer).await {
+                tracing::info!(%error, %peer, "edge crossing did not start");
+            }
+        });
     }
 
     /// A computer that another one controls does not send its own input.
@@ -771,6 +801,7 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
             shared
                 .apply_config_locked(Config::load(&shared.config_path)?, false)
                 .await?;
+            shared.load_layout();
             Ok(Response::Ack)
         }
         Request::ListPeers => Ok(Response::Peers {
@@ -881,6 +912,7 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
                 session.record_arming_to_grab(changed_at.saturating_duration_since(started_at));
                 session.record_switch_time_leakage(arming_leakage_events);
             }
+            desktop::set_sending(shared, true);
             if let Err(error) = shared.begin_outbound(&peer).await {
                 tracing::warn!(%error, %peer, "outbound session could not start");
                 shared
@@ -901,6 +933,7 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
         } => {
             *shared.arming_started.lock().await = None;
             *shared.active_outbound.lock().await = None;
+            desktop::set_sending(shared, false);
         }
         RuntimeEvent::OwnershipChanged { .. } => {}
         RuntimeEvent::TerminalRequested => {
