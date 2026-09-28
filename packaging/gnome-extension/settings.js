@@ -100,6 +100,13 @@ export class Settings {
         this.page.add(switching);
         this._shortcuts = new Adw.PreferencesGroup({title: 'Shortcuts', visible: false});
         this.page.add(this._shortcuts);
+        const clipboard = new Adw.PreferencesGroup();
+        this._clipboard = new Adw.SwitchRow({title: 'Share Clipboard', subtitle: 'Text and images go with the pointer to the other computer. Never files.', sensitive: false});
+        this._clipboard.connect('notify::active', () => {
+            if (!this._updating) this._run({command: 'set_clipboard', share: this._clipboard.active});
+        });
+        clipboard.add(this._clipboard);
+        this.page.add(clipboard);
         const preferences = new Adw.PreferencesGroup();
         this._login = new Adw.SwitchRow({title: 'Start at Login', subtitle: 'Keep zflow available after you close settings.'});
         this._login.connect('notify::active', () => {
@@ -130,7 +137,7 @@ export class Settings {
     async _run(request) {
         if (this._busy) return false;
         this._busy = true;
-        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = this._pause.sensitive = false;
+        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = this._pause.sensitive = this._clipboard.sensitive = false;
         for (const row of [...this._keyboards.values(), ...this._controls.values(), ...this._scrolls.values()]) row.sensitive = false;
         this._showError(null);
         let success = false;
@@ -157,6 +164,10 @@ export class Settings {
         this._sharing.sensitive = online && !this._busy;
         this._pause.active = (known && snapshot.pause_at_edges) ?? false;
         this._pause.sensitive = online && snapshot.pause_at_edges !== null && !this._busy;
+        // An agent from before clipboard sharing leaves it out.
+        const share = known ? (snapshot.share_clipboard ?? null) : null;
+        this._clipboard.active = share ?? false;
+        this._clipboard.sensitive = online && share !== null && !this._busy;
         this._login.active = (known && snapshot.autostart) ?? false;
         this._login.sensitive = known && snapshot.autostart !== null && !this._busy;
         this._pairButton.sensitive = online && !this._busy && !this._pairing;

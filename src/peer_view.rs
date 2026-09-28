@@ -6,12 +6,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     app::layout_model::Layout,
+    clipboard::{ClipKind, MAX_CLIP_BYTES},
     config::{Config, PeerConfig},
     core::KeyboardMode,
-    desktop::{DesktopRequest, Edge, FRACTION_MAX, Point},
+    desktop::{DesktopRequest, DesktopResponse, Edge, FRACTION_MAX, Point},
 };
 
 pub const SOCKET_PATH: &str = "/run/zflow-gui/peers.sock";
+/// The largest message between the service and the desktop agent: a whole
+/// clip in base64, plus room for the JSON around it. Every other local
+/// stream keeps [`crate::control::MAX_CONTROL_MESSAGE`].
+pub const MAX_AGENT_MESSAGE: usize =
+    MAX_CLIP_BYTES.div_ceil(3) * 4 + crate::control::MAX_CONTROL_MESSAGE;
+/// The longest notice the service asks the desktop to show.
+const MAX_NOTICE: usize = 256;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -50,6 +58,9 @@ pub enum Request {
     },
     SetSwitching {
         pause_at_edges: bool,
+    },
+    SetClipboard {
+        share: bool,
     },
     /// The pointer pushed against an edge that leads to another computer.
     /// `position` is a fraction of the desktop along that edge, out of
@@ -95,6 +106,13 @@ pub enum LocalRequest {
     Sending { active: bool },
     /// Puts the pointer back where a crossing returned.
     Warp { position: Point },
+    /// Reads the clipboard for the computer the pointer went to. The answer
+    /// is an [`AgentReply::Clipboard`].
+    ReadClipboard,
+    /// Puts a clip from the computer the pointer came from on the clipboard.
+    WriteClipboard { kind: ClipKind, data: ClipData },
+    /// Shows the person a short notice, such as why a clip stayed here.
+    Notify { message: String },
 }
 
 /// A range of one outer edge of this desktop, as fractions of its length
@@ -115,6 +133,9 @@ impl AgentRequest {
             Self::Local(LocalRequest::Edges { .. }) => "edges",
             Self::Local(LocalRequest::Sending { .. }) => "sending",
             Self::Local(LocalRequest::Warp { .. }) => "warp",
+            Self::Local(LocalRequest::ReadClipboard) => "read_clipboard",
+            Self::Local(LocalRequest::WriteClipboard { .. }) => "write_clipboard",
+            Self::Local(LocalRequest::Notify { .. }) => "notify",
         }
     }
 
@@ -131,7 +152,89 @@ impl AgentRequest {
                 );
                 Ok(())
             }
+            Self::Local(LocalRequest::Notify { message }) => {
+                anyhow::ensure!(
+                    !message.is_empty() && message.len() <= MAX_NOTICE,
+                    "Invalid notice"
+                );
+                Ok(())
+            }
+            // The agent checks a clip's bytes before writing them.
             Self::Local(_) => Ok(()),
+        }
+    }
+}
+
+/// Clipboard bytes, as base64 in JSON. Debug shows only the size, because
+/// logs must never hold clipboard content.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ClipData(pub Vec<u8>);
+
+impl std::fmt::Debug for ClipData {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ClipData({} bytes)", self.0.len())
+    }
+}
+
+impl Serialize for ClipData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for ClipData {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        base64::decode(&text)
+            .map(Self)
+            .ok_or_else(|| serde::de::Error::custom("clipboard data is not base64"))
+    }
+}
+
+/// What the desktop agent found on the clipboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "clipboard", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClipboardContents {
+    Clip {
+        kind: ClipKind,
+        data: ClipData,
+    },
+    Empty,
+    /// Over [`MAX_CLIP_BYTES`]; only the size leaves GNOME.
+    TooLarge {
+        bytes: usize,
+    },
+}
+
+/// What the desktop agent answers the service. Only the agent sends these,
+/// on its own stream. A peer's handoff request still gets a plain
+/// [`DesktopResponse`], which reads the same here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AgentReply {
+    Desktop(DesktopResponse),
+    Clipboard(ClipboardContents),
+}
+
+impl AgentReply {
+    /// A short name for logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Desktop(response) => crate::session::desktop_response_kind(response),
+            Self::Clipboard(ClipboardContents::Clip { .. }) => "clip",
+            Self::Clipboard(ClipboardContents::Empty) => "empty",
+            Self::Clipboard(ClipboardContents::TooLarge { .. }) => "too_large",
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Desktop(response) => response.validate(),
+            Self::Clipboard(ClipboardContents::Clip { data, .. }) => {
+                anyhow::ensure!(data.0.len() <= MAX_CLIP_BYTES, "Clip over the limit");
+                Ok(())
+            }
+            Self::Clipboard(_) => Ok(()),
         }
     }
 }
@@ -221,6 +324,9 @@ pub struct DesktopStatus {
     /// "local". A service from before the layout editor leaves it out.
     #[serde(default)]
     pub layout: Option<Layout>,
+    /// Whether the clipboard goes along with the pointer.
+    #[serde(default)]
+    pub share_clipboard: bool,
 }
 
 impl DesktopStatus {
@@ -236,6 +342,7 @@ impl DesktopStatus {
             activation_chord: config.input.activation_chord.clone(),
             escape_chord: config.input.escape_chord.clone(),
             layout: None,
+            share_clipboard: config.clipboard.share,
         }
     }
 }
@@ -266,6 +373,68 @@ pub async fn status() -> anyhow::Result<DesktopStatus> {
     match request(&Request::Status {}).await? {
         DesktopReply::Status(status) => Ok(status),
         _ => anyhow::bail!("Unexpected response; update the zflow service"),
+    }
+}
+
+/// Standard base64 with padding (RFC 4648), which is all the clipboard
+/// needs from it.
+mod base64 {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode(bytes: &[u8]) -> String {
+        let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let group = chunk.iter().enumerate().fold(0_u32, |group, (at, &byte)| {
+                group | (u32::from(byte) << (16 - 8 * at))
+            });
+            for at in 0..4 {
+                text.push(if at <= chunk.len() {
+                    char::from(ALPHABET[(group >> (18 - 6 * at)) as usize & 63])
+                } else {
+                    '='
+                });
+            }
+        }
+        text
+    }
+
+    /// None for anything that is not exactly what [`encode`] writes.
+    pub fn decode(text: &str) -> Option<Vec<u8>> {
+        let text = text.as_bytes();
+        if !text.len().is_multiple_of(4) {
+            return None;
+        }
+        let groups = text.len() / 4;
+        let mut bytes = Vec::with_capacity(groups * 3);
+        for (index, chunk) in text.chunks(4).enumerate() {
+            let padding = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+            if padding > 2 || (padding > 0 && index + 1 != groups) {
+                return None;
+            }
+            let group = chunk[..4 - padding]
+                .iter()
+                .try_fold(0_u32, |group, &c| Some((group << 6) | sextet(c)?))?
+                << (6 * padding);
+            let [_, decoded @ ..] = group.to_be_bytes();
+            let (kept, dropped) = decoded.split_at(3 - padding);
+            if dropped.iter().any(|&byte| byte != 0) {
+                return None;
+            }
+            bytes.extend_from_slice(kept);
+        }
+        Some(bytes)
+    }
+
+    fn sextet(c: u8) -> Option<u32> {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        Some(value.into())
     }
 }
 
@@ -303,9 +472,19 @@ mod tests {
             r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":8,"peer":"desk"}"#,
             r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":-1}"#,
             r#"{"command":"move_tile","id":"local","x":1,"y":2}"#,
+            r#"{"command":"set_clipboard","share":"yes"}"#,
+            r#"{"command":"set_clipboard","share":true,"peer":"desk"}"#,
+            // Only the service asks the agent for these, on its own stream.
+            r#"{"command":"read_clipboard"}"#,
+            r#"{"command":"write_clipboard","kind":"text","data":"aGk="}"#,
+            r#"{"command":"notify","message":"hi"}"#,
         ] {
             assert!(serde_json::from_str::<Request>(json).is_err(), "{json}");
         }
+        assert!(matches!(
+            serde_json::from_str(r#"{"command":"set_clipboard","share":true}"#).unwrap(),
+            Request::SetClipboard { share: true }
+        ));
     }
 
     #[test]
@@ -336,6 +515,9 @@ mod tests {
             r#"{"command":"warp","position":{"x":1,"y":2}}"#,
             r#"{"command":"edges","edges":[],"pause_ms":0}"#,
             r#"{"command":"sending","active":true}"#,
+            r#"{"command":"read_clipboard"}"#,
+            r#"{"command":"write_clipboard","kind":"png","data":"iVBORw0KGgo="}"#,
+            r#"{"command":"notify","message":"Clipboard not shared"}"#,
         ] {
             assert!(
                 serde_json::from_str::<DesktopRequest>(json).is_err(),
@@ -364,6 +546,133 @@ mod tests {
         assert!(edges(0, FRACTION_MAX).validate().is_ok());
         assert!(edges(5, 5).validate().is_err());
         assert!(edges(0, FRACTION_MAX + 1).validate().is_err());
+        let notice = |message: &str| {
+            AgentRequest::Local(LocalRequest::Notify {
+                message: message.into(),
+            })
+            .validate()
+        };
+        assert!(notice(&crate::clipboard::too_large(5 << 20)).is_ok());
+        assert!(notice("").is_err());
+        assert!(notice(&"a".repeat(MAX_NOTICE + 1)).is_err());
+    }
+
+    #[test]
+    fn a_clip_crosses_the_agent_stream_as_base64_and_only_that_stream_fits_it() {
+        // RFC 4648's test vectors.
+        for (bytes, text) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            let data = ClipData(bytes.into());
+            assert_eq!(serde_json::to_value(&data).unwrap(), text);
+            assert_eq!(
+                serde_json::from_value::<ClipData>(text.into()).unwrap(),
+                data
+            );
+        }
+        // Only what the encoder writes: no stray padding, characters or bits.
+        for text in [
+            "Zg=", "Zg", "Z===", "Zg==Zg==", "Zm9v\n", "Zm-v", "Zh==", "Zm9=", "====",
+        ] {
+            assert!(base64::decode(text).is_none(), "{text}");
+        }
+        assert_eq!(
+            format!("{:?}", ClipData(b"secret".to_vec())),
+            "ClipData(6 bytes)",
+            "logs never hold clipboard content"
+        );
+        let full = AgentRequest::Local(LocalRequest::WriteClipboard {
+            kind: ClipKind::Png,
+            data: ClipData(vec![0xff; MAX_CLIP_BYTES]),
+        });
+        let length = serde_json::to_vec(&full).unwrap().len();
+        assert!(length > crate::control::MAX_CONTROL_MESSAGE && length <= MAX_AGENT_MESSAGE);
+        let reply = AgentReply::Clipboard(ClipboardContents::Clip {
+            kind: ClipKind::Text,
+            data: ClipData(vec![b'a'; MAX_CLIP_BYTES]),
+        });
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= MAX_AGENT_MESSAGE);
+        assert!(reply.validate().is_ok());
+        let over = AgentReply::Clipboard(ClipboardContents::Clip {
+            kind: ClipKind::Text,
+            data: ClipData(vec![b'a'; MAX_CLIP_BYTES + 1]),
+        });
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn handoff_replies_read_the_same_and_a_clip_is_never_one() {
+        use crate::desktop::{Geometry, Rect};
+        let geometry = Geometry {
+            monitors: vec![Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+        };
+        for response in [
+            DesktopResponse::Snapshot {
+                geometry: geometry.clone(),
+                position: Point { x: 5, y: 5 },
+            },
+            DesktopResponse::Prepared {
+                geometry,
+                position: Point { x: 3, y: 540 },
+            },
+            DesktopResponse::Active,
+            DesktopResponse::Returned { position: 7 },
+            DesktopResponse::Finished,
+            DesktopResponse::unavailable("GNOME integration unavailable"),
+        ] {
+            let text = serde_json::to_string(&response).unwrap();
+            let reply = AgentReply::Desktop(response);
+            assert_eq!(serde_json::to_string(&reply).unwrap(), text);
+            assert_eq!(serde_json::from_str::<AgentReply>(&text).unwrap(), reply);
+        }
+        for (contents, kind) in [
+            (
+                ClipboardContents::Clip {
+                    kind: ClipKind::Text,
+                    data: ClipData(b"hi".to_vec()),
+                },
+                "clip",
+            ),
+            (ClipboardContents::Empty, "empty"),
+            (ClipboardContents::TooLarge { bytes: 5 << 20 }, "too_large"),
+        ] {
+            let text = serde_json::to_string(&contents).unwrap();
+            assert!(
+                serde_json::from_str::<DesktopResponse>(&text).is_err(),
+                "{text}"
+            );
+            let reply = serde_json::from_str::<AgentReply>(&text).unwrap();
+            assert_eq!(reply.kind(), kind);
+            assert_eq!(reply, AgentReply::Clipboard(contents));
+        }
+        assert_eq!(
+            serde_json::to_string(&ClipboardContents::Clip {
+                kind: ClipKind::Png,
+                data: ClipData(vec![0x89, b'P']),
+            })
+            .unwrap(),
+            r#"{"clipboard":"clip","kind":"png","data":"iVA="}"#
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn base64_round_trips(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)) {
+            let text = base64::encode(&bytes);
+            proptest::prop_assert_eq!(text.len(), bytes.len().div_ceil(3) * 4);
+            proptest::prop_assert_eq!(base64::decode(&text), Some(bytes));
+        }
     }
 
     #[test]
@@ -371,11 +680,21 @@ mod tests {
         let mut config = Config::default();
         config.daemon.state_dir = "/private/identity-location".into();
         config.transport.discovery = false;
+        config.clipboard.share = true;
         let value = serde_json::to_value(DesktopStatus::from_config(&config)).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 10);
+        assert_eq!(value.as_object().unwrap().len(), 11);
         assert!(value.get("peers").is_some());
         assert_eq!(value["discovery"], false);
+        assert_eq!(value["share_clipboard"], true);
         assert!(!value.to_string().contains("identity-location"));
+        // A service from before clipboard sharing leaves it out.
+        let mut old = value;
+        old.as_object_mut().unwrap().remove("share_clipboard");
+        assert!(
+            !serde_json::from_value::<DesktopStatus>(old)
+                .unwrap()
+                .share_clipboard
+        );
     }
 
     #[test]

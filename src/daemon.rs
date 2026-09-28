@@ -45,6 +45,7 @@ use crate::{
 };
 
 const SESSION_EVENT_CAPACITY: usize = 1_024;
+mod clipboard;
 mod crossing;
 mod desktop;
 mod peer_view;
@@ -145,6 +146,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
         inbound_owner: Mutex::new(None),
+        clipboard_echo: Mutex::new(BTreeMap::new()),
         desktop: desktop::Hub::default(),
         seat,
         seat_gate: RwLock::new(initial_seat),
@@ -365,6 +367,8 @@ struct Shared {
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
     inbound_owner: Mutex<Option<(String, u64)>>,
+    /// Per peer, the clip last sent to it and the one it last gave here.
+    clipboard_echo: Mutex<BTreeMap<String, crate::clipboard::Echo>>,
     desktop: desktop::Hub,
     seat: watch::Receiver<SeatState>,
     /// The inbound injection gate, kept current by `watch_seat`.
@@ -1129,18 +1133,22 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
                 session.record_switch_time_leakage(arming_leakage_events);
             }
             desktop::set_sending(shared, true);
-            if let Err(error) = shared.begin_outbound(&peer).await {
-                tracing::warn!(%error, %peer, "outbound session could not start");
-                shared
-                    .runtime
-                    .send_critical(
-                        RuntimeCommand::Release {
-                            transport_live: false,
-                        },
-                        TERMINAL_SEND_TIMEOUT,
-                    )
-                    .await
-                    .map_err(|error| anyhow!(error))?;
+            match shared.begin_outbound(&peer).await {
+                // The pointer left for `peer`, so the clipboard goes along.
+                Ok(()) => shared.share_clipboard(&peer),
+                Err(error) => {
+                    tracing::warn!(%error, %peer, "outbound session could not start");
+                    shared
+                        .runtime
+                        .send_critical(
+                            RuntimeCommand::Release {
+                                transport_live: false,
+                            },
+                            TERMINAL_SEND_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                }
             }
         }
         RuntimeEvent::OwnershipChanged {
@@ -1818,8 +1826,7 @@ impl Shared {
                     }
                 }
             }
-            // Linux keeps clips once the GNOME side can write them.
-            SessionEventKind::Clipboard { .. } => {}
+            SessionEventKind::Clipboard { clip } => self.keep_clipboard(event.peer, clip),
             SessionEventKind::Layout { layout } => {
                 self.merge_layout(&event.peer, event.session_id, layout)
                     .await;
@@ -1906,7 +1913,7 @@ impl Shared {
     }
 
     async fn route_receiver_effects(
-        &self,
+        self: &Arc<Self>,
         peer: &str,
         session_id: u64,
         effects: Vec<ReceiverEffect>,
@@ -2010,6 +2017,8 @@ impl Shared {
                 .is_some_and(|(owner_peer, owner_id)| owner_peer == peer && *owner_id == session_id)
             {
                 *owner = None;
+                // The pointer went back to `peer`, so the clipboard goes along.
+                self.share_clipboard(peer);
             }
         }
         if rejected {
