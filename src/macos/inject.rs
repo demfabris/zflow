@@ -1,9 +1,5 @@
 //! Posting input on the Mac for a peer that controls it.
 
-// Nothing posts yet, and tests never reach the real poster. Remove once the
-// injector is wired in.
-#![allow(dead_code)]
-
 use std::{
     collections::{BTreeMap, VecDeque},
     ffi::{CStr, c_char},
@@ -181,6 +177,11 @@ impl Default for Environment {
     }
 }
 
+/// Sees each of the peer's moves before it is posted, from the cursor to
+/// where the move would put it before the clamp to the displays. True drops
+/// the move. A desktop handoff uses it to notice the pointer leaving.
+pub(crate) type Watch = Box<dyn FnMut(CursorPosition, CursorPosition) -> bool + Send>;
+
 /// Everything the injector does to the Mac. Tests use `FakeBackend`.
 pub(crate) trait Backend: Send + 'static {
     fn post(&mut self, event: &Posted) -> Result<()>;
@@ -239,6 +240,7 @@ pub(crate) struct InjectorCore<B> {
     displays: Vec<DesktopRect>,
     display_generation: Option<u32>,
     locked: Option<(Instant, bool)>,
+    watch: Option<Watch>,
 }
 
 impl<B: Backend> InjectorCore<B> {
@@ -263,7 +265,12 @@ impl<B: Backend> InjectorCore<B> {
             displays: Vec::new(),
             display_generation: None,
             locked: None,
+            watch: None,
         }
+    }
+
+    pub fn watch(&mut self, watch: Watch) {
+        self.watch = Some(watch);
     }
 
     /// Applies one batch in order. A failure or a locked screen releases
@@ -660,6 +667,27 @@ impl<B: Backend> InjectorCore<B> {
             x: from.x + dx as f64,
             y: from.y + dy as f64,
         };
+        if self.watch.as_mut().is_some_and(|watch| watch(from, target)) {
+            return Ok(());
+        }
+        self.post_move(from, target, dx, dy)
+    }
+
+    /// Puts the cursor at `point` with a posted move, which unlike a warp
+    /// does not hold off the Mac's own input.
+    pub fn move_to(&mut self, point: CursorPosition) -> Result<()> {
+        let from = self.cursor();
+        let (dx, dy) = ((point.x - from.x).round(), (point.y - from.y).round());
+        self.post_move(from, point, dx as i64, dy as i64)
+    }
+
+    fn post_move(
+        &mut self,
+        from: CursorPosition,
+        target: CursorPosition,
+        dx: i64,
+        dy: i64,
+    ) -> Result<()> {
         let to = clamp_to_displays(target, self.displays());
         if self.unseen.len() == UNSEEN_MOVES {
             self.unseen.pop_front();
@@ -731,7 +759,9 @@ enum InjectCommand {
         keyboard: Option<KeyboardMode>,
         applied: oneshot::Sender<Result<Instant>>,
     },
+    MoveTo(CursorPosition),
     ReleaseAll,
+    Watch(Watch),
 }
 
 /// Posts on its own thread, `zflow-inject`, which also times key repeat.
@@ -776,8 +806,18 @@ impl Injector {
         answer
     }
 
+    /// Puts the cursor at `point`, after anything sent before.
+    pub fn move_to(&self, point: CursorPosition) {
+        self.send(InjectCommand::MoveTo(point));
+    }
+
     pub fn release_all(&self) {
         self.send(InjectCommand::ReleaseAll);
+    }
+
+    /// Shows `watch` every move from now on.
+    pub fn watch(&self, watch: Watch) {
+        self.send(InjectCommand::Watch(watch));
     }
 
     fn send(&self, command: InjectCommand) {
@@ -826,7 +866,13 @@ fn run<B: Backend>(mut core: InjectorCore<B>, commands: mpsc::Receiver<InjectCom
                     .map(|()| Instant::now());
                 let _ = applied.send(result);
             }
+            Some(InjectCommand::MoveTo(point)) => {
+                if let Err(error) = core.move_to(point) {
+                    tracing::warn!(error = %format!("{error:#}"), "could not place the Mac cursor");
+                }
+            }
             Some(InjectCommand::ReleaseAll) => core.release_all(),
+            Some(InjectCommand::Watch(watch)) => core.watch(watch),
             None => {}
         }
         // Steady input can keep the timeout from firing, so the repeat is
@@ -1015,6 +1061,8 @@ pub(crate) fn post_allowed() -> bool {
 }
 
 /// Wakes the display as local input would.
+// A handoff's Prepare wakes the display once the Wi-Fi lease work lands.
+#[allow(dead_code)]
 pub(crate) fn declare_user_activity() -> Result<()> {
     // SAFETY: this only declares an IOKit power assertion.
     ensure!(
@@ -1072,6 +1120,7 @@ unsafe extern "C" {
     fn zflow_mac_key_repeat_ns(initial: *mut u64, interval: *mut u64) -> i32;
     fn zflow_mac_session_locked() -> i32;
     fn zflow_mac_post_allowed() -> i32;
+    #[allow(dead_code)]
     fn zflow_mac_declare_user_activity() -> i32;
     fn zflow_mac_inject_install_exit_handlers();
     fn zflow_mac_post_media_key(key: u32, down: i32, mark: i64) -> i32;
@@ -1878,6 +1927,31 @@ mod tests {
             ["move 799,599 by 1000,1000"]
         );
         assert!(apply(&mut core, &fake, vec![motion(0, 0, 0, 0)], start).is_empty());
+    }
+
+    #[test]
+    fn a_handoff_places_the_cursor_and_sees_each_move_before_the_clamp() {
+        let start = Instant::now();
+        let (mut core, fake) = open(KeyboardMode::Standard, start);
+        core.move_to(CursorPosition { x: 3.0, y: 540.0 }).unwrap();
+        assert_eq!(fake.take_log(), ["move 3,540 by -957,0"]);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        core.watch(Box::new({
+            let seen = seen.clone();
+            move |from: CursorPosition, to: CursorPosition| {
+                seen.lock().unwrap().push((from.x, to.x));
+                to.x < 0.0
+            }
+        }));
+        assert_eq!(
+            apply(&mut core, &fake, vec![motion(-2, 0, 0, 0)], start),
+            ["move 1,540 by -2,0"]
+        );
+        assert!(
+            apply(&mut core, &fake, vec![motion(-5, 0, 0, 0)], start).is_empty(),
+            "a move out through the edge is dropped"
+        );
+        assert_eq!(*seen.lock().unwrap(), [(3.0, 1.0), (1.0, -4.0)]);
     }
 
     #[test]

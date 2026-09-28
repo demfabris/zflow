@@ -1,25 +1,35 @@
-//! Keeps this Mac's input going one way at a time: out to a peer while this
-//! Mac sends, or in from one peer's session while that peer controls it.
+//! Lets paired computers control this Mac, and keeps its input going one
+//! way at a time: out to a peer while this Mac sends, or in from one peer's
+//! session while that peer controls it.
 
-// Nothing takes input from a peer yet. Remove once receiving is wired in.
-#![cfg_attr(not(test), allow(dead_code))]
-
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Instant,
+};
 
 use anyhow::{Result, bail};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use super::{
+    CursorPosition,
+    handoff_server::{Desk, HandoffServer},
+    inject::{self, Injector},
+};
 use crate::{
-    config::PeerPermissions,
-    core::ReceiverEffect,
-    desktop::DesktopResponse,
-    session::{SessionEvent, SessionEventKind},
+    config::{PeerConfig, PeerPermissions},
+    core::{KeyboardMode, ReceiverEffect, SessionCloseReason},
+    desktop::{DesktopRequest, DesktopResponse, Geometry, Point},
+    session::{SessionEvent, SessionEventKind, SessionHandle},
 };
 
 // The Linux daemon's words for the same refusals.
 pub(crate) const SENDING: &str = "This computer is sending its own input";
 pub(crate) const OWNED: &str = "Another computer owns input";
 pub(crate) const HANDOFF_ACTIVE: &str = "A desktop handoff is already active";
+const NOT_ALLOWED: &str =
+    "Desktop control requires the active unlocked local session and an authorized paired peer";
+const REJECTED: &str = "receiver effects were rejected before backend application";
 
 #[derive(Default)]
 struct State {
@@ -78,19 +88,17 @@ impl Ownership {
         Some(OutboundGuard(self.clone()))
     }
 
-    /// Gives this Mac's input to `peer`'s session for an activation. None
-    /// while this Mac sends, or another peer or session controls it or holds
-    /// its desktop. The same session may claim again, and the newest claim
-    /// holds it.
-    pub fn claim_inbound(&self, peer: &str, session_id: u64) -> Option<InboundClaim> {
+    /// Gives this Mac's input to `peer`'s session for an activation, or
+    /// says why not: this Mac sends, or another peer or session controls it
+    /// or holds its desktop. The same session may claim again, and the
+    /// newest claim holds it.
+    pub fn claim_inbound(&self, peer: &str, session_id: u64) -> Result<InboundClaim, &'static str> {
         let mut state = self.state();
-        if state.check(peer, session_id).is_err() {
-            return None;
-        }
+        state.check(peer, session_id)?;
         state.claims += 1;
         let claim = state.claims;
         state.inbound = Some((peer.to_owned(), session_id, claim));
-        Some(InboundClaim {
+        Ok(InboundClaim {
             ownership: self.clone(),
             claim,
         })
@@ -269,24 +277,409 @@ pub(super) fn answer_waiting_events(events: &mut mpsc::Receiver<SessionEvent>) -
     }
 }
 
-/// The Mac does not take input from other computers yet. Refuse whatever a
-/// receiver would handle.
-pub(super) fn refuse_inbound(kind: SessionEventKind) {
-    match kind {
-        SessionEventKind::Desktop { reply, .. } => {
-            let _ = reply.send(DesktopResponse::unavailable(
-                "Mac source cannot receive desktop handoffs",
-            ));
+/// Turns a peer's scrolling around, as the daemon does for a Mac with
+/// natural scrolling against a desktop without it. Pointer motion stays.
+fn reverse_scrolling(effects: &mut [ReceiverEffect]) {
+    for effect in effects {
+        if let ReceiverEffect::Motion { delta, .. } = effect {
+            delta.scroll_x = -delta.scroll_x;
+            delta.scroll_y = -delta.scroll_y;
         }
-        SessionEventKind::ReceiverEffects { applied, .. } => {
-            let _ = applied.send(Err(
-                "the Mac does not accept input from other computers".into()
-            ));
+    }
+}
+
+/// What receiving reads from this Mac. Tests use `FakeBackend`.
+pub(crate) trait Screen: Send + Sync + 'static {
+    fn geometry(&self) -> Result<Geometry>;
+    /// Changes whenever macOS reconfigures a display.
+    fn generation(&self) -> u32;
+    fn cursor(&self) -> Result<CursorPosition>;
+    /// macOS lets zflow post events.
+    fn post_allowed(&self) -> bool;
+    /// The screen lock is up, or another user has the console.
+    fn locked(&self) -> bool;
+}
+
+pub(crate) struct MacScreen;
+
+impl Screen for MacScreen {
+    fn geometry(&self) -> Result<Geometry> {
+        super::desktop_geometry()
+    }
+
+    fn generation(&self) -> u32 {
+        super::display_generation()
+    }
+
+    fn cursor(&self) -> Result<CursorPosition> {
+        super::cursor_position()
+    }
+
+    fn post_allowed(&self) -> bool {
+        inject::post_allowed()
+    }
+
+    fn locked(&self) -> bool {
+        inject::session_locked()
+    }
+}
+
+#[cfg(test)]
+impl Screen for inject::FakeBackend {
+    fn geometry(&self) -> Result<Geometry> {
+        let monitors = self
+            .state()
+            .displays
+            .iter()
+            .map(|display| crate::desktop::Rect {
+                x: display.x as i32,
+                y: display.y as i32,
+                width: display.width as u32,
+                height: display.height as u32,
+            })
+            .collect();
+        Ok(Geometry { monitors })
+    }
+
+    fn generation(&self) -> u32 {
+        self.state().generation
+    }
+
+    fn cursor(&self) -> Result<CursorPosition> {
+        self.state()
+            .cursor
+            .ok_or_else(|| anyhow::anyhow!("no cursor"))
+    }
+
+    fn post_allowed(&self) -> bool {
+        true
+    }
+
+    fn locked(&self) -> bool {
+        self.state().locked
+    }
+}
+
+/// Each peer's current session, so a revoked peer or a lapsed handoff can
+/// end it.
+#[derive(Clone, Default)]
+struct Sessions(Arc<Mutex<BTreeMap<String, SessionHandle>>>);
+
+impl Sessions {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, SessionHandle>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Closes `peer`'s session, if it is still `session_id` when one is given.
+    fn close(&self, peer: &str, session_id: Option<u64>, reason: SessionCloseReason) {
+        let sessions = self.lock();
+        if let Some(session) = sessions.get(peer)
+            && session_id.is_none_or(|id| id == session.id())
+        {
+            session.close(reason);
         }
-        SessionEventKind::OutboundEnded
-        | SessionEventKind::Closed { .. }
-        | SessionEventKind::Layout { .. }
-        | SessionEventKind::Clipboard { .. } => {}
+    }
+}
+
+/// This Mac as the handoff server sees it.
+pub(crate) struct MacDesk {
+    screen: Arc<dyn Screen>,
+    injector: Arc<Injector>,
+    sessions: Sessions,
+}
+
+impl Desk for MacDesk {
+    fn geometry(&self) -> Result<Geometry> {
+        self.screen.geometry()
+    }
+
+    fn generation(&self) -> u32 {
+        self.screen.generation()
+    }
+
+    fn cursor(&self) -> Result<CursorPosition> {
+        self.screen.cursor()
+    }
+
+    fn move_to(&self, point: Point) {
+        self.injector.move_to(CursorPosition {
+            x: f64::from(point.x),
+            y: f64::from(point.y),
+        });
+    }
+
+    fn release_all(&self) {
+        self.injector.release_all();
+    }
+
+    fn close(&self, peer: &str, session_id: u64) {
+        self.sessions
+            .close(peer, Some(session_id), SessionCloseReason::LeaseExpired);
+    }
+}
+
+/// Who may control this Mac, and how.
+#[derive(Default)]
+struct Policy {
+    /// Every paired computer, while sharing is on.
+    peers: BTreeMap<String, PeerConfig>,
+    /// Accessibility, as the app last saw it.
+    accessibility: bool,
+}
+
+/// Lets paired computers control this Mac. The links share one, with the
+/// injector and the handoff server.
+pub(crate) struct Receiving {
+    ownership: Ownership,
+    screen: Arc<dyn Screen>,
+    injector: Arc<Injector>,
+    handoff: Arc<HandoffServer<MacDesk>>,
+    policy: Mutex<Policy>,
+    sessions: Sessions,
+}
+
+impl Receiving {
+    /// Posts on this Mac.
+    pub fn mac() -> Result<Arc<Self>> {
+        Ok(Self::new(Injector::mac()?, Arc::new(MacScreen)))
+    }
+
+    pub fn new(injector: Injector, screen: Arc<dyn Screen>) -> Arc<Self> {
+        let ownership = Ownership::default();
+        let injector = Arc::new(injector);
+        let sessions = Sessions::default();
+        let desk = MacDesk {
+            screen: screen.clone(),
+            injector: injector.clone(),
+            sessions: sessions.clone(),
+        };
+        let handoff = Arc::new(HandoffServer::new(desk, ownership.clone()));
+        // Weak, so the injector thread does not keep the server alive, and
+        // through it the injector itself.
+        let server = Arc::downgrade(&handoff);
+        injector.watch(Box::new(move |from, to| {
+            server
+                .upgrade()
+                .is_some_and(|server| server.moved(from, to))
+        }));
+        Arc::new(Self {
+            ownership,
+            screen,
+            injector,
+            handoff,
+            policy: Mutex::default(),
+            sessions,
+        })
+    }
+
+    pub fn ownership(&self) -> &Ownership {
+        &self.ownership
+    }
+
+    fn policy(&self) -> MutexGuard<'_, Policy> {
+        self.policy.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Who may control this Mac, and how their keys and scrolling act. A
+    /// controlling peer that may no longer loses control at once.
+    pub fn set_peers(&self, peers: BTreeMap<String, PeerConfig>) {
+        let mut policy = self.policy();
+        if policy.peers != peers {
+            policy.peers = peers;
+            self.revoke(&policy);
+        }
+    }
+
+    pub fn set_accessibility(&self, allowed: bool) {
+        let mut policy = self.policy();
+        if policy.accessibility != allowed {
+            policy.accessibility = allowed;
+            self.revoke(&policy);
+        }
+    }
+
+    /// Ends the session of a controlling peer the policy no longer admits.
+    fn revoke(&self, policy: &Policy) {
+        let Some(peer) = self.ownership.controller() else {
+            return;
+        };
+        let permissions = policy.peers.get(&peer).map(|record| &record.permissions);
+        if admit(permissions, policy.accessibility, false) == Admission::Refuse {
+            tracing::info!(%peer, "peer may no longer control this Mac");
+            self.sessions
+                .close(&peer, None, SessionCloseReason::PermissionRevoked);
+        }
+    }
+
+    /// Whether `peer` may control this Mac, with how its keys act and
+    /// whether its scrolling turns around. `fresh` also asks macOS whether
+    /// zflow may post and whether the screen is locked, as a new activation
+    /// or a desktop request does; the injector checks the lock on every
+    /// batch.
+    fn admission(&self, peer: &str, fresh: bool) -> (Admission, KeyboardMode, bool) {
+        let (permissions, keyboard, reverse, accessibility) = {
+            let policy = self.policy();
+            let record = policy.peers.get(peer);
+            (
+                record.map(|record| record.permissions),
+                record.map_or(KeyboardMode::Standard, |record| record.keyboard),
+                record.is_some_and(|record| record.reverse_scroll),
+                policy.accessibility,
+            )
+        };
+        let post_allowed = accessibility && (!fresh || self.screen.post_allowed());
+        let locked = fresh && self.screen.locked();
+        let admission = admit(permissions.as_ref(), post_allowed, locked);
+        (admission, keyboard, reverse)
+    }
+
+    /// Starts taking `peer`'s input over `session`.
+    pub fn inbound(self: &Arc<Self>, peer: &str, session: &SessionHandle) -> Inbound {
+        self.sessions
+            .lock()
+            .insert(peer.to_owned(), session.clone());
+        Inbound {
+            receiving: self.clone(),
+            peer: peer.to_owned(),
+            session: session.clone(),
+            claim: None,
+        }
+    }
+
+    /// Ends handoffs whose peer stopped polling or whose displays changed.
+    /// Runs until dropped.
+    pub async fn watch(&self) {
+        self.handoff.watch().await;
+    }
+
+    async fn desktop(
+        &self,
+        peer: &str,
+        session_id: u64,
+        request: DesktopRequest,
+    ) -> DesktopResponse {
+        if self.admission(peer, true).0 == Admission::Refuse {
+            return DesktopResponse::unavailable(NOT_ALLOWED);
+        }
+        self.handoff.request(peer, session_id, request).await
+    }
+}
+
+/// One session's input from its peer. Dropping it lets go of whatever the
+/// peer still holds on this Mac.
+pub(crate) struct Inbound {
+    receiving: Arc<Receiving>,
+    peer: String,
+    session: SessionHandle,
+    claim: Option<InboundClaim>,
+}
+
+impl Inbound {
+    /// Answers a desktop request on its own task. A Poll can wait 200 ms,
+    /// and the session's input must not wait behind it.
+    pub fn desktop(&self, request: DesktopRequest, reply: oneshot::Sender<DesktopResponse>) {
+        let (receiving, peer, id) = (self.receiving.clone(), self.peer.clone(), self.session.id());
+        tokio::spawn(async move {
+            let _ = reply.send(receiving.desktop(&peer, id, request).await);
+        });
+    }
+
+    /// Posts one batch of the peer's input, or says why not, which closes
+    /// the session.
+    pub async fn effects(
+        &mut self,
+        effects: Vec<ReceiverEffect>,
+        received_at: Instant,
+    ) -> Result<(), String> {
+        let opens = effects
+            .iter()
+            .any(|effect| matches!(effect, ReceiverEffect::ActivationOpened(_)));
+        // A batch can close one activation and open the next, so the last
+        // one says whether the peer still holds this Mac afterwards.
+        let closes = effects.iter().rev().find_map(|effect| match effect {
+            ReceiverEffect::ActivationOpened(_) => Some(false),
+            ReceiverEffect::ActivationClosed { .. } => Some(true),
+            _ => None,
+        }) == Some(true);
+        let (mut admission, keyboard, reverse) = self.receiving.admission(&self.peer, opens);
+        if opens {
+            if admission == Admission::Refuse {
+                self.release();
+                return Err(NOT_ALLOWED.into());
+            }
+            let claim = self
+                .receiving
+                .ownership
+                .claim_inbound(&self.peer, self.session.id());
+            match claim {
+                Ok(claim) => {
+                    if self.claim.replace(claim).is_none() {
+                        tracing::info!(peer = %self.peer, "peer took control of this Mac");
+                    }
+                }
+                Err(reason) => {
+                    self.release();
+                    return Err(reason.into());
+                }
+            }
+        } else if self.claim.is_none() {
+            // Only an activation this session claimed reaches the Mac.
+            admission = Admission::Refuse;
+        }
+        let (mut deliver, refused) = admitted_effects(effects, admission);
+        if reverse {
+            reverse_scrolling(&mut deliver);
+        }
+        let applied = if deliver.is_empty() {
+            Ok(())
+        } else {
+            let keyboard = opens.then_some(keyboard);
+            match self.receiving.injector.apply(deliver, keyboard).await {
+                Ok(Ok(applied_at)) => {
+                    self.session
+                        .record_receive_to_inject(received_at, applied_at);
+                    Ok(())
+                }
+                Ok(Err(error)) => Err(format!("{error:#}")),
+                Err(_) => Err("the Mac input thread stopped".into()),
+            }
+        };
+        if refused || applied.is_err() {
+            self.release();
+        } else if closes && self.claim.take().is_some() {
+            // Closing the activation already let go of everything.
+            tracing::info!(peer = %self.peer, "peer let go of this Mac");
+        }
+        if refused {
+            return Err(REJECTED.into());
+        }
+        applied
+    }
+
+    /// Lets go of whatever the peer holds, and of its claim on this Mac.
+    fn release(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            // Sent before the claim goes, so it reaches the injector ahead
+            // of the next peer's input.
+            self.receiving.injector.release_all();
+            drop(claim);
+            tracing::info!(peer = %self.peer, "peer lost control of this Mac");
+        }
+    }
+}
+
+impl Drop for Inbound {
+    fn drop(&mut self) {
+        self.release();
+        let id = self.session.id();
+        self.receiving.handoff.closed(&self.peer, id);
+        let mut sessions = self.receiving.sessions.lock();
+        if sessions
+            .get(&self.peer)
+            .is_some_and(|session| session.id() == id)
+        {
+            sessions.remove(&self.peer);
+        }
     }
 }
 
@@ -313,7 +706,7 @@ mod tests {
             ownership.begin_outbound().is_none(),
             "one crossing at a time"
         );
-        assert!(ownership.claim_inbound("linux", 1).is_none());
+        assert!(ownership.claim_inbound("linux", 1).is_err());
         assert_eq!(ownership.begin_lease("linux", 1).err(), Some(SENDING));
         assert_eq!(ownership.desktop_allowed("linux", 1), Err(SENDING));
         assert_eq!(ownership.controller(), None);
@@ -332,10 +725,10 @@ mod tests {
         let ownership = Ownership::default();
         let first = ownership.claim_inbound("linux", 1).unwrap();
         assert!(
-            ownership.claim_inbound("linux", 2).is_none(),
+            ownership.claim_inbound("linux", 2).is_err(),
             "another session"
         );
-        assert!(ownership.claim_inbound("desk", 1).is_none(), "another peer");
+        assert!(ownership.claim_inbound("desk", 1).is_err(), "another peer");
         assert_eq!(ownership.desktop_allowed("desk", 1), Err(OWNED));
         assert_eq!(ownership.begin_lease("desk", 1).err(), Some(OWNED));
         assert_eq!(ownership.desktop_allowed("linux", 1), Ok(()));
@@ -344,9 +737,9 @@ mod tests {
         let second = ownership.claim_inbound("linux", 1).unwrap();
         drop(first);
         assert_eq!(ownership.controller().as_deref(), Some("linux"));
-        assert!(ownership.claim_inbound("linux", 2).is_none());
+        assert!(ownership.claim_inbound("linux", 2).is_err());
         drop(second);
-        assert!(ownership.claim_inbound("linux", 2).is_some());
+        assert!(ownership.claim_inbound("linux", 2).is_ok());
     }
 
     #[test]
@@ -359,7 +752,7 @@ mod tests {
             Some(HANDOFF_ACTIVE)
         );
         assert!(ownership.begin_outbound().is_none());
-        assert!(ownership.claim_inbound("desk", 1).is_none());
+        assert!(ownership.claim_inbound("desk", 1).is_err());
         let claim = ownership.claim_inbound("linux", 1).unwrap();
         drop(lease);
         assert_eq!(ownership.controller().as_deref(), Some("linux"));

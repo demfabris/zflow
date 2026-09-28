@@ -181,10 +181,26 @@ impl NativeApp {
                     self.check_local_network();
                 }
             }
-            // Who may control this Mac, and how its keys act, wait until it
-            // accepts input (ROADMAP Phase 2). The app keeps the login item.
-            Request::SetPeer { .. }
-            | Request::SetAutostart { .. }
+            Request::SetPeer {
+                name,
+                allow_control,
+                keyboard,
+                reverse_scroll,
+            } => {
+                let peer = self
+                    .document
+                    .draft
+                    .peers
+                    .get_mut(&name)
+                    .with_context(|| format!("Unknown computer {name}"))?;
+                crate::peer_view::set_peer(peer, allow_control, keyboard, reverse_scroll);
+                self.save_config()?;
+                // Links take who may control this Mac without reconnecting,
+                // so a crossing in progress carries on.
+                self.sync_links();
+            }
+            // The app keeps the login item.
+            Request::SetAutostart { .. }
             | Request::SetSwitching { .. }
             | Request::OpenSettings
             | Request::OpenLogs
@@ -299,6 +315,7 @@ impl NativeApp {
     }
 
     pub fn tick(&mut self) {
+        self.links.set_receive_policy(self.accessibility);
         let was_enabled = self.observer.is_enabled();
         self.observer.tick(&self.links);
         if was_enabled && !self.observer.is_enabled() {
@@ -475,12 +492,18 @@ impl NativeApp {
     fn snapshot(&self) -> api::Snapshot<MacPlatform> {
         let config = self.document.saved();
         let sharing = config.macos.sharing && !self.emergency_paused;
-        let peers = peer_rows(config, self.links.states(), self.observer.session_peer());
+        let controller = self.links.controller();
+        let peers = peer_rows(
+            config,
+            self.links.states(),
+            self.observer.session_peer(),
+            controller.as_deref(),
+        );
         let nearby = self.nearby.snapshot();
         let connected = peers.iter().any(|p| {
             matches!(
                 p.state,
-                PeerState::Connected | PeerState::ControlledFromHere
+                PeerState::Connected | PeerState::ControlledFromHere | PeerState::ControllingThis
             )
         });
         let checking = !connected && peers.iter().any(|p| p.state == PeerState::Connecting);
@@ -578,12 +601,14 @@ fn retry() -> Action {
     }
 }
 
-/// Each paired computer, from its link and the crossing in progress. A
-/// computer without a link does not take input from this Mac, or sharing is off.
+/// Each paired computer, from its link, the crossing in progress, and the
+/// peer controlling this Mac. A computer without a link may not connect, or
+/// sharing is off.
 fn peer_rows<'a>(
     config: &Config,
     links: impl Iterator<Item = (&'a str, LinkState)>,
     controlled: Option<&str>,
+    controller: Option<&str>,
 ) -> Vec<Peer> {
     let mut links: BTreeMap<_, _> = links.collect();
     config
@@ -592,7 +617,8 @@ fn peer_rows<'a>(
         .map(|(name, record)| {
             let (state, error) = match links.remove(name.as_str()) {
                 _ if controlled == Some(name) => (PeerState::ControlledFromHere, None),
-                Some(LinkState::Ready(_)) => (PeerState::Connected, None),
+                _ if controller == Some(name) => (PeerState::ControllingThis, None),
+                Some(LinkState::Ready(_) | LinkState::Connected) => (PeerState::Connected, None),
                 Some(LinkState::Connecting) => (PeerState::Connecting, None),
                 Some(LinkState::Down(error)) => (PeerState::Unreachable, Some(error)),
                 None => (PeerState::Paired, None),
@@ -727,7 +753,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["accessibility", "block_awdl", "local_network"]
         );
-        // Controls for being controlled wait until this Mac accepts input.
         let error = app
             .request(Request::SetPeer {
                 name: "desk".into(),
@@ -736,7 +761,44 @@ mod tests {
                 reverse_scroll: None,
             })
             .unwrap_err();
-        assert_eq!(error.to_string(), "Not available on this computer");
+        assert_eq!(error.to_string(), "Unknown computer desk");
+    }
+
+    #[test]
+    fn peer_settings_are_saved_without_restarting_sharing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let peer =
+            crate::identity::Identity::load_or_create(&directory.path().join("desk")).unwrap();
+        let mut config = Config::default();
+        config.transport.discovery = false;
+        config.macos.sharing = false;
+        let permissions = crate::config::PeerPermissions {
+            connect: true,
+            ..Default::default()
+        };
+        let record = crate::config::PeerConfig::from_spki(peer.spki(), Vec::new(), permissions);
+        config.peers.insert("desk".into(), record.unwrap());
+        config.save(&path).unwrap();
+        let mut app = NativeApp::open(path.clone()).unwrap();
+        let armed_at = app.retry_at;
+        let value = app
+            .request(Request::SetPeer {
+                name: "desk".into(),
+                allow_control: Some(true),
+                keyboard: Some(crate::core::KeyboardMode::PcPositions),
+                reverse_scroll: Some(true),
+            })
+            .unwrap();
+        assert_eq!(app.retry_at, armed_at, "sharing did not restart");
+        let saved = &Config::load(&path).unwrap().peers["desk"];
+        assert!(saved.permissions.send_normal && saved.permissions.receive_normal);
+        assert_eq!(saved.keyboard, crate::core::KeyboardMode::PcPositions);
+        assert!(saved.reverse_scroll);
+        let row = &value["peers"][0];
+        assert_eq!(row["allow_control"], true);
+        assert_eq!(row["keyboard"], "pc_positions");
+        assert_eq!(row["reverse_scroll"], true);
     }
 
     #[test]
@@ -775,7 +837,7 @@ mod tests {
             ("down", LinkState::Down("connection refused".into())),
             ("new", LinkState::Connecting),
         ];
-        let peers = peer_rows(&config, links.into_iter(), Some("busy"));
+        let peers = peer_rows(&config, links.into_iter(), Some("busy"), None);
         let rows: Vec<_> = peers
             .iter()
             .map(|peer| (peer.name.as_str(), peer.state, peer.detail.as_str()))
@@ -809,5 +871,16 @@ mod tests {
         let unlinked = link_health(&peers[4..]).unwrap();
         assert_eq!(unlinked.level, Level::Error);
         assert!(unlinked.action.is_none());
+
+        // One peer controls this Mac, and another only may.
+        let links = [("busy", ready()), ("desk", LinkState::Connected)];
+        let peers = peer_rows(&config, links.into_iter(), None, Some("busy"));
+        let states: Vec<_> = peers.iter().map(|peer| peer.state).collect();
+        assert_eq!(
+            states[..2],
+            [PeerState::ControllingThis, PeerState::Connected]
+        );
+        let status = Status::new(Some(true), &peers[..2], &[], false);
+        assert_eq!(status.title, "Controlled by busy");
     }
 }

@@ -3,9 +3,6 @@
 //! it leaves again through the same edge, and Finish or a lapsed lease ends
 //! the handoff.
 
-// Nothing answers handoffs yet. Remove once receiving is wired in.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
     sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
@@ -517,6 +514,20 @@ impl<D: Desk> HandoffServer<D> {
         }
     }
 
+    /// Ends the handoff of a session that closed, and lets go of whatever
+    /// its peer held.
+    pub fn closed(&self, peer: &str, session_id: u64) {
+        let ended = self
+            .lease()
+            .take_if(|lease| lease.peer == peer && lease.session_id == session_id);
+        if ended.is_some() {
+            drop(ended);
+            tracing::info!(%peer, session_id, "desktop handoff ended with its session");
+            self.changed.notify_waiters();
+            self.desk.release_all();
+        }
+    }
+
     /// Ends a handoff that went two seconds without a Poll, or whose
     /// displays changed. As on Linux, whatever the peer holds is let go and
     /// its session closes. True if one ended.
@@ -939,6 +950,20 @@ mod tests {
         assert_eq!(ownership.controller(), None);
         assert_eq!(desk.state().closed.len(), 4);
         watching.abort();
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_ends_its_handoff() {
+        let (server, desk, ownership) = setup(single());
+        server.request("linux", 1, prepare(7)).await;
+        server.closed("linux", 2);
+        server.closed("desk", 1);
+        assert_eq!(ownership.controller().as_deref(), Some("linux"));
+        assert_eq!(desk.state().releases, 0);
+        server.closed("linux", 1);
+        assert_eq!(ownership.controller(), None);
+        assert_eq!(desk.state().releases, 1);
+        assert!(desk.state().closed.is_empty(), "it is closed already");
     }
 
     #[tokio::test]

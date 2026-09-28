@@ -1,11 +1,13 @@
-//! One authenticated input session per paired receiver while sharing is on.
+//! One authenticated input session per paired computer while sharing is on.
 //! The desktop snapshot and every crossing reuse it, so a crossing costs a
 //! Prepare round trip instead of a QUIC handshake and session negotiation.
+//! The same session carries the peer's input when it controls this Mac.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -32,7 +34,7 @@ use crate::{
 
 use super::{
     Activation, CursorPosition, SourceStatus,
-    receive::{self, OutboundGuard, Ownership},
+    receive::{Inbound, OutboundGuard, Receiving},
     run_crossing,
 };
 
@@ -55,6 +57,9 @@ pub enum LinkState {
     Connecting,
     /// Connected, with the receiver's current desktop. Only this state crosses.
     Ready(Geometry),
+    /// Connected to a peer that does not take input from this Mac, so it
+    /// can only control it.
+    Connected,
     /// Not usable right now. The link keeps retrying.
     Down(String),
 }
@@ -79,8 +84,27 @@ enum Command {
     Retry,
 }
 
+/// What a link's session depends on. The rest of a peer's record, such as
+/// whether it may control this Mac, reaches the link without a reconnect.
+#[derive(Clone, PartialEq)]
+struct LinkKey {
+    spki_der_hex: String,
+    addresses: Vec<SocketAddr>,
+    receive_normal: bool,
+}
+
+impl LinkKey {
+    fn of(peer: &PeerConfig) -> Self {
+        Self {
+            spki_der_hex: peer.spki_der_hex.clone(),
+            addresses: peer.addresses.clone(),
+            receive_normal: peer.permissions.receive_normal,
+        }
+    }
+}
+
 struct Link {
-    peer: PeerConfig,
+    key: LinkKey,
     config: Config,
     commands: mpsc::UnboundedSender<Command>,
     state: watch::Receiver<LinkState>,
@@ -94,42 +118,63 @@ pub struct Links {
     closing: BTreeMap<String, JoinHandle<()>>,
     nearby: watch::Sender<Vec<SocketAddr>>,
     changed: bool,
-    ownership: Ownership,
+    receiving: Arc<Receiving>,
 }
 
 impl Links {
     pub fn new() -> Result<Self> {
+        Self::with_receiving(Receiving::mac()?)
+    }
+
+    /// Links that post through `backend` instead of on this Mac, with
+    /// motion that is not accelerated.
+    #[cfg(test)]
+    pub(crate) fn with_backend(backend: super::inject::FakeBackend) -> Result<Self> {
+        let profile = super::pointer::Profile::Flat { speed: 0.0 };
+        let injector = super::inject::Injector::start(backend.clone(), profile)?;
+        Self::with_receiving(Receiving::new(injector, Arc::new(backend)))
+    }
+
+    fn with_receiving(receiving: Arc<Receiving>) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("zflow-sharing")
             .enable_all()
             .build()
             .context("Could not start the sharing runtime")?;
+        runtime.spawn({
+            let receiving = receiving.clone();
+            async move { receiving.watch().await }
+        });
         Ok(Self {
             runtime: Some(runtime),
             links: BTreeMap::new(),
             closing: BTreeMap::new(),
             nearby: watch::channel(Vec::new()).0,
             changed: false,
-            ownership: Ownership::default(),
+            receiving,
         })
     }
 
-    /// Keeps one link per peer that may receive input from this Mac, and
-    /// closes the others. `None` closes every link. A peer whose record or
-    /// session settings changed reconnects.
+    /// Keeps one link per peer that may connect, and closes the others.
+    /// `None` closes every link. A peer whose address, key, or permission
+    /// to receive changed reconnects, and so does every peer when the
+    /// session settings change.
     pub fn sync(&mut self, config: Option<&Config>) {
+        let peers = config.map(|config| config.peers.clone());
+        self.receiving.set_peers(peers.unwrap_or_default());
         let settings = config.map(session_settings);
         let wanted: BTreeMap<&String, &PeerConfig> = config
             .into_iter()
             .flat_map(|config| &config.peers)
-            .filter(|(_, peer)| peer.permissions.connect && peer.permissions.receive_normal)
+            .filter(|(_, peer)| peer.permissions.connect)
             .collect();
         let stale: Vec<String> = self
             .links
             .iter()
             .filter(|(name, link)| {
-                wanted.get(name) != Some(&&link.peer) || settings.as_ref() != Some(&link.config)
+                wanted.get(name).map(|peer| LinkKey::of(peer)) != Some(link.key.clone())
+                    || settings.as_ref() != Some(&link.config)
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -154,6 +199,7 @@ impl Links {
                 name.clone(),
                 peer.clone(),
                 settings.clone(),
+                self.receiving.clone(),
                 receiver,
                 state_sender,
                 self.nearby.subscribe(),
@@ -162,7 +208,7 @@ impl Links {
             self.links.insert(
                 name.clone(),
                 Link {
-                    peer: peer.clone(),
+                    key: LinkKey::of(peer),
                     config: settings.clone(),
                     commands,
                     state,
@@ -204,7 +250,7 @@ impl Links {
         if !matches!(*link.state.borrow(), LinkState::Ready(_)) {
             return None;
         }
-        let guard = self.ownership.begin_outbound()?;
+        let guard = self.receiving.ownership().begin_outbound()?;
         let (stop, stopped) = watch::channel(false);
         let (status, events) = mpsc::unbounded_channel();
         link.commands
@@ -225,7 +271,13 @@ impl Links {
 
     /// The peer controlling this Mac, or about to.
     pub fn controller(&self) -> Option<String> {
-        self.ownership.controller()
+        self.receiving.ownership().controller()
+    }
+
+    /// Whether Accessibility lets peers control this Mac. The app sets it
+    /// on every tick; turning it off ends control at once.
+    pub fn set_receive_policy(&self, accessibility: bool) {
+        self.receiving.set_accessibility(accessibility);
     }
 
     /// Reconnects waiting links now and rechecks connected receivers.
@@ -275,10 +327,12 @@ fn session_settings(config: &Config) -> Config {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     name: String,
     peer: PeerConfig,
     config: Config,
+    receiving: Arc<Receiving>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     state: watch::Sender<LinkState>,
     mut nearby: watch::Receiver<Vec<SocketAddr>>,
@@ -298,7 +352,10 @@ async fn run(
         match opened {
             Ok(mut session) => {
                 let opened_at = Instant::now();
-                let lost = session.serve(&mut commands, &state).await;
+                let mut inbound = receiving.inbound(&name, &session.handle);
+                let lost = session.serve(&mut commands, &state, &mut inbound).await;
+                // Lets go of whatever the peer held before the session goes.
+                drop(inbound);
                 if let Some(reason) = &lost {
                     state.send_replace(LinkState::Down(reason.clone()));
                 }
@@ -390,6 +447,8 @@ struct Session {
     epoch: SessionEpoch,
     activations: u64,
     raw_touch: bool,
+    /// The peer takes input from this Mac, so the link reads its desktop.
+    sends: bool,
 }
 
 impl Session {
@@ -452,6 +511,7 @@ impl Session {
             epoch: SessionEpoch(epoch),
             activations: 0,
             raw_touch,
+            sends: peer.permissions.receive_normal,
         })
     }
 
@@ -465,14 +525,20 @@ impl Session {
         }
     }
 
-    /// Serves crossings until the session ends, returning why, or until the
-    /// link is closed, returning None.
+    /// Serves crossings and the peer's input until the session ends,
+    /// returning why, or until the link is closed, returning None.
     async fn serve(
         &mut self,
         commands: &mut mpsc::UnboundedReceiver<Command>,
         state: &watch::Sender<LinkState>,
+        inbound: &mut Inbound,
     ) -> Option<String> {
-        let mut ready = self.snapshot(state).await;
+        let mut ready = if self.sends {
+            self.snapshot(state).await
+        } else {
+            state.send_replace(LinkState::Connected);
+            false
+        };
         let mut retry = FIRST_SNAPSHOT_RETRY;
         loop {
             if ready {
@@ -481,7 +547,8 @@ impl Session {
             tokio::select! {
                 command = commands.recv() => match command {
                     None => return None,
-                    Some(Command::Retry) => ready = self.snapshot(state).await,
+                    Some(Command::Retry) if self.sends => ready = self.snapshot(state).await,
+                    Some(Command::Retry) => {}
                     Some(command) if !ready => refuse(command, "the other computer is not ready"),
                     Some(Command::Cross {
                         handoff,
@@ -519,10 +586,25 @@ impl Session {
                 },
                 event = self.events.recv() => match event.map(|event| event.kind) {
                     Some(SessionEventKind::Closed { reason }) => return Some(reason),
-                    Some(kind) => receive::refuse_inbound(kind),
+                    Some(SessionEventKind::Desktop { request, reply }) => {
+                        inbound.desktop(request, reply);
+                    }
+                    Some(SessionEventKind::ReceiverEffects {
+                        effects,
+                        received_at,
+                        applied,
+                        ..
+                    }) => {
+                        let _ = applied.send(inbound.effects(effects, received_at).await);
+                    }
+                    Some(
+                        SessionEventKind::OutboundEnded
+                        | SessionEventKind::Layout { .. }
+                        | SessionEventKind::Clipboard { .. },
+                    ) => {}
                     None => return Some("input session closed".into()),
                 },
-                () = tokio::time::sleep(retry), if !ready => {
+                () = tokio::time::sleep(retry), if !ready && self.sends => {
                     ready = self.snapshot(state).await;
                     retry = (retry * 2).min(SNAPSHOT_RETRY);
                 }
@@ -615,6 +697,10 @@ mod tests {
         config::PeerPermissions,
         core::{HidUsage, ReceiverEffect},
         desktop::{Edge, FRACTION_MAX, Point, Rect},
+        macos::{
+            inject::FakeBackend,
+            receive::{self, Ownership},
+        },
         transport::{accept_input, input_server_config},
     };
 
@@ -741,18 +827,54 @@ mod tests {
         config
     }
 
-    fn key(state: KeyState) -> CapturedDeviceFrame {
+    fn captured(frame: CaptureFrame) -> CapturedDeviceFrame {
         CapturedDeviceFrame {
             device_path: "test".into(),
             captured_at: Instant::now(),
-            frame: CaptureFrame {
-                transitions: vec![CaptureTransition::Key {
-                    usage: HidUsage::keyboard(4),
-                    state,
-                }],
-                ..CaptureFrame::default()
-            },
+            frame,
         }
+    }
+
+    fn key(state: KeyState) -> CapturedDeviceFrame {
+        captured(CaptureFrame {
+            transitions: vec![CaptureTransition::Key {
+                usage: HidUsage::keyboard(4),
+                state,
+            }],
+            ..CaptureFrame::default()
+        })
+    }
+
+    fn button(state: KeyState) -> CapturedDeviceFrame {
+        captured(CaptureFrame {
+            transitions: vec![CaptureTransition::Button {
+                button: crate::core::PointerButton(1),
+                state,
+            }],
+            ..CaptureFrame::default()
+        })
+    }
+
+    fn motion(dx: i64, scroll_y: i64) -> CapturedDeviceFrame {
+        captured(CaptureFrame {
+            motion: crate::core::MotionDelta {
+                dx,
+                scroll_y,
+                ..Default::default()
+            },
+            event_count: 1,
+            ..CaptureFrame::default()
+        })
+    }
+
+    fn left_alt(state: KeyState) -> CapturedDeviceFrame {
+        captured(CaptureFrame {
+            transitions: vec![CaptureTransition::Key {
+                usage: HidUsage::keyboard(0xe2),
+                state,
+            }],
+            ..CaptureFrame::default()
+        })
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -906,7 +1028,7 @@ mod tests {
             .to_vec();
         let mut receiver = server.block_on(receiver(linux.path(), &spki, false));
         let mut config = mac_config(mac.path(), linux.path(), receiver.address);
-        let mut links = Links::new().unwrap();
+        let mut links = Links::with_backend(FakeBackend::default()).unwrap();
         assert!(links.cross(handoff("linux"), ENTRY, false).is_none());
         links.sync(Some(&config));
         assert!(links.changed());
@@ -932,13 +1054,17 @@ mod tests {
         assert!(links.cross(handoff("other"), ENTRY, false).is_none());
 
         // While a peer controls this Mac, nothing crosses.
-        let claim = links.ownership.claim_inbound("linux", 1).unwrap();
+        let claim = links
+            .receiving
+            .ownership()
+            .claim_inbound("linux", 1)
+            .unwrap();
         assert_eq!(links.controller().as_deref(), Some("linux"));
         assert!(links.cross(handoff("linux"), ENTRY, false).is_none());
         drop(claim);
         assert_eq!(links.controller(), None);
         assert!(
-            links.ownership.begin_outbound().is_some(),
+            links.receiving.ownership().begin_outbound().is_some(),
             "no crossing kept input"
         );
 
@@ -959,6 +1085,344 @@ mod tests {
         drop(links);
     }
 
+    /// A fake Linux computer on its own runtime, and this Mac's links to it,
+    /// ready, posting into `fake`.
+    struct Pair {
+        links: Links,
+        receiver: Receiver,
+        config: Config,
+        fake: FakeBackend,
+        server: tokio::runtime::Runtime,
+        directories: [tempfile::TempDir; 2],
+    }
+
+    fn pair(record: impl FnOnce(&mut PeerConfig)) -> Pair {
+        let server = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let directories = [(); 2].map(|_| tempfile::tempdir().unwrap());
+        let [mac, linux] = [0, 1].map(|index| directories[index].path());
+        let spki = Identity::load_or_create(mac).unwrap().spki().to_vec();
+        let receiver = server.block_on(receiver(linux, &spki, false));
+        let mut config = mac_config(mac, linux, receiver.address);
+        let peer = config.peers.get_mut("linux").unwrap();
+        peer.permissions.send_normal = true;
+        record(peer);
+        let fake = FakeBackend::default();
+        let mut links = Links::with_backend(fake.clone()).unwrap();
+        links.set_receive_policy(true);
+        links.sync(Some(&config));
+        wait_until(&mut links, |links| {
+            links
+                .states()
+                .any(|(_, state)| matches!(state, LinkState::Ready(_) | LinkState::Connected))
+        });
+        Pair {
+            links,
+            receiver,
+            config,
+            fake,
+            server,
+            directories,
+        }
+    }
+
+    /// The first activation of the fake computer's session.
+    fn activation(session: &SessionHandle) -> SessionContext {
+        SessionContext {
+            session_epoch: SessionEpoch([9; 16]),
+            transport_generation: session.generation(),
+            activation_id: ActivationId(1),
+        }
+    }
+
+    /// Waits until the Mac posted `line`, and returns what it posted so far.
+    fn posted(fake: &FakeBackend, line: &str, within: Duration) -> Vec<String> {
+        let deadline = Instant::now() + within;
+        loop {
+            let log = fake.state().log.clone();
+            if log.iter().any(|posted| posted == line) {
+                return log;
+            }
+            assert!(Instant::now() < deadline, "never posted {line}: {log:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Waits until the Mac closes the fake computer's session `id`.
+    fn closed(server: &tokio::runtime::Runtime, receiver: &mut Receiver, id: u64) {
+        server.block_on(async {
+            loop {
+                let closed = tokio::time::timeout(Duration::from_secs(2), receiver.closed.recv())
+                    .await
+                    .expect("the Mac closed the session")
+                    .unwrap();
+                if closed == id {
+                    break;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_peer_controls_this_mac_over_the_session_this_mac_dialed() {
+        let Pair {
+            links,
+            mut receiver,
+            fake,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|peer| {
+            peer.keyboard = crate::core::KeyboardMode::PcPositions;
+            peer.reverse_scroll = true;
+        });
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        let ask = |request| server.block_on(linux.desktop_request(request)).unwrap();
+        assert_eq!(
+            ask(DesktopRequest::Snapshot),
+            DesktopResponse::Snapshot {
+                geometry: geometry(),
+                position: Point { x: 960, y: 540 },
+            }
+        );
+        let token = 7;
+        let prepare = DesktopRequest::Prepare {
+            token,
+            edge: Edge::Left,
+            start: 0,
+            end: FRACTION_MAX,
+            position: 500_000,
+        };
+        assert_eq!(
+            ask(prepare),
+            DesktopResponse::Prepared {
+                geometry: geometry(),
+                position: Point { x: 3, y: 540 },
+            }
+        );
+        assert_eq!(links.controller().as_deref(), Some("linux"));
+
+        linux.begin_outbound(activation(&linux)).unwrap();
+        for frame in [
+            key(KeyState::Pressed),
+            key(KeyState::Released),
+            left_alt(KeyState::Pressed),
+            left_alt(KeyState::Released),
+            motion(0, 120),
+            button(KeyState::Pressed),
+            button(KeyState::Released),
+        ] {
+            linux.capture(frame).unwrap();
+        }
+        let log = posted(
+            &fake,
+            "button 0 up at 3,540 click 1",
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            log[0], "move 3,540 by -957,0",
+            "Prepare put the cursor at the entry"
+        );
+        for line in ["key 0 down", "key 0 up", "button 0 down at 3,540 click 1"] {
+            assert!(log.iter().any(|posted| posted == line), "{line}: {log:?}");
+        }
+        assert!(
+            log.iter().any(|line| line.starts_with("modifier 55 down")),
+            "the peer's Alt is Cmd in PC positions: {log:?}"
+        );
+        assert!(
+            log.iter().any(|line| line == "scroll lines 0,-1"),
+            "the peer's scrolling is turned around: {log:?}"
+        );
+
+        // The pointer leaves through the edge it came in by.
+        linux.capture(motion(-100, 0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let returned = loop {
+            match ask(DesktopRequest::Poll { token }) {
+                DesktopResponse::Active => {
+                    assert!(Instant::now() < deadline, "the pointer never left");
+                }
+                response => break response,
+            }
+        };
+        assert_eq!(returned, DesktopResponse::Returned { position: 500_000 });
+        // Motion after that stays off the Mac.
+        fake.take_log();
+        for frame in [
+            motion(50, 0),
+            button(KeyState::Pressed),
+            button(KeyState::Released),
+        ] {
+            linux.capture(frame).unwrap();
+        }
+        let log = posted(
+            &fake,
+            "button 0 down at 3,540 click 2",
+            Duration::from_secs(2),
+        )
+        .into_iter()
+        .chain(fake.take_log())
+        .collect::<Vec<_>>();
+        assert!(log.iter().all(|line| !line.starts_with("move")), "{log:?}");
+
+        server
+            .block_on(linux.end_outbound(SessionCloseReason::LocalRelease))
+            .unwrap();
+        assert_eq!(
+            ask(DesktopRequest::Finish { token }),
+            DesktopResponse::Finished
+        );
+        assert_eq!(links.controller(), None);
+        assert!(links.receiving.ownership().begin_outbound().is_some());
+        drop(links);
+    }
+
+    #[test]
+    fn keys_a_vanished_peer_held_are_let_go_within_its_lease() {
+        let Pair {
+            links,
+            mut receiver,
+            fake,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|_| {});
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        linux.begin_outbound(activation(&linux)).unwrap();
+        linux.capture(key(KeyState::Pressed)).unwrap();
+        posted(&fake, "key 0 down", Duration::from_secs(2));
+        assert_eq!(links.controller().as_deref(), Some("linux"));
+        // The peer stops without a word, as when its process is killed.
+        let vanished = Instant::now();
+        drop(linux);
+        server.shutdown_background();
+        posted(&fake, "key 0 up", Duration::from_millis(1200));
+        assert!(vanished.elapsed() < Duration::from_millis(1200));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while links.controller().is_some() {
+            assert!(Instant::now() < deadline, "the peer kept control");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(links);
+        drop(receiver);
+    }
+
+    #[test]
+    fn a_peer_may_not_control_this_mac_without_leave_or_while_it_sends() {
+        // Not allowed to control this Mac.
+        let Pair {
+            links,
+            mut receiver,
+            fake,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|peer| peer.permissions.send_normal = false);
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        let snapshot = server.block_on(linux.desktop_request(DesktopRequest::Snapshot));
+        assert!(matches!(
+            snapshot.unwrap(),
+            DesktopResponse::Unavailable { .. }
+        ));
+        linux.begin_outbound(activation(&linux)).unwrap();
+        linux.capture(key(KeyState::Pressed)).unwrap();
+        closed(&server, &mut receiver, linux.id());
+        assert!(fake.take_log().iter().all(|line| line != "key 0 down"));
+        assert_eq!(links.controller(), None);
+        drop(links);
+
+        // This Mac is sending its own input.
+        let Pair {
+            links,
+            mut receiver,
+            fake,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|_| {});
+        let sending = links.receiving.ownership().begin_outbound().unwrap();
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        linux.begin_outbound(activation(&linux)).unwrap();
+        linux.capture(key(KeyState::Pressed)).unwrap();
+        closed(&server, &mut receiver, linux.id());
+        assert!(fake.take_log().iter().all(|line| line != "key 0 down"));
+        drop(sending);
+        drop(links);
+
+        // Control taken away while the peer holds a key.
+        let Pair {
+            mut links,
+            mut receiver,
+            mut config,
+            fake,
+            server,
+            directories: _directories,
+        } = pair(|_| {});
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        linux.begin_outbound(activation(&linux)).unwrap();
+        linux.capture(key(KeyState::Pressed)).unwrap();
+        posted(&fake, "key 0 down", Duration::from_secs(2));
+        let task = links.links["linux"].task.id();
+        config
+            .peers
+            .get_mut("linux")
+            .unwrap()
+            .permissions
+            .send_normal = false;
+        links.sync(Some(&config));
+        assert_eq!(links.links["linux"].task.id(), task, "the link stays");
+        posted(&fake, "key 0 up", Duration::from_secs(1));
+        closed(&server, &mut receiver, linux.id());
+        assert_eq!(links.controller(), None);
+        drop(links);
+    }
+
+    #[test]
+    fn a_peer_that_only_controls_this_mac_is_connected_without_a_desktop() {
+        let Pair {
+            mut links,
+            mut receiver,
+            mut config,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|peer| peer.permissions.receive_normal = false);
+        assert!(
+            links
+                .states()
+                .any(|(name, state)| name == "linux" && state == LinkState::Connected)
+        );
+        assert!(links.cross(handoff("linux"), ENTRY, false).is_none());
+        let first = server.block_on(receiver.sessions.recv()).unwrap();
+
+        // Whether it may control this Mac, and how, keeps the session.
+        let task = links.links["linux"].task.id();
+        let peer = config.peers.get_mut("linux").unwrap();
+        peer.permissions.send_normal = false;
+        peer.keyboard = crate::core::KeyboardMode::Mac;
+        peer.reverse_scroll = true;
+        links.sync(Some(&config));
+        assert_eq!(links.links["linux"].task.id(), task);
+
+        // Taking input from this Mac needs the desktop, so it reconnects.
+        config
+            .peers
+            .get_mut("linux")
+            .unwrap()
+            .permissions
+            .receive_normal = true;
+        links.sync(Some(&config));
+        assert_ne!(links.links["linux"].task.id(), task);
+        wait_until(&mut links, ready);
+        let second = server.block_on(receiver.sessions.recv()).unwrap();
+        assert_ne!(first.id(), second.id());
+        drop(links);
+    }
+
     #[test]
     fn a_refused_crossing_gives_input_back() {
         let ownership = Ownership::default();
@@ -971,13 +1435,13 @@ mod tests {
             status,
             guard: ownership.begin_outbound().unwrap(),
         };
-        assert!(ownership.claim_inbound("linux", 1).is_none());
+        assert!(ownership.claim_inbound("linux", 1).is_err());
         refuse(command, "the other computer is not connected");
         assert!(matches!(
             statuses.try_recv(),
             Ok(SourceStatus::Cancelled(_))
         ));
-        assert!(ownership.claim_inbound("linux", 1).is_some());
+        assert!(ownership.claim_inbound("linux", 1).is_ok());
     }
 
     #[test]

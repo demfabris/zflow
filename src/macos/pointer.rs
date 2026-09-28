@@ -1,9 +1,6 @@
 //! Pointer motion and scroll for posting on the Mac: the acceleration curve,
 //! keeping the cursor on a display, and wheel lines versus pixels.
 
-// Nothing posts yet. Remove once the injector is wired in.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
     str::FromStr,
     time::{Duration, Instant},

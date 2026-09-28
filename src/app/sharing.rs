@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn nothing_crosses_while_a_peer_controls_the_mac() {
-        let links = Links::new().unwrap();
+        let links = Links::with_backend(Default::default()).unwrap();
         let mut observer = Observer::default();
         observer.enabled = true;
         observer.previous = Some(Point { x: 1, y: 540 });

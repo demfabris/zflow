@@ -35,6 +35,7 @@ use crate::{
     session::{SessionEvent, SessionEventKind, SessionHandle},
 };
 
+pub(crate) use inject::{install_exit_handlers, supports_key};
 pub use link::{Crossing, LinkState, Links};
 pub use local_network::{LocalNetwork, local_network_access};
 

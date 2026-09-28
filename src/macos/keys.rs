@@ -1,9 +1,6 @@
 //! Mac virtual keycodes and HID usages, read one way when capturing and the
 //! other way when posting.
 
-// Only capture reads this so far. Remove once the injector is wired in.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use crate::core::{HidUsage, HidUsagePage};
 
 /// Mac keycodes and the keyboard-page usage at the same position. 10 and 50
