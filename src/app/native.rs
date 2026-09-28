@@ -595,11 +595,18 @@ impl NativeApp {
                 self.layout.draft = previous;
                 return Err(error);
             }
-            if self.observer.is_active() {
-                self.restart();
-            }
+            self.rearm();
         }
         Ok(())
+    }
+
+    /// Arms sharing again with a changed layout. A crossing in progress,
+    /// perhaps the one a peer's edit arrived during, finishes first.
+    fn rearm(&mut self) {
+        if self.observer.is_active() {
+            self.observer.disarm();
+            self.retry_at = Instant::now();
+        }
     }
 
     /// Places this Mac and each paired computer with a known desktop size,
@@ -657,9 +664,7 @@ impl NativeApp {
                 self.layout.draft = previous;
                 return Err(error);
             }
-            if self.observer.is_active() {
-                self.restart();
-            }
+            self.rearm();
         }
         Ok(())
     }

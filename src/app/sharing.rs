@@ -97,6 +97,16 @@ impl Observer {
         }
     }
 
+    /// Stops arming with the current layout, and lets a crossing in progress
+    /// finish with its own. The app arms again with the new layout.
+    pub fn disarm(&mut self) {
+        if self.enabled {
+            tracing::info!("edge sharing disarmed for a new layout");
+        }
+        self.enabled = false;
+        self.previous = None;
+    }
+
     pub fn enable(&mut self, config: &Config, layout: &Layout) -> Result<()> {
         let geometry = macos::desktop_geometry()?;
         handoff::validate(layout, &geometry)?;
@@ -343,12 +353,17 @@ mod tests {
     use crate::desktop::{Edge, Geometry, Rect, ReturnMapping};
     use tokio::sync::{mpsc, watch};
 
-    /// An armed observer running one crossing, fed `statuses` before the
-    /// crossing's channel closes.
-    fn finished(statuses: &[SourceStatus], report_end: bool) -> Observer {
+    /// An armed observer running one crossing, the crossing's status
+    /// sender, and whether it was told to stop.
+    fn crossing() -> (
+        Observer,
+        mpsc::UnboundedSender<SourceStatus>,
+        watch::Receiver<bool>,
+    ) {
         let mut observer = Observer::default();
         observer.enabled = true;
         let (status, events) = mpsc::unbounded_channel();
+        let (stop, stopped) = watch::channel(false);
         let geometry = Geometry {
             monitors: vec![Rect {
                 x: 0,
@@ -359,7 +374,7 @@ mod tests {
         };
         observer.running = Some(Running {
             crossing: Crossing {
-                stop: watch::channel(false).0,
+                stop,
                 status: events,
             },
             handoff: Handoff {
@@ -387,6 +402,13 @@ mod tests {
             span: tracing::Span::none(),
             started: Instant::now(),
         });
+        (observer, status, stopped)
+    }
+
+    /// An armed observer running one crossing, fed `statuses` before the
+    /// crossing's channel closes.
+    fn finished(statuses: &[SourceStatus], report_end: bool) -> Observer {
+        let (mut observer, status, _stopped) = crossing();
         for status in statuses {
             observer.record(status.clone());
         }
@@ -421,6 +443,21 @@ mod tests {
         assert!(observer.is_enabled());
         assert_eq!(observer.previous, None);
         assert_eq!(observer.notice, "Controlled by linux");
+    }
+
+    #[test]
+    fn a_new_layout_lets_the_crossing_in_progress_finish() {
+        let (mut observer, status, stopped) = crossing();
+        observer.disarm();
+        assert!(observer.has_session() && !observer.is_enabled());
+        assert!(!*stopped.borrow(), "the crossing goes on");
+        observer.record(SourceStatus::Returned { position: 0 });
+        observer.record(SourceStatus::Stopped);
+        drop(status);
+        observer.finish();
+        // Not a failure or a pause: the app arms again with the new layout.
+        assert!(!observer.has_session() && !observer.is_enabled());
+        assert!(!observer.pause_requested);
     }
 
     #[test]
