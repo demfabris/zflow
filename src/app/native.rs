@@ -139,6 +139,8 @@ impl NativeApp {
         if let Some(kept) = &app.shared.draft.layout {
             app.links.share_layout(kept.clone());
         }
+        // A computer paired while zflow was not running has no tile yet.
+        app.place_new_peers();
         app.sync_links();
         Ok(app)
     }
@@ -222,6 +224,7 @@ impl NativeApp {
                 self.document.draft.peers.remove(&name);
                 self.save_config()?;
                 self.restart();
+                self.place_new_peers();
             }
             Request::AllowAccessibility => {
                 crate::macos::accessibility_authorized(true);
@@ -363,7 +366,9 @@ impl NativeApp {
     fn reload(&mut self) {
         match ConfigDocument::open(self.document.path.clone()).and_then(|doc| {doc.validate()?; Ok(doc)}) {
             Ok(document) if !document.is_new() => {
-                if document.saved()!=self.document.saved() { self.document=document; self.restart(); }
+                // Pairing saves the configuration itself, so a computer paired
+                // here gets its tile once the change is read.
+                if document.saved()!=self.document.saved() { self.document=document; self.restart(); self.place_new_peers(); }
                 else { self.document=document; }
                 self.config_error=None;
             },
@@ -518,6 +523,8 @@ impl NativeApp {
         }
         tracing::info!(%peer, version = layout.version, "layout adopted");
         self.keep_layout(layout);
+        // A computer paired here but not there has no tile in it yet.
+        self.place_new_peers();
         true
     }
 
@@ -537,9 +544,37 @@ impl NativeApp {
         Some(Identity::load_or_create(state).ok()?.fingerprint_hex())
     }
 
+    /// Gives each paired computer the kept layout lacks a tile beside this
+    /// Mac, such as one paired after the computers were arranged, and tells
+    /// the other computers, as the Linux daemon does. Without a kept layout
+    /// there is nothing to add to: the first one places every computer.
+    fn place_new_peers(&mut self) {
+        let Some(kept) = &self.shared.draft.layout else {
+            return;
+        };
+        let Some(own) = self.own_key() else {
+            return;
+        };
+        let keys = peer_keys(self.document.saved());
+        let Some(placed) =
+            kept.with_tiles_for(&own, keys.values().map(String::as_str), PEER_TILE_SIZE)
+        else {
+            return;
+        };
+        tracing::info!(
+            version = placed.version,
+            "paired computer placed in the layout"
+        );
+        self.keep_layout(placed);
+        if let Err(error) = self.show_shared() {
+            self.layout_error = Some(format!("{error:#}"));
+        }
+    }
+
     /// Arranges the computers on this Mac until it first connects. The
     /// arrangement then becomes the shared layout, and from there on this
-    /// Mac only writes its own tile's size and adds computers without one.
+    /// Mac only writes its own tile's size, adding its tile if a peer's
+    /// layout lacks it.
     fn sync_layout(&mut self) -> Result<()> {
         if self.layout_error.is_some() {
             return Ok(());
@@ -566,19 +601,15 @@ impl NativeApp {
         let Some(own) = self.own_key() else {
             return Ok(());
         };
-        let keys = peer_keys(self.document.saved());
-        let peers: Vec<_> = keys
-            .iter()
-            .map(|(name, key)| {
-                let size = self.desktops.get(name).copied();
-                (key.clone(), size.unwrap_or(PEER_TILE_SIZE))
-            })
-            .collect();
         let next = match &self.shared.draft.layout {
-            Some(kept) => refreshed(kept, &own, size, &peers),
+            Some(kept) => refreshed(kept, &own, size),
             None => next_version(None).and_then(|version| {
-                let mut first = self.layout.draft.to_shared(version, &own, &keys);
-                add_missing_tiles(&mut first, &peers);
+                let keys = peer_keys(self.document.saved());
+                let first = self.layout.draft.to_shared(version, &own, &keys);
+                // Computers whose desktop is not known yet were not arranged.
+                let first = first
+                    .with_tiles_for(&own, keys.values().map(String::as_str), PEER_TILE_SIZE)
+                    .unwrap_or(first);
                 first.validate().is_ok().then_some(first)
             }),
         };
@@ -816,54 +847,34 @@ fn next_version(kept: Option<&SharedLayout>) -> Option<u64> {
     kept.map_or(0, |kept| kept.version).checked_add(1)
 }
 
-/// A new version of `kept`, edited by this Mac (`own`), in which every
-/// computer in `peers` has a tile and this Mac's tile has its desktop's
-/// `size`. None when it needs neither.
-fn refreshed(
-    kept: &SharedLayout,
-    own: &str,
-    size: (u32, u32),
-    peers: &[(String, (u32, u32))],
-) -> Option<SharedLayout> {
+/// A new version of `kept`, edited by this Mac (`own`), in which this Mac's
+/// tile has its desktop's `size`. A layout from a computer that has not seen
+/// this Mac yet gets this Mac's tile to the right of the others. None when
+/// nothing changes.
+fn refreshed(kept: &SharedLayout, own: &str, size: (u32, u32)) -> Option<SharedLayout> {
+    if kept.tiles.iter().any(|tile| tile.key == own) {
+        return kept.with_own_size(own, size.0, size.1);
+    }
+    if kept.tiles.len() >= MAX_SHARED_TILES {
+        return None;
+    }
+    let right = kept
+        .tiles
+        .iter()
+        .map(|tile| i64::from(tile.x) + i64::from(tile.width))
+        .max()
+        .unwrap_or(0);
     let mut next = kept.clone();
-    let missing = std::iter::once((own.to_owned(), size)).chain(peers.iter().cloned());
-    let added = add_missing_tiles(&mut next, &missing.collect::<Vec<_>>());
-    if added {
-        next.version = next_version(Some(kept))?;
-        next.editor = own.to_owned();
-        next.validate().ok()?;
-    }
-    next.with_own_size(own, size.0, size.1)
-        .or(added.then_some(next))
-}
-
-/// Gives each computer in `wanted` without a tile one of its size, in a
-/// row to the right of the others. Returns whether it added any.
-fn add_missing_tiles(layout: &mut SharedLayout, wanted: &[(String, (u32, u32))]) -> bool {
-    let mut added = false;
-    for (key, (width, height)) in wanted {
-        if layout.tiles.len() >= MAX_SHARED_TILES || layout.tiles.iter().any(|t| t.key == *key) {
-            continue;
-        }
-        let right = layout
-            .tiles
-            .iter()
-            .map(|tile| i64::from(tile.x) + i64::from(tile.width))
-            .max()
-            .unwrap_or(0);
-        if right > i64::from(layout_model::MAX_COORDINATE) {
-            break;
-        }
-        layout.tiles.push(Tile {
-            key: key.clone(),
-            x: right as i32,
-            y: 0,
-            width: *width,
-            height: *height,
-        });
-        added = true;
-    }
-    added
+    next.tiles.push(Tile {
+        key: own.to_owned(),
+        x: i32::try_from(right).ok()?,
+        y: 0,
+        width: size.0,
+        height: size.1,
+    });
+    next.version = next_version(Some(kept))?;
+    next.editor = own.to_owned();
+    next.validate().ok().map(|()| next)
 }
 
 fn retry() -> Action {
@@ -1197,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn this_mac_adds_missing_tiles_and_writes_only_its_own_size() {
+    fn this_mac_adds_its_own_tile_and_writes_only_its_own_size() {
         let key = |n: u8| format!("{n:064x}");
         let kept = SharedLayout {
             version: 5,
@@ -1210,26 +1221,18 @@ mod tests {
                 height: 1080,
             }],
         };
-        // This Mac, and a computer paired later, get tiles to the right. A
+        // A layout from a computer that has not seen this Mac yet. The
         // peer's tile keeps the size that peer wrote.
-        let peers = [(key(2), (2560, 1440)), (key(3), (1920, 1080))];
-        let next = refreshed(&kept, &key(1), (3008, 1692), &peers).unwrap();
+        let next = refreshed(&kept, &key(1), (3008, 1692)).unwrap();
         assert_eq!((next.version, &next.editor), (6, &key(1)));
         let places: Vec<_> = next
             .tiles
             .iter()
             .map(|tile| (tile.key.clone(), tile.x, tile.width))
             .collect();
-        assert_eq!(
-            places,
-            [
-                (key(2), 0, 1920),
-                (key(1), 1920, 3008),
-                (key(3), 4928, 1920)
-            ]
-        );
-        assert!(refreshed(&next, &key(1), (3008, 1692), &peers).is_none());
-        let resized = refreshed(&next, &key(1), (1512, 982), &peers).unwrap();
+        assert_eq!(places, [(key(2), 0, 1920), (key(1), 1920, 3008)]);
+        assert!(refreshed(&next, &key(1), (3008, 1692)).is_none());
+        let resized = refreshed(&next, &key(1), (1512, 982)).unwrap();
         assert_eq!((resized.version, resized.tiles[1].width), (7, 1512));
 
         // Versions stop where JSON numbers stop being exact.
@@ -1238,7 +1241,91 @@ mod tests {
             version: crate::desktop::MAX_TOKEN,
             ..next
         };
-        assert!(refreshed(&last, &key(1), (1512, 982), &peers).is_none());
+        assert!(refreshed(&last, &key(1), (1512, 982)).is_none());
+    }
+
+    #[test]
+    fn a_computer_paired_later_gets_a_tile_beside_this_mac() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let identity = |name: &str| Identity::load_or_create(&directory.path().join(name)).unwrap();
+        let [desk, laptop, tablet] = ["desk", "laptop", "tablet"].map(identity);
+        let record = |peer: &Identity| {
+            let permissions = crate::config::PeerPermissions::default();
+            crate::config::PeerConfig::from_spki(peer.spki(), Vec::new(), permissions).unwrap()
+        };
+        let mut config = Config::default();
+        config.daemon.state_dir = directory.path().join("state");
+        config.transport.discovery = false;
+        config.macos.sharing = false;
+        config.peers.insert("desk".into(), record(&desk));
+        config.save(&path).unwrap();
+        let mut app = NativeApp::open(path.clone()).unwrap();
+        let (own, theirs) = (app.own_key().unwrap(), desk.fingerprint_hex());
+        let tile = |key: &str, x| Tile {
+            key: key.into(),
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let kept = |app: &NativeApp| app.shared.draft.layout.clone().unwrap();
+        let arranged = SharedLayout {
+            version: 3,
+            editor: theirs.clone(),
+            tiles: vec![tile(&own, 0), tile(&theirs, 1920)],
+        };
+        assert!(app.take_layout("desk", arranged.clone()));
+        assert_eq!(kept(&app), arranged, "nothing missing");
+
+        // Pairing saves the configuration, and the app reads it from there.
+        config.peers.insert("laptop".into(), record(&laptop));
+        config.save(&path).unwrap();
+        app.reload();
+        let placed = kept(&app);
+        assert_eq!((placed.version, &placed.editor), (4, &own));
+        // Desk is right of this Mac, so the laptop goes left.
+        let laptop_tile = tile(&laptop.fingerprint_hex(), -1920);
+        assert_eq!(placed.tiles[2], laptop_tile);
+        let shown = app.layout.draft.monitors.iter();
+        assert!(
+            shown
+                .map(|m| m.peer.as_deref())
+                .any(|peer| peer == Some("laptop"))
+        );
+
+        // Desk's newer layout, with desk below, lacks the laptop, which
+        // gets its tile back on the right.
+        let below = SharedLayout {
+            version: 9,
+            tiles: vec![
+                tile(&own, 0),
+                Tile {
+                    y: 1080,
+                    ..tile(&theirs, 0)
+                },
+            ],
+            ..arranged
+        };
+        assert!(app.take_layout("desk", below));
+        let placed = kept(&app);
+        assert_eq!((placed.version, &placed.editor), (10, &own));
+        assert_eq!(
+            placed.tiles[2],
+            Tile {
+                x: 1920,
+                ..laptop_tile
+            }
+        );
+
+        // A computer paired while the app was closed is placed at startup.
+        drop(app);
+        config.peers.insert("tablet".into(), record(&tablet));
+        config.save(&path).unwrap();
+        let app = NativeApp::open(path).unwrap();
+        let placed = kept(&app);
+        assert_eq!((placed.version, placed.tiles.len()), (11, 4));
+        assert_eq!(placed.tiles[3], tile(&tablet.fingerprint_hex(), -1920));
     }
 
     #[test]
