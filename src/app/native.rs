@@ -700,6 +700,7 @@ mod tests {
             "peers",
             "pairing",
             "nearby",
+            "pause_at_edges",
             "shortcuts",
             "autostart",
             "config_path",
