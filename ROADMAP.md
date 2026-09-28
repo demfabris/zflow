@@ -437,6 +437,18 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A layout edit shows up on the other machine within 2 s.
 - **Size:** about 15 files, 1500 to 2000 LOC.
 - **Risks:** barrier hits from local motion; held keys at the edge; remappers; extension review; wider device access.
+- **Status (2026-09-28):** in progress on branch `linux-edge-sending`.
+  - Done:
+    - Capture-all: an empty `capture_devices` list captures every keyboard and pointer, and a device another program grabbed (EBUSY) is skipped.
+    - The daemon half of change 9, and the rule for two computers dialing each other at once (`identity::wins_simultaneous_dial`).
+    - GNOME edge barriers: a push sends `edge_hit`, and the daemon activates that peer. While sending, the pointer is hidden and an idle inhibitor is held.
+    - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
+  - Left:
+    - Change 10: entry placement and return through Prepare, Poll and Finish.
+    - Linux writing its own tile size.
+    - The Linux layout canvas.
+    - The Mac sending and merging layouts (Phase 2 side).
+  - Known limit: a key held on a remapper-grabbed device at the moment zflow opens it blocks arming until the daemon restarts.
 
 ### Phase 4: the Deskflow extras
 
