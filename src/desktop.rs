@@ -369,10 +369,25 @@ impl SharedLayout {
     /// of its desktop. Each computer writes only its own size, so two never
     /// edit the same tile. The sides that touch a neighbour stay where they
     /// are, so the crossings stay; a tile that would still overlap another
-    /// moves to the right of the rest. None when the size is already right or
-    /// the tile is missing.
+    /// moves to the right of the rest. A layout from a computer that never
+    /// had this one gets its tile beside the first tile, so an edge leads to
+    /// it. None when the size is already right or the layout is full.
     pub fn with_own_size(&self, key: &str, width: u32, height: u32) -> Option<Self> {
-        let index = self.tiles.iter().position(|tile| tile.key == key)?;
+        let Some(index) = self.tiles.iter().position(|tile| tile.key == key) else {
+            if self.tiles.len() >= MAX_SHARED_TILES {
+                return None;
+            }
+            let mut next = self.clone();
+            next.tiles.push(free_spot(
+                &self.tiles,
+                self.tiles.first(),
+                key,
+                (width, height),
+            )?);
+            next.version = self.version.checked_add(1)?;
+            next.editor = key.to_owned();
+            return next.validate().ok().map(|()| next);
+        };
         let old = &self.tiles[index];
         if (old.width, old.height) == (width, height) {
             return None;
@@ -432,7 +447,6 @@ impl SharedLayout {
         keys: impl IntoIterator<Item = &'a str>,
         (width, height): (u32, u32),
     ) -> Option<Self> {
-        use crate::app::layout_model::MAX_COORDINATE;
         let mut next = self.clone();
         for key in keys {
             if key == own || next.tiles.iter().any(|tile| tile.key == key) {
@@ -441,39 +455,8 @@ impl SharedLayout {
             if next.tiles.len() >= MAX_SHARED_TILES {
                 break;
             }
-            let tile = |x: i64, y: i64| {
-                let bounds = -i64::from(MAX_COORDINATE)..=i64::from(MAX_COORDINATE);
-                (bounds.contains(&x) && bounds.contains(&y)).then(|| Tile {
-                    key: key.to_owned(),
-                    x: x as i32,
-                    y: y as i32,
-                    width,
-                    height,
-                })
-            };
-            let (w, h) = (i64::from(width), i64::from(height));
             let anchor = next.tiles.iter().find(|tile| tile.key == own);
-            let beside = anchor.map_or_else(Vec::new, |a| {
-                let ((left, right), (top, bottom)) = (span(a.x, a.width), span(a.y, a.height));
-                vec![
-                    (right, top),
-                    (left - w, top),
-                    (left, bottom),
-                    (left, top - h),
-                ]
-            });
-            let past_all = next
-                .tiles
-                .iter()
-                .map(|tile| span(tile.x, tile.width).1)
-                .max()
-                .unwrap_or(0);
-            let row = anchor.map_or(0, |a| i64::from(a.y));
-            let placed = beside
-                .into_iter()
-                .chain([(past_all, row)])
-                .filter_map(|(x, y)| tile(x, y))
-                .find(|tile| !next.tiles.iter().any(|other| overlaps(tile, other)))?;
+            let placed = free_spot(&next.tiles, anchor, key, (width, height))?;
             next.tiles.push(placed);
         }
         if next.tiles.len() == self.tiles.len() {
@@ -483,6 +466,49 @@ impl SharedLayout {
         next.editor = own.to_owned();
         next.validate().ok().map(|()| next)
     }
+}
+
+/// Where a new tile of `size` for `key` goes among `tiles`: beside `anchor`
+/// where there is room (right, left, below, above), else to the right of all
+/// of them. None when that is off the canvas.
+fn free_spot(
+    tiles: &[Tile],
+    anchor: Option<&Tile>,
+    key: &str,
+    (width, height): (u32, u32),
+) -> Option<Tile> {
+    use crate::app::layout_model::MAX_COORDINATE;
+    let tile = |x: i64, y: i64| {
+        let bounds = -i64::from(MAX_COORDINATE)..=i64::from(MAX_COORDINATE);
+        (bounds.contains(&x) && bounds.contains(&y)).then(|| Tile {
+            key: key.to_owned(),
+            x: x as i32,
+            y: y as i32,
+            width,
+            height,
+        })
+    };
+    let (w, h) = (i64::from(width), i64::from(height));
+    let beside = anchor.map_or_else(Vec::new, |a| {
+        let ((left, right), (top, bottom)) = (span(a.x, a.width), span(a.y, a.height));
+        vec![
+            (right, top),
+            (left - w, top),
+            (left, bottom),
+            (left, top - h),
+        ]
+    });
+    let past_all = tiles
+        .iter()
+        .map(|tile| span(tile.x, tile.width).1)
+        .max()
+        .unwrap_or(0);
+    let row = anchor.map_or(0, |a| i64::from(a.y));
+    beside
+        .into_iter()
+        .chain([(past_all, row)])
+        .filter_map(|(x, y)| tile(x, y))
+        .find(|tile| !tiles.iter().any(|other| overlaps(tile, other)))
 }
 
 fn span(start: i32, size: u32) -> (i64, i64) {
@@ -581,6 +607,11 @@ mod tests {
             .with_tiles_for(&key(1), keys.iter().map(String::as_str), size)
             .unwrap();
         assert_eq!(past.tiles[1..], [tile(3, 1000, 0, 1920, 1080)]);
+        // A layout from a computer that never had this one: this computer
+        // writes its own tile beside the first one.
+        let joined = foreign.with_own_size(&key(1), 1280, 720).unwrap();
+        assert_eq!((joined.version, &joined.editor), (4, &key(1)));
+        assert_eq!(joined.tiles[1..], [tile(1, 1000, 0, 1280, 720)]);
         let full = SharedLayout {
             tiles: (0..MAX_SHARED_TILES)
                 .map(|n| tile(n + 10, n as i32 * 2000, 0, 1000, 800))
@@ -593,6 +624,7 @@ mod tests {
                 .is_none(),
             "no room for another computer"
         );
+        assert!(full.with_own_size(&key(1), 1280, 720).is_none());
     }
 
     #[test]
@@ -654,9 +686,11 @@ mod tests {
             small.with_own_size(&key(1), 1000, 800).is_none(),
             "already right"
         );
-        assert!(
-            small.with_own_size(&key(3), 1000, 800).is_none(),
-            "not in the layout"
+        let added = small.with_own_size(&key(3), 1000, 800).unwrap();
+        assert_eq!(
+            (added.tiles[2].x, added.tiles[2].y),
+            (-1000, 0),
+            "a missing tile goes beside the first, where there is room"
         );
         let taller = small.with_own_size(&key(2), 500, 900).unwrap();
         assert_eq!((taller.version, &taller.editor), (6, &key(2)));

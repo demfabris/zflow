@@ -1416,6 +1416,20 @@ fn receiver_authorized(config: &Config, peer: &str, gate: InjectionGate) -> bool
     }
 }
 
+/// Whether a batch leaves its activation closed. One batch can close an
+/// activation and open the next, so the last of those effects decides.
+fn ends_closed(effects: &[ReceiverEffect]) -> bool {
+    effects
+        .iter()
+        .rev()
+        .find_map(|effect| match effect {
+            ReceiverEffect::ActivationOpened(_) => Some(false),
+            ReceiverEffect::ActivationClosed { .. } => Some(true),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 fn claim_inbound(
     owner: &mut Option<(String, u64)>,
     peer: &str,
@@ -1985,9 +1999,7 @@ impl Shared {
             }
         }
 
-        let closed = effects
-            .iter()
-            .any(|effect| matches!(effect, ReceiverEffect::ActivationClosed { .. }));
+        let closed = ends_closed(&effects);
         let (mut deliver, mut rejected) = admitted_effects(effects, admission);
         if reverse_scroll {
             reverse_scrolling(&mut deliver);
@@ -2261,6 +2273,24 @@ mod tests {
         config.input.experimental_touchpad = true;
         let experimental = advertised_capabilities(&config);
         assert!(experimental.contains(&InputCapability::Touch));
+    }
+
+    #[test]
+    fn the_last_activation_effect_in_a_batch_decides_the_owner() {
+        let session = SessionContext {
+            session_epoch: SessionEpoch([1; 16]),
+            transport_generation: TransportGeneration(1),
+            activation_id: ActivationId(1),
+        };
+        let opened = ReceiverEffect::ActivationOpened(session);
+        let closed = ReceiverEffect::ActivationClosed {
+            session,
+            reason: SessionCloseReason::LocalRelease,
+        };
+        assert!(!ends_closed(&[]));
+        assert!(!ends_closed(std::slice::from_ref(&opened)));
+        assert!(!ends_closed(&[closed.clone(), opened.clone()]));
+        assert!(ends_closed(&[opened, closed]));
     }
 
     #[test]

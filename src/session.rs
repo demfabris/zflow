@@ -2468,6 +2468,8 @@ mod tests {
         .expect("capture time regression timed out");
     }
 
+    // Only Linux posts touch; the Mac backend drops it before this looks.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn touch_capture_times_survive_datagrams_and_checkpoint_recovery() {
         use crate::core::{ContactId, SourceDimensions, TouchContact, TouchTool};

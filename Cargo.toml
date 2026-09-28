@@ -58,6 +58,8 @@ evdev = { git = "https://github.com/cmr/evdev", rev = "7fee138a341f73b81b9c4f8c5
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.23"
+# Paused time for handoff server tests.
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"
