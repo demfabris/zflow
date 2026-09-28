@@ -4,6 +4,7 @@ mod awdl;
 mod keys;
 mod link;
 mod local_network;
+mod pointer;
 
 use std::{
     ffi::CStr,
