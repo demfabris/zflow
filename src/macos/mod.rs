@@ -865,7 +865,7 @@ fn mac_keycode_to_hid(code: u16) -> Option<HidUsage> {
         7 => 0x1b,
         8 => 0x06,
         9 => 0x19,
-        10 => 0x64, // ISO section
+        10 => 0x64, // left of Z; capture_bridge.c swaps 10 and 50 on ISO keyboards
         11 => 0x05,
         12 => 0x14,
         13 => 0x1a,
@@ -905,7 +905,7 @@ fn mac_keycode_to_hid(code: u16) -> Option<HidUsage> {
         47 => 0x37,
         48 => 0x2b,
         49 => 0x2c,
-        50 => 0x35,
+        50 => 0x35, // left of 1; capture_bridge.c swaps 10 and 50 on ISO keyboards
         51 => 0x2a,
         53 => 0x29,
         54 => 0xe7,

@@ -23,6 +23,7 @@ static bool fake_button_state(CGEventSourceStateID, CGMouseButton);
 static CGEventFlags fake_flags_state(CGEventSourceStateID);
 static Boolean fake_trusted(void);
 static Boolean fake_secure_input(void);
+static OSType fake_layout_type(SInt16);
 static Boolean fake_trusted_options(CFDictionaryRef);
 static CFMachPortRef fake_tap(CGEventTapLocation, CGEventTapPlacement,
                              CGEventTapOptions, CGEventMask,
@@ -52,6 +53,7 @@ static CFRunLoopRunResult fake_run_loop(CFRunLoopMode, CFTimeInterval, Boolean);
 #define AXIsProcessTrusted fake_trusted
 #define AXIsProcessTrustedWithOptions fake_trusted_options
 #define IsSecureEventInputEnabled fake_secure_input
+#define KBGetLayoutType fake_layout_type
 #include "../src/macos/capture_bridge.c"
 #undef CFRunLoopRunInMode
 
@@ -122,6 +124,18 @@ static Boolean fake_trusted(void) { return false; }
 
 static bool secure_input;
 static Boolean fake_secure_input(void) { return secure_input; }
+
+// Keyboard types with the layouts HIToolbox reports for them.
+enum { ANSI_KEYBOARD = 40, ISO_KEYBOARD = 41, JIS_KEYBOARD = 42 };
+
+static OSType fake_layout_type(SInt16 keyboard) {
+  switch (keyboard) {
+    case ANSI_KEYBOARD: return 0x414E5349; // 'ANSI'
+    case ISO_KEYBOARD: return ZFLOW_KEYBOARD_ISO;
+    case JIS_KEYBOARD: return 0x4A495320; // 'JIS '
+    default: return 0x3F3F3F3F; // '????'
+  }
+}
 
 static Boolean fake_trusted_options(CFDictionaryRef options) {
   assert(CFDictionaryGetValue(options, kAXTrustedCheckOptionPrompt) == kCFBooleanTrue);
@@ -403,6 +417,7 @@ static void reset(void) {
   g_return_pending = false;
   g_queue_head = g_queue_tail = 0;
   memset(g_forwarded_keys, 0, sizeof(g_forwarded_keys));
+  memset(g_forwarded_codes, 0, sizeof(g_forwarded_codes));
   memset(g_forwarded_buttons, 0, sizeof(g_forwarded_buttons));
   held_key = held_button = -1;
   tap_available = true;
@@ -673,6 +688,8 @@ static void event_tests(void) {
   // them to the other computer for keys and buttons no longer down.
   reset();
   g_forwarded_keys[4] = g_forwarded_keys[55] = true;
+  g_forwarded_codes[4] = 4;
+  g_forwarded_codes[55] = 55;
   g_forwarded_buttons[1] = g_forwarded_buttons[2] = true;
   held_key = 55;
   held_button = 1;
@@ -739,6 +756,68 @@ static void event_tests(void) {
   CFRelease(event);
 }
 
+// Sends a key from a keyboard of that type through the tap and returns the
+// code the bridge forwarded for it.
+static uint16_t tap_key(uint16_t keycode, bool down, int64_t keyboard) {
+  CGEventRef event = CGEventCreateKeyboardEvent(NULL, keycode, down);
+  assert(event);
+  CGEventSetIntegerValueField(event, kCGKeyboardEventKeyboardType, keyboard);
+  assert(event_callback(NULL, down ? kCGEventKeyDown : kCGEventKeyUp, event, NULL) == NULL);
+  CFRelease(event);
+  ZFlowMacEvent captured, extra;
+  assert(zflow_mac_capture_poll(&captured));
+  assert(captured.kind == ZFLOW_EVENT_KEY && captured.pressed == down);
+  assert(!zflow_mac_capture_poll(&extra));
+  return captured.code;
+}
+
+static void iso_key_tests(void) {
+  // macOS swaps 10 and 50 on ISO keyboards only. Swapped back, each code
+  // names one position on every layout.
+  reset();
+  const uint16_t swapped[] = {10, 50};
+  const int64_t unswapped[] = {ANSI_KEYBOARD, JIS_KEYBOARD, 0};
+  for (size_t i = 0; i < sizeof(unswapped) / sizeof(unswapped[0]); i++) {
+    for (size_t k = 0; k < 2; k++) {
+      assert(tap_key(swapped[k], true, unswapped[i]) == swapped[k]);
+      assert(tap_key(swapped[k], false, unswapped[i]) == swapped[k]);
+    }
+  }
+  for (size_t k = 0; k < 2; k++) {
+    assert(tap_key(swapped[k], true, ISO_KEYBOARD) == 60 - swapped[k]);
+    assert(tap_key(swapped[k], false, ISO_KEYBOARD) == 60 - swapped[k]);
+  }
+  assert(tap_key(42, true, ISO_KEYBOARD) == 42);
+  assert(tap_key(42, false, ISO_KEYBOARD) == 42);
+
+  // A repeat or release from after a keyboard type change keeps the code the
+  // press chose.
+  assert(tap_key(10, true, ISO_KEYBOARD) == 50);
+  assert(tap_key(10, true, ANSI_KEYBOARD) == 50);
+  assert(tap_key(10, false, ANSI_KEYBOARD) == 50);
+  assert(tap_key(50, true, ANSI_KEYBOARD) == 50);
+  assert(tap_key(50, false, ISO_KEYBOARD) == 50);
+
+  // A release lost while the tap was off has no event to read the type from.
+  // Sending the raw code would release a key the other computer never got.
+  assert(tap_key(10, true, ISO_KEYBOARD) == 50);
+  assert(tap_key(50, true, ISO_KEYBOARD) == 10);
+  g_event_tap = CFMachPortCreate(NULL, idle_port, NULL, NULL);
+  CGEventRef timeout = CGEventCreate(NULL);
+  assert(timeout);
+  assert(event_callback(NULL, kCGEventTapDisabledByTimeout, timeout, NULL) == timeout);
+  ZFlowMacEvent captured;
+  assert(zflow_mac_capture_poll(&captured));
+  assert(captured.kind == ZFLOW_EVENT_KEY && captured.code == 50 && !captured.pressed);
+  assert(zflow_mac_capture_poll(&captured));
+  assert(captured.kind == ZFLOW_EVENT_KEY && captured.code == 10 && !captured.pressed);
+  assert(!zflow_mac_capture_poll(&captured));
+  assert(!g_forwarded_keys[10] && !g_forwarded_keys[50]);
+  CFRelease(timeout);
+  CFRelease(g_event_tap);
+  g_event_tap = NULL;
+}
+
 int main(void) {
   // A capture thread that misses its stop hangs the join. Fail instead.
   alarm(30);
@@ -754,6 +833,7 @@ int main(void) {
   multitouch_tests();
   touch_tests();
   event_tests();
+  iso_key_tests();
   reset();
   tap_available = false;
   int taps = tap_calls;
