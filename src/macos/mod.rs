@@ -1,6 +1,7 @@
 //! macOS input source: native capture, and crossings over a receiver's session.
 
 mod awdl;
+mod handoff_server;
 mod inject;
 mod keys;
 mod link;
@@ -14,7 +15,7 @@ use std::{
     os::raw::c_char,
     path::PathBuf,
     pin::Pin,
-    sync::Once,
+    sync::{Mutex, Once, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -30,7 +31,7 @@ use crate::{
         ContactId, MotionDelta, PointerButton, SessionCloseReason, SessionContext,
         SourceDimensions, TouchContact, TouchState, TouchTool,
     },
-    desktop::{DesktopRequest, DesktopResponse, Point, Rect},
+    desktop::{DesktopRequest, DesktopResponse, Geometry, Point, Rect},
     session::{SessionEvent, SessionEventKind, SessionHandle},
 };
 
@@ -162,6 +163,39 @@ pub fn active_desktop_rectangles() -> Result<Vec<DesktopRect>> {
 pub fn display_generation() -> u32 {
     // SAFETY: the bridge registers its reconfiguration callback once.
     unsafe { zflow_mac_display_generation() }
+}
+
+static GEOMETRY: Mutex<Option<(u32, Geometry)>> = Mutex::new(None);
+
+/// The Mac desktop in whole points, read again only after macOS
+/// reconfigures a display or after `forget_desktop_geometry`.
+pub fn desktop_geometry() -> Result<Geometry> {
+    let generation = display_generation();
+    let mut cache = GEOMETRY.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((cached, geometry)) = cache.as_ref()
+        && *cached == generation
+    {
+        return Ok(geometry.clone());
+    }
+    let geometry = Geometry {
+        monitors: active_desktop_rectangles()?
+            .into_iter()
+            .map(|r| Rect {
+                x: r.x.round() as i32,
+                y: r.y.round() as i32,
+                width: r.width.round() as u32,
+                height: r.height.round() as u32,
+            })
+            .collect(),
+    };
+    geometry.validate()?;
+    *cache = Some((generation, geometry.clone()));
+    Ok(geometry)
+}
+
+/// Drops the cached desktop, in case a display change went unnoticed.
+pub fn forget_desktop_geometry() {
+    *GEOMETRY.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 pub fn input_is_neutral() -> bool {

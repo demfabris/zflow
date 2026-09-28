@@ -1,13 +1,10 @@
-use std::{
-    sync::{Mutex, atomic::AtomicU64},
-    time::Instant,
-};
+use std::{sync::atomic::AtomicU64, time::Instant};
 
 use anyhow::{Context, Result};
 
 use crate::{
     config::Config,
-    desktop::{Geometry, Point, Rect},
+    desktop::Point,
     macos::{self, Crossing, Links, SourceStatus},
 };
 
@@ -101,7 +98,7 @@ impl Observer {
     }
 
     pub fn enable(&mut self, config: &Config, layout: &Layout) -> Result<()> {
-        let geometry = local_geometry()?;
+        let geometry = macos::desktop_geometry()?;
         handoff::validate(layout, &geometry)?;
         for transition in layout.transitions() {
             if layout.monitors[transition.source].peer.is_none() {
@@ -189,7 +186,9 @@ impl Observer {
         let Some(running) = &mut self.running else {
             return;
         };
-        if !local_geometry().is_ok_and(|geometry| running.handoff.matches_geometry(&geometry)) {
+        if !macos::desktop_geometry()
+            .is_ok_and(|geometry| running.handoff.matches_geometry(&geometry))
+        {
             if !running.failed {
                 tracing::warn!(parent: &running.span, "crossing cancelled: Mac display geometry changed");
             }
@@ -275,7 +274,7 @@ impl Observer {
 
     fn observe(&mut self, links: &Links) -> Result<()> {
         let layout = self.layout.as_ref().context("No saved layout")?;
-        let geometry = local_geometry()?;
+        let geometry = macos::desktop_geometry()?;
         handoff::validate(layout, &geometry)?;
         let position = macos::cursor_position()?;
         let current = Point {
@@ -338,43 +337,10 @@ impl Drop for Observer {
     }
 }
 
-static GEOMETRY: Mutex<Option<(u32, Geometry)>> = Mutex::new(None);
-
-/// The Mac desktop, read again only after macOS reconfigures a display or
-/// after `forget_geometry`.
-pub(super) fn local_geometry() -> Result<Geometry> {
-    let generation = macos::display_generation();
-    let mut cache = GEOMETRY.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some((cached, geometry)) = cache.as_ref()
-        && *cached == generation
-    {
-        return Ok(geometry.clone());
-    }
-    let geometry = Geometry {
-        monitors: macos::active_desktop_rectangles()?
-            .into_iter()
-            .map(|r| Rect {
-                x: r.x.round() as i32,
-                y: r.y.round() as i32,
-                width: r.width.round() as u32,
-                height: r.height.round() as u32,
-            })
-            .collect(),
-    };
-    geometry.validate()?;
-    *cache = Some((generation, geometry.clone()));
-    Ok(geometry)
-}
-
-/// Drops the cached desktop, in case a display change went unnoticed.
-pub(super) fn forget_geometry() {
-    *GEOMETRY.lock().unwrap_or_else(|error| error.into_inner()) = None;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop::{Edge, ReturnMapping};
+    use crate::desktop::{Edge, Geometry, Rect, ReturnMapping};
     use tokio::sync::{mpsc, watch};
 
     /// An armed observer running one crossing, fed `statuses` before the

@@ -5,11 +5,11 @@ use super::{
     model::ConfigDocument,
     nearby::{BrowserStatus, NearbyBrowser},
     pairing::Pairing,
-    sharing::{self, Observer},
+    sharing::Observer,
 };
 use crate::{
     config::Config,
-    macos::{LinkState, Links, LocalNetwork},
+    macos::{self, LinkState, Links, LocalNetwork},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -319,7 +319,7 @@ impl NativeApp {
             self.maintenance = Instant::now();
             self.reload();
             // Also a fallback for display and permission changes that sent no callback.
-            sharing::forget_geometry();
+            macos::forget_desktop_geometry();
             let accessibility = self.accessibility_granted();
             if accessibility != self.accessibility {
                 tracing::info!(accessibility, "Accessibility changed");
@@ -402,7 +402,7 @@ impl NativeApp {
         if self.layout_error.is_some() {
             return Ok(());
         }
-        let Ok(local) = sharing::local_geometry().and_then(|geometry| geometry.bounds()) else {
+        let Ok(local) = macos::desktop_geometry().and_then(|geometry| geometry.bounds()) else {
             return Ok(());
         };
         let fits = |width: u32, height: u32| {
@@ -490,7 +490,7 @@ impl NativeApp {
         }
         // A computer gets its tile once it connects, so until then there is
         // nothing to drag.
-        let layout_issue = sharing::local_geometry()
+        let layout_issue = macos::desktop_geometry()
             .and_then(|g| handoff::validate(&self.layout.draft, &g))
             .err()
             .filter(|_| connected)
