@@ -216,7 +216,8 @@ pointer: the computer the pointer leaves sends its text, or one PNG image,
 to the computer it enters. Files never go, and a clip over 3 MB stays put
 with a notice. The switch is stored in `[clipboard].share`. The Mac
 settings window has the same **Share clipboard** switch; a clip too large to
-share shows as a warning under **Checks** until the next one goes.
+share shows as a warning under **Checks** until the next one goes. A copy a
+password manager marks as concealed or transient stays on the Mac.
 
 Linux stores the sharing switch in `[daemon].sharing`; pausing closes active
 input sessions and blocks sending and receiving, including pre-login input,

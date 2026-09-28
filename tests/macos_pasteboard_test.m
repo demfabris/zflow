@@ -121,6 +121,19 @@ static void *checks(void *unused) {
     assert(caption.kind == ZFLOW_CLIP_TEXT && caption.count != written);
     assert([caption.data isEqualToData:[@"caption" dataUsingEncoding:NSUTF8StringEncoding]]);
 
+    // A password manager's copy, or one meant only for a moment, stays here,
+    // though it is news.
+    for (NSString *marker in @[ CONCEALED_TYPE, TRANSIENT_TYPE ]) {
+      on_main_thread(^{
+        [board clearContents];
+        [board setString:@"hunter2" forType:NSPasteboardTypeString];
+        [board setData:[NSData data] forType:marker];
+      });
+      Read secret = read_board(&written, 1024);
+      assert(secret.status == 0 && secret.kind == ZFLOW_CLIP_EMPTY);
+      assert(!secret.data && secret.length == 0 && secret.count != written);
+    }
+
     // A PNG reads as it is.
     on_main_thread(^{
       [board clearContents];

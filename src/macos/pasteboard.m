@@ -26,6 +26,12 @@ enum {
 // managers and anyone listing its types can tell where it came from.
 static NSString *const ZFLOW_CLIP_MARKER = @"io.zflow.clip";
 
+// Password managers mark what they copy with these (nspasteboard.org), and so
+// do apps that put something on the pasteboard only for a moment. Neither is
+// meant to leave this Mac.
+static NSString *const CONCEALED_TYPE = @"org.nspasteboard.ConcealedType";
+static NSString *const TRANSIENT_TYPE = @"org.nspasteboard.TransientType";
+
 // How long a call waits for the main thread, in seconds. Tests shorten it.
 static double zflow_pasteboard_wait = 3.0;
 
@@ -77,9 +83,30 @@ static NSData *png_from_tiff(NSData *tiff) {
   return converted ? png : nil;
 }
 
+// What zflow shares from `board`: UTF-8 text if there is any, else a PNG,
+// else a TIFF, with `tiff` set. Nothing when the copy is marked concealed or
+// transient. Main thread only.
+static NSData *clip_on(NSPasteboard *board, uint32_t *kind, bool *tiff) {
+  NSArray<NSPasteboardType> *types = board.types;
+  if ([types containsObject:CONCEALED_TYPE] || [types containsObject:TRANSIENT_TYPE]) return nil;
+  NSString *text = [board stringForType:NSPasteboardTypeString];
+  NSData *found = nil;
+  if (text) {
+    found = [text dataUsingEncoding:NSUTF8StringEncoding];
+    *kind = ZFLOW_CLIP_TEXT;
+  } else if ((found = [board dataForType:NSPasteboardTypePNG])) {
+    *kind = ZFLOW_CLIP_PNG;
+  } else if ((found = [board dataForType:NSPasteboardTypeTIFF])) {
+    *kind = ZFLOW_CLIP_PNG;
+    *tiff = true;
+  }
+  return found;
+}
+
 // Reads the pasteboard `name`, or the general one when it is NULL: UTF-8
-// text if there is any, else a PNG, else a TIFF turned into a PNG. When the
-// change count is still `*unchanged_at`, reads nothing and says so in `kind`.
+// text if there is any, else a PNG, else a TIFF turned into a PNG, and
+// nothing from a password manager. When the change count is still
+// `*unchanged_at`, reads nothing and says so in `kind`.
 // `length` is the clip's size; `data` gets a copy only when that is at most
 // `limit`, to free with zflow_mac_pasteboard_free. Returns 0, or -1 when the
 // main thread did not answer in time or an image could not be converted.
@@ -105,16 +132,7 @@ int zflow_mac_pasteboard_read(const char *name, const int64_t *unchanged_at, siz
         found_kind = ZFLOW_CLIP_UNCHANGED;
         return;
       }
-      NSString *text = [board stringForType:NSPasteboardTypeString];
-      if (text) {
-        found = [text dataUsingEncoding:NSUTF8StringEncoding];
-        found_kind = ZFLOW_CLIP_TEXT;
-      } else if ((found = [board dataForType:NSPasteboardTypePNG])) {
-        found_kind = ZFLOW_CLIP_PNG;
-      } else if ((found = [board dataForType:NSPasteboardTypeTIFF])) {
-        found_kind = ZFLOW_CLIP_PNG;
-        tiff = true;
-      }
+      found = clip_on(board, &found_kind, &tiff);
     });
     if (!answered) return -1;
     *change_count = count;

@@ -145,7 +145,9 @@ Checks:
     Settings shows "Clipboard not shared: 5.0 MB is over the 3 MB limit" under
     Checks until the next clip goes. No bounce: after pasting Ubuntu's text on
     the Mac, cross to Ubuntu and back without copying; the Mac log shows no
-    "clipboard sent" line, and Ubuntu's clipboard is unchanged. Note whether
+    "clipboard sent" line, and Ubuntu's clipboard is unchanged. Copy a password
+    in 1Password and cross: Ubuntu's clipboard is unchanged, and
+    the Mac log shows no "clipboard sent" line. Note whether
     macOS 27 shows its paste privacy alert when the Mac reads the clipboard at
     a crossing, and what the alert says. Turn the switch off on the Mac: a clip
     from Ubuntu is dropped ("clipboard from peer dropped: sharing is off").
