@@ -68,6 +68,9 @@ pub enum LinkState {
     /// Connected to a peer that does not take input from this Mac, so it
     /// can only control it.
     Connected,
+    /// Connected, but the peer takes no input from this Mac for now, and
+    /// says why. It can still control this Mac, and the link keeps asking.
+    Refused(String),
     /// Not usable right now. The link keeps retrying.
     Down(String),
 }
@@ -1153,19 +1156,21 @@ async fn answered(snapshot: &mut Option<Snapshot>) -> Result<DesktopResponse> {
 /// Puts the receiver's desktop into the link state. True if it can be
 /// crossed into.
 fn show(state: &watch::Sender<LinkState>, response: Result<DesktopResponse>) -> bool {
-    let geometry = response.and_then(|response| {
+    let response = response.and_then(|response| {
         response.validate()?;
-        match response {
-            DesktopResponse::Snapshot { geometry, .. } => Ok(geometry),
-            DesktopResponse::Unavailable { reason } => bail!("{reason}"),
-            _ => bail!("Unexpected response from the other computer"),
-        }
+        Ok(response)
     });
-    let ready = geometry.is_ok();
-    state.send_replace(match geometry {
-        Ok(geometry) => LinkState::Ready(geometry),
-        Err(error) => LinkState::Down(format!("{error:#}")),
-    });
+    let (ready, shown) = match response {
+        Ok(DesktopResponse::Snapshot { geometry, .. }) => (true, LinkState::Ready(geometry)),
+        // The session works, so the peer can still control this Mac.
+        Ok(DesktopResponse::Unavailable { reason }) => (false, LinkState::Refused(reason)),
+        Ok(_) => (
+            false,
+            LinkState::Down("Unexpected response from the other computer".into()),
+        ),
+        Err(error) => (false, LinkState::Down(format!("{error:#}"))),
+    };
+    state.send_replace(shown);
     ready
 }
 
@@ -1939,6 +1944,39 @@ mod tests {
         wait_until(&mut links, ready);
         assert!(!linux.is_closed());
         assert!(receiver.closed.try_recv().is_err());
+        drop(links);
+    }
+
+    #[test]
+    fn a_peer_that_takes_no_input_from_this_mac_stays_connected() {
+        let Pair {
+            mut links,
+            mut receiver,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|_| {});
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        receiver
+            .hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        links.retry();
+        let (_, reply) = held(&server, &mut receiver, Duration::from_secs(2))
+            .expect("the Mac asked for the desktop");
+        receiver
+            .hold
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Linux's answer when its switch for this Mac is off, or it is locked.
+        let reason = "Desktop control requires the active unlocked local session and an authorized paired peer";
+        let _ = reply.send(DesktopResponse::unavailable(reason));
+        wait_until(&mut links, |links| {
+            links
+                .states()
+                .any(|(_, state)| state == LinkState::Refused(reason.into()))
+        });
+        // The link keeps asking, and crosses again once the peer takes input.
+        wait_until(&mut links, ready);
+        assert!(!linux.is_closed());
         drop(links);
     }
 

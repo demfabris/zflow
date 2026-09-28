@@ -545,10 +545,12 @@ impl NativeApp {
             return Ok(());
         }
         let size = (local.width, local.height);
-        let connected = self
-            .links
-            .states()
-            .any(|(_, state)| matches!(state, LinkState::Ready(_) | LinkState::Connected));
+        let connected = self.links.states().any(|(_, state)| {
+            matches!(
+                state,
+                LinkState::Ready(_) | LinkState::Connected | LinkState::Refused(_)
+            )
+        });
         if self.shared.draft.layout.is_none() {
             self.arrange(size)?;
             if !connected {
@@ -691,7 +693,8 @@ impl NativeApp {
         let checking = !connected && peers.iter().any(|p| p.state == PeerState::Connecting);
         let mut health = vec![self.sharing_health(sharing)];
         if sharing {
-            health.extend(link_health(&peers));
+            let refused = refusals(self.links.states(), controller.as_deref());
+            health.extend(link_health(&peers, &refused));
             // The Mac still dials, so peers can control it over that.
             if let Some(error) = self.links.listen_error() {
                 health.push(Health::new(
@@ -880,7 +883,9 @@ fn peer_rows<'a>(
             let (state, error) = match links.remove(name.as_str()) {
                 _ if controlled == Some(name) => (PeerState::ControlledFromHere, None),
                 _ if controller == Some(name) => (PeerState::ControllingThis, None),
-                Some(LinkState::Ready(_) | LinkState::Connected) => (PeerState::Connected, None),
+                Some(LinkState::Ready(_) | LinkState::Connected | LinkState::Refused(_)) => {
+                    (PeerState::Connected, None)
+                }
                 Some(LinkState::Connecting) => (PeerState::Connecting, None),
                 Some(LinkState::Down(error)) => (PeerState::Unreachable, Some(error)),
                 None => (PeerState::Paired, None),
@@ -894,10 +899,27 @@ fn peer_rows<'a>(
         .collect()
 }
 
-/// One row for the links to paired computers, with a retry when one is down.
-/// Called only while sharing is on, so a computer without a link is one that
-/// does not take input from this Mac.
-fn link_health(peers: &[Peer]) -> Option<Health> {
+/// Why connected computers take no input from this Mac right now. The one
+/// controlling this Mac refuses while it sends, so it is left out.
+fn refusals<'a>(
+    links: impl Iterator<Item = (&'a str, LinkState)>,
+    controller: Option<&str>,
+) -> Vec<String> {
+    links
+        .filter(|(name, _)| Some(*name) != controller)
+        .filter_map(|(name, state)| match state {
+            LinkState::Refused(reason) => {
+                Some(format!("{name} takes no input from this Mac: {reason}"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// One row for the links to paired computers, with a retry when one is down
+/// or `refused` input from this Mac. Called only while sharing is on, so a
+/// computer without a link is one that does not take input from this Mac.
+fn link_health(peers: &[Peer], refused: &[String]) -> Option<Health> {
     if peers.is_empty() {
         return None;
     }
@@ -911,6 +933,12 @@ fn link_health(peers: &[Peer]) -> Option<Health> {
         Health {
             action: Some(retry()),
             ..Health::new("computers", Level::Error, title, down.join("\n"))
+        }
+    } else if !refused.is_empty() {
+        // Connected all the same, so they can still control this Mac.
+        Health {
+            action: Some(retry()),
+            ..Health::new("computers", Level::Warning, title, refused.join("\n"))
         }
     } else if peers.iter().all(|peer| peer.state == PeerState::Paired) {
         Health::new(
@@ -1260,7 +1288,7 @@ mod tests {
                 ("off", PeerState::Paired, "Paired"),
             ]
         );
-        let row = link_health(&peers).unwrap();
+        let row = link_health(&peers, &[]).unwrap();
         assert_eq!(
             (row.level, row.detail.as_str()),
             (Level::Error, "down: connection refused")
@@ -1269,10 +1297,10 @@ mod tests {
         let status = Status::new(Some(true), &peers, &[row], false);
         assert_eq!(status.title, "Controlling busy");
         let fine = &peers[..2];
-        assert_eq!(link_health(fine).unwrap().level, Level::Ok);
-        assert!(link_health(&[]).is_none());
+        assert_eq!(link_health(fine, &[]).unwrap().level, Level::Ok);
+        assert!(link_health(&[], &[]).is_none());
         // Sharing is on, but no computer takes input from this Mac.
-        let unlinked = link_health(&peers[4..]).unwrap();
+        let unlinked = link_health(&peers[4..], &[]).unwrap();
         assert_eq!(unlinked.level, Level::Error);
         assert!(unlinked.action.is_none());
 
@@ -1286,5 +1314,20 @@ mod tests {
         );
         let status = Status::new(Some(true), &peers[..2], &[], false);
         assert_eq!(status.title, "Controlled by busy");
+
+        // A computer that takes no input from this Mac can still control it.
+        let links = [
+            ("busy", LinkState::Refused("sending".into())),
+            ("desk", LinkState::Refused("locked".into())),
+        ];
+        let refused = refusals(links.clone().into_iter(), Some("busy"));
+        assert_eq!(refused, ["desk takes no input from this Mac: locked"]);
+        let peers = peer_rows(&config, links.into_iter(), None, Some("busy"));
+        assert_eq!(peers[1].state, PeerState::Connected);
+        let row = link_health(&peers[..2], &refused).unwrap();
+        assert_eq!(row.level, Level::Warning);
+        assert_eq!(row.action.as_ref().unwrap().command, "retry");
+        let status = Status::new(Some(true), &peers[1..2], &[row], false);
+        assert_eq!(status.title, "Ready");
     }
 }
