@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::identity::encode_hex;
+use crate::{core::KeyboardMode, identity::encode_hex};
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const MAX_LEASE: Duration = Duration::from_secs(1);
@@ -183,6 +183,10 @@ pub struct PeerConfig {
     pub addresses: Vec<SocketAddr>,
     #[serde(default)]
     pub permissions: PeerPermissions,
+    /// How keys from this peer act here. Left out while standard, so a file
+    /// that never changes it still loads in older binaries.
+    #[serde(default, skip_serializing_if = "KeyboardMode::is_standard")]
+    pub keyboard: KeyboardMode,
 }
 
 impl PeerConfig {
@@ -196,6 +200,7 @@ impl PeerConfig {
             spki_der_hex: encode_hex(spki),
             addresses,
             permissions,
+            keyboard: KeyboardMode::Standard,
         })
     }
 
@@ -535,11 +540,34 @@ mod tests {
                 spki_der_hex: "not hex".into(),
                 addresses: Vec::new(),
                 permissions: PeerPermissions::default(),
+                keyboard: KeyboardMode::Standard,
             },
         );
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
 
         assert!(PeerConfig::from_spki(&[], Vec::new(), PeerPermissions::default()).is_err());
+    }
+
+    #[test]
+    fn peer_keyboard_is_saved_only_when_it_changes() {
+        let mut config = Config::default();
+        let peer = PeerConfig::from_spki(b"key", Vec::new(), PeerPermissions::default()).unwrap();
+        config.peers.insert("desk".into(), peer);
+        let standard = toml::to_string_pretty(&config).unwrap();
+        assert!(!standard.contains("keyboard"));
+
+        config.peers.get_mut("desk").unwrap().keyboard = KeyboardMode::Mac;
+        let mac = toml::to_string_pretty(&config).unwrap();
+        assert!(mac.contains("keyboard = \"mac\""));
+        assert_eq!(toml::from_str::<Config>(&mac).unwrap(), config);
+
+        let unknown = mac.replace("keyboard = \"mac\"", "keyboard = \"dvorak\"");
+        assert!(toml::from_str::<Config>(&unknown).is_err());
+
+        // A hand edit may copy the CLI's spelling.
+        let dashed = mac.replace("keyboard = \"mac\"", "keyboard = \"pc-positions\"");
+        let dashed = toml::from_str::<Config>(&dashed).unwrap();
+        assert_eq!(dashed.peers["desk"].keyboard, KeyboardMode::PcPositions);
     }
 
     #[cfg(unix)]

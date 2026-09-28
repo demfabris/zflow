@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, PeerConfig};
+use crate::{
+    config::{Config, PeerConfig},
+    core::KeyboardMode,
+};
 
 pub const SOCKET_PATH: &str = "/run/zflow-gui/peers.sock";
 
@@ -17,6 +20,15 @@ pub enum Request {
     },
     Forget {
         name: String,
+    },
+    SetKeyboard {
+        name: String,
+        mode: KeyboardMode,
+    },
+    /// Whether the focused desktop app is a terminal. The desktop agent sends
+    /// this; it never leaves this computer.
+    Focus {
+        terminal: bool,
     },
     Desktop {},
     /// Listens and shows a fresh setup code, or connects to `remote` with the
@@ -131,6 +143,9 @@ mod tests {
             r#"{"command":"snapshot"}"#,
             r#"{"command":"pair","remote":null,"identity":"attacker"}"#,
             r#"{"command":"pair","remote":null,"code":null,"name":"desk","permissions":{"inject_prelogin":true}}"#,
+            r#"{"command":"set_keyboard","name":"desk","mode":"dvorak"}"#,
+            r#"{"command":"set_keyboard","name":"desk","mode":"mac","permissions":{"inject_prelogin":true}}"#,
+            r#"{"command":"focus","terminal":true,"peer":"desk"}"#,
         ] {
             assert!(serde_json::from_str::<Request>(json).is_err());
         }
@@ -146,5 +161,27 @@ mod tests {
         assert!(value.get("peers").is_some());
         assert_eq!(value["discovery"], false);
         assert!(!value.to_string().contains("identity-location"));
+    }
+
+    #[test]
+    fn focus_parses_and_stays_out_of_status() {
+        assert!(matches!(
+            serde_json::from_str(r#"{"command":"focus","terminal":true}"#).unwrap(),
+            Request::Focus { terminal: true }
+        ));
+        assert!(matches!(
+            serde_json::from_str(
+                r#"{"command":"set_keyboard","name":"desk","mode":"pc_positions"}"#
+            )
+            .unwrap(),
+            Request::SetKeyboard {
+                mode: KeyboardMode::PcPositions,
+                ..
+            }
+        ));
+        let value = serde_json::to_value(DesktopStatus::from_config(&Config::default())).unwrap();
+        for field in ["focus", "terminal"] {
+            assert!(value.get(field).is_none());
+        }
     }
 }

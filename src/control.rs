@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     config::{PeerConfig, PeerPermissions},
+    core::KeyboardMode,
     metrics::SessionMetricsSnapshot,
 };
 
@@ -31,6 +32,10 @@ pub enum Request {
     SetPeerPermissions {
         peer: String,
         permissions: PeerPermissions,
+    },
+    SetPeerKeyboard {
+        peer: String,
+        keyboard: KeyboardMode,
     },
 }
 

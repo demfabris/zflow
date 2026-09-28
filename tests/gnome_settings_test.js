@@ -23,6 +23,7 @@ const snapshot = {
 };
 let failSharing = false;
 let callCount = 0;
+let keyboardCalls = 0;
 const xml = '<node><interface name="io.zflow.Desktop"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>';
 const object = Gio.DBusExportedObject.wrapJSObject(xml, {
     Call(json) {
@@ -36,6 +37,12 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
             break;
         case 'set_autostart': snapshot.autostart = request.enabled; break;
         case 'forget': delete snapshot.daemon.peers[request.name]; break;
+        case 'set_keyboard':
+            keyboardCalls++;
+            // The daemon leaves the default out of the peer record.
+            if (request.mode === 'standard') delete snapshot.daemon.peers[request.name].keyboard;
+            else snapshot.daemon.peers[request.name].keyboard = request.mode;
+            break;
         case 'pair':
             if (request.remote === null) {
                 snapshot.pairing = {state: 'listening', code: '482 913'};
@@ -67,6 +74,19 @@ app.connect('activate', () => {
         const firstRow = settings._peerRows[0];
         await settings.client.refresh();
         assert(settings._peerRows[0] === firstRow, 'refresh must preserve keyboard focus');
+        const keyboard = settings._keyboards.get('MacBook');
+        assert(keyboard.selected === 0, 'a peer without a keyboard mode shows standard keys');
+        keyboard.selected = 2;
+        assert(!keyboard.sensitive, 'a request in flight locks the dropdown instead of dropping a choice');
+        // Times out if the dropdown stays locked after the request.
+        await waitFor(() => snapshot.daemon.peers.MacBook.keyboard === 'mac' && !settings._busy && keyboard.sensitive);
+        keyboard.selected = 0;
+        await waitFor(() => snapshot.daemon.peers.MacBook.keyboard === undefined && !settings._busy);
+        assert(keyboardCalls === 2, 'each choice sends set_keyboard once');
+        snapshot.daemon.peers.MacBook.keyboard = 'pc_positions';
+        await waitFor(() => keyboard.selected === 1);
+        assert(keyboardCalls === 2, 'a snapshot moves the dropdown without sending a request');
+        assert(settings._peerRows[0] === firstRow && settings._keyboards.get('MacBook') === keyboard, 'a keyboard change keeps the row');
         settings._sharing.active = false;
         await waitFor(() => !snapshot.daemon.sharing && !settings._busy);
         assert(settings._status.title === 'Sharing paused', 'pause reaches daemon and refreshes status');
@@ -111,7 +131,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, focus, pause, rollback, login, pairing, first-run pairing, forget, offline and cleanup passed');
+        print('GTK settings: status, focus, keyboard mode, pause, rollback, login, pairing, first-run pairing, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

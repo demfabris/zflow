@@ -151,22 +151,127 @@ async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Res
     };
     tracing::info!("desktop agent ready");
 
+    let report = async |terminal| {
+        let request = crate::peer_view::Request::Focus { terminal };
+        if let Err(error) = crate::peer_view::request(&request).await {
+            tracing::debug!(error = %format_args!("{error:#}"), "desktop focus not sent");
+        }
+    };
+    // The daemon forgets the focus when this stream closes, however this ends.
+    tokio::select! {
+        result = serve(&mut stream, &proxy, &bus, &owner) => result,
+        result = forward_focus(connection, &proxy, owner.as_str(), report) => result,
+    }
+}
+
+/// Answers the daemon's desktop requests through GNOME Shell.
+#[cfg(target_os = "linux")]
+async fn serve(
+    stream: &mut tokio::net::UnixStream,
+    proxy: &zbus::Proxy<'_>,
+    bus: &zbus::fdo::DBusProxy<'_>,
+    owner: &zbus::names::OwnedUniqueName,
+) -> anyhow::Result<()> {
+    use crate::desktop::{DesktopRequest, DesktopResponse};
     loop {
-        let request: DesktopRequest = crate::control::read_message(&mut stream).await?;
+        let request: DesktopRequest = crate::control::read_message(stream).await?;
         request.validate()?;
-        let response = match call(&proxy, &request).await {
+        let response = match call(proxy, &request).await {
             Ok(response) => response,
             Err(error) => {
                 // A restarted Shell has a new unique name; start over to find and check it.
-                ensure!(
-                    bus.name_has_owner((&owner).into()).await?,
+                anyhow::ensure!(
+                    bus.name_has_owner(owner.into()).await?,
                     "GNOME Shell restarted"
                 );
                 DesktopResponse::unavailable(format!("GNOME integration unavailable: {error}"))
             }
         };
-        crate::control::write_message(&mut stream, &response).await?;
+        crate::control::write_message(stream, &response).await?;
     }
+}
+
+/// Reports whether a terminal has focus, first as it is now and then on every
+/// change, so Mac shortcuts can use Ctrl+Shift there. Returns only on error.
+#[cfg(target_os = "linux")]
+async fn forward_focus(
+    connection: &zbus::Connection,
+    proxy: &zbus::Proxy<'_>,
+    owner: &str,
+    mut report: impl AsyncFnMut(bool),
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use zbus::{MatchRule, MessageStream, message::Type};
+    // The extension sends this only to the agent. Anyone can address the
+    // agent, so accept it only from Shell.
+    let changes = MatchRule::builder()
+        .msg_type(Type::Signal)
+        .sender(owner)?
+        .path(crate::desktop::OBJECT_PATH)?
+        .interface(crate::desktop::BUS_NAME)?
+        .member("FocusChanged")?
+        .build();
+    let owners = MatchRule::builder()
+        .msg_type(Type::Signal)
+        .sender("org.freedesktop.DBus")?
+        .interface("org.freedesktop.DBus")?
+        .member("NameOwnerChanged")?
+        .arg(0, crate::desktop::BUS_NAME)?
+        .build();
+    // Subscribe before asking, so no change falls in between.
+    let mut changes = MessageStream::for_match_rule(changes, connection, None).await?;
+    let mut owners = MessageStream::for_match_rule(owners, connection, None).await?;
+    let mut terminal = focus(proxy).await;
+    loop {
+        report(terminal).await;
+        terminal = tokio::select! {
+            message = next_message(&mut changes) => {
+                message.context("The session bus closed")??.body().deserialize::<bool>()?
+            }
+            message = next_message(&mut owners) => {
+                let message = message.context("The session bus closed")??;
+                let body = message.body();
+                let (_, _, new): (&str, &str, &str) = body.deserialize()?;
+                // Shell drops the name while the extension is off, such as
+                // on the lock screen, and takes it again after.
+                match new {
+                    "" => false,
+                    new if new == owner => focus(proxy).await,
+                    _ => anyhow::bail!("GNOME Shell restarted"),
+                }
+            }
+        };
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn next_message(stream: &mut zbus::MessageStream) -> Option<zbus::Result<zbus::Message>> {
+    use zbus::export::futures_core::Stream;
+    std::future::poll_fn(|context| std::pin::Pin::new(&mut *stream).poll_next(context)).await
+}
+
+/// Whether a terminal has focus, or false when the extension cannot say.
+#[cfg(target_os = "linux")]
+async fn focus(proxy: &zbus::Proxy<'_>) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum Reply {
+        Focus { terminal: bool },
+    }
+    let reply = async {
+        let json: String = tokio::time::timeout(
+            std::time::Duration::from_millis(450),
+            proxy.call("Call", &(r#"{"command":"focus"}"#,)),
+        )
+        .await??;
+        let Reply::Focus { terminal } = serde_json::from_str(&json)?;
+        anyhow::Ok(terminal)
+    }
+    .await;
+    reply.unwrap_or_else(|error| {
+        tracing::debug!(error = %format_args!("{error:#}"), "GNOME focus unavailable");
+        false
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -362,5 +467,93 @@ mod tests {
             *callers.lock().unwrap(),
             [agent.unique_name().unwrap().to_string()]
         );
+    }
+
+    struct FocusShell;
+
+    #[zbus::interface(name = "org.gnome.Shell.Extensions.Zflow")]
+    impl FocusShell {
+        fn call(&self, json: &str) -> String {
+            assert_eq!(json, r#"{"command":"focus"}"#);
+            r#"{"status":"focus","terminal":true}"#.into()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
+    async fn focus_follows_shell_signals_and_owner() {
+        use crate::desktop::{BUS_NAME, OBJECT_PATH};
+        let agent = zbus::Connection::session().await.unwrap();
+        let shell = zbus::connection::Builder::session()
+            .unwrap()
+            .serve_at(OBJECT_PATH, FocusShell)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        shell.request_name(BUS_NAME).await.unwrap();
+        let owner = shell.unique_name().unwrap().to_owned();
+        let impostor = zbus::Connection::session().await.unwrap();
+        let (sent, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let forward = tokio::spawn({
+            let agent = agent.clone();
+            let owner = owner.clone();
+            async move {
+                let proxy = zbus::Proxy::new(&agent, owner.clone(), OBJECT_PATH, BUS_NAME)
+                    .await
+                    .unwrap();
+                // Not an async closure: its future would borrow `sent`, and
+                // tokio::spawn cannot prove that Send.
+                let report = move |terminal| {
+                    sent.send(terminal).unwrap();
+                    std::future::ready(())
+                };
+                forward_focus(&agent, &proxy, owner.as_str(), report).await
+            }
+        });
+        let emit = async |from: &zbus::Connection, terminal: bool| {
+            from.emit_signal(
+                agent.unique_name(),
+                OBJECT_PATH,
+                BUS_NAME,
+                "FocusChanged",
+                &(terminal,),
+            )
+            .await
+            .unwrap();
+        };
+        assert_eq!(reports.recv().await, Some(true), "asks once at the start");
+        emit(&shell, false).await;
+        assert_eq!(reports.recv().await, Some(false));
+        emit(&impostor, true).await;
+        // The bus has handled the impostor's signal once this returns.
+        zbus::fdo::DBusProxy::new(&impostor)
+            .await
+            .unwrap()
+            .get_id()
+            .await
+            .unwrap();
+        emit(&shell, false).await;
+        assert_eq!(reports.recv().await, Some(false), "only Shell is heard");
+        emit(&shell, true).await;
+        assert_eq!(reports.recv().await, Some(true));
+        shell.release_name(BUS_NAME).await.unwrap();
+        assert_eq!(
+            reports.recv().await,
+            Some(false),
+            "no extension, no terminal"
+        );
+        shell.request_name(BUS_NAME).await.unwrap();
+        assert_eq!(
+            reports.recv().await,
+            Some(true),
+            "asks again when it returns"
+        );
+        shell.release_name(BUS_NAME).await.unwrap();
+        impostor.request_name(BUS_NAME).await.unwrap();
+        assert_eq!(reports.recv().await, Some(false));
+        let error = forward.await.unwrap().unwrap_err();
+        assert_eq!(format!("{error:#}"), "GNOME Shell restarted");
+        assert_eq!(reports.recv().await, None);
     }
 }

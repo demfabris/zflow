@@ -24,6 +24,7 @@ use serde::Serialize;
 use crate::{
     config::{Config, PeerConfig, PeerPermissions, PlayoutMode},
     control::{DaemonStatus, Request, Response, read_message, write_message},
+    core::KeyboardMode,
     identity::Identity,
 };
 
@@ -126,6 +127,12 @@ enum PeerCommand {
         #[arg(action = ArgAction::Set, value_parser = on_off())]
         value: bool,
     },
+    /// Choose how keys from a peer act here, from its next crossing.
+    Keyboard {
+        peer: String,
+        #[arg(value_parser = keyboard_mode())]
+        mode: KeyboardMode,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -164,6 +171,14 @@ enum PairCommand {
 
 fn on_off() -> impl TypedValueParser<Value = bool> {
     PossibleValuesParser::new(["on", "off"]).map(|value| value == "on")
+}
+
+fn keyboard_mode() -> impl TypedValueParser<Value = KeyboardMode> {
+    PossibleValuesParser::new(["standard", "pc-positions", "mac"]).map(|mode| match mode.as_str() {
+        "pc-positions" => KeyboardMode::PcPositions,
+        "mac" => KeyboardMode::Mac,
+        _ => KeyboardMode::Standard,
+    })
 }
 
 fn playout_mode() -> impl TypedValueParser<Value = PlayoutMode> {
@@ -231,6 +246,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Peer { command } => match command {
             PeerCommand::Revoke { peer } => revoke_peer(path, peer),
             PeerCommand::AllowPrelogin { peer, value } => allow_prelogin(path, peer, value),
+            PeerCommand::Keyboard { peer, mode } => set_peer_keyboard(path, peer, mode),
         },
         Command::Switch { peer } => daemon_command(path, Request::Activate { peer }),
         Command::Local => daemon_command(path, Request::Local),
@@ -798,6 +814,46 @@ fn doctor_linux(config: &Config, failed: &mut bool) {
     if config.input.allow_prelogin_input {
         doctor_prelogin_ordering(failed);
     }
+
+    if config
+        .peers
+        .values()
+        .any(|peer| !peer.keyboard.is_standard())
+        && let Ok(devices) = fs::read_to_string("/proc/bus/input/devices")
+    {
+        for remapper in keyboard_remappers(&devices) {
+            println!(
+                "warn keyboard remapper: {remapper} may also remap zflow's keyboard; scope it away from \"{}\" (vendor {:04x}, product {:04x})",
+                crate::linux::ZFLOW_KEYBOARD_NAME,
+                crate::linux::ZFLOW_VENDOR_ID,
+                crate::linux::ZFLOW_KEYBOARD_PRODUCT_ID
+            );
+        }
+    }
+}
+
+/// Remappers that grab every keyboard, by the name of the virtual keyboard
+/// they add. xremap may append its pid.
+#[cfg(target_os = "linux")]
+const KEYBOARD_REMAPPERS: &[(&str, &str)] = &[
+    ("XWayKeyz (virtual) Keyboard", "Toshy"),
+    ("keyd virtual keyboard", "keyd"),
+    ("xremap", "xremap"),
+    ("kanata", "kanata"),
+];
+
+/// The remappers whose keyboard is listed in /proc/bus/input/devices.
+#[cfg(target_os = "linux")]
+fn keyboard_remappers(devices: &str) -> Vec<&'static str> {
+    let names = devices
+        .lines()
+        .filter_map(|line| line.strip_prefix("N: Name=\"")?.strip_suffix('"'))
+        .collect::<Vec<_>>();
+    KEYBOARD_REMAPPERS
+        .iter()
+        .filter(|(device, _)| names.iter().any(|name| name.starts_with(device)))
+        .map(|&(_, remapper)| remapper)
+        .collect()
 }
 
 /// The udev property the packaged rule sets on the virtual touchpad. Without
@@ -1494,6 +1550,25 @@ fn allow_prelogin(path: PathBuf, peer: String, allowed: bool) -> Result<()> {
     Ok(())
 }
 
+fn set_peer_keyboard(path: PathBuf, peer: String, keyboard: KeyboardMode) -> Result<()> {
+    let mut config = Config::load(&path)?;
+    let Some(record) = config.peers.get_mut(&peer) else {
+        bail!("unknown peer {peer}");
+    };
+    record.keyboard = keyboard;
+    if config.daemon.control_socket.exists() {
+        return daemon_command(path, Request::SetPeerKeyboard { peer, keyboard });
+    }
+    config.save(&path)?;
+    let name = match keyboard {
+        KeyboardMode::Standard => "standard",
+        KeyboardMode::PcPositions => "pc-positions",
+        KeyboardMode::Mac => "mac",
+    };
+    println!("keyboard for {peer}: {name}");
+    Ok(())
+}
+
 fn daemon_command(path: PathBuf, request: Request) -> Result<()> {
     let config = Config::load(&path)?;
     match daemon_request(&config.daemon.control_socket, request)? {
@@ -1601,6 +1676,31 @@ mod tests {
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(require_group_access(&fs::metadata(&path).unwrap(), group, 0o040).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_finds_keyboard_remappers_in_the_input_device_list() {
+        let devices = "\
+I: Bus=0003 Vendor=05ac Product=024f Version=0111
+N: Name=\"Apple Internal Keyboard\"
+P: Phys=usb-0000:00:14.0-1/input0
+
+I: Bus=0006 Vendor=1209 Product=5a01 Version=0001
+N: Name=\"zflow remote keyboard\"
+
+I: Bus=0003 Vendor=1234 Product=5678 Version=0001
+N: Name=\"xremap pid=4242\"
+
+I: Bus=0010 Vendor=0fac Product=0ade Version=0001
+N: Name=\"keyd virtual keyboard\"
+";
+        assert_eq!(keyboard_remappers(devices), ["keyd", "xremap"]);
+        assert_eq!(
+            keyboard_remappers("N: Name=\"XWayKeyz (virtual) Keyboard\"\n"),
+            ["Toshy"]
+        );
+        assert!(keyboard_remappers("N: Name=\"zflow remote keyboard\"\n").is_empty());
     }
 
     #[cfg(target_os = "linux")]
@@ -1778,6 +1878,67 @@ mod tests {
 
         assert_eq!(daemon.join().unwrap(), Request::ReloadConfig);
         assert!(Config::load(&path).unwrap().input.experimental_touchpad);
+    }
+
+    #[test]
+    fn peer_keyboard_saves_offline_and_asks_a_running_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let socket = directory.path().join("zflowd.sock");
+        let mut config = Config::default();
+        config.daemon.state_dir = directory.path().join("state");
+        config.daemon.control_socket = socket.clone();
+        let record =
+            PeerConfig::from_spki(b"peer public key", Vec::new(), PeerPermissions::default())
+                .unwrap();
+        config.peers.insert("desk".into(), record);
+        config.save(&path).unwrap();
+        let keyboard = |peer: &str, mode: &str| {
+            let config = path.to_str().unwrap();
+            run(
+                Cli::try_parse_from(["zflow", "--config", config, "peer", "keyboard", peer, mode])
+                    .unwrap(),
+            )
+        };
+
+        assert!(keyboard("laptop", "mac").is_err());
+        keyboard("desk", "pc-positions").unwrap();
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.peers["desk"].keyboard, KeyboardMode::PcPositions);
+        assert!(
+            Cli::try_parse_from(["zflow", "peer", "keyboard", "desk", "pc_positions"]).is_err()
+        );
+
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let daemon = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                    let (mut stream, _) =
+                        tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                            .await
+                            .expect("the CLI never asked the daemon")
+                            .unwrap();
+                    let request: Request = read_message(&mut stream).await.unwrap();
+                    write_message(&mut stream, &Response::Ack).await.unwrap();
+                    request
+                })
+        });
+
+        keyboard("desk", "mac").unwrap();
+        assert_eq!(
+            daemon.join().unwrap(),
+            Request::SetPeerKeyboard {
+                peer: "desk".into(),
+                keyboard: KeyboardMode::Mac,
+            }
+        );
+        // The daemon saves what it applies.
+        assert_eq!(Config::load(&path).unwrap(), saved);
     }
 
     #[test]

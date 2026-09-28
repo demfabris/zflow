@@ -25,8 +25,8 @@ use crate::{
         write_message,
     },
     core::{
-        ActivationId, InputCapability, ReceiverEffect, SessionCloseReason, SessionContext,
-        SessionEpoch, TransportGeneration,
+        ActivationId, InputCapability, KeyboardMode, ReceiverEffect, SessionCloseReason,
+        SessionContext, SessionEpoch, TransportGeneration,
     },
     discovery::{Advertisement, Discovery, DiscoveryError},
     identity::{Identity, encode_hex},
@@ -722,6 +722,17 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
                 .get_mut(&peer)
                 .with_context(|| format!("unknown peer {peer}"))?
                 .permissions = permissions;
+            shared.apply_config_locked(config, true).await?;
+            Ok(Response::Ack)
+        }
+        Request::SetPeerKeyboard { peer, keyboard } => {
+            let _mutation = shared.config_mutation.lock().await;
+            let mut config = shared.config.read().await.clone();
+            config
+                .peers
+                .get_mut(&peer)
+                .with_context(|| format!("unknown peer {peer}"))?
+                .keyboard = keyboard;
             shared.apply_config_locked(config, true).await?;
             Ok(Response::Ack)
         }
@@ -1440,9 +1451,13 @@ impl Shared {
         };
 
         let gate = *self.seat_gate.read().await;
-        let admission = {
+        let (admission, keyboard) = {
             let config = self.config.read().await;
-            admit(&config, peer, gate)
+            let keyboard = config
+                .peers
+                .get(peer)
+                .map_or(KeyboardMode::Standard, |record| record.keyboard);
+            (admit(&config, peer, gate), keyboard)
         };
         let permitted = admission != Admission::Refuse;
         if opens {
@@ -1469,6 +1484,8 @@ impl Shared {
             let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
             let command = RuntimeCommand::ReceiverEffects {
                 effects: deliver,
+                // Read once per activation, so a change applies at the next one.
+                keyboard: opens.then_some(keyboard),
                 touch_captured_at,
                 applied: Some(applied_tx),
             };
@@ -1751,6 +1768,7 @@ mod tests {
                     receive_normal: false,
                     inject_prelogin: false,
                 },
+                keyboard: KeyboardMode::Standard,
             },
         );
         assert!(receiver_authorized(
@@ -1838,6 +1856,7 @@ mod tests {
                     receive_normal: false,
                     inject_prelogin: false,
                 },
+                keyboard: KeyboardMode::Standard,
             },
         );
         config

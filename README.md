@@ -95,6 +95,33 @@ reads its desktop, and reuses the connection for every crossing. A lost
 connection reconnects on its own; emergency pause stays paused.
 GNOME must be unlocked. Other Linux desktops do not yet supply this return path.
 
+## Keyboard modes
+
+The Linux receiver keeps a keyboard mode for each paired computer. A change
+applies from that computer's next crossing.
+
+- **Standard keys** (`standard`, the default): keys arrive as sent. A Mac's
+  Cmd is Super and Option is Alt.
+- **PC key positions** (`pc-positions`): Option and Cmd trade places, so each
+  key does what the PC key in that spot does.
+- **Mac shortcuts** (`mac`): Cmd acts as Ctrl, plus common macOS shortcuts
+  such as Cmd+Tab, Option+arrows and Cmd+arrows. With the GNOME integration
+  running, Cmd+C and Cmd+V in a terminal copy and paste with Ctrl+Shift+C and
+  Ctrl+Shift+V. Without it, Cmd+C in a terminal is Ctrl+C.
+
+Choose the mode from the dropdown beside each computer in the GNOME settings
+window, or from the CLI:
+
+```sh
+sudo zflow peer keyboard desk mac
+```
+
+Toshy, keyd, xremap and kanata also grab `zflow remote keyboard`, so use
+`standard` with them or keep them off it. Toshy takes it for a PC keyboard; set
+`keyboards_UserCustom_dct = {'zflow remote keyboard': 'Apple'}` in its config.
+To keep keyd off it, add `-1209:5a01` under `[ids]`. `zflow doctor` warns when
+it finds one of them while a computer uses another mode.
+
 ## Settings and configuration
 
 The native window exposes computer pairing and arrangement, **Block AWDL while
@@ -117,10 +144,11 @@ comments. External edits reload automatically; invalid edits display an error
 while the last valid configuration stays in use. Conflicting writes fail instead
 of overwriting an external edit.
 
-The GNOME window exposes sharing, pairing, forgetting computers, and **Start at
-Login**. Its panel menu shows the current sender or receiver and a sharing
-switch. The extension preferences show the same GTK settings. Closing either
-window leaves the desktop agent running. Pairing closes when its dialog closes.
+The GNOME window exposes sharing, pairing, keyboard modes, forgetting
+computers, and **Start at Login**. Its panel menu shows the current sender or
+receiver and a sharing switch. The extension preferences show the same GTK
+settings. Closing either window leaves the desktop agent running. Pairing
+closes when its dialog closes.
 
 Linux stores the sharing switch in `[daemon].sharing`; pausing closes active
 input sessions and blocks sending and receiving, including pre-login input,

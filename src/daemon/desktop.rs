@@ -37,7 +37,12 @@ pub(super) struct Hub {
 }
 
 impl Hub {
-    async fn disconnected(&self, id: u64, sessions: &Mutex<BTreeMap<String, SessionHandle>>) {
+    async fn disconnected(
+        &self,
+        id: u64,
+        sessions: &Mutex<BTreeMap<String, SessionHandle>>,
+        runtime: &LinuxRuntimeControl,
+    ) {
         let lease = {
             let mut broker = self.broker.lock().await;
             if broker.as_ref().is_none_or(|(current, _)| *current != id) {
@@ -45,6 +50,18 @@ impl Hub {
             }
             let lease = self.lease.lock().await.take();
             *broker = None;
+            // No agent is left to correct a lost reset, so it waits out a full
+            // queue. Sending it before the broker slot frees up keeps it ahead
+            // of the next agent's first report.
+            if let Err(error) = runtime
+                .send_critical(
+                    RuntimeCommand::DesktopFocus { terminal: false },
+                    TERMINAL_SEND_TIMEOUT,
+                )
+                .await
+            {
+                tracing::warn!(%error, "desktop focus reset not delivered");
+            }
             lease
         };
         if let Some(lease) = lease
@@ -55,6 +72,20 @@ impl Hub {
                 .filter(|s| s.id() == lease.session_id)
         {
             session.close(SessionCloseReason::BackendUnavailable);
+        }
+    }
+
+    /// Passes the desktop's terminal focus to the input runtime while a
+    /// desktop agent is connected.
+    pub async fn focus(&self, runtime: &LinuxRuntimeControl, terminal: bool) {
+        // Holding the lock keeps a late report from landing after the reset
+        // in `disconnected`.
+        let broker = self.broker.lock().await;
+        // A dropped update only affects shortcuts pressed until the next one.
+        if broker.is_some()
+            && let Err(error) = runtime.send(RuntimeCommand::DesktopFocus { terminal })
+        {
+            tracing::debug!(%error, "desktop focus not delivered");
         }
     }
 
@@ -349,7 +380,10 @@ pub(super) async fn serve(
             tracing::warn!(broker_id = id, error = %format_args!("{error:#}"), "desktop agent stopped");
         }
     }
-    shared.desktop.disconnected(id, &shared.sessions).await;
+    shared
+        .desktop
+        .disconnected(id, &shared.sessions, &shared.runtime)
+        .await;
     result
 }
 
@@ -456,7 +490,8 @@ mod tests {
         });
         let sessions = Mutex::new(BTreeMap::new());
         let held_sessions = sessions.lock().await;
-        let cleanup = hub.disconnected(1, &sessions);
+        let (runtime, _commands, _poll) = LinuxRuntimeControl::queue(1);
+        let cleanup = hub.disconnected(1, &sessions, &runtime);
         tokio::pin!(cleanup);
         assert!(
             tokio::time::timeout(Duration::from_millis(10), &mut cleanup)
@@ -486,7 +521,10 @@ mod tests {
             token: 9,
             renewed: Instant::now(),
         });
-        hub.disconnected(1, &Mutex::new(BTreeMap::new())).await;
+        let (runtime, mut commands, _poll) = LinuxRuntimeControl::queue(1);
+        hub.disconnected(1, &Mutex::new(BTreeMap::new()), &runtime)
+            .await;
+        assert!(commands.try_recv().is_err(), "the live agent's focus stays");
         assert_eq!(hub.broker.lock().await.as_ref().unwrap().0, 2);
         assert!(
             hub.lease
@@ -497,6 +535,40 @@ mod tests {
                 .permits("mac", 5, 9)
         );
         assert!(!hub.allows_session("mac", 4).await);
+    }
+
+    #[tokio::test]
+    async fn disconnected_broker_resets_focus_before_another_can_connect() {
+        let hub = Hub::default();
+        let (sender, _jobs) = mpsc::channel(1);
+        *hub.broker.lock().await = Some((1, sender));
+        let (runtime, mut commands, _poll) = LinuxRuntimeControl::queue(1);
+        hub.focus(&runtime, true).await;
+        let sessions = Mutex::new(BTreeMap::new());
+        let cleanup = hub.disconnected(1, &sessions, &runtime);
+        tokio::pin!(cleanup);
+        // The reset waits out the full queue instead of being dropped, and
+        // keeps the broker slot until it is queued.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut cleanup)
+                .await
+                .is_err()
+        );
+        assert!(hub.broker.try_lock().is_err());
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(RuntimeCommand::DesktopFocus { terminal: true })
+        ));
+        tokio::time::timeout(Duration::from_millis(100), cleanup)
+            .await
+            .unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(RuntimeCommand::DesktopFocus { terminal: false })
+        ));
+        assert!(hub.broker.try_lock().unwrap().is_none());
+        hub.focus(&runtime, true).await;
+        assert!(commands.try_recv().is_err(), "no agent, no focus reports");
     }
 
     #[test]

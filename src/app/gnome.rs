@@ -36,6 +36,10 @@ enum Request {
     Forget {
         name: String,
     },
+    SetKeyboard {
+        name: String,
+        mode: crate::core::KeyboardMode,
+    },
     Pair {
         /// Absent to listen; otherwise an IP address, with the port optional.
         remote: Option<String>,
@@ -85,6 +89,9 @@ impl Service {
             }
             Request::Forget { name } => {
                 crate::peer_view::request(&DaemonRequest::Forget { name }).await?;
+            }
+            Request::SetKeyboard { name, mode } => {
+                crate::peer_view::request(&DaemonRequest::SetKeyboard { name, mode }).await?;
             }
             Request::SetAutostart { enabled } => set_autostart(enabled)?,
             Request::Pair { remote, code } => {

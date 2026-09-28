@@ -309,6 +309,8 @@ Linux maps evdev codes at capture and injection boundaries. macOS maps CG virtua
 
 The target interprets physical keys through its active layout. A US physical key sent to an ABNT target behaves as if the same physical keyboard were plugged into that target. Text transfer and layout synthesis remain outside v1.
 
+The receiver may apply a keyboard mode chosen for each peer after admission and before injection, such as swapping Option and Cmd or mapping macOS shortcuts. The wire, receiver snapshots, and acknowledgements stay physical.
+
 ### Pointer
 
 Each source declares whether its deltas represent device-like unaccelerated motion or desktop-accelerated motion. A session MUST NOT mix those units without a new activation.
