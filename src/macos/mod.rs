@@ -215,6 +215,7 @@ pub fn secure_input_enabled() -> bool {
 struct Activation<'a> {
     session: &'a SessionHandle,
     events: &'a mut mpsc::Receiver<SessionEvent>,
+    layouts: &'a mut link::LayoutRoute,
     context: SessionContext,
     raw_touch: bool,
 }
@@ -283,7 +284,10 @@ async fn cross(
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<Option<u32>> {
-    receive::answer_waiting_events(activation.events)?;
+    let session = activation.session;
+    receive::answer_waiting_events(activation.events, |layout| {
+        activation.layouts.take(session, layout)
+    })?;
     if stopped(stop) {
         return Ok(None);
     }
@@ -666,6 +670,7 @@ async fn forward<'a>(
                     let error = anyhow!("input session closed: {reason}");
                     return ended.failed("input session closed", error);
                 }
+                Some(SessionEventKind::Layout { layout }) => activation.layouts.take(session, layout),
                 Some(kind) => receive::answer_while_sending(kind),
                 None => {
                     let error = anyhow!("input session event channel closed");

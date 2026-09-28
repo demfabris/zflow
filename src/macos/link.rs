@@ -1,8 +1,9 @@
 //! One authenticated input session per paired computer while sharing is on.
 //! The desktop snapshot and every crossing reuse it, so a crossing costs a
 //! Prepare round trip instead of a QUIC handshake and session negotiation.
-//! The same session carries the peer's input when it controls this Mac.
-//! Peers may also connect first; the Mac keeps one session per peer.
+//! The same session carries the peer's input when it controls this Mac,
+//! and the shared layout both ways. Peers may also connect first; the Mac
+//! keeps one session per peer.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -27,7 +28,7 @@ use crate::{
         ActivationId, InputCapability, SessionCloseReason, SessionContext, SessionEpoch,
         TransportGeneration,
     },
-    desktop::{DesktopRequest, DesktopResponse, Geometry},
+    desktop::{DesktopRequest, DesktopResponse, Geometry, SharedLayout},
     identity::{Identity, wins_simultaneous_dial},
     session::{SessionEvent, SessionEventKind, SessionHandle, SessionOptions, start_session},
     transport::{
@@ -86,6 +87,53 @@ struct Opened {
 impl Opened {
     fn close(self, reason: SessionCloseReason) {
         self.handle.close(reason);
+    }
+}
+
+/// Carries the shared layout between the app and one link's sessions.
+/// The app keeps one layout for every peer; each session gets it when it
+/// starts and whenever it changes, and hands back a newer one.
+pub(super) struct LayoutRoute {
+    peer: String,
+    kept: watch::Receiver<Option<SharedLayout>>,
+    received: mpsc::UnboundedSender<(String, SharedLayout)>,
+    /// The newest layout the current session's peer is known to hold.
+    peer_has: Option<SharedLayout>,
+}
+
+impl LayoutRoute {
+    /// Sends the kept layout if the peer does not hold it or a newer one.
+    fn offer(&mut self, session: &SessionHandle) {
+        let Some(kept) = self.kept.borrow_and_update().clone() else {
+            return;
+        };
+        if self
+            .peer_has
+            .as_ref()
+            .is_some_and(|has| !kept.is_newer_than(has))
+        {
+            return;
+        }
+        match session.send_layout(kept.clone()) {
+            Ok(()) => self.peer_has = Some(kept),
+            Err(error) => tracing::debug!(peer = %self.peer, %error, "layout not sent"),
+        }
+    }
+
+    /// Takes the peer's layout: a newer one goes to the app, and an older
+    /// one gets the kept layout back.
+    pub(super) fn take(&mut self, session: &SessionHandle, layout: SharedLayout) {
+        self.peer_has = Some(layout.clone());
+        let newer = self
+            .kept
+            .borrow()
+            .as_ref()
+            .is_none_or(|kept| layout.is_newer_than(kept));
+        if newer {
+            let _ = self.received.send((self.peer.clone(), layout));
+        } else {
+            self.offer(session);
+        }
     }
 }
 
@@ -168,6 +216,11 @@ pub struct Links {
     /// How long after this Mac's dial a peer's connection counts as dialed
     /// at the same moment.
     dial_window: Duration,
+    /// The layout this Mac keeps, which every session gets.
+    layout: watch::Sender<Option<SharedLayout>>,
+    /// Newer layouts peers sent, by peer, until the app takes them.
+    received: mpsc::UnboundedReceiver<(String, SharedLayout)>,
+    received_sender: mpsc::UnboundedSender<(String, SharedLayout)>,
 }
 
 impl Links {
@@ -195,6 +248,7 @@ impl Links {
             let receiving = receiving.clone();
             async move { receiving.watch().await }
         });
+        let (received_sender, received) = mpsc::unbounded_channel();
         Ok(Self {
             runtime: Some(runtime),
             links: BTreeMap::new(),
@@ -205,6 +259,9 @@ impl Links {
             listener: None,
             listen_error: None,
             dial_window: CONNECT_TIMEOUT,
+            layout: watch::channel(None).0,
+            received,
+            received_sender,
         })
     }
 
@@ -265,12 +322,19 @@ impl Links {
                 config: settings.clone(),
                 window: self.dial_window,
             };
+            let layouts = LayoutRoute {
+                peer: name.clone(),
+                kept: self.layout.subscribe(),
+                received: self.received_sender.clone(),
+                peer_has: None,
+            };
             let task = runtime.spawn(run(
                 remote,
                 self.receiving.clone(),
                 receiver,
                 state_sender,
                 self.nearby.subscribe(),
+                layouts,
                 self.closing.remove(name),
             ));
             self.links.insert(
@@ -452,6 +516,21 @@ impl Links {
         }
     }
 
+    /// Makes `layout` the one every peer gets: each session is sent it
+    /// unless its peer already holds it or a newer one.
+    pub fn share_layout(&self, layout: SharedLayout) {
+        self.layout.send_if_modified(|current| {
+            let changed = current.as_ref() != Some(&layout);
+            *current = Some(layout);
+            changed
+        });
+    }
+
+    /// Layouts peers sent that are newer than the shared one, oldest first.
+    pub fn take_layouts(&mut self) -> Vec<(String, SharedLayout)> {
+        std::iter::from_fn(|| self.received.try_recv().ok()).collect()
+    }
+
     /// Discovered receivers, tried after each peer's own addresses.
     pub fn set_nearby(&self, nearby: Vec<SocketAddr>) {
         self.nearby.send_if_modified(|current| {
@@ -531,6 +610,7 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
     state: watch::Sender<LinkState>,
     mut nearby: watch::Receiver<Vec<SocketAddr>>,
+    mut layouts: LayoutRoute,
     previous: Option<JoinHandle<()>>,
 ) {
     // The receiver refuses a second session from this Mac while the old one is open.
@@ -558,7 +638,14 @@ async fn run(
                 let opened_at = Instant::now();
                 let mut inbound = receiving.inbound(name, &session.handle);
                 let served = session
-                    .serve(&mut commands, &state, &mut inbound, wins, remote.window)
+                    .serve(
+                        &mut commands,
+                        &state,
+                        &mut inbound,
+                        &mut layouts,
+                        wins,
+                        remote.window,
+                    )
                     .await;
                 // Lets go of whatever the peer held before the session goes.
                 drop(inbound);
@@ -893,9 +980,13 @@ impl Session {
         commands: &mut mpsc::UnboundedReceiver<Command>,
         state: &watch::Sender<LinkState>,
         inbound: &mut Inbound,
+        layouts: &mut LayoutRoute,
         wins: bool,
         window: Duration,
     ) -> Served {
+        // A new session holds nothing yet.
+        layouts.peer_has = None;
+        layouts.offer(&self.handle);
         let mut ready = if self.sends {
             self.snapshot(state).await
         } else {
@@ -935,6 +1026,7 @@ impl Session {
                         let activation = Activation {
                             session: &self.handle,
                             events: &mut self.events,
+                            layouts: &mut *layouts,
                             context,
                             raw_touch: self.raw_touch,
                         };
@@ -970,13 +1062,11 @@ impl Session {
                     }) => {
                         let _ = applied.send(inbound.effects(effects, received_at).await);
                     }
-                    Some(
-                        SessionEventKind::OutboundEnded
-                        | SessionEventKind::Layout { .. }
-                        | SessionEventKind::Clipboard { .. },
-                    ) => {}
+                    Some(SessionEventKind::Layout { layout }) => layouts.take(&self.handle, layout),
+                    Some(SessionEventKind::OutboundEnded | SessionEventKind::Clipboard { .. }) => {}
                     None => return Served::Lost("input session closed".into()),
                 },
+                Ok(()) = layouts.kept.changed() => layouts.offer(&self.handle),
                 () = tokio::time::sleep(retry), if !ready && self.sends => {
                     ready = self.snapshot(state).await;
                     retry = (retry * 2).min(SNAPSHOT_RETRY);
@@ -1127,6 +1217,7 @@ mod tests {
         sessions: mpsc::UnboundedReceiver<SessionHandle>,
         effects: mpsc::UnboundedReceiver<(u64, ReceiverEffect)>,
         closed: mpsc::UnboundedReceiver<u64>,
+        layouts: mpsc::UnboundedReceiver<SharedLayout>,
         _endpoint: Endpoint,
     }
 
@@ -1141,6 +1232,7 @@ mod tests {
         let (sessions_tx, sessions) = mpsc::unbounded_channel();
         let (effects_tx, effects) = mpsc::unbounded_channel();
         let (closed_tx, closed) = mpsc::unbounded_channel();
+        let (layouts_tx, layouts) = mpsc::unbounded_channel();
         let accepting = endpoint.clone();
         tokio::spawn(async move {
             while let Some(incoming) = accepting.accept().await {
@@ -1160,7 +1252,8 @@ mod tests {
                     continue;
                 };
                 let _ = sessions_tx.send(session);
-                let (effects_tx, closed_tx) = (effects_tx.clone(), closed_tx.clone());
+                let (effects_tx, closed_tx, layouts_tx) =
+                    (effects_tx.clone(), closed_tx.clone(), layouts_tx.clone());
                 tokio::spawn(async move {
                     while let Some(event) = events.recv().await {
                         match event.kind {
@@ -1178,8 +1271,10 @@ mod tests {
                             SessionEventKind::Closed { .. } => {
                                 let _ = closed_tx.send(event.session_id);
                             }
+                            SessionEventKind::Layout { layout } => {
+                                let _ = layouts_tx.send(layout);
+                            }
                             SessionEventKind::OutboundEnded
-                            | SessionEventKind::Layout { .. }
                             | SessionEventKind::Clipboard { .. } => {}
                         }
                     }
@@ -1191,6 +1286,7 @@ mod tests {
             sessions,
             effects,
             closed,
+            layouts,
             _endpoint: endpoint,
         }
     }
@@ -1296,7 +1392,7 @@ mod tests {
             let prepared = session.handle.desktop_request(prepare).await.unwrap();
             assert!(matches!(prepared, DesktopResponse::Prepared { .. }));
             // The previous release left an OutboundEnded behind.
-            receive::answer_waiting_events(&mut session.events).unwrap();
+            receive::answer_waiting_events(&mut session.events, drop).unwrap();
             let context = session.next_context();
             session.handle.begin_outbound(context).unwrap();
             session.handle.capture(key(KeyState::Pressed)).unwrap();
@@ -1768,6 +1864,64 @@ mod tests {
         posted(&fake, "key 0 up", Duration::from_secs(1));
         closed(&server, &mut receiver, linux.id());
         assert_eq!(links.controller(), None);
+        drop(links);
+    }
+
+    #[test]
+    fn every_session_gets_the_kept_layout_and_a_newer_one_comes_back() {
+        let key = format!("{:064x}", 1);
+        let layout = |version| SharedLayout {
+            version,
+            editor: key.clone(),
+            tiles: vec![crate::desktop::Tile {
+                key: key.clone(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+        };
+        let Pair {
+            mut links,
+            mut receiver,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|_| {});
+        let next_layout = |receiver: &mut Receiver| {
+            let layout = server.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), receiver.layouts.recv()).await
+            });
+            layout.expect("the Mac sent its layout").unwrap()
+        };
+        links.share_layout(layout(2));
+        assert_eq!(next_layout(&mut receiver), layout(2));
+
+        // A newer one goes to the app, and once kept it is not sent back.
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        linux.send_layout(layout(3)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let taken = loop {
+            let taken = links.take_layouts();
+            if !taken.is_empty() {
+                break taken;
+            }
+            assert!(Instant::now() < deadline, "the newer layout never came");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(taken, [("linux".to_owned(), layout(3))]);
+        links.share_layout(layout(3));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(receiver.layouts.try_recv().is_err(), "no echo");
+
+        // An older one gets the kept one back.
+        linux.send_layout(layout(1)).unwrap();
+        assert_eq!(next_layout(&mut receiver), layout(3));
+        assert!(links.take_layouts().is_empty());
+
+        // So does the next session.
+        linux.close(SessionCloseReason::BackendUnavailable);
+        assert_eq!(next_layout(&mut receiver), layout(3));
         drop(links);
     }
 

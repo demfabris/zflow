@@ -19,7 +19,7 @@ use super::{
 use crate::{
     config::{PeerConfig, PeerPermissions},
     core::{KeyboardMode, ReceiverEffect, SessionCloseReason},
-    desktop::{DesktopRequest, DesktopResponse, Geometry, Point},
+    desktop::{DesktopRequest, DesktopResponse, Geometry, Point, SharedLayout},
     session::{SessionEvent, SessionEventKind, SessionHandle},
 };
 
@@ -261,16 +261,19 @@ pub(super) fn answer_while_sending(kind: SessionEventKind) {
 }
 
 /// Answers events that arrived while the link was idle, including the
-/// OutboundEnded that trails the previous crossing's release.
-pub(super) fn answer_waiting_events(events: &mut mpsc::Receiver<SessionEvent>) -> Result<()> {
+/// OutboundEnded that trails the previous crossing's release. A peer's
+/// layout goes to `layout`.
+pub(super) fn answer_waiting_events(
+    events: &mut mpsc::Receiver<SessionEvent>,
+    mut layout: impl FnMut(SharedLayout),
+) -> Result<()> {
     loop {
         match events.try_recv() {
-            Ok(event) => {
-                if let SessionEventKind::Closed { reason } = event.kind {
-                    bail!("input session closed: {reason}");
-                }
-                answer_while_sending(event.kind);
-            }
+            Ok(event) => match event.kind {
+                SessionEventKind::Closed { reason } => bail!("input session closed: {reason}"),
+                SessionEventKind::Layout { layout: shared } => layout(shared),
+                kind => answer_while_sending(kind),
+            },
             Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
             Err(mpsc::error::TryRecvError::Disconnected) => bail!("input session closed"),
         }
@@ -871,7 +874,7 @@ mod tests {
             }))
             .await
             .unwrap();
-        answer_waiting_events(&mut events).unwrap();
+        answer_waiting_events(&mut events, drop).unwrap();
         assert_eq!(
             desktop.await.unwrap(),
             DesktopResponse::unavailable(SENDING)
@@ -882,8 +885,8 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(answer_waiting_events(&mut events).is_err());
+        assert!(answer_waiting_events(&mut events, drop).is_err());
         drop(sender);
-        assert!(answer_waiting_events(&mut events).is_err());
+        assert!(answer_waiting_events(&mut events, drop).is_err());
     }
 }
