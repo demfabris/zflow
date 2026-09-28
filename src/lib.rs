@@ -3,6 +3,7 @@
 pub mod app;
 pub mod capture;
 pub mod cli;
+pub mod clipboard;
 pub mod config;
 pub mod control;
 pub mod core;

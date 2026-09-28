@@ -1,13 +1,16 @@
 use super::*;
+use crate::app::layout_model::Layout;
 use crate::control::ControlError;
 use crate::desktop::{DesktopRequest, DesktopResponse};
+use crate::desktop::{Edge, FRACTION_MAX};
 use crate::linux::SeatState;
+use crate::peer_view::{AgentRequest, LocalRequest, OutboundEdge};
 use crate::session::{desktop_operation, desktop_response_kind};
 use anyhow::ensure;
 use tokio::net::UnixStream;
 
 struct Job {
-    request: DesktopRequest,
+    request: AgentRequest,
     origin: Option<(String, u64)>,
     reply: tokio::sync::oneshot::Sender<DesktopResponse>,
     queued_at: Instant,
@@ -29,8 +32,20 @@ impl Lease {
     }
 }
 
+/// What GNOME Shell shows for this computer's own input.
+#[derive(Default)]
+pub(super) struct LocalState {
+    /// Edges that lead to another computer, with that computer's name.
+    edges: Vec<(OutboundEdge, String)>,
+    /// Whether the pointer has to rest against an edge before it crosses.
+    pause: bool,
+    sending: bool,
+}
+
 #[derive(Default)]
 pub(super) struct Hub {
+    /// One task sends every change to the agent, in order.
+    local: watch::Sender<LocalState>,
     broker: Mutex<Option<(u64, mpsc::Sender<Job>)>>,
     lease: Mutex<Option<Lease>>,
     next: AtomicU64,
@@ -98,16 +113,37 @@ impl Hub {
     }
 
     async fn call(&self, request: DesktopRequest) -> DesktopResponse {
-        self.call_scoped(request, None).await
+        self.call_scoped(AgentRequest::Handoff(request), None).await
+    }
+
+    /// This desktop's monitors and pointer, from GNOME.
+    pub(super) async fn snapshot(&self) -> DesktopResponse {
+        self.call(DesktopRequest::Snapshot).await
+    }
+
+    /// Puts the pointer at `position` on this desktop.
+    pub(super) async fn warp(&self, position: crate::desktop::Point) -> DesktopResponse {
+        self.call_scoped(AgentRequest::Local(LocalRequest::Warp { position }), None)
+            .await
+    }
+
+    /// The computer whose edge the pointer pushed against, if any.
+    pub(super) fn edge_peer(&self, edge: Edge, position: u32) -> Option<String> {
+        self.local
+            .borrow()
+            .edges
+            .iter()
+            .find(|(range, _)| range.edge == edge && (range.start..=range.end).contains(&position))
+            .map(|(_, peer)| peer.clone())
     }
 
     async fn call_scoped(
         &self,
-        request: DesktopRequest,
+        request: AgentRequest,
         origin: Option<(String, u64)>,
     ) -> DesktopResponse {
         let started = Instant::now();
-        let operation = desktop_operation(&request);
+        let operation = request.operation();
         let broker = self
             .broker
             .lock()
@@ -183,6 +219,78 @@ impl Hub {
     }
 }
 
+/// The local tile's edges that touch another computer's tile, as barrier
+/// ranges along this desktop.
+pub(super) fn outbound_edges(layout: &Layout) -> Vec<(OutboundEdge, String)> {
+    let fraction = |value: f64| (value.clamp(0.0, 1.0) * f64::from(FRACTION_MAX)).round() as u32;
+    layout
+        .transitions()
+        .into_iter()
+        .filter(|transition| layout.monitors[transition.source].peer.is_none())
+        .filter_map(|transition| {
+            let peer = layout.monitors[transition.target].peer.clone()?;
+            let range = OutboundEdge {
+                edge: transition.edge,
+                start: fraction(transition.source_start),
+                end: fraction(transition.source_end),
+            };
+            (range.start < range.end).then_some((range, peer))
+        })
+        .collect()
+}
+
+/// How long the pointer rests against an edge when crossings pause there,
+/// as Deskflow's switch delay does.
+const PAUSE_MS: u32 = 250;
+
+pub(super) fn set_edges(shared: &Shared, edges: Vec<(OutboundEdge, String)>, pause: bool) {
+    shared.desktop.local.send_modify(|state| {
+        state.edges = edges;
+        state.pause = pause;
+    });
+}
+
+pub(super) fn set_sending(shared: &Shared, sending: bool) {
+    shared
+        .desktop
+        .local
+        .send_modify(|state| state.sending = sending);
+}
+
+/// Sends the agent each change to the edges and sending state, in order,
+/// and everything again when an agent connects.
+pub(super) fn start_local_sync(shared: Arc<Shared>) {
+    let mut changes = shared.desktop.local.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let (edges, pause_ms, active) = {
+                let state = changes.borrow_and_update();
+                (
+                    state.edges.iter().map(|(range, _)| *range).collect(),
+                    if state.pause { PAUSE_MS } else { 0 },
+                    state.sending,
+                )
+            };
+            // Showing the pointer again matters more than the barriers.
+            for request in [
+                LocalRequest::Sending { active },
+                LocalRequest::Edges { edges, pause_ms },
+            ] {
+                let response = shared
+                    .desktop
+                    .call_scoped(AgentRequest::Local(request), None)
+                    .await;
+                if let DesktopResponse::Unavailable { reason } = response {
+                    tracing::debug!(%reason, "desktop agent did not take local state");
+                }
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
 pub(super) async fn request(
     shared: Arc<Shared>,
     peer: String,
@@ -211,6 +319,10 @@ pub(super) async fn request(
             return DesktopResponse::unavailable(
                 "Desktop control requires the active unlocked local session and an authorized paired peer",
             );
+        }
+        // Arming or sending, this computer's own input goes elsewhere.
+        if shared.runtime.status().ownership != OwnershipPhase::Idle {
+            return DesktopResponse::unavailable("This computer is sending its own input");
         }
         if shared.active_outbound.lock().await.is_some()
             || shared
@@ -249,7 +361,10 @@ pub(super) async fn request(
     }
     let response = shared
         .desktop
-        .call_scoped(request.clone(), Some((peer.clone(), session_id)))
+        .call_scoped(
+            AgentRequest::Handoff(request.clone()),
+            Some((peer.clone(), session_id)),
+        )
         .await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let outcome = desktop_response_kind(&response);
@@ -263,6 +378,14 @@ pub(super) async fn request(
     }
     if let DesktopResponse::Unavailable { reason } = &response {
         tracing::warn!(%peer, session_id, operation, %reason, "desktop receiver operation unavailable");
+    }
+    // A computer crossing into this one checks this desktop against its
+    // layout, so keep this computer's tile the right size.
+    if let DesktopResponse::Snapshot { geometry, .. } | DesktopResponse::Prepared { geometry, .. } =
+        &response
+    {
+        let (shared, geometry) = (shared.clone(), geometry.clone());
+        tokio::spawn(async move { shared.fit_own_tile(&geometry).await });
     }
     if let DesktopRequest::Prepare { token, .. } = request
         && !matches!(response, DesktopResponse::Prepared { .. })
@@ -303,6 +426,17 @@ pub(super) async fn serve(
         *broker = Some((id, sender));
     }
     tracing::info!(broker_id = id, "desktop agent connected");
+    // A new agent starts from a clean Shell: no barriers, pointer shown.
+    shared.desktop.local.send_modify(|_| {});
+    // The desktop may have changed size while no agent was connected.
+    tokio::spawn({
+        let shared = shared.clone();
+        async move {
+            if let DesktopResponse::Snapshot { geometry, .. } = shared.desktop.snapshot().await {
+                shared.fit_own_tile(&geometry).await;
+            }
+        }
+    });
     let mut latest = shared.seat.clone();
     let mut seat = SeatGrace::new(latest.borrow_and_update().clone(), Instant::now());
     let result = async {
@@ -398,7 +532,7 @@ async fn broker_job(
     id: u64,
     job: Job,
 ) -> Result<()> {
-    let operation = desktop_operation(&job.request);
+    let operation = job.request.operation();
     let peer = job
         .origin
         .as_ref()
@@ -459,7 +593,7 @@ async fn broker_job(
         tracing::trace!(broker_id = id, %peer, ?session_id, operation, outcome, queue_ms, compositor_ms, elapsed_ms, "desktop broker operation completed");
     }
     if job.reply.send(response).is_err()
-        && let DesktopRequest::Prepare { token, .. } = job.request
+        && let AgentRequest::Handoff(DesktopRequest::Prepare { token, .. }) = job.request
     {
         tracing::debug!(
             broker_id = id,
@@ -569,6 +703,46 @@ mod tests {
         assert!(hub.broker.try_lock().unwrap().is_none());
         hub.focus(&runtime, true).await;
         assert!(commands.try_recv().is_err(), "no agent, no focus reports");
+    }
+
+    #[test]
+    fn only_the_local_tiles_touching_edges_become_barriers() {
+        use crate::app::layout_model::Monitor;
+        let tile = |id: &str, x, y, width, height| Monitor {
+            id: id.into(),
+            label: id.into(),
+            peer: (id != "local").then(|| id.into()),
+            x,
+            y,
+            width,
+            height,
+        };
+        let layout = Layout {
+            monitors: vec![
+                tile("local", 0, 0, 2000, 1000),
+                // Touches the lower half of the right edge.
+                tile("mac", 2000, 500, 1000, 1000),
+                // Touches nothing.
+                tile("far", 5000, 0, 100, 100),
+            ],
+        };
+        let edges = outbound_edges(&layout);
+        assert_eq!(
+            edges,
+            [(
+                OutboundEdge {
+                    edge: Edge::Right,
+                    start: FRACTION_MAX / 2,
+                    end: FRACTION_MAX,
+                },
+                "mac".to_owned()
+            )]
+        );
+        let hub = Hub::default();
+        hub.local.send_modify(|state| state.edges = edges);
+        assert_eq!(hub.edge_peer(Edge::Right, 750_000).as_deref(), Some("mac"));
+        assert_eq!(hub.edge_peer(Edge::Right, 100_000), None);
+        assert_eq!(hub.edge_peer(Edge::Left, 750_000), None);
     }
 
     #[test]

@@ -157,7 +157,8 @@ pub struct LinuxRuntimeStatus {
 ///
 /// This deliberately shares the runtime's exact all-or-none selector rules,
 /// so `zflow doctor` cannot claim a configuration is usable when the daemon
-/// would refuse to grab it.
+/// would refuse to grab it. With no selectors it lists every keyboard and
+/// pointer the scan could open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureSelectionDiagnostic {
     pub selected_paths: Vec<PathBuf>,
@@ -169,7 +170,7 @@ pub struct CaptureSelectionDiagnostic {
 
 impl CaptureSelectionDiagnostic {
     pub fn is_complete(&self) -> bool {
-        self.configured > 0 && self.unmatched == 0 && self.ambiguous == 0
+        !self.selected_paths.is_empty() && self.unmatched == 0 && self.ambiguous == 0
     }
 }
 
@@ -1001,8 +1002,17 @@ impl RuntimeLoop {
             .ownership
             .at_complete_boundary(self.capture.aggregate_state(), kernel_neutral);
         match effect {
-            OwnershipEffect::AcquireGrabs => match self.capture.grab_all() {
-                Ok(()) => {
+            OwnershipEffect::AcquireGrabs => match self
+                .capture
+                .grab_all(self.config.capture_devices.is_empty())
+            {
+                Ok(skipped) => {
+                    for path in skipped {
+                        tracing::info!(
+                            path = %path.display(),
+                            "left a capture device to the program that grabbed it"
+                        );
+                    }
                     let _ = self.ownership.grab_succeeded();
                     self.emit_ownership();
                 }
@@ -1172,8 +1182,10 @@ struct CaptureSelection {
 }
 
 impl CaptureSelection {
+    /// Every selector resolved to one node, or, with no selectors, at least
+    /// one keyboard or pointer was found.
     fn is_complete(&self) -> bool {
-        self.configured > 0 && self.unmatched == 0 && self.ambiguous == 0
+        !self.selected.is_empty() && self.unmatched == 0 && self.ambiguous == 0
     }
 
     fn capture_set(&self) -> &[DeviceInfo] {
@@ -1189,6 +1201,18 @@ fn select_configured<'a>(
     selectors: &[ConfigDeviceSelector],
     devices: impl Iterator<Item = &'a DeviceInfo>,
 ) -> CaptureSelection {
+    if selectors.is_empty() {
+        // No selectors captures every keyboard and pointer. zflow's own
+        // devices are left out by identity; other programs' virtual devices,
+        // such as a remapper's output, are captured like hardware.
+        return CaptureSelection {
+            selected: devices
+                .filter(|device| device.class.is_some() && !device.is_zflow_virtual())
+                .cloned()
+                .collect(),
+            ..CaptureSelection::default()
+        };
+    }
     let devices = devices.collect::<Vec<_>>();
     let mut resolved = Vec::with_capacity(selectors.len());
     let mut unmatched = 0;
@@ -1401,8 +1425,8 @@ mod tests {
 
     use super::*;
     use crate::linux::{
-        FrameAccumulator, ZFLOW_DEVICE_VERSION, ZFLOW_POINTER_NAME, ZFLOW_POINTER_PHYS,
-        ZFLOW_POINTER_PRODUCT_ID, ZFLOW_VENDOR_ID,
+        DeviceClass, FrameAccumulator, ZFLOW_DEVICE_VERSION, ZFLOW_POINTER_NAME,
+        ZFLOW_POINTER_PHYS, ZFLOW_POINTER_PRODUCT_ID, ZFLOW_VENDOR_ID,
     };
 
     fn frame(events: &[(KeyCode, i32)]) -> CaptureFrame {
@@ -1483,6 +1507,8 @@ mod tests {
             vendor,
             product,
             version: 1,
+            // Configured selectors never look at the class.
+            class: None,
         }
     }
 
@@ -1731,6 +1757,118 @@ mod tests {
         assert!(!selection.is_complete());
         assert_eq!(selection.unmatched, 1);
         assert!(selection.capture_set().is_empty());
+    }
+
+    fn classified(path: &str, name: &str, class: Option<DeviceClass>) -> DeviceInfo {
+        DeviceInfo {
+            class,
+            ..device(path, name, "usb-0000:01/input0", 0x1234, 0x5678)
+        }
+    }
+
+    fn zflow_pointer(path: &str) -> DeviceInfo {
+        let mut pointer = device(
+            path,
+            ZFLOW_POINTER_NAME,
+            ZFLOW_POINTER_PHYS,
+            ZFLOW_VENDOR_ID,
+            ZFLOW_POINTER_PRODUCT_ID,
+        );
+        pointer.bus = BusType::BUS_VIRTUAL.0;
+        pointer.version = ZFLOW_DEVICE_VERSION;
+        pointer.class = Some(DeviceClass::Pointer);
+        pointer
+    }
+
+    #[test]
+    fn empty_selectors_capture_every_keyboard_and_pointer_but_zflows_own() {
+        let keyboard = classified(
+            "/dev/input/event3",
+            "AT Translated Set 2 keyboard",
+            Some(DeviceClass::Keyboard),
+        );
+        let power = classified("/dev/input/event4", "Power Button", None);
+        let touchpad = classified(
+            "/dev/input/event5",
+            "SYNA Touchpad",
+            Some(DeviceClass::Touchpad),
+        );
+        let mut keyd = classified(
+            "/dev/input/event20",
+            "keyd virtual keyboard",
+            Some(DeviceClass::Keyboard),
+        );
+        keyd.bus = BusType::BUS_VIRTUAL.0;
+        let mut openlogi = classified(
+            "/dev/input/event21",
+            "OpenLogi virtual mouse",
+            Some(DeviceClass::Pointer),
+        );
+        openlogi.bus = BusType::BUS_VIRTUAL.0;
+        let own = zflow_pointer("/dev/input/event22");
+
+        let selection = select_configured(
+            &[],
+            [&keyboard, &power, &touchpad, &keyd, &openlogi, &own].into_iter(),
+        );
+
+        assert!(selection.is_complete());
+        let selected = selection
+            .capture_set()
+            .iter()
+            .map(|device| device.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected,
+            [&keyboard, &touchpad, &keyd, &openlogi].map(|device| device.path.clone())
+        );
+    }
+
+    #[test]
+    fn empty_selectors_without_a_keyboard_or_pointer_cannot_activate() {
+        let power = classified("/dev/input/event4", "Power Button", None);
+        let own = zflow_pointer("/dev/input/event22");
+
+        let selection = select_configured(&[], [&power, &own].into_iter());
+        let nothing = select_configured(&[], [].iter());
+
+        for selection in [selection, nothing] {
+            assert!(!selection.is_complete());
+            assert!(selection.capture_set().is_empty());
+            assert_eq!(
+                activation_capture_blocker(selection.is_complete(), true),
+                Some(RuntimeDiagnostic::CaptureSelectionIncomplete)
+            );
+        }
+    }
+
+    #[test]
+    fn configured_selectors_ignore_other_keyboards_and_pointers() {
+        let configured = selector(
+            "/dev/input/event3",
+            "Actually Good Keyboard",
+            "usb-0000:01/input0",
+        );
+        let keyboard = classified(
+            "/dev/input/event3",
+            "Actually Good Keyboard",
+            Some(DeviceClass::Keyboard),
+        );
+        let mouse = DeviceInfo {
+            class: Some(DeviceClass::Pointer),
+            ..device(
+                "/dev/input/event4",
+                "Other Mouse",
+                "usb-0000:02/input0",
+                0x1234,
+                0x9999,
+            )
+        };
+
+        let selection = select_configured(&[configured], [&keyboard, &mouse].into_iter());
+
+        assert!(selection.is_complete());
+        assert_eq!(selection.capture_set(), [keyboard]);
     }
 
     #[test]

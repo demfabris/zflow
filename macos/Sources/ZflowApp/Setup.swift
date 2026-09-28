@@ -106,7 +106,7 @@ struct SetupFacts: Equatable {
 extension Snapshot {
   /// Which edge of this Mac leads to `peer`, from the saved layout.
   func edge(toward peer: String?) -> String? {
-    let monitors = layout.monitors
+    let monitors = layout?.monitors ?? []
     guard let mac = monitors.first(where: { $0.peer == nil }),
       let other = monitors.first(where: { $0.peer != nil && (peer == nil || $0.peer == peer) })
     else { return nil }

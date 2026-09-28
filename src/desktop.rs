@@ -298,16 +298,158 @@ impl DesktopResponse {
     }
 }
 
+/// At most this many computers share a layout, which keeps it inside one
+/// desktop message.
+pub const MAX_SHARED_TILES: usize = 16;
+
+/// The arrangement every paired computer keeps. Tiles are keyed by key
+/// fingerprint, because each computer names the others differently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedLayout {
+    /// Raised by every edit. With `editor` it orders two versions, so both
+    /// computers keep the same one.
+    pub version: u64,
+    /// The fingerprint of the computer that made this version.
+    pub editor: String,
+    pub tiles: Vec<Tile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tile {
+    /// The computer's key fingerprint.
+    pub key: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SharedLayout {
+    pub fn validate(&self) -> Result<()> {
+        use crate::app::layout_model::{MAX_COORDINATE, MAX_DIMENSION};
+        let fingerprint = |key: &str| {
+            key.len() == 64
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        ensure!(fingerprint(&self.editor), "Invalid layout editor");
+        // Kept to what JSON carries exactly, which also stops two computers
+        // from pinning it at the maximum and trading edits forever.
+        ensure!(self.version <= MAX_TOKEN, "Invalid layout version");
+        ensure!(
+            self.tiles.len() <= MAX_SHARED_TILES,
+            "A shared layout holds at most {MAX_SHARED_TILES} computers"
+        );
+        let mut keys = std::collections::BTreeSet::new();
+        for tile in &self.tiles {
+            ensure!(
+                fingerprint(&tile.key) && keys.insert(&tile.key),
+                "Invalid or repeated layout tile"
+            );
+            ensure!(
+                (-MAX_COORDINATE..=MAX_COORDINATE).contains(&tile.x)
+                    && (-MAX_COORDINATE..=MAX_COORDINATE).contains(&tile.y)
+                    && (1..=MAX_DIMENSION).contains(&tile.width)
+                    && (1..=MAX_DIMENSION).contains(&tile.height),
+                "Invalid layout tile geometry"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether this version replaces `other`. Both computers answer the same.
+    pub fn is_newer_than(&self, other: &Self) -> bool {
+        (self.version, &self.editor) > (other.version, &other.editor)
+    }
+
+    /// A new version in which the computer `key` gives its own tile the size
+    /// of its desktop. Each computer writes only its own size, so two never
+    /// edit the same tile. The sides that touch a neighbour stay where they
+    /// are, so the crossings stay; a tile that would still overlap another
+    /// moves to the right of the rest. None when the size is already right or
+    /// the tile is missing.
+    pub fn with_own_size(&self, key: &str, width: u32, height: u32) -> Option<Self> {
+        let index = self.tiles.iter().position(|tile| tile.key == key)?;
+        let old = &self.tiles[index];
+        if (old.width, old.height) == (width, height) {
+            return None;
+        }
+        let span = |start: i32, size: u32| (i64::from(start), i64::from(start) + i64::from(size));
+        let overlaps = |a: &Tile, b: &Tile| {
+            let ((al, ar), (at, ab)) = (span(a.x, a.width), span(a.y, a.height));
+            let ((bl, br), (bt, bb)) = (span(b.x, b.width), span(b.y, b.height));
+            al < br && ar > bl && at < bb && ab > bt
+        };
+        let others = || {
+            self.tiles
+                .iter()
+                .enumerate()
+                .filter(move |(i, _)| *i != index)
+                .map(|(_, other)| other)
+        };
+        let ((left, right), (top, bottom)) = (span(old.x, old.width), span(old.y, old.height));
+        let beside = |other: &Tile| {
+            let (other_top, other_bottom) = span(other.y, other.height);
+            other_top < bottom && other_bottom > top
+        };
+        let above_or_below = |other: &Tile| {
+            let (other_left, other_right) = span(other.x, other.width);
+            other_left < right && other_right > left
+        };
+        let touches_left = others().any(|o| beside(o) && span(o.x, o.width).1 == left);
+        let touches_right = others().any(|o| beside(o) && i64::from(o.x) == right);
+        let touches_top = others().any(|o| above_or_below(o) && span(o.y, o.height).1 == top);
+        let touches_bottom = others().any(|o| above_or_below(o) && i64::from(o.y) == bottom);
+        let mut next = self.clone();
+        next.version = self.version.checked_add(1)?;
+        next.editor = key.to_owned();
+        let tile = &mut next.tiles[index];
+        if touches_right && !touches_left {
+            tile.x = i32::try_from(right - i64::from(width)).ok()?;
+        }
+        if touches_bottom && !touches_top {
+            tile.y = i32::try_from(bottom - i64::from(height)).ok()?;
+        }
+        tile.width = width;
+        tile.height = height;
+        let resized = next.tiles[index].clone();
+        if others().any(|other| overlaps(&resized, other)) {
+            let right = others()
+                .map(|other| other.x.saturating_add(other.width as i32))
+                .max()
+                .unwrap_or(0);
+            next.tiles[index].x = right;
+            next.tiles[index].y = 0;
+        }
+        next.validate().ok().map(|()| next)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "direction", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopMessage {
-    Request { id: u64, request: DesktopRequest },
-    Response { id: u64, response: DesktopResponse },
+    Request {
+        id: u64,
+        request: DesktopRequest,
+    },
+    Response {
+        id: u64,
+        response: DesktopResponse,
+    },
+    /// The sender's layout, sent when a session starts and after each change.
+    /// It needs no answer.
+    Layout {
+        layout: SharedLayout,
+    },
 }
 
 impl DesktopMessage {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::Layout { layout } => layout.validate(),
             Self::Request { id, request } => {
                 ensure!(*id != 0, "Invalid desktop request ID");
                 request.validate()
@@ -323,6 +465,121 @@ impl DesktopMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_shared_layout_fits_one_desktop_message_and_orders_versions() {
+        let key = |n: usize| format!("{n:064x}");
+        let tile = |n| Tile {
+            key: key(n),
+            x: -crate::app::layout_model::MAX_COORDINATE,
+            y: -crate::app::layout_model::MAX_COORDINATE,
+            width: crate::app::layout_model::MAX_DIMENSION,
+            height: crate::app::layout_model::MAX_DIMENSION,
+        };
+        let layout = SharedLayout {
+            version: MAX_TOKEN,
+            editor: key(99),
+            tiles: (0..MAX_SHARED_TILES).map(tile).collect(),
+        };
+        let message = DesktopMessage::Layout {
+            layout: layout.clone(),
+        };
+        message.validate().unwrap();
+        assert!(serde_json::to_vec(&message).unwrap().len() <= MAX_MESSAGE_BYTES);
+
+        let mut invalid = layout.clone();
+        invalid.tiles.push(tile(MAX_SHARED_TILES));
+        assert!(invalid.validate().is_err(), "too many tiles");
+        let mut invalid = layout.clone();
+        invalid.tiles[1].key = key(0);
+        assert!(invalid.validate().is_err(), "repeated key");
+        let mut invalid = layout.clone();
+        invalid.tiles[0].width = 0;
+        assert!(invalid.validate().is_err(), "a tile without area");
+        let mut invalid = layout.clone();
+        invalid.editor = "ABC".into();
+        assert!(invalid.validate().is_err(), "not a fingerprint");
+
+        // A computer writes its own size, as a new version it edited.
+        let small = SharedLayout {
+            version: 5,
+            editor: key(9),
+            tiles: vec![
+                Tile {
+                    key: key(1),
+                    x: 0,
+                    y: 0,
+                    width: 1000,
+                    height: 800,
+                },
+                Tile {
+                    key: key(2),
+                    x: 1000,
+                    y: 0,
+                    width: 500,
+                    height: 500,
+                },
+            ],
+        };
+        assert!(
+            small.with_own_size(&key(1), 1000, 800).is_none(),
+            "already right"
+        );
+        assert!(
+            small.with_own_size(&key(3), 1000, 800).is_none(),
+            "not in the layout"
+        );
+        let taller = small.with_own_size(&key(2), 500, 900).unwrap();
+        assert_eq!((taller.version, &taller.editor), (6, &key(2)));
+        assert_eq!((taller.tiles[1].x, taller.tiles[1].height), (1000, 900));
+        // The side touching a neighbour stays, whether the tile grows or shrinks.
+        let wider = small.with_own_size(&key(1), 1200, 800).unwrap();
+        assert_eq!((wider.tiles[0].x, wider.tiles[0].width), (-200, 1200));
+        let narrower = small.with_own_size(&key(1), 600, 800).unwrap();
+        assert_eq!((narrower.tiles[0].x, narrower.tiles[0].width), (400, 600));
+        // Squeezed between two neighbours, a grown tile moves past the others.
+        let mut middle = small.clone();
+        middle.tiles.push(Tile {
+            key: key(3),
+            x: -300,
+            y: 0,
+            width: 300,
+            height: 800,
+        });
+        let crowded = middle.with_own_size(&key(1), 1200, 800).unwrap();
+        assert_eq!((crowded.tiles[0].x, crowded.tiles[0].y), (1500, 0));
+        let mut maxed = small.clone();
+        maxed.version = MAX_TOKEN;
+        assert!(
+            maxed.with_own_size(&key(1), 1200, 800).is_none(),
+            "the version cannot grow"
+        );
+        maxed.version = MAX_TOKEN + 1;
+        assert!(maxed.validate().is_err());
+
+        let older = SharedLayout {
+            version: 3,
+            editor: key(9),
+            tiles: Vec::new(),
+        };
+        let tie = SharedLayout {
+            version: 3,
+            editor: key(1),
+            tiles: Vec::new(),
+        };
+        let newer = SharedLayout {
+            version: 4,
+            editor: key(0),
+            tiles: Vec::new(),
+        };
+        assert!(newer.is_newer_than(&older) && !older.is_newer_than(&newer));
+        assert!(
+            older.is_newer_than(&tie) && !tie.is_newer_than(&older),
+            "the editor breaks a tie"
+        );
+        assert!(!older.is_newer_than(&older));
+    }
+
     #[test]
     fn rejects_invalid_range_and_token() {
         assert!(DesktopRequest::Poll { token: 0 }.validate().is_err());

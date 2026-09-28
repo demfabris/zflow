@@ -8,8 +8,7 @@ mod desktop;
 pub mod desktop_agent;
 #[cfg(target_os = "linux")]
 pub mod gnome;
-#[cfg(target_os = "macos")]
-mod handoff;
+pub(crate) mod handoff;
 pub mod layout_model;
 pub mod model;
 #[cfg(target_os = "macos")]

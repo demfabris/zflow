@@ -146,6 +146,8 @@ fn device_info_from_sysfs(event_path: PathBuf, class_path: &Path) -> Option<Devi
         vendor: read_hex_u16(device.join("id/vendor"))?,
         product: read_hex_u16(device.join("id/product"))?,
         version: read_hex_u16(device.join("id/version"))?,
+        // Readiness looks only at zflow's own devices, found by identity.
+        class: None,
     })
 }
 
@@ -201,6 +203,7 @@ mod tests {
             vendor: ZFLOW_VENDOR_ID,
             product,
             version: ZFLOW_DEVICE_VERSION,
+            class: None,
         }
     }
 

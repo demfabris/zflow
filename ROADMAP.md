@@ -61,7 +61,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 
 | Feature | Deskflow | Mac | Linux | Verdict | Why |
 |---|---|---|---|---|---|
-| Layout editor | 5x3 grid | exists (`ComputerLayout.swift`) | missing (`settings.js:36`) | build | Needed for sending from Linux. |
+| Layout editor | 5x3 grid | exists (`ComputerLayout.swift`) | exists (`settings.js`, drag or arrow keys) | have | Both edit the shared layout. |
 | Partial edge links | Text config only | exists (`src/app/layout_model.rs:98-146`) | shared code | have | |
 | One layout for all machines | The server's | One per Mac | none | build | Decision 4. |
 | Per-monitor tiles | none ([#6257](https://github.com/deskflow/deskflow/issues/6257)) | partial: the type allows several tiles per peer (`layout_model.rs:13-31`), but the app builds one bounding box per computer (`native.rs:436-477`) | none | skip | Entry already snaps to the nearest monitor (`extension.js:175-190`). Portal barriers only work on outer edges (`SPEC.md:518`). |
@@ -314,7 +314,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 | 1 | Status: Ready / Controlling X / Controlled by X / Paused / Needs attention | Title plus badge | `snapshot.status` (`native.rs:522-541`, `client.js:15-25`) | yes | yes |
 | 2 | Input sharing | Switch | `set_sharing` | menu only | yes |
 | 3 | Health | Rows with fix buttons | `snapshot.health[]`, `retry` | yes (popover, `SettingsView.swift:114-204`) | one error row (`settings.js:47-51`) |
-| 4 | Computers: layout | Drag tiles | `move_tile` (`native.rs:151-177`) | yes | no |
+| 4 | Computers: layout | Drag tiles | `move_tile` (`native.rs:151-177`) | yes | yes |
 | 5 | Peer row: name and state | Subtitle | `snapshot.peers[].state` (`native.rs:505-518`, `daemon/peer_view.rs:103-117`) | names only (`Core.swift:35`) | yes (the `settings.js:106` label is backwards) |
 | 6 | Can control this computer | Switch | `set_peer {allow_control}` (new) | no | root CLI only (`src/control.rs:32-35`) |
 | 7 | Keys from this computer | Dropdown | `set_peer {keyboard}` | no | yes |
@@ -409,7 +409,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - The GNOME agent, panel and settings window use it. Health rows and shortcut rows show on Linux. Nearby records carry `pair_address`, so the 43120 rewrite in `settings.js` is gone.
   - The GNOME API level went from 1 to 2, because the snapshot changed shape. Phase 3 needs no second raise if it ships in the same release.
   - Items 8 and 11 wait for Phase 4, since they are new features.
-  - Left for the Mac: `native.rs` builds `api::Snapshot` and matches `api::Request` (`move` becomes `move_tile`, `pair_start` becomes `pair`, `receiver_error` becomes peer states plus health rows, and the Mac-only fields go into its platform struct). Then remove the `allow(dead_code)` at the top of `api.rs`, update `Core.swift`, `SettingsView.swift` and `PairingView.swift` (use `pair_address`), and fix the FFI tests.
+  - The Mac half is done too. `native.rs` builds `api::Snapshot<MacPlatform>` and matches `api::Request`. Link errors are `unreachable` peers with the error as their text, plus a "Paired computers" health row with Retry. That row is also an error when no paired computer takes input from this Mac. Missing Accessibility, a failed crossing, layout and configuration errors are health rows too, so the status says "Needs attention" for them. The Allow button for Accessibility is only in the "This Mac" section. The layout check waits until a computer connects, since a new one has no tile yet. The Mac platform struct carries Accessibility, Local Network and Reduce Wi-Fi lag for the "This Mac" section; the app adds the helper and Move to Applications. The Mac hides "Can control this computer" and the keyboard picker until Phase 2. A missing Wi-Fi helper no longer makes the status "Needs attention", since sharing works without it.
 
 ### Phase 2: the Mac receives (Mac)
 
@@ -437,6 +437,24 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A layout edit shows up on the other machine within 2 s.
 - **Size:** about 15 files, 1500 to 2000 LOC.
 - **Risks:** barrier hits from local motion; held keys at the edge; remappers; extension review; wider device access.
+- **Status (2026-09-28):** in progress on branch `linux-edge-sending`.
+  - Done:
+    - Capture-all: an empty `capture_devices` list captures every keyboard and pointer, and a device another program grabbed (EBUSY) is skipped.
+    - The daemon half of change 9, and the rule for two computers dialing each other at once (`identity::wins_simultaneous_dial`).
+    - GNOME edge barriers: a push sends `edge_hit`. While sending, the pointer is hidden and an idle inhibitor is held. The barriers come back after unlocking, and they stop 8 px short of the desktop's corners (Phase 4's dead corners).
+    - Change 10: the pure handoff parts are shared in `src/app/handoff.rs`, and `src/daemon/crossing.rs` drives a crossing: Prepare at the matching entry point, arm, Poll until the pointer leaves the other computer, warp back and Finish. A push made with a key or button held gives up after 400 ms instead of crossing later.
+    - Each computer writes its own tile size into the shared layout. A resize keeps the sides that touch a neighbour.
+    - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
+    - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
+  - Left:
+    - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
+    - The live checks in TESTPLAN.md, "Two-way input sitting".
+    - A computer paired after a layout exists gets no tile until someone adds it.
+  - Known limits:
+    - A key held on a remapper-grabbed device at the moment zflow opens it blocks arming until the daemon restarts.
+    - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
+    - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
+    - With three or more computers where not every pair is paired, an edit on one computer drops the tiles of computers it has not paired. SPEC's rule against resurrecting forgotten computers causes this; peer-to-peer hops (Phase 4) need a rule that keeps third-party tiles.
 
 ### Phase 4: the Deskflow extras
 
@@ -449,6 +467,8 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A Mac "switch to next computer" chord.
   - Mac media keys.
   - Open logs.
+- **Status (2026-09-28):** started on Linux, on branch `linux-edge-sending`.
+  - Done: dead corners (outbound barriers stop 8 px short of the desktop's corners), pause at edges (`[switching] pause_at_edges`, `set_switching`, 250 ms rest against a barrier on Linux), and reverse scrolling per computer. `reverse_scroll` is on the peer record, in `set_peer` and in the snapshot; the Linux daemon turns that peer's scroll around, and the settings window has the switch. The Mac injector and Mac UI pick it up in Phase 2.
 - **Acceptance:**
   - Text and PNG copy/paste work both ways.
   - A 5 MiB clip is refused with a notice, without disconnecting.

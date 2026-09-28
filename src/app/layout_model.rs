@@ -1,10 +1,13 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::model::{Contents, Document};
-use crate::desktop::Edge;
+use crate::desktop::{Edge, MAX_SHARED_TILES, SharedLayout, Tile};
 
 pub const MAX_MONITORS: usize = 32;
 pub const MAX_COORDINATE: i32 = 100_000;
@@ -94,6 +97,83 @@ impl Layout {
             }
         }
         Ok(())
+    }
+
+    /// The shared form of this layout. `keys` maps each paired computer's
+    /// name here to its key fingerprint. A tile for a computer that is not
+    /// paired is left out, so a forgotten computer does not come back.
+    pub fn to_shared(
+        &self,
+        version: u64,
+        own: &str,
+        keys: &BTreeMap<String, String>,
+    ) -> SharedLayout {
+        let mut seen = BTreeSet::new();
+        let tiles = self
+            .monitors
+            .iter()
+            .filter_map(|monitor| {
+                let key = match &monitor.peer {
+                    None => own.to_owned(),
+                    Some(name) => keys.get(name)?.clone(),
+                };
+                // One tile per computer.
+                seen.insert(key.clone()).then_some(Tile {
+                    key,
+                    x: monitor.x,
+                    y: monitor.y,
+                    width: monitor.width,
+                    height: monitor.height,
+                })
+            })
+            .take(MAX_SHARED_TILES)
+            .collect();
+        SharedLayout {
+            version,
+            editor: own.to_owned(),
+            tiles,
+        }
+    }
+
+    /// This computer's view of a shared layout: its own tile is the local
+    /// one, and paired computers get their names here. Tiles of computers
+    /// that are not paired here are left out.
+    pub fn from_shared(
+        shared: &SharedLayout,
+        own: &str,
+        own_label: &str,
+        keys: &BTreeMap<String, String>,
+    ) -> Self {
+        let names: BTreeMap<&str, &str> = keys
+            .iter()
+            .map(|(name, key)| (key.as_str(), name.as_str()))
+            .collect();
+        let monitors = shared
+            .tiles
+            .iter()
+            .filter_map(|tile| {
+                let (id, label, peer) = if tile.key == own {
+                    ("local".to_owned(), own_label.to_owned(), None)
+                } else {
+                    let name = *names.get(tile.key.as_str())?;
+                    (
+                        format!("peer:{name}"),
+                        name.to_owned(),
+                        Some(name.to_owned()),
+                    )
+                };
+                Some(Monitor {
+                    id,
+                    label,
+                    peer,
+                    x: tile.x,
+                    y: tile.y,
+                    width: tile.width,
+                    height: tile.height,
+                })
+            })
+            .collect();
+        Self { monitors }
     }
 
     pub fn transitions(&self) -> Vec<Transition> {
@@ -240,6 +320,55 @@ mod tests {
             width,
             height,
         }
+    }
+
+    #[test]
+    fn a_shared_layout_reads_the_same_arrangement_on_both_computers() {
+        let (mac, ubuntu) = (format!("{:064x}", 1), format!("{:064x}", 2));
+        // The Mac's layout, with a computer it paired and one it forgot.
+        let on_mac = Layout {
+            monitors: vec![
+                monitor("local", 0, 0, 3008, 1692),
+                monitor("ubuntu", 3008, 0, 2560, 1440),
+                monitor("gone", -1000, 0, 1000, 800),
+            ],
+        };
+        let mac_keys = BTreeMap::from([("ubuntu".to_owned(), ubuntu.clone())]);
+        let shared = on_mac.to_shared(7, &mac, &mac_keys);
+        shared.validate().unwrap();
+        assert_eq!((shared.version, &shared.editor), (7, &mac));
+        assert_eq!(shared.tiles.len(), 2, "the forgotten computer is left out");
+
+        // Ubuntu calls the Mac "MacBook"; its own tile becomes the local one.
+        let ubuntu_keys = BTreeMap::from([("MacBook".to_owned(), mac.clone())]);
+        let on_ubuntu = Layout::from_shared(&shared, &ubuntu, "This computer", &ubuntu_keys);
+        let local = on_ubuntu
+            .monitors
+            .iter()
+            .find(|m| m.peer.is_none())
+            .unwrap();
+        assert_eq!(
+            (local.id.as_str(), local.x, local.width),
+            ("local", 3008, 2560)
+        );
+        let peer = on_ubuntu
+            .monitors
+            .iter()
+            .find(|m| m.peer.is_some())
+            .unwrap();
+        assert_eq!(
+            (peer.id.as_str(), peer.label.as_str(), peer.x),
+            ("peer:MacBook", "MacBook", 0)
+        );
+        assert_eq!(
+            on_ubuntu.transitions().len(),
+            2,
+            "one edge in each direction"
+        );
+
+        // A computer Ubuntu has not paired is not placed there.
+        let stranger = Layout::from_shared(&shared, &ubuntu, "This computer", &BTreeMap::new());
+        assert_eq!(stranger.monitors.len(), 1);
     }
 
     #[test]

@@ -74,6 +74,7 @@ pub struct InputConnection {
     control_send: ControlSender,
     control_receive: ControlReceiver,
     datagrams: DatagramChannel,
+    clipboard: ClipboardChannel,
 }
 
 impl fmt::Debug for InputConnection {
@@ -103,6 +104,7 @@ impl InputConnection {
             control_send: self.control_send,
             control_receive: self.control_receive,
             datagrams: self.datagrams,
+            clipboard: self.clipboard,
         }
     }
 
@@ -119,6 +121,78 @@ pub struct InputChannels {
     pub control_send: ControlSender,
     pub control_receive: ControlReceiver,
     pub datagrams: DatagramChannel,
+    pub clipboard: ClipboardChannel,
+}
+
+/// The kind and length a clipboard stream announces, if it may be read.
+fn clip_header(header: &[u8; 7]) -> Option<(crate::clipboard::ClipKind, usize)> {
+    let length = u32::from_be_bytes(header[3..].try_into().expect("four bytes")) as usize;
+    let kind = crate::clipboard::ClipKind::from_code(header[2])?;
+    (header[..2] == *CLIPBOARD_PREFACE && length <= crate::clipboard::MAX_CLIP_BYTES)
+        .then_some((kind, length))
+}
+
+/// Starts every clipboard stream, so a stray stream is refused at once.
+const CLIPBOARD_PREFACE: &[u8; 2] = b"ZC";
+/// Why a clipboard stream was stopped, for the other end's diagnostics.
+const CLIPBOARD_REFUSED: u32 = 1;
+
+/// The one-way streams that carry clipboard contents, one transfer each.
+/// They send at a lower priority than the control stream, and QUIC puts
+/// datagrams ahead of stream data in every packet, so a large clip does
+/// not hold up input.
+#[derive(Clone)]
+pub struct ClipboardChannel {
+    connection: Connection,
+}
+
+impl ClipboardChannel {
+    /// Sends one clip and finishes its stream. Dropping the future part way
+    /// ends the stream early, and the other end discards what it got.
+    pub async fn send(&self, clip: &crate::clipboard::Clip) -> Result<(), TransportError> {
+        let failed = |error: &dyn fmt::Display| TransportError::Clipboard(error.to_string());
+        let mut stream = self.connection.open_uni().await?;
+        stream.set_priority(-1).map_err(|error| failed(&error))?;
+        let mut header = [0_u8; 7];
+        header[..2].copy_from_slice(CLIPBOARD_PREFACE);
+        header[2] = clip.kind().code();
+        header[3..].copy_from_slice(&(clip.data().len() as u32).to_be_bytes());
+        stream
+            .write_all(&header)
+            .await
+            .map_err(|error| failed(&error))?;
+        stream
+            .write_all(clip.data())
+            .await
+            .map_err(|error| failed(&error))?;
+        stream.finish().map_err(|error| failed(&error))?;
+        Ok(())
+    }
+
+    /// Waits for the next clip from the peer. A bad or oversized clip is an
+    /// error for that stream only; the connection stays up.
+    pub async fn receive(&self) -> Result<crate::clipboard::Clip, TransportError> {
+        use crate::clipboard::Clip;
+        let failed = |error: &dyn fmt::Display| TransportError::Clipboard(error.to_string());
+        let mut stream = self.connection.accept_uni().await?;
+        let mut header = [0_u8; 7];
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| failed(&error))?;
+        let Some((kind, length)) = clip_header(&header) else {
+            let _ = stream.stop(VarInt::from_u32(CLIPBOARD_REFUSED));
+            return Err(TransportError::Clipboard(
+                "the peer sent an invalid or oversized clip".into(),
+            ));
+        };
+        let mut data = vec![0_u8; length];
+        stream
+            .read_exact(&mut data)
+            .await
+            .map_err(|error| failed(&error))?;
+        Clip::new(kind, data).map_err(|error| failed(&format!("{error:#}")))
+    }
 }
 
 pub struct ControlSender {
@@ -628,10 +702,11 @@ fn input_connection(
             state: ControlReceiveState::default(),
         },
         datagrams: DatagramChannel {
-            connection,
+            connection: connection.clone(),
             negotiated_maximum,
             outgoing,
         },
+        clipboard: ClipboardChannel { connection },
     }
 }
 
@@ -1022,6 +1097,28 @@ fn close_protocol(connection: &Connection, reason: &'static [u8]) {
 #[cfg(test)]
 mod tests {
     use super::{LatestDatagramQueue, PendingDatagramClass};
+
+    #[test]
+    fn a_clipboard_stream_announces_a_known_kind_within_the_cap() {
+        use crate::clipboard::{ClipKind, MAX_CLIP_BYTES};
+        let header = |prefix: &[u8; 2], kind: u8, length: usize| {
+            let mut header = [0_u8; 7];
+            header[..2].copy_from_slice(prefix);
+            header[2] = kind;
+            header[3..].copy_from_slice(&(length as u32).to_be_bytes());
+            header
+        };
+        assert_eq!(
+            super::clip_header(&header(b"ZC", 2, MAX_CLIP_BYTES)),
+            Some((ClipKind::Png, MAX_CLIP_BYTES))
+        );
+        assert_eq!(
+            super::clip_header(&header(b"ZC", 2, MAX_CLIP_BYTES + 1)),
+            None
+        );
+        assert_eq!(super::clip_header(&header(b"ZC", 9, 5)), None);
+        assert_eq!(super::clip_header(&header(b"XX", 1, 5)), None);
+    }
     use bytes::Bytes;
 
     #[test]

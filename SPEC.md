@@ -163,9 +163,11 @@ On Linux, physical devices stay on their normal kernel path while zflow is idle.
 Each input source follows four routing states:
 
 1. **Idle**: no grabs exist. Local input flows normally. A daemon crash, restart, or package upgrade in this state cannot affect local input, and a restarted daemon is immediately fully functional.
-2. **Arming**: zflow has selected and authenticated a peer and an activation was requested (hotkey chord, or a portal edge event). For the hotkey path, zflowd waits until every key and button across the capture set is neutral (verified through EVIOCGKEY and tracked state), then takes EVIOCGRAB on every node in the set, all or none. EBUSY or any failure releases acquired grabs and returns to Idle with a diagnostic.
+2. **Arming**: zflow has selected and authenticated a peer and an activation was requested (hotkey chord, or a portal edge event). For the hotkey path, zflowd waits until every key and button across the capture set is neutral (verified through EVIOCGKEY and tracked state), then takes EVIOCGRAB on every node in the set, all or none. EBUSY or any failure releases acquired grabs and returns to Idle with a diagnostic. One exception: with no configured devices the set is every keyboard, mouse and touchpad, and a node another program already grabbed (EBUSY) is skipped and never released, since it was never zflow's. A remapper such as keyd holds its source that way and re-emits on a virtual node, which zflow grabs instead. Arming then succeeds if at least one node was grabbed; any other failure still releases the whole set.
 3. **Remote**: grabbed physical events serialize to the peer. The local escape chord works without network cooperation because the daemon reads every event.
 4. **Releasing**: zflow queues a terminal state when the connection remains live, ungrabs the set at a complete SYN_REPORT boundary, and the physical devices return to normal kernel consumers. The receiver cleans up through that terminal state or its lease and lifecycle rules.
+
+**Edge crossings on GNOME**: the GNOME extension places a barrier on each outer edge that the layout connects to a paired computer. A push against one makes zflowd prepare that peer's desktop at the matching entry point, then arm exactly as for the chord, and poll the peer until the pointer leaves through the peer's edge. It then puts the pointer at the matching point here, gives input back and finishes the handoff. The chord still activates without preparing the peer. With "Pause at edges" on (`[switching] pause_at_edges`), a push crosses only after the pointer rests 250 ms against the barrier, and leaving the barrier first cancels it. While this computer sends, the extension hides the pointer and the desktop agent holds a gnome-session idle inhibitor, because grabbed devices give GNOME no input and it would otherwise lock the screen. Only zflowd can ask for barriers, pointer moves or hiding; these are local agent requests that no input session can carry.
 
 **One direction at a time**: a computer MUST NOT start sending while another computer controls it, and MUST refuse a peer's activation while its own capture set is Arming, Remote, or Releasing. When two computers cross toward each other at once, each refuses the other and both stay local; the user crosses again.
 
@@ -192,6 +194,10 @@ The decoder MUST:
 - expose a fuzz target for every message family.
 
 Payloads are the core model types in postcard behind a three-byte header (magic and family); desktop metadata is JSON. The logical model below is fixed for the first prototype.
+
+### Shared layout
+
+Every paired computer keeps one arrangement of all their desktops. Tiles are keyed by key fingerprint, because each computer names the others differently, and hold at most 16 computers so one desktop message carries the whole layout. Each edit raises the layout's version and records its editor's fingerprint; the higher (version, editor) wins, so both ends keep the same layout without a coordinator. A computer sends its layout when a session starts and after each change, keeps a newer one it receives, passes it on to its other peers, and answers an older one with its own. A computer drops tiles for keys it has not paired, so a forgotten computer never returns through a peer's copy, and it computes its own crossing edges from its own tile.
 
 Authenticated session negotiation selects the maximum datagram size, input capabilities, pointer units, scroll fields, contact limit, receiver lease, and checkpoint bound. A required capability mismatch prevents activation.
 
@@ -447,9 +453,9 @@ Linux uses evdev for physical capture and uinput for remote injection. EVIOCGRAB
 
 zflowd grabs the configured capture set on demand at the Arming transition and releases it when Remote ends, per the Input ownership section. While Idle it holds no grabs and reads the set only to detect the activation chord and track state. This keeps the daemon out of the local input path, keeps upgrades and restarts harmless, and lets a hotplugged device join the set without a reboot; the cost is the bounded arming leak, measured by the backbone matrix.
 
-zflowd runs as a dedicated service account unless a platform test proves that root is required. The account may read selected evdev nodes and open /dev/uinput. Membership in the broad input group grants keylogger-level access, so installers MUST NOT add interactive users to it.
+zflowd runs as a dedicated service account unless a platform test proves that root is required. The account may read keyboard and pointer evdev nodes and open /dev/uinput. Membership in the broad input group grants keylogger-level access, so installers MUST NOT add interactive users to it.
 
-The installer ensures that uinput exists as a built-in driver or loaded module, grants zflowd write access to /dev/uinput, read access to selected evdev nodes, and write access only to nodes that need negotiated LED feedback. It verifies those permissions after a cold boot.
+The installer ensures that uinput exists as a built-in driver or loaded module, grants zflowd write access to /dev/uinput, read access to every keyboard and pointer evdev node, and write access only to nodes that need negotiated LED feedback. It verifies those permissions after a cold boot.
 
 The service starts from multi-user.target and retries network discovery without blocking the display manager on network-online.target. When pre-login support is enabled, zflowd orders before the enabled display-manager unit and uses Type=notify. It sends READY=1 only after /dev/uinput is accessible, the baseline virtual devices exist, and their matching udev add events expose the required properties, so a pre-login client can receive input before the greeter appears. Network availability does not delay readiness. A daemon start at any later time is equally functional; no state depends on starting before the session.
 
@@ -481,7 +487,7 @@ libinput requires udev classification and device-specific properties; a uinput n
 
 ### Capture
 
-A capture set is all-or-none: at Arming, zflowd opens and grabs every event node in the configured logical set, and EVIOCGRAB returning EBUSY or any setup failure releases the whole set and returns to Idle with a diagnostic.
+A configured capture set is all-or-none: at Arming, zflowd opens and grabs every event node in the configured logical set, and EVIOCGRAB returning EBUSY or any setup failure releases the whole set and returns to Idle with a diagnostic. With no configured devices, zflowd captures every keyboard, mouse and touchpad except its own virtual devices, and skips a node that returns EBUSY, as the Input ownership section describes.
 
 The daemon handles:
 

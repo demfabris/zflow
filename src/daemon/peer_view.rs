@@ -98,6 +98,11 @@ async fn desktop_command(
         shared.desktop.focus(&shared.runtime, terminal).await;
         return Ok(DesktopReply::Ack);
     }
+    if let Request::EdgeHit { edge, position } = request {
+        authorize_peer(stream, daemon_uid, shared.active_uid())?;
+        shared.edge_hit(edge, position);
+        return Ok(DesktopReply::Ack);
+    }
     let _mutation = shared.config_mutation.lock().await;
     authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();
@@ -116,10 +121,16 @@ async fn desktop_command(
                 .as_ref()
                 .map(|active| active.peer.clone()),
             connected: shared.sessions.lock().await.keys().cloned().collect(),
+            layout: shared.layout_status().await,
             ..DesktopStatus::from_config(&config)
         })),
         Request::SetSharing { enabled } => {
             config.daemon.sharing = enabled;
+            shared.apply_config_locked(config, true).await?;
+            Ok(DesktopReply::Ack)
+        }
+        Request::SetSwitching { pause_at_edges } => {
+            config.switching.pause_at_edges = pause_at_edges;
             shared.apply_config_locked(config, true).await?;
             Ok(DesktopReply::Ack)
         }
@@ -134,12 +145,22 @@ async fn desktop_command(
             name,
             allow_control,
             keyboard,
+            reverse_scroll,
         } => {
             let Some(peer) = config.peers.get_mut(&name) else {
                 bail!("Unknown computer {name}");
             };
-            crate::peer_view::set_peer(peer, allow_control, keyboard);
+            crate::peer_view::set_peer(peer, allow_control, keyboard, reverse_scroll);
             shared.apply_config_locked(config, true).await?;
+            Ok(DesktopReply::Ack)
+        }
+        Request::MoveTile {
+            id,
+            x,
+            y,
+            tolerance,
+        } => {
+            shared.move_tile(&id, x, y, tolerance).await?;
             Ok(DesktopReply::Ack)
         }
         _ => bail!("Unsupported desktop operation"),

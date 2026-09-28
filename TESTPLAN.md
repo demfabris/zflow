@@ -4,6 +4,47 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
+
+One sitting with the Mac and the Ubuntu box, run from one branch that holds both
+halves (`linux-edge-sending` merged into the Mac's Phase 2 branch). Both ends
+speak `zflow/3`, so a build from before it cannot join. To roll back, install
+`main` on both computers.
+
+Setup on Ubuntu:
+
+1. `sudo just install-linux`. It installs `zflow` and `zflowd`, reloads udev, so
+   every keyboard and pointer is readable by the `zflow` account, and restarts
+   the service.
+2. Empty `capture_devices` in `/etc/zflow/zflow.toml`, then run `sudo zflow doctor`.
+   It should report "every keyboard and pointer". On the maintainer's box keyd
+   grabs the PRO X 60 and OpenLogi grabs the PRO X 2, so a crossing grabs their
+   virtual outputs and the journal names the busy sources it skipped.
+3. As the desktop user, run `zflow desktop-agent --install`, then log out and
+   back in so GNOME Shell loads the API 2 extension. The panel shows a status,
+   not "Update zflow".
+4. After the Mac connects, `journalctl -u zflowd` shows "layout adopted" and
+   "outbound edges placed", and `/var/lib/zflow/layout.json` holds the layout.
+
+Checks:
+
+- **Edge crossing:** push the pointer into the edge that touches the Mac. No
+  dialog appears, the Linux pointer hides, and the Mac cursor enters at the
+  matching point.
+- **Return:** leave through the Mac's edge. The Linux pointer comes back at the
+  matching point and shows again.
+- **Escape chord:** Ctrl+Super+Backspace returns input from any state.
+- **Screen stays awake:** a 15-minute session on the Mac leaves the Linux
+  screen unlocked.
+- **One direction at a time:** while the Mac controls Linux, pushing against a
+  Linux edge starts nothing. Crossing from both computers at the same moment
+  leaves both local.
+- **Hotplug:** a mouse plugged in between crossings is grabbed at the next one.
+- **Shared layout:** a tile moved on the Mac shows up on Linux within 2 s, and
+  the barriers follow. Changing the Linux resolution logs "this computer's tile
+  resized", and the Mac's tile for Linux follows.
+- **Chord:** Ctrl+Super+F12 still sends to the Mac without preparing its desktop.
+
 ## Binary releases and Debian packaging, September 16
 
 Run `just test-install` (also included in `just check`). The tests use local
@@ -387,8 +428,8 @@ drops a session, and a prompt close. These need live checks on real hardware:
 - Turn Wi-Fi off for 30 seconds while idle, and again while controlling
   Ubuntu. Expect `input link lost`, a reconnect after Wi-Fi returns, and a
   working crossing. Repeat with a zflowd restart and a one-minute Mac sleep.
-- With a signed build, install the AWDL helper, confirm Settings reports it
-  ready, and cross with **Block AWDL while sharing** on. `ifconfig awdl0` must
+- With a signed build, install the Wi-Fi helper, confirm Settings reports it
+  ready, and cross with **Reduce Wi-Fi lag** on. `ifconfig awdl0` must
   show it down during capture and restored after return.
 
 ## Historical configuration GUI observations

@@ -27,6 +27,16 @@ pub struct Config {
     pub playout: PlayoutConfig,
     pub peers: BTreeMap<String, PeerConfig>,
     pub macos: MacosConfig,
+    pub switching: SwitchingConfig,
+}
+
+/// How crossings start, the same on every platform.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SwitchingConfig {
+    /// The pointer has to rest against an edge for a moment before it
+    /// crosses, so reaching for something at the screen edge stays here.
+    pub pause_at_edges: bool,
 }
 
 impl Default for Config {
@@ -39,6 +49,7 @@ impl Default for Config {
             playout: PlayoutConfig::default(),
             peers: BTreeMap::new(),
             macos: MacosConfig::default(),
+            switching: SwitchingConfig::default(),
         }
     }
 }
@@ -187,6 +198,10 @@ pub struct PeerConfig {
     /// that never changes it still loads in older binaries.
     #[serde(default, skip_serializing_if = "KeyboardMode::is_standard")]
     pub keyboard: KeyboardMode,
+    /// Turns this peer's scrolling around here, for a Mac with natural
+    /// scrolling against a desktop without it. Left out while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reverse_scroll: bool,
 }
 
 impl PeerConfig {
@@ -201,6 +216,7 @@ impl PeerConfig {
             addresses,
             permissions,
             keyboard: KeyboardMode::Standard,
+            reverse_scroll: false,
         })
     }
 
@@ -541,6 +557,7 @@ mod tests {
                 addresses: Vec::new(),
                 permissions: PeerPermissions::default(),
                 keyboard: KeyboardMode::Standard,
+                reverse_scroll: false,
             },
         );
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));

@@ -22,38 +22,65 @@ struct Nearby: Decodable, Identifiable, Sendable {
   var instance: String
   var addresses: [String]
   var compatible: Bool
+  /// Where its pairing listener waits; computers advertise their input port.
+  var pairAddress: String?
   var id: String { instance }
 }
+/// src/app/api.rs Snapshot, which the GNOME settings window shows too. The
+/// shared rows come first, in window order, then the ones for this Mac.
 struct Snapshot: Decodable, Sendable {
-  var configPath: String
-  var layoutPath: String
-  var status: String
-  var sharing: Bool
-  var blockAwdl: Bool
-  var accessibility: Bool
-  var notice: String
-  var peers: [String]
-  var layout: Layout
+  var status: Status
+  /// Nil while the part that shares input cannot be reached.
+  var sharing: Bool?
+  var health: [Health]
+  var layout: Layout?
+  var peers: [Peer]
   var pairing: Pairing
   var nearby: [Nearby]
-  var configError: String?
-  var layoutError: String?
-  var receiverError: String?
-  var receiverChecked: Bool
-  var checking: Bool
+  var shortcuts: [Shortcut]
+  /// Nil here: the app keeps the login item itself.
+  var autostart: Bool?
+  var configPath: String
+  var platform: MacPlatform
+
+  var peerNames: [String] { peers.map(\.name) }
+}
+struct Status: Decodable, Sendable {
+  /// ready, controlling, controlled, paused, checking, setup or attention.
+  var state: String
+  var peer: String?
+  var title: String
+}
+struct Peer: Decodable, Identifiable, Sendable {
+  var name: String
+  /// paired, connecting, connected, controlling_this, controlled_from_here or unreachable.
+  var state: String
+  var detail: String
+  var allowControl: Bool
+  var keyboard: String
+  var id: String { name }
+}
+struct Health: Decodable, Identifiable, Sendable {
+  var id: String
+  /// ok, warning or error.
+  var level: String
+  var title: String
+  var detail: String
+  var action: HealthAction?
+}
+struct HealthAction: Decodable, Sendable {
+  var label: String
+  var command: String
+}
+struct Shortcut: Decodable, Sendable {
+  var title: String
+  var keys: String
+}
+struct MacPlatform: Decodable, Sendable {
+  var accessibility: Bool
   /// "allowed", "blocked", or "unknown" until setup asks to find computers.
   var localNetwork: String
-
-  var title: String {
-    switch status {
-    case "ready": "Ready"
-    case "sharing": "Sharing"
-    case "paused": "Paused"
-    case "checking": "Checking…"
-    case "setup": "Pair a computer"
-    default: "Needs attention"
-    }
-  }
+  var blockAwdl: Bool
 }
 struct CoreRequest: Encodable, Sendable {
   var command: String

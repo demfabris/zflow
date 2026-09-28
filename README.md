@@ -211,7 +211,9 @@ the updated layout arms.
 
 Pairing lists receivers advertised on the local network. Discovery does not
 verify identity; only the setup code shown on the receiver does. Manual
-addresses remain available. The Linux daemon advertises the receiver. macOS
+addresses remain available. The Linux daemon advertises itself and also
+browses: when it dials a paired computer, it tries nearby addresses too, with
+that computer's pinned key, so a changed address does not break the link. macOS
 asks for Local Network access the first time the Mac browses, so the Mac waits
 for the setup's Local Network step or **Pair Computer…** in Settings. Once a
 computer is paired, it browses from launch. Browsing then continues while the
@@ -223,7 +225,14 @@ permission rules from app bundles. See [Apple's local-network guidance](https://
 
 ## Install and select devices
 
-After installing zflow on both Linux machines:
+With `capture_devices` empty, the default, a Linux machine that sends
+captures every keyboard, mouse, and touchpad. The packaged udev rule lets the
+zflow account read them. A device another program already grabbed is skipped:
+keyd, for example, holds the physical keyboard and types through `keyd virtual
+keyboard`, and zflow captures that one instead. `sudo zflow doctor` lists what
+it would capture.
+
+To capture only some devices, list them:
 
 ```sh
 sudo zflow devices
@@ -241,6 +250,9 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger --action=change --subsystem-match=input
 sudo zflow doctor
 ```
+
+A listed device must be free: if another program grabbed it, every crossing
+fails. List the remapper's virtual device instead.
 
 Raw touchpad forwarding is experimental. Enable it on both machines. A running
 daemon applies it without a restart: it creates the virtual touchpad and ends

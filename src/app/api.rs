@@ -5,10 +5,6 @@
 //! order of the `Snapshot` fields. Each platform fills `platform` with the
 //! rows under it.
 
-// Only the GNOME agent builds its snapshot here so far. Remove this once
-// native.rs does too (ROADMAP Phase 1).
-#![cfg_attr(target_os = "macos", allow(dead_code))]
-
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -22,11 +18,13 @@ pub(super) struct Snapshot<P> {
     /// None while the part that shares input cannot be reached.
     pub sharing: Option<bool>,
     pub health: Vec<Health>,
-    /// None until this computer has a layout editor.
+    /// None while there is no layout to arrange.
     pub layout: Option<Layout>,
     pub peers: Vec<Peer>,
     pub pairing: PairingSnapshot,
     pub nearby: Vec<NearbyRecord>,
+    /// None where crossings cannot pause yet.
+    pub pause_at_edges: Option<bool>,
     pub shortcuts: Vec<Shortcut>,
     /// None where the app keeps it, as the Mac app does with its login item.
     pub autostart: Option<bool>,
@@ -104,6 +102,8 @@ pub(super) struct Peer {
     /// Whether it may control this computer.
     pub allow_control: bool,
     pub keyboard: KeyboardMode,
+    /// Whether its scrolling is turned around here.
+    pub reverse_scroll: bool,
 }
 
 // Linux does not see connection attempts or link errors yet.
@@ -135,6 +135,7 @@ impl Peer {
             detail: detail.into(),
             allow_control: record.permissions.send_normal,
             keyboard: record.keyboard,
+            reverse_scroll: record.reverse_scroll,
         }
     }
 }
@@ -187,10 +188,11 @@ pub(super) struct Shortcut {
 
 /// Everything a window or menu may ask for. A request the platform does not
 /// have fails with an error rather than doing nothing.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+// Each platform leaves the fields of the other's requests unread.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum Request {
+pub(crate) enum Request {
     Snapshot,
     SetSharing {
         enabled: bool,
@@ -200,6 +202,7 @@ pub(super) enum Request {
         name: String,
         allow_control: Option<bool>,
         keyboard: Option<KeyboardMode>,
+        reverse_scroll: Option<bool>,
     },
     Forget {
         name: String,
@@ -223,6 +226,9 @@ pub(super) enum Request {
     PairCancel,
     /// Checks the other computers again now.
     Retry,
+    SetSwitching {
+        pause_at_edges: bool,
+    },
     SetAutostart {
         enabled: bool,
     },
@@ -244,6 +250,8 @@ pub(super) enum Request {
     Discover,
     /// Linux: opens the settings window.
     OpenSettings,
+    /// Linux: follows the service's log in a terminal.
+    OpenLogs,
     /// Linux: installs and turns on the GNOME extension.
     InstallExtension,
 }
@@ -264,6 +272,7 @@ mod tests {
                 inject_prelogin: false,
             },
             keyboard: KeyboardMode::Mac,
+            reverse_scroll: false,
         }
     }
 
@@ -315,7 +324,7 @@ mod tests {
             value,
             serde_json::json!({
                 "name": "desk", "state": "controlled_from_here", "detail": "Controlled from here",
-                "allow_control": false, "keyboard": "mac",
+                "allow_control": false, "keyboard": "mac", "reverse_scroll": false,
             })
         );
     }
@@ -356,6 +365,7 @@ mod tests {
             peers: Vec::new(),
             pairing: PairingSnapshot::default(),
             nearby: Vec::new(),
+            pause_at_edges: None,
             shortcuts: Vec::new(),
             autostart: None,
             config_path: "/etc/zflow/zflow.toml".into(),
@@ -371,6 +381,7 @@ mod tests {
             "peers",
             "pairing",
             "nearby",
+            "pause_at_edges",
             "shortcuts",
             "autostart",
             "config_path",

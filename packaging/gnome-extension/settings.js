@@ -1,10 +1,20 @@
 import Adw from 'gi://Adw?version=1';
+import Gdk from 'gi://Gdk?version=4.0';
 import Gtk from 'gi://Gtk?version=4.0';
+import Pango from 'gi://Pango';
 import {Client, compatible, statusText} from './client.js';
 
 // src/core/keymap.rs KeyboardMode, in dropdown order.
 const KEYBOARD_MODES = ['standard', 'pc_positions', 'mac'];
 const HEALTH_ICONS = {ok: 'object-select-symbolic', warning: 'dialog-warning-symbolic', error: 'dialog-error-symbolic'};
+const NO_LAYOUT = 'Arrange computers in zflow on the other computer.';
+const LAYOUT_HINT = 'Drag computers to match your desk. The pointer crosses where two touch.';
+// As in the Mac app (ComputerLayout.swift): an arrow key moves a tile 100
+// layout units and snaps within 150; a drag snaps within 14 pixels.
+const KEY_STEP = 100;
+const KEY_TOLERANCE = 150;
+const DRAG_TOLERANCE = 14;
+const ARROWS = {[Gdk.KEY_Left]: [-1, 0], [Gdk.KEY_Right]: [1, 0], [Gdk.KEY_Up]: [0, -1], [Gdk.KEY_Down]: [0, 1]};
 
 function button(label, action, css = []) {
     const widget = new Gtk.Button({label, valign: Gtk.Align.CENTER, css_classes: css});
@@ -24,6 +34,7 @@ export class Settings {
         this._shortcutKey = '';
         this._keyboards = new Map();
         this._controls = new Map();
+        this._scrolls = new Map();
         // Rows are rebuilt when a computer connects, so remember which are open.
         this._expanded = new Set();
         this.page = new Adw.PreferencesPage({title: 'zflow', icon_name: 'input-mouse-symbolic'});
@@ -47,10 +58,46 @@ export class Settings {
         this._errorGroup.add(this._error);
         this.page.add(this._errorGroup);
 
-        this._computers = new Adw.PreferencesGroup({title: 'Computers', description: 'Arrange computers in zflow on the other computer.'});
+        this._computers = new Adw.PreferencesGroup({title: 'Computers', description: NO_LAYOUT});
         this._pairButton = button('Pair Computer…', () => this._openPairing(), ['suggested-action']);
         this._computers.header_suffix = this._pairButton;
+        // The layout comes first, above the computers' rows. Each tile is a
+        // button, so it takes keyboard focus and has a name.
+        this._tiles = new Map();
+        this._layoutKey = '';
+        this._pressed = null;
+        this._boardSize = [440, 200];
+        this._board = new Gtk.Fixed();
+        // One drag for the whole box. On a tile, it would measure from the
+        // tile that moves under it. It sees a press before the tile's button
+        // does, as a scrolled window's drag does, and takes it only once the
+        // pointer moves.
+        const drag = new Gtk.GestureDrag({propagation_phase: Gtk.PropagationPhase.CAPTURE});
+        drag.connect('drag-begin', (_drag, x, y) => {
+            // Later tiles draw on top.
+            this._pressed = [...this._tiles.values()].findLast(tile => x >= tile.x && y >= tile.y && x < tile.x + tile.size[0] && y < tile.y + tile.size[1]);
+        });
+        drag.connect('drag-update', (_drag, dx, dy) => this._dragTile(drag, dx, dy));
+        drag.connect('drag-end', (_drag, dx, dy) => this._dropTile(dx, dy));
+        this._board.add_controller(drag);
+        // A Gtk.Fixed does not report its width, so the empty area under it does.
+        const area = new Gtk.DrawingArea({content_height: this._boardSize[1], hexpand: true});
+        area.connect('resize', (_area, width, height) => {
+            this._boardSize = [width, height];
+            this._placeTiles();
+        });
+        const canvas = new Gtk.Overlay({child: area, overflow: Gtk.Overflow.HIDDEN});
+        canvas.add_overlay(this._board);
+        this._layout = new Adw.PreferencesRow({title: 'Layout', child: canvas, activatable: false, focusable: false, visible: false});
+        this._computers.add(this._layout);
         this.page.add(this._computers);
+        const switching = new Adw.PreferencesGroup();
+        this._pause = new Adw.SwitchRow({title: 'Pause at Edges', subtitle: 'Rest the pointer against an edge for a moment before it crosses.', sensitive: false});
+        this._pause.connect('notify::active', () => {
+            if (!this._updating) this._run({command: 'set_switching', pause_at_edges: this._pause.active});
+        });
+        switching.add(this._pause);
+        this.page.add(switching);
         this._shortcuts = new Adw.PreferencesGroup({title: 'Shortcuts', visible: false});
         this.page.add(this._shortcuts);
         const preferences = new Adw.PreferencesGroup();
@@ -60,6 +107,13 @@ export class Settings {
         });
         preferences.add(this._login);
         this.page.add(preferences);
+        // Rows only this computer has, under the shared ones.
+        const local = new Adw.PreferencesGroup({title: 'This Computer'});
+        const logs = new Adw.ActionRow({title: 'Service Log', subtitle: 'Follow what zflow’s background service is doing.'});
+        this._logs = button('Open', () => this._run({command: 'open_logs'}));
+        logs.add_suffix(this._logs);
+        local.add(logs);
+        this.page.add(local);
         this._help = new Adw.PreferencesGroup();
         this.page.add(this._help);
         this.client = new Client(snapshot => this._update(snapshot), true);
@@ -76,8 +130,8 @@ export class Settings {
     async _run(request) {
         if (this._busy) return false;
         this._busy = true;
-        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = false;
-        for (const row of [...this._keyboards.values(), ...this._controls.values()]) row.sensitive = false;
+        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = this._pause.sensitive = false;
+        for (const row of [...this._keyboards.values(), ...this._controls.values(), ...this._scrolls.values()]) row.sensitive = false;
         this._showError(null);
         let success = false;
         try { await this.client.call(request); success = true; }
@@ -101,6 +155,8 @@ export class Settings {
             : state === 'paused' ? 'media-playback-pause-symbolic' : 'input-mouse-symbolic';
         this._sharing.active = online && snapshot.sharing;
         this._sharing.sensitive = online && !this._busy;
+        this._pause.active = (known && snapshot.pause_at_edges) ?? false;
+        this._pause.sensitive = online && snapshot.pause_at_edges !== null && !this._busy;
         this._login.active = (known && snapshot.autostart) ?? false;
         this._login.sensitive = known && snapshot.autostart !== null && !this._busy;
         this._pairButton.sensitive = online && !this._busy && !this._pairing;
@@ -109,6 +165,7 @@ export class Settings {
         this._errorGroup.visible = !!this._error.subtitle;
         this._help.description = `Changes save automatically. Advanced settings are in ${known ? snapshot.config_path : '/etc/zflow/zflow.toml'}.`;
         this._updateHealth(known ? snapshot.health : []);
+        this._updateLayout(known ? snapshot.layout : null);
         this._updatePeers(known ? snapshot.peers : []);
         this._updateShortcuts(known ? snapshot.shortcuts : []);
         // A fresh install opens pairing with its code on screen, so the other
@@ -135,16 +192,126 @@ export class Settings {
         this._health.visible = rows.length > 0;
     }
 
+    _updateLayout(layout) {
+        const monitors = layout?.monitors ?? [];
+        this._layout.visible = monitors.length > 0;
+        this._computers.description = monitors.length ? LAYOUT_HINT : NO_LAYOUT;
+        // Keep tiles, and the focused one, while unchanged snapshots arrive. A
+        // move keeps its tile too, so arrow keys can move it again.
+        const key = JSON.stringify(monitors);
+        if (key === this._layoutKey) return;
+        this._layoutKey = key;
+        const ids = new Set(monitors.map(({id}) => id));
+        for (const [id, tile] of this._tiles) {
+            if (ids.has(id)) continue;
+            this._board.remove(tile.button);
+            this._tiles.delete(id);
+        }
+        for (const monitor of monitors) {
+            const tile = this._tiles.get(monitor.id) ?? this._newTile(monitor);
+            tile.monitor = monitor;
+            tile.label.label = tile.button.tooltip_text = monitor.label;
+            tile.button.update_property([Gtk.AccessibleProperty.DESCRIPTION], [`Position ${monitor.x}, ${monitor.y}. Drag it or use the arrow keys to move it.`]);
+        }
+        this._placeTiles();
+    }
+
+    _newTile(monitor) {
+        const {id} = monitor;
+        const label = new Gtk.Label({ellipsize: Pango.EllipsizeMode.END, max_width_chars: 12});
+        // This computer's tile is the highlighted one.
+        const button = new Gtk.Button({child: label, css_classes: monitor.peer ? [] : ['suggested-action']});
+        // Where the tile shows on the board, in pixels.
+        const tile = {button, label, monitor, x: 0, y: 0, size: [0, 0], dragging: false};
+        const keys = new Gtk.EventControllerKey();
+        keys.connect('key-pressed', (_keys, keyval) => {
+            const step = ARROWS[keyval];
+            if (!step) return false;
+            const {x, y} = tile.monitor;
+            this._moveTile(id, x + step[0] * KEY_STEP, y + step[1] * KEY_STEP, KEY_TOLERANCE);
+            return true;
+        });
+        button.add_controller(keys);
+        this._board.put(button, 0, 0);
+        this._tiles.set(id, tile);
+        return tile;
+    }
+
+    // Scales the layout to fit the box and centers it, as the Mac app does.
+    _placeTiles() {
+        const tiles = [...this._tiles.values()];
+        if (!tiles.length) return;
+        const [width, height] = this._boardSize;
+        const monitors = tiles.map(tile => tile.monitor);
+        const left = Math.min(...monitors.map(m => m.x));
+        const top = Math.min(...monitors.map(m => m.y));
+        const right = Math.max(...monitors.map(m => m.x + m.width));
+        const bottom = Math.max(...monitors.map(m => m.y + m.height));
+        const scale = this._scale = Math.min(Math.max(width - 90, 1) / (right - left), Math.max(height - 70, 1) / (bottom - top), 0.12);
+        const offsetX = (width - (right - left) * scale) / 2;
+        const offsetY = (height - (bottom - top) * scale) / 2;
+        for (const tile of tiles) {
+            const m = tile.monitor;
+            const size = tile.size = [Math.max(64, Math.round(m.width * scale)), Math.max(40, Math.round(m.height * scale))];
+            tile.x = Math.round(offsetX + (m.x - left + m.width / 2) * scale - size[0] / 2);
+            tile.y = Math.round(offsetY + (m.y - top + m.height / 2) * scale - size[1] / 2);
+            tile.button.set_size_request(...size);
+            if (!tile.dragging) this._board.move(tile.button, tile.x, tile.y);
+        }
+    }
+
+    // Past a click, the pressed tile follows the pointer.
+    _dragTile(drag, dx, dy) {
+        const tile = this._pressed;
+        if (!tile) return;
+        if (!tile.dragging) {
+            if (Math.hypot(dx, dy) < 3) return;
+            tile.dragging = true;
+            // The tile's button lets go of the press.
+            drag.set_state(Gtk.EventSequenceState.CLAIMED);
+        }
+        this._board.move(tile.button, ...this._dragged(tile, dx, dy));
+    }
+
+    // Sends where the tile was dropped, in layout units.
+    _dropTile(dx, dy) {
+        const tile = this._pressed;
+        this._pressed = null;
+        if (!tile?.dragging) return;
+        tile.dragging = false;
+        const [x, y] = this._dragged(tile, dx, dy);
+        const {id, x: left, y: top} = tile.monitor;
+        const scale = this._scale;
+        this._moveTile(id, left + Math.round((x - tile.x) / scale), top + Math.round((y - tile.y) / scale), Math.round(DRAG_TOLERANCE / scale));
+    }
+
+    // Where a dragged tile shows: it follows the pointer but stays in the box.
+    _dragged(tile, dx, dy) {
+        const [width, height] = this._boardSize;
+        const clamp = (value, max) => Math.min(Math.max(value, 0), Math.max(max, 0));
+        return [clamp(tile.x + dx, width - tile.size[0]), clamp(tile.y + dy, height - tile.size[1])];
+    }
+
+    // Tiles stay sensitive during a request, so the focused one keeps focus;
+    // a move while another runs is dropped.
+    async _moveTile(id, x, y, tolerance) {
+        const moved = await this._run({command: 'move_tile', id, x, y, tolerance});
+        // A refused move leaves the layout as it was, so put a dragged tile back.
+        if (!this._disposed) this._placeTiles();
+        return moved;
+    }
+
     _updatePeers(peers) {
         // Keep rows and keyboard focus stable while unchanged snapshots arrive.
         // A keyboard or permission change only moves its control, below.
-        const key = JSON.stringify(peers.map(({keyboard: _keyboard, allow_control: _control, ...peer}) => peer));
+        const key = JSON.stringify(peers.map(({keyboard: _keyboard, allow_control: _control, reverse_scroll: _scroll, ...peer}) => peer));
         if (key !== this._peerKey) {
             this._peerKey = key;
             for (const row of this._peerRows) this._computers.remove(row);
             this._peerRows = [];
             this._keyboards.clear();
             this._controls.clear();
+            this._scrolls.clear();
             for (const {name, detail} of peers) {
                 const row = new Adw.ExpanderRow({title: name, subtitle: detail, use_markup: false, expanded: this._expanded.has(name)});
                 row.connect('notify::expanded', () => row.expanded ? this._expanded.add(name) : this._expanded.delete(name));
@@ -161,6 +328,12 @@ export class Settings {
                 });
                 row.add_row(keyboard);
                 this._keyboards.set(name, keyboard);
+                const scroll = new Adw.SwitchRow({title: 'Reverse scrolling', subtitle: 'Turn its scrolling around here'});
+                scroll.connect('notify::active', () => {
+                    if (!this._updating) this._run({command: 'set_peer', name, reverse_scroll: scroll.active});
+                });
+                row.add_row(scroll);
+                this._scrolls.set(name, scroll);
                 const forget = new Gtk.Button({icon_name: 'user-trash-symbolic', tooltip_text: `Forget ${name}`, valign: Gtk.Align.CENTER, css_classes: ['flat']});
                 forget.connect('clicked', () => this._forget(name));
                 row.add_suffix(forget);
@@ -174,12 +347,14 @@ export class Settings {
             }
         }
         this._updating = true;
-        for (const {name, keyboard: mode, allow_control} of peers) {
+        for (const {name, keyboard: mode, allow_control, reverse_scroll} of peers) {
             const keyboard = this._keyboards.get(name);
             const control = this._controls.get(name);
+            const scroll = this._scrolls.get(name);
             keyboard.selected = Math.max(0, KEYBOARD_MODES.indexOf(mode));
             control.active = allow_control;
-            keyboard.sensitive = control.sensitive = !this._busy;
+            scroll.active = !!reverse_scroll;
+            keyboard.sensitive = control.sensitive = scroll.sensitive = !this._busy;
         }
         this._updating = false;
     }
