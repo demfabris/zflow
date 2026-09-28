@@ -153,7 +153,11 @@ static CGEventRef create_event(const ZFlowMacPosted *posted) {
     default:
       return NULL;
   }
-  CGEventSetFlags(event, (CGEventFlags)posted->flags);
+  // Caps Lock comes from the Mac's own lock, which its keyboard can flip
+  // while a peer types. Setting the flags replaces the source's.
+  CGEventFlags caps = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) &
+      kCGEventFlagMaskAlphaShift;
+  CGEventSetFlags(event, ((CGEventFlags)posted->flags & ~kCGEventFlagMaskAlphaShift) | caps);
   CGEventSetIntegerValueField(event, kCGEventSourceUserData, ZFLOW_POSTED_MARK);
   return event;
 }

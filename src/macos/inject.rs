@@ -169,7 +169,6 @@ pub(crate) struct Environment {
     pub iso: bool,
     pub repeat: KeyRepeat,
     pub double_click: Duration,
-    pub caps_lock: bool,
 }
 
 impl Default for Environment {
@@ -178,7 +177,6 @@ impl Default for Environment {
             iso: false,
             repeat: DEFAULT_REPEAT,
             double_click: DEFAULT_DOUBLE_CLICK,
-            caps_lock: false,
         }
     }
 }
@@ -186,8 +184,8 @@ impl Default for Environment {
 /// Everything the injector does to the Mac. Tests use `FakeBackend`.
 pub(crate) trait Backend: Send + 'static {
     fn post(&mut self, event: &Posted) -> Result<()>;
-    /// Flips the real Caps Lock and returns whether it is now on.
-    fn toggle_caps_lock(&mut self) -> Result<bool>;
+    /// Flips the real Caps Lock.
+    fn toggle_caps_lock(&mut self) -> Result<()>;
     /// Releases whatever the native side still holds, after a failed post.
     fn release_all(&mut self);
     fn environment(&mut self) -> Environment;
@@ -495,10 +493,10 @@ impl<B: Backend> InjectorCore<B> {
         }
         if usage == CAPS_LOCK {
             // The press flips the real lock; its release does nothing.
-            if pressed {
-                self.environment.caps_lock = self.backend.toggle_caps_lock()?;
-            }
-            return Ok(());
+            return match pressed {
+                true => self.backend.toggle_caps_lock(),
+                false => Ok(()),
+            };
         }
         if pressed {
             self.press(usage, now)
@@ -575,10 +573,11 @@ impl<B: Backend> InjectorCore<B> {
         }
     }
 
-    /// Held modifiers with their side bits, plus Caps Lock. Every event
-    /// carries them.
+    /// Held modifiers with their side bits. Every event carries them, and
+    /// inject.c adds Caps Lock from the Mac's own lock, which the Mac's
+    /// keyboard can flip at any time.
     fn flags(&self) -> u64 {
-        keys::modifier_flags(self.codes.keys().copied(), self.environment.caps_lock)
+        keys::modifier_flags(self.codes.keys().copied())
     }
 
     fn button(&mut self, button: PointerButton, pressed: bool, now: Instant) -> Result<()> {
@@ -892,14 +891,14 @@ impl Backend for MacBackend {
     }
 
     /// Flips the real lock, light included.
-    fn toggle_caps_lock(&mut self) -> Result<bool> {
+    fn toggle_caps_lock(&mut self) -> Result<()> {
         let on = !self.caps_lock()?;
         // SAFETY: this only calls IOHIDSystem.
         ensure!(
             unsafe { zflow_mac_set_caps_lock(i32::from(on)) } == 0,
             "could not set Caps Lock"
         );
-        Ok(on)
+        Ok(())
     }
 
     fn release_all(&mut self) {
@@ -912,7 +911,6 @@ impl Backend for MacBackend {
             iso: keyboard_is_iso(),
             repeat: key_repeat(),
             double_click: double_click_interval(),
-            caps_lock: self.caps_lock().unwrap_or(false),
         }
     }
 
@@ -1093,6 +1091,8 @@ pub(crate) struct Fake {
     /// What was posted, in order, as text tests compare.
     pub log: Vec<String>,
     pub environment: Environment,
+    /// The Mac's own Caps Lock.
+    pub caps_lock: bool,
     pub cursor: Option<CursorPosition>,
     /// How many posted moves the cursor shows late, as macOS may.
     pub lag: usize,
@@ -1112,6 +1112,7 @@ impl Default for Fake {
         Self {
             log: Vec::new(),
             environment: Environment::default(),
+            caps_lock: false,
             cursor: Some(CursorPosition { x: 960.0, y: 540.0 }),
             lag: 0,
             moves: VecDeque::new(),
@@ -1159,14 +1160,14 @@ impl Backend for FakeBackend {
         Ok(())
     }
 
-    fn toggle_caps_lock(&mut self) -> Result<bool> {
+    fn toggle_caps_lock(&mut self) -> Result<()> {
         let mut fake = self.state();
         ensure!(!fake.fail, "Caps Lock failed");
-        let on = !fake.environment.caps_lock;
-        fake.environment.caps_lock = on;
+        fake.caps_lock = !fake.caps_lock;
+        let on = fake.caps_lock;
         fake.log
             .push(format!("caps {}", if on { "on" } else { "off" }));
-        Ok(on)
+        Ok(())
     }
 
     fn release_all(&mut self) {
@@ -1523,7 +1524,7 @@ mod tests {
                 vec![key(0x39, true), key(0x39, false), key(0x04, true)],
                 start
             ),
-            ["caps on", "key 0 down flags 0x10000"]
+            ["caps on", "key 0 down"]
         );
         assert_eq!(core.deadline(), Some(after(start, 250)));
         assert_eq!(
@@ -1539,17 +1540,17 @@ mod tests {
         );
         assert_eq!(
             apply(&mut core, &fake, vec![closed()], start),
-            ["key 0 up flags 0x10000", "release all"]
+            ["key 0 up", "release all"]
         );
-        assert!(fake.state().environment.caps_lock);
+        assert!(fake.state().caps_lock);
 
-        // A new activation reads the lock the Mac already has.
-        fake.state().environment.caps_lock = false;
+        // The Mac's own keyboard turned it off; the next press turns it on.
+        fake.state().caps_lock = false;
         core.apply(vec![opened()], None, start).unwrap();
         fake.take_log();
         assert_eq!(
-            apply(&mut core, &fake, vec![key(0x04, true)], start),
-            ["key 0 down"]
+            apply(&mut core, &fake, vec![key(0x39, true)], start),
+            ["caps on"]
         );
     }
 

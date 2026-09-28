@@ -151,7 +151,6 @@ const SHIFT: u64 = 0x0002_0000;
 const CONTROL: u64 = 0x0004_0000;
 const OPTION: u64 = 0x0008_0000;
 const COMMAND: u64 = 0x0010_0000;
-const CAPS_LOCK: u64 = 0x0001_0000;
 const NUMERIC_PAD: u64 = 0x0020_0000;
 const HELP: u64 = 0x0040_0000;
 const FUNCTION: u64 = 0x0080_0000;
@@ -226,8 +225,8 @@ pub fn is_modifier(code: u16) -> bool {
 
 /// Event flags for the held keycodes: each modifier's aggregate flag and its
 /// left or right device bit. Other keycodes add nothing.
-pub fn modifier_flags(held: impl IntoIterator<Item = u16>, caps_lock: bool) -> u64 {
-    let mut flags = if caps_lock { CAPS_LOCK } else { 0 };
+pub fn modifier_flags(held: impl IntoIterator<Item = u16>) -> u64 {
+    let mut flags = 0;
     for code in held {
         if let Some(&(_, aggregate, device)) = MODIFIERS.iter().find(|&&(m, _, _)| m == code) {
             flags |= aggregate | device;
@@ -355,16 +354,16 @@ mod tests {
 
         for (left_keycode, right_keycode, aggregate, left, right) in pairs {
             assert!(is_modifier(left_keycode) && is_modifier(right_keycode));
-            assert_eq!(modifier_flags([left_keycode], false), aggregate | left);
-            assert_eq!(modifier_flags([right_keycode], false), aggregate | right);
+            assert_eq!(modifier_flags([left_keycode]), aggregate | left);
+            assert_eq!(modifier_flags([right_keycode]), aggregate | right);
             assert_eq!(
-                modifier_flags([left_keycode, right_keycode], false),
+                modifier_flags([left_keycode, right_keycode]),
                 aggregate | left | right
             );
         }
-        assert_eq!(modifier_flags([55, 56], false), 0x0012_000a);
-        assert_eq!(modifier_flags([0, 57], false), 0);
-        assert_eq!(modifier_flags([], true), 0x0001_0000);
+        assert_eq!(modifier_flags([55, 56]), 0x0012_000a);
+        assert_eq!(modifier_flags([0, 57]), 0);
+        assert_eq!(modifier_flags([]), 0);
         assert!(!is_modifier(0) && !is_modifier(57));
     }
 

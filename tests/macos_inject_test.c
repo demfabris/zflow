@@ -18,6 +18,7 @@
 
 static void fake_post(CGEventTapLocation, CGEventRef);
 static CGEventRef fake_create(CGEventSourceRef);
+static CGEventFlags fake_flags_state(CGEventSourceStateID);
 static void fake_suppression_interval(CGEventSourceRef, CFTimeInterval);
 static void fake_suppression_filter(CGEventSourceRef, CGEventFilterMask,
                                     CGEventSuppressionState);
@@ -41,6 +42,7 @@ static IOReturn fake_user_activity(CFStringRef, IOPMUserActiveType, IOPMAssertio
 // tests never post input on the host.
 #define CGEventPost fake_post
 #define CGEventCreate fake_create
+#define CGEventSourceFlagsState fake_flags_state
 #define CGEventSourceSetLocalEventsSuppressionInterval fake_suppression_interval
 #define CGEventSourceSetLocalEventsFilterDuringSuppressionState fake_suppression_filter
 #define IOServiceGetMatchingService fake_matching_service
@@ -88,6 +90,7 @@ static SInt16 keyboard_type = 40;
 static bool post_access = true;
 static int activity_calls;
 static CGPoint cursor = {640, 400};
+static CGEventFlags live_flags;
 
 static void fake_post(CGEventTapLocation tap, CGEventRef event) {
   assert(tap == kCGHIDEventTap);
@@ -106,6 +109,11 @@ static void fake_post(CGEventTapLocation tap, CGEventRef event) {
 static CGEventRef fake_create(CGEventSourceRef source) {
   assert(!source);
   return CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, cursor, kCGMouseButtonLeft);
+}
+
+static CGEventFlags fake_flags_state(CGEventSourceStateID state) {
+  assert(state == kCGEventSourceStateHIDSystemState);
+  return live_flags;
 }
 
 static void fake_suppression_interval(CGEventSourceRef source, CFTimeInterval seconds) {
@@ -319,6 +327,17 @@ static void key_tests(void) {
   assert(CGEventGetFlags(event) == (kCGEventFlagMaskCommand | NX_DEVICERCMDKEYMASK));
   event = post_one((ZFlowMacPosted){.kind = ZFLOW_POST_MODIFIER, .code = 54});
   assert(CGEventGetType(event) == kCGEventFlagsChanged && CGEventGetFlags(event) == 0);
+
+  // Caps Lock follows the Mac's own lock, whatever the caller sent.
+  live_flags = kCGEventFlagMaskAlphaShift | kCGEventFlagMaskControl;
+  event = post_one((ZFlowMacPosted){.kind = ZFLOW_POST_KEY, .code = 0, .down = 1,
+                                    .flags = kCGEventFlagMaskCommand});
+  assert(CGEventGetFlags(event) == (kCGEventFlagMaskAlphaShift | kCGEventFlagMaskCommand));
+  live_flags = 0;
+  event = post_one((ZFlowMacPosted){
+      .kind = ZFLOW_POST_KEY, .code = 0,
+      .flags = kCGEventFlagMaskAlphaShift | kCGEventFlagMaskCommand});
+  assert(CGEventGetFlags(event) == kCGEventFlagMaskCommand);
 }
 
 static void scroll_tests(void) {
