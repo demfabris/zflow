@@ -108,3 +108,26 @@ import Testing
   } catch { #expect(error.localizedDescription == "Unknown computer") }
   await core.shutdown()
 }
+
+@Test func eachComputersSettingsReachTheEngine() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let file = directory.appendingPathComponent("zflow.toml")
+  try "[transport]\ndiscovery = false\n[macos]\nsharing = false\n[peers.desk]\nspki_der_hex = \"01\"\n"
+    .write(to: file, atomically: true, encoding: .utf8)
+  let core = CoreBridge(path: file.path)
+  let initial = try #require(try await core.request(CoreRequest(command: "snapshot")).peers.first)
+  #expect(!initial.allowControl && initial.keyboard == "standard" && !initial.reverseScroll)
+  // Two-word fields go out in snake case, one at a time.
+  _ = try await core.request(CoreRequest(command: "set_peer", name: "desk", allowControl: true))
+  _ = try await core.request(
+    CoreRequest(command: "set_peer", name: "desk", keyboard: "pc_positions"))
+  let changed = try await core.request(
+    CoreRequest(command: "set_peer", name: "desk", reverseScroll: true))
+  let desk = try #require(changed.peers.first)
+  #expect(desk.allowControl && desk.keyboard == "pc_positions" && desk.reverseScroll)
+  let saved = try String(contentsOf: file, encoding: .utf8)
+  #expect(saved.contains("keyboard = \"pc_positions\"") && saved.contains("reverse_scroll = true"))
+  await core.shutdown()
+}

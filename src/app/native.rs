@@ -758,7 +758,7 @@ impl NativeApp {
         if !self.accessibility {
             return row(
                 Level::Error,
-                "Allow Accessibility below so zflow can share the keyboard and pointer.",
+                "Allow Accessibility below so zflow can share the keyboard and pointer, and so paired computers can control this Mac.",
             );
         }
         if let Some(error) = self.crossing_error.as_ref().filter(|_| sharing) {
