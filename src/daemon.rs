@@ -61,6 +61,10 @@ const MAX_LOCAL_CLIENTS: usize = 64;
 const MAX_NEARBY: usize = 64;
 /// The shared layout this computer keeps, in its state directory.
 const LAYOUT_FILE: &str = "layout.json";
+/// A paired computer's tile has this size until that computer writes its own.
+const PEER_TILE_SIZE: (u32, u32) = (1920, 1080);
+/// The largest snap distance a move may ask for, in layout units, as on the Mac.
+const MAX_SNAP: u32 = 2048;
 /// Logind answers Unknown when a reply is slow or races a property change.
 /// Such a short Unknown holds injection and keeps the last definite state for
 /// authorization, so it does not end a live crossing.
@@ -512,13 +516,7 @@ impl Shared {
             }
             return;
         }
-        let path = self.config.read().await.daemon.state_dir.join(LAYOUT_FILE);
-        let saved = serde_json::to_string(&layout)
-            .map_err(anyhow::Error::from)
-            .and_then(|text| crate::config::save_text(&path, &text).map_err(Into::into));
-        if let Err(error) = saved {
-            tracing::warn!(%error, "layout not saved; still using it until restart");
-        }
+        self.save_layout(&layout).await;
         tracing::info!(peer = %from, version = layout.version, "layout adopted");
         self.keep_layout(layout, Some(session_id)).await;
         // The other computer may not know this desktop's size yet.
@@ -566,13 +564,7 @@ impl Shared {
         }) else {
             return;
         };
-        let path = self.config.read().await.daemon.state_dir.join(LAYOUT_FILE);
-        let saved = serde_json::to_string(&resized)
-            .map_err(anyhow::Error::from)
-            .and_then(|text| crate::config::save_text(&path, &text).map_err(Into::into));
-        if let Err(error) = saved {
-            tracing::warn!(%error, "layout not saved; still using it until restart");
-        }
+        self.save_layout(&resized).await;
         tracing::info!(
             width = bounds.width,
             height = bounds.height,
@@ -580,6 +572,71 @@ impl Shared {
             "this computer's tile resized"
         );
         self.keep_layout(resized, None).await;
+    }
+
+    /// Writes `layout` to the state directory, so it outlives a restart.
+    async fn save_layout(&self, layout: &crate::desktop::SharedLayout) {
+        let path = self.config.read().await.daemon.state_dir.join(LAYOUT_FILE);
+        let saved = serde_json::to_string(layout)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| crate::config::save_text(&path, &text).map_err(Into::into));
+        if let Err(error) = saved {
+            tracing::warn!(%error, "layout not saved; still using it until restart");
+        }
+    }
+
+    /// The layout this computer keeps, or, before anyone arranged the
+    /// computers, the one it would start from. Starting one asks GNOME for
+    /// this desktop's size.
+    async fn layout_or_initial(&self) -> Result<crate::desktop::SharedLayout> {
+        if let Some(layout) = self.layout.lock().await.clone() {
+            return Ok(layout);
+        }
+        let geometry = match self.desktop.snapshot().await {
+            crate::desktop::DesktopResponse::Snapshot { geometry, .. } => geometry,
+            crate::desktop::DesktopResponse::Unavailable { reason } => bail!("{reason}"),
+            _ => bail!("GNOME did not describe this desktop"),
+        };
+        let bounds = geometry.bounds()?;
+        initial_layout(
+            &self.identity_fingerprint,
+            bounds.width,
+            bounds.height,
+            &peer_keys(&*self.config.read().await),
+        )
+    }
+
+    /// What the settings window arranges. None while there is no layout and
+    /// GNOME cannot describe this desktop.
+    pub(super) async fn layout_status(&self) -> Option<crate::app::layout_model::Layout> {
+        let layout = self.layout_or_initial().await.ok()?;
+        let keys = peer_keys(&*self.config.read().await);
+        Some(layout_view(&layout, &self.identity_fingerprint, &keys))
+    }
+
+    /// Moves one computer, as the settings window asks, and tells the
+    /// other computers. The first move also starts the layout.
+    pub(super) async fn move_tile(
+        self: &Arc<Self>,
+        id: &str,
+        x: i32,
+        y: i32,
+        tolerance: u32,
+    ) -> Result<()> {
+        let current = self.layout_or_initial().await?;
+        let keys = peer_keys(&*self.config.read().await);
+        let moved = with_tile_moved(
+            &current,
+            &self.identity_fingerprint,
+            &keys,
+            id,
+            (x, y),
+            tolerance,
+        )?;
+        self.save_layout(&moved).await;
+        tracing::info!(%id, version = moved.version, "tile moved");
+        self.keep_layout(moved, None).await;
+        Ok(())
     }
 
     /// Starts a crossing toward the computer behind the edge the pointer
@@ -1384,6 +1441,84 @@ fn peer_keys(config: &Config) -> BTreeMap<String, String> {
         .iter()
         .filter_map(|(name, peer)| Some((name.clone(), peer.fingerprint_hex().ok()?)))
         .collect()
+}
+
+/// This computer's view of a shared layout: its own tile is "local", and
+/// paired computers carry their names here.
+fn layout_view(
+    layout: &crate::desktop::SharedLayout,
+    own: &str,
+    keys: &BTreeMap<String, String>,
+) -> crate::app::layout_model::Layout {
+    crate::app::layout_model::Layout::from_shared(layout, own, "This computer", keys)
+}
+
+/// The layout to start from before anyone arranged the computers: this
+/// computer's tile, then each paired computer to its right. It is version 0,
+/// so the first edit makes version 1.
+fn initial_layout(
+    own: &str,
+    width: u32,
+    height: u32,
+    keys: &BTreeMap<String, String>,
+) -> Result<crate::desktop::SharedLayout> {
+    let mut seen = std::collections::BTreeSet::from([own]);
+    let peers = keys
+        .values()
+        .filter(|key| seen.insert(key.as_str()))
+        .map(|key| (key.as_str(), PEER_TILE_SIZE));
+    let mut x: i32 = 0;
+    let tiles = std::iter::once((own, (width, height)))
+        .chain(peers)
+        .take(crate::desktop::MAX_SHARED_TILES)
+        .map(|(key, (width, height))| {
+            let tile = crate::desktop::Tile {
+                key: key.to_owned(),
+                x,
+                y: 0,
+                width,
+                height,
+            };
+            x = x.saturating_add(i32::try_from(width).unwrap_or(i32::MAX));
+            tile
+        })
+        .collect();
+    let layout = crate::desktop::SharedLayout {
+        version: 0,
+        editor: own.to_owned(),
+        tiles,
+    };
+    layout
+        .validate()
+        .context("This desktop is too large for the layout")?;
+    Ok(layout)
+}
+
+/// A new version of `layout`, edited by this computer, with the tile `id` of
+/// its view at (x, y), or against an edge within `tolerance` of there. Tiles
+/// of computers not paired here are left out, as in any layout it writes.
+fn with_tile_moved(
+    layout: &crate::desktop::SharedLayout,
+    own: &str,
+    keys: &BTreeMap<String, String>,
+    id: &str,
+    (x, y): (i32, i32),
+    tolerance: u32,
+) -> Result<crate::desktop::SharedLayout> {
+    let mut view = layout_view(layout, own, keys);
+    let index = view
+        .monitors
+        .iter()
+        .position(|monitor| monitor.id == id)
+        .with_context(|| format!("The layout has no computer {id}"))?;
+    let (x, y) = view
+        .snap_move(index, x, y, tolerance.min(MAX_SNAP) as i32)
+        .context("Computers cannot overlap")?;
+    view.monitors[index].x = x;
+    view.monitors[index].y = y;
+    let moved = view.to_shared(layout.version.saturating_add(1), own, keys);
+    moved.validate()?;
+    Ok(moved)
 }
 
 fn eligible_outbound_peers(config: &Config) -> Vec<String> {
@@ -2328,5 +2463,99 @@ mod tests {
         let (injected, refused) = admitted_effects(effects(), Admission::Inject);
         assert!(!refused);
         assert_eq!(injected.len(), 5);
+    }
+
+    fn fingerprint(n: u8) -> String {
+        format!("{n:064x}")
+    }
+
+    #[test]
+    fn the_first_layout_puts_each_paired_computer_right_of_this_one() {
+        let own = fingerprint(1);
+        let keys = BTreeMap::from([
+            ("mac".to_owned(), fingerprint(2)),
+            ("desk".to_owned(), fingerprint(3)),
+            // One computer paired twice gets one tile.
+            ("mac again".to_owned(), fingerprint(2)),
+        ]);
+        let layout = initial_layout(&own, 2560, 1440, &keys).unwrap();
+        assert_eq!((layout.version, &layout.editor), (0, &own));
+        let tiles: Vec<_> = layout
+            .tiles
+            .iter()
+            .map(|t| (t.key.clone(), t.x, t.y, t.width, t.height))
+            .collect();
+        assert_eq!(
+            tiles,
+            [
+                (own.clone(), 0, 0, 2560, 1440),
+                (fingerprint(3), 2560, 0, 1920, 1080),
+                (fingerprint(2), 4480, 0, 1920, 1080),
+            ]
+        );
+        assert_eq!(
+            initial_layout(&own, 2560, 1440, &BTreeMap::new())
+                .unwrap()
+                .tiles
+                .len(),
+            1,
+            "nothing paired yet"
+        );
+        let many: BTreeMap<_, _> = (2..40).map(|n| (n.to_string(), fingerprint(n))).collect();
+        assert_eq!(
+            initial_layout(&own, 2560, 1440, &many).unwrap().tiles.len(),
+            crate::desktop::MAX_SHARED_TILES
+        );
+        assert!(
+            initial_layout(
+                &own,
+                crate::app::layout_model::MAX_DIMENSION + 1,
+                1440,
+                &keys
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_move_snaps_and_makes_a_version_this_computer_edited() {
+        let own = fingerprint(1);
+        let keys = BTreeMap::from([("mac".to_owned(), fingerprint(2))]);
+        let mut layout = initial_layout(&own, 2560, 1440, &keys).unwrap();
+        // A peer made the last version, and it still holds a computer that
+        // is not paired here.
+        layout.version = 7;
+        layout.editor = fingerprint(9);
+        layout.tiles.push(crate::desktop::Tile {
+            key: fingerprint(5),
+            x: 0,
+            y: 5000,
+            width: 100,
+            height: 100,
+        });
+        let at = |layout: &crate::desktop::SharedLayout, key: &str| {
+            let tile = layout.tiles.iter().find(|t| t.key == key).unwrap();
+            (tile.x, tile.y)
+        };
+
+        // Dropped 20 units into this computer, it snaps against its left edge.
+        let moved = with_tile_moved(&layout, &own, &keys, "peer:mac", (-1900, 40), 150).unwrap();
+        assert_eq!((moved.version, &moved.editor), (8, &own));
+        assert_eq!(at(&moved, &fingerprint(2)), (-1920, 40));
+        assert_eq!(at(&moved, &own), (0, 0));
+        assert_eq!(moved.tiles.len(), 2, "the unpaired computer is left out");
+        // This computer's own tile moves by its view's id.
+        let moved = with_tile_moved(&moved, &own, &keys, "local", (0, 1100), 0).unwrap();
+        assert_eq!((moved.version, at(&moved, &own)), (9, (0, 1100)));
+
+        // A huge tolerance is capped rather than read as a negative one.
+        assert!(with_tile_moved(&layout, &own, &keys, "peer:mac", (-1900, 40), u32::MAX).is_ok());
+        let error = with_tile_moved(&layout, &own, &keys, "peer:desk", (0, 0), 0).unwrap_err();
+        assert!(
+            error.to_string().contains("no computer peer:desk"),
+            "{error}"
+        );
+        let error = with_tile_moved(&layout, &own, &keys, "peer:mac", (100, 100), 0).unwrap_err();
+        assert!(error.to_string().contains("overlap"), "{error}");
     }
 }

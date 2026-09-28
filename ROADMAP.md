@@ -61,7 +61,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 
 | Feature | Deskflow | Mac | Linux | Verdict | Why |
 |---|---|---|---|---|---|
-| Layout editor | 5x3 grid | exists (`ComputerLayout.swift`) | missing (`settings.js:36`) | build | Needed for sending from Linux. |
+| Layout editor | 5x3 grid | exists (`ComputerLayout.swift`) | exists (`settings.js`, drag or arrow keys) | have | Both edit the shared layout. |
 | Partial edge links | Text config only | exists (`src/app/layout_model.rs:98-146`) | shared code | have | |
 | One layout for all machines | The server's | One per Mac | none | build | Decision 4. |
 | Per-monitor tiles | none ([#6257](https://github.com/deskflow/deskflow/issues/6257)) | partial: the type allows several tiles per peer (`layout_model.rs:13-31`), but the app builds one bounding box per computer (`native.rs:436-477`) | none | skip | Entry already snaps to the nearest monitor (`extension.js:175-190`). Portal barriers only work on outer edges (`SPEC.md:518`). |
@@ -314,7 +314,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 | 1 | Status: Ready / Controlling X / Controlled by X / Paused / Needs attention | Title plus badge | `snapshot.status` (`native.rs:522-541`, `client.js:15-25`) | yes | yes |
 | 2 | Input sharing | Switch | `set_sharing` | menu only | yes |
 | 3 | Health | Rows with fix buttons | `snapshot.health[]`, `retry` | yes (popover, `SettingsView.swift:114-204`) | one error row (`settings.js:47-51`) |
-| 4 | Computers: layout | Drag tiles | `move_tile` (`native.rs:151-177`) | yes | no |
+| 4 | Computers: layout | Drag tiles | `move_tile` (`native.rs:151-177`) | yes | yes |
 | 5 | Peer row: name and state | Subtitle | `snapshot.peers[].state` (`native.rs:505-518`, `daemon/peer_view.rs:103-117`) | names only (`Core.swift:35`) | yes (the `settings.js:106` label is backwards) |
 | 6 | Can control this computer | Switch | `set_peer {allow_control}` (new) | no | root CLI only (`src/control.rs:32-35`) |
 | 7 | Keys from this computer | Dropdown | `set_peer {keyboard}` | no | yes |
@@ -443,10 +443,10 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - The daemon half of change 9, and the rule for two computers dialing each other at once (`identity::wins_simultaneous_dial`).
     - GNOME edge barriers: a push sends `edge_hit`, and the daemon activates that peer. While sending, the pointer is hidden and an idle inhibitor is held.
     - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
+    - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, it shows this computer with each paired one to its right; the first move saves that layout, and edges cross only after it.
   - Left:
     - Change 10: entry placement and return through Prepare, Poll and Finish.
     - Linux writing its own tile size.
-    - The Linux layout canvas.
     - The Mac sending and merging layouts (Phase 2 side).
   - Known limit: a key held on a remapper-grabbed device at the moment zflow opens it blocks arming until the daemon restarts.
 

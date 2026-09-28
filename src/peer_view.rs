@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    app::layout_model::Layout,
     config::{Config, PeerConfig},
     core::KeyboardMode,
     desktop::{DesktopRequest, Edge, FRACTION_MAX, Point},
@@ -52,6 +53,15 @@ pub enum Request {
     EdgeHit {
         edge: Edge,
         position: u32,
+    },
+    /// Moves a computer in the shared layout. `id` names a tile of
+    /// [`DesktopStatus::layout`]; it lands at `x`, `y` in layout units, or
+    /// against an edge within `tolerance` of there.
+    MoveTile {
+        id: String,
+        x: i32,
+        y: i32,
+        tolerance: u32,
     },
 }
 
@@ -191,6 +201,10 @@ pub struct DesktopStatus {
     pub activation_chord: Vec<String>,
     #[serde(default)]
     pub escape_chord: Vec<String>,
+    /// This computer's view of the shared layout, with its own tile named
+    /// "local". A service from before the layout editor leaves it out.
+    #[serde(default)]
+    pub layout: Option<Layout>,
 }
 
 impl DesktopStatus {
@@ -204,6 +218,7 @@ impl DesktopStatus {
             discovery: config.transport.discovery,
             activation_chord: config.input.activation_chord.clone(),
             escape_chord: config.input.escape_chord.clone(),
+            layout: None,
         }
     }
 }
@@ -262,9 +277,40 @@ mod tests {
             r#"{"command":"focus","terminal":true,"peer":"desk"}"#,
             r#"{"command":"edge_hit","edge":"right","position":5,"peer":"desk"}"#,
             r#"{"command":"warp","position":{"x":1,"y":2}}"#,
+            // A move names a tile and a spot, never the shared layout's
+            // version, editor, keys or sizes.
+            r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":8,"version":9}"#,
+            r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":8,"editor":"00"}"#,
+            r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":8,"key":"00"}"#,
+            r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":8,"width":1}"#,
+            r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":8,"peer":"desk"}"#,
+            r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":-1}"#,
+            r#"{"command":"move_tile","id":"local","x":1,"y":2}"#,
         ] {
-            assert!(serde_json::from_str::<Request>(json).is_err());
+            assert!(serde_json::from_str::<Request>(json).is_err(), "{json}");
         }
+    }
+
+    #[test]
+    fn move_tile_parses_and_an_older_status_without_a_layout_still_reads() {
+        assert!(matches!(
+            serde_json::from_str(
+                r#"{"command":"move_tile","id":"peer:mac","x":-1920,"y":40,"tolerance":150}"#
+            )
+            .unwrap(),
+            Request::MoveTile {
+                x: -1920,
+                y: 40,
+                tolerance: 150,
+                ..
+            }
+        ));
+        let mut value =
+            serde_json::to_value(DesktopStatus::from_config(&Config::default())).unwrap();
+        assert!(value["layout"].is_null());
+        value.as_object_mut().unwrap().remove("layout");
+        let old: DesktopStatus = serde_json::from_value(value).unwrap();
+        assert!(old.layout.is_none());
     }
 
     #[test]
@@ -308,7 +354,7 @@ mod tests {
         config.daemon.state_dir = "/private/identity-location".into();
         config.transport.discovery = false;
         let value = serde_json::to_value(DesktopStatus::from_config(&config)).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 8);
+        assert_eq!(value.as_object().unwrap().len(), 9);
         assert!(value.get("peers").is_some());
         assert_eq!(value["discovery"], false);
         assert!(!value.to_string().contains("identity-location"));
