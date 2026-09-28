@@ -70,6 +70,10 @@ jobs:
             tests/macos_capture_test.c -framework ApplicationServices -framework CoreFoundation \
             -o target/debug/macos-capture-test
           ./target/debug/macos-capture-test
+          xcrun --sdk macosx clang -isysroot "$sdk" -std=c11 -O2 -Wall -Wextra -Werror \
+            tests/macos_inject_test.c -framework ApplicationServices -framework CoreFoundation \
+            -framework IOKit -o target/debug/macos-inject-test
+          ./target/debug/macos-inject-test
       - name: Swift bridge
         run: |
           MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --locked --lib

@@ -1,6 +1,7 @@
 //! macOS input source: native capture, and crossings over a receiver's session.
 
 mod awdl;
+mod inject;
 mod keys;
 mod link;
 mod local_network;

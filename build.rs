@@ -1,6 +1,8 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/macos/capture_bridge.c");
     println!("cargo:rerun-if-changed=src/macos/awdl_client.c");
+    println!("cargo:rerun-if-changed=src/macos/inject.c");
+    println!("cargo:rerun-if-changed=src/macos/media.m");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -9,10 +11,20 @@ fn main() {
     cc::Build::new()
         .file("src/macos/capture_bridge.c")
         .file("src/macos/awdl_client.c")
+        .file("src/macos/inject.c")
         .flag("-std=c11")
         .warnings(true)
         .compile("zflow_macos_capture");
+    // Objective-C rejects -std=c11, so it builds on its own.
+    cc::Build::new()
+        .file("src/macos/media.m")
+        .flag("-fobjc-arc")
+        .warnings(true)
+        .compile("zflow_macos_media");
+    println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-lib=framework=ApplicationServices");
     println!("cargo:rustc-link-lib=framework=Carbon");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    println!("cargo:rustc-link-lib=framework=IOKit");
+    println!("cargo:rustc-link-lib=objc");
 }
