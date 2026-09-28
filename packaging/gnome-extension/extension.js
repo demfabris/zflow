@@ -80,7 +80,14 @@ export default class ZflowExtension extends Extension {
             this._sendFocus();
         });
         this._agentWatch = Gio.bus_watch_name_on_connection(Gio.DBus.session, AGENT, Gio.BusNameWatcherFlags.NONE,
-            (_connection, _name, owner) => { this._agent = owner; this._sendFocus(); }, () => { this._agent = null; });
+            (_connection, _name, owner) => { this._agent = owner; this._sendFocus(); },
+            () => {
+                // Nobody is left to hear a push or to show the pointer again.
+                this._agent = null;
+                this._edges = [];
+                this._placeEdges();
+                this._setHidden(false);
+            });
         this._object = Gio.DBusExportedObject.wrapJSObject(XML, this);
         this._object.export(Gio.DBus.session, PATH);
         this._busId = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS, Gio.BusNameOwnerFlags.NONE, null, null);
@@ -218,8 +225,13 @@ export default class ZflowExtension extends Extension {
             if (!Array.isArray(r.edges) || r.edges.length > 64
                 || !r.edges.every(e => EDGES.includes(e?.edge) && validRange(e.start, e.end)))
                 throw new Error('Invalid outbound edges');
-            this._edges = r.edges.map(({edge, start, end}) => ({edge, start, end}));
-            this._placeEdges();
+            const edges = r.edges.map(({edge, start, end}) => ({edge, start, end}));
+            // Rebuilding would forget the push in progress, so a pointer still
+            // resting on the barrier after a return would cross again.
+            if (JSON.stringify(edges) !== JSON.stringify(this._edges)) {
+                this._edges = edges;
+                this._placeEdges();
+            }
             return {status: 'finished'};
         }
         const snapshot = this._snapshot();

@@ -373,6 +373,14 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     assert.equal((await d.extension._request({command: 'warp', position: {x: 2000, y: 900}})).status, 'finished');
     assert.deepEqual({...d.extension._snapshot().position}, {x: 2000, y: 900});
     await assert.rejects(d.extension._request({command: 'warp', position: {x: 2000, y: 1050}}), /outside the monitors/);
+    const placed = d.barriers.length;
+    await d.extension._request({command: 'edges', edges: [{edge: 'right', start: 0, end: 1000000}]});
+    assert.equal(d.barriers.length, placed, 'the same edges keep their barriers and the push in progress');
+    await d.extension._request({command: 'sending', active: true});
+    d.watch.vanished();
+    assert.equal(tracker.count, 0, 'without the agent the pointer shows again');
+    assert.ok(d.barriers.every(b => b.destroyed), 'and no barrier is left');
+    d.watch.appeared(null, 'io.zflow.Desktop', ':1.7');
     await d.extension._request({command: 'sending', active: true});
     d.extension.disable();
     assert.equal(tracker.count, 0, 'disable shows the pointer again');

@@ -165,7 +165,14 @@ async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Res
         result = serve(&mut stream, &proxy, &bus, &owner, &mut awake) => result,
         result = forward_signals(connection, &proxy, owner.as_str(), report) => result,
     };
+    // Without the service nothing would show the pointer again or hear a push.
     awake.set(connection, false).await;
+    for request in [
+        crate::peer_view::LocalRequest::Sending { active: false },
+        crate::peer_view::LocalRequest::Edges { edges: Vec::new() },
+    ] {
+        let _ = call(&proxy, &crate::peer_view::AgentRequest::Local(request)).await;
+    }
     result
 }
 
@@ -182,7 +189,9 @@ impl IdleInhibitor {
     const IDLE: u32 = 8;
 
     async fn set(&mut self, connection: &zbus::Connection, active: bool) {
-        let result = async {
+        // The service waits for this request, so a slow gnome-session must not
+        // hold it up.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(300), async {
             let proxy = zbus::Proxy::new(
                 connection,
                 "org.gnome.SessionManager",
@@ -206,10 +215,12 @@ impl IdleInhibitor {
                 _ => {}
             }
             Ok::<_, zbus::Error>(())
-        }
+        })
         .await;
-        if let Err(error) = result {
-            tracing::warn!(%error, active, "GNOME idle inhibitor not changed");
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, active, "GNOME idle inhibitor not changed"),
+            Err(_) => tracing::warn!(active, "GNOME idle inhibitor timed out"),
         }
     }
 }
@@ -313,7 +324,10 @@ async fn forward_signals(
                 // on the lock screen, and takes it again after.
                 Some(match new {
                     "" => false,
-                    new if new == owner => focus(proxy).await,
+                    // Shell turns the extension back on after unlocking, and it
+                    // starts without barriers. A new connection makes the
+                    // service send them again.
+                    new if new == owner => anyhow::bail!("The zflow GNOME extension restarted"),
                     _ => anyhow::bail!("GNOME Shell restarted"),
                 })
             }
@@ -860,17 +874,10 @@ mod tests {
             Some(false),
             "no extension, no terminal"
         );
+        // A returning extension has lost its barriers; reconnecting resends them.
         shell.request_name(BUS_NAME).await.unwrap();
-        assert_eq!(
-            reports.recv().await,
-            Some(true),
-            "asks again when it returns"
-        );
-        shell.release_name(BUS_NAME).await.unwrap();
-        impostor.request_name(BUS_NAME).await.unwrap();
-        assert_eq!(reports.recv().await, Some(false));
         let error = forward.await.unwrap().unwrap_err();
-        assert_eq!(format!("{error:#}"), "GNOME Shell restarted");
+        assert_eq!(format!("{error:#}"), "The zflow GNOME extension restarted");
         assert_eq!(reports.recv().await, None);
     }
 }
