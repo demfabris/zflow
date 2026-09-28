@@ -1961,9 +1961,9 @@ mod tests {
             ),
             [
                 "scroll lines 0,-2",
-                "scroll pixels 15,0",
+                "scroll pixels 1,0",
                 "move 962,540 by 2,0",
-                "scroll pixels 0,120"
+                "scroll pixels 0,10"
             ]
         );
     }

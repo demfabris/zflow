@@ -21,8 +21,11 @@ const POINTS_PER_UNIT: f64 = 1.0;
 const MOTION_TIMEOUT: Duration = Duration::from_millis(300);
 const MIN_INTERVAL_MS: f64 = 1.0;
 const MAX_INTERVAL_MS: f64 = 50.0;
-/// A Linux wheel sends 120 units per detent. A Mac sends points.
+/// Scroll on the wire counts 120 units to a detent, as Linux does.
 const WHEEL_DETENT: i64 = 120;
+/// CoreGraphics' default scale from lines to pixels (CGEvent.h), so a detent
+/// scrolls as far in pixels as it does as a line.
+const PIXELS_PER_LINE: i64 = 10;
 
 /// How motion from a peer is scaled. `speed` is libinput's setting, -1 to 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -182,17 +185,21 @@ pub enum Scroll {
     Pixels { x: i32, y: i32 },
 }
 
-/// Posts whole detents as lines and everything else as pixels, one per unit.
+/// Posts whole detents as lines and everything else as pixels, a line's
+/// worth per detent.
 #[derive(Clone, Debug, Default)]
 pub struct ScrollSplit {
     /// Units since the last whole detent on each axis. A high-resolution
     /// wheel stays in pixels until it lines up with a detent again.
     pending: (i64, i64),
+    /// The part under a pixel on each axis, in 120ths of a pixel, carried so
+    /// small steps still add up.
+    remainder: (i64, i64),
 }
 
 impl ScrollSplit {
     pub fn reset(&mut self) {
-        self.pending = (0, 0);
+        *self = Self::default();
     }
 
     pub fn split(&mut self, x: i64, y: i64) -> Option<Scroll> {
@@ -209,11 +216,19 @@ impl ScrollSplit {
             (self.pending.0 + x % WHEEL_DETENT) % WHEEL_DETENT,
             (self.pending.1 + y % WHEEL_DETENT) % WHEEL_DETENT,
         );
-        Some(Scroll::Pixels {
-            x: wheel(x),
-            y: wheel(y),
-        })
+        let x = pixels(&mut self.remainder.0, x);
+        let y = pixels(&mut self.remainder.1, y);
+        (x != 0 || y != 0).then_some(Scroll::Pixels { x, y })
     }
+}
+
+/// Whole pixels for `units` of wheel, keeping the part under a pixel.
+fn pixels(remainder: &mut i64, units: i64) -> i32 {
+    let scaled = units
+        .saturating_mul(PIXELS_PER_LINE)
+        .saturating_add(*remainder);
+    *remainder = scaled % WHEEL_DETENT;
+    wheel(scaled / WHEEL_DETENT)
 }
 
 /// Scroll event fields are 32-bit; an absurd value is clamped.
@@ -417,22 +432,27 @@ mod tests {
     }
 
     #[test]
-    fn partial_detents_scroll_pixels_until_they_line_up() {
+    fn partial_detents_scroll_a_line_of_pixels_per_detent_until_they_line_up() {
+        // A high-resolution Linux wheel sends 15 units a step.
         let mut split = ScrollSplit::default();
-        let mut total = 0;
-        for _ in 0..8 {
-            let Some(Scroll::Pixels { x: 0, y }) = split.split(0, 15) else {
-                panic!("expected pixels");
-            };
-            total += y;
-        }
-        assert_eq!(total, 120);
+        let steps: Vec<_> = (0..8).map(|_| split.split(0, 15)).collect();
+        let step = |y| Some(Scroll::Pixels { x: 0, y });
+        assert_eq!(steps, [1, 1, 1, 2, 1, 1, 1, 2].map(step));
         assert_eq!(split.split(0, 120), Some(Scroll::Lines { x: 0, y: 1 }));
 
-        assert_eq!(split.split(-60, 0), Some(Scroll::Pixels { x: -60, y: 0 }));
-        assert_eq!(split.split(-120, 0), Some(Scroll::Pixels { x: -120, y: 0 }));
-        assert_eq!(split.split(-60, 0), Some(Scroll::Pixels { x: -60, y: 0 }));
+        assert_eq!(split.split(-60, 0), Some(Scroll::Pixels { x: -5, y: 0 }));
+        assert_eq!(split.split(-120, 0), Some(Scroll::Pixels { x: -10, y: 0 }));
+        assert_eq!(split.split(-60, 0), Some(Scroll::Pixels { x: -5, y: 0 }));
         assert_eq!(split.split(-120, 0), Some(Scroll::Lines { x: -1, y: 0 }));
+
+        // Steps under a pixel post nothing until they add up, either way.
+        assert_eq!(split.split(0, 9), None);
+        assert_eq!(split.split(0, 9), step(1));
+        assert_eq!(split.split(0, -6), None);
+        for _ in 0..9 {
+            assert_eq!(split.split(0, 12), step(1));
+        }
+        assert_eq!(split.split(0, 120), Some(Scroll::Lines { x: 0, y: 1 }));
 
         split.split(0, 7);
         split.reset();
