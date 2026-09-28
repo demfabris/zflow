@@ -155,6 +155,9 @@ impl Observer {
             // leaves resting on an edge does not cross once it lets go.
             self.previous = None;
             if self.enabled && self.running.is_none() {
+                if !self.controlled {
+                    tracing::info!(%peer, "edge crossings skipped while controlled");
+                }
                 self.notice = format!("Controlled by {peer}");
                 self.controlled = true;
             }
