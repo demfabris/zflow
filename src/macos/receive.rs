@@ -653,7 +653,15 @@ impl Inbound {
                 .claim_inbound(&self.peer, self.session.id());
             match claim {
                 Ok(claim) => {
-                    if self.claim.replace(claim).is_none() {
+                    let first = self.claim.replace(claim).is_none();
+                    // A revocation between the check above and the claim
+                    // found no controller to end, so check again now that
+                    // the claim is there for the next one to see.
+                    if self.receiving.admission(&self.peer, false).0 == Admission::Refuse {
+                        self.release();
+                        return Err(NOT_ALLOWED.into());
+                    }
+                    if first {
                         tracing::info!(peer = %self.peer, "peer took control of this Mac");
                         self.take_control();
                     }

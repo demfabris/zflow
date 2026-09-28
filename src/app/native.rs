@@ -270,14 +270,15 @@ impl NativeApp {
     }
 
     /// AXIsProcessTrusted can stay true after zflow is removed from the
-    /// Accessibility list. A crossing's tap then blocks the Mac's input, and
-    /// new crossings fail. The window server knows, so ask it for a tap while
-    /// sharing is armed and until access comes back.
+    /// Accessibility list. A crossing's tap then blocks the Mac's input, new
+    /// crossings fail, and a peer's input is silently dropped. The window
+    /// server knows, so ask it for a tap while sharing is armed, while a peer
+    /// controls this Mac, and until access comes back.
     fn accessibility_granted(&mut self) -> bool {
         if !crate::macos::accessibility_authorized(false) {
             return false;
         }
-        if self.accessibility && !self.observer.is_active() {
+        if self.accessibility && !self.observer.is_active() && self.links.controller().is_none() {
             return true;
         }
         if self
