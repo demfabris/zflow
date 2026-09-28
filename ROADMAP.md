@@ -28,7 +28,7 @@ Tags: **exists**, **partial**, **missing**. "Guess" marks anything not proven by
 | 4 | Monitor layout: shared or per machine? | **Shared.** Tiles keyed by key fingerprint, newest version wins. Needs `zflow/3`. |
 | 5 | Order? | **Phase 0, then Phase 1**, with a Mac injection spike alongside Phase 1. |
 | 6 | Clipboard? | **Text and images, synced when the pointer crosses, in Phase 4. Never files.** |
-| 7 | Mac pointer acceleration? | **A curve in Rust.** A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
+| 7 | Mac pointer acceleration? | **A curve in Rust.** Spike I showed posted motion is not accelerated. A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
 | 8 | Protocol bumps? | **One batched `zflow/3` bump, no `zflow/2` fallback.** New desktop commands are strict JSON anyway. |
 
 ---
@@ -263,7 +263,7 @@ Cost: the network-facing account can read every keyboard. To reduce that, open d
 
 ## 4. Mac receiver (Mac)
 
-The baseline is CGEventPost from the logged-in app, which is what Deskflow and lan-mouse do. No new process is needed.
+The baseline is CGEventPost from the logged-in app, which is what Deskflow and lan-mouse do. No new process is needed. Spike I (2026-09-28, `spikes/i-mac-inject/RESULT.md`) passed on this Mac: the gotchas below are measured unless marked (guess).
 
 **Reusable pieces:**
 - The receiver state machine (`src/core/receiver.rs`) and playout (`src/session/receive.rs`).
@@ -276,16 +276,16 @@ The baseline is CGEventPost from the logged-in app, which is what Deskflow and l
 
 | Area | Design | Gotcha |
 |---|---|---|
-| Event source | HID system-state source, posted at the HID tap. | Set the suppression interval to 0 and permit local events. Otherwise the Mac's own trackpad stalls. |
-| Pointer | Current cursor plus the delta after a curve, clamped to the displays and snapped to the nearest one. Also set the delta fields. | Linux sends raw deltas (`src/session.rs:97`), and CGEventPost does not accelerate them (guess). |
-| Drag and clicks | Drag event types while a button is down. Click state, and the event number on macOS 27. | Without these there is no double-click, and background windows do not focus on 27. |
-| Keys | Inverted table, ISO swap, modifier flags (including the left/right device bits) on every event. | Without flags, Cmd+click breaks. |
-| Repeat | Made on the receiver at the System Settings delay and interval. | The wire drops repeats (`src/session.rs:595-599`). |
-| Caps Lock | Post keycode 57; fall back to `IOHIDSetModifierLockState` (guess). | |
-| Unmapped keys | PrintScreen, ScrollLock and Pause become F13 to F15. Drop F21 to F24. | |
-| Media keys | NX_SYSDEFINED subtype 8. | Brightness may only drive the built-in display (guess). |
-| Scroll | Line units for a wheel, pixel units for continuous scrolling. | No phase or momentum on the wire (`src/session.rs:103-104`). |
-| Wake | `IOPMAssertionDeclareUserActivity` on Prepare. | Test display wake on macOS 27. |
+| Event source | HID system-state source, posted at the HID tap, suppression interval 0, local events permitted. | The Mac's own trackpad kept working with every source tried, including the default one, while events were posted every 8 ms. The deprecated system-wide suppression calls are not needed. |
+| Pointer | Current cursor plus the delta after a curve, clamped to the displays and snapped to the nearest one. Also set the delta fields. | Linux sends raw deltas (`src/session.rs:97`). CGEventPost places the cursor at the event location 1:1, with no acceleration; delta fields alone do not move it. macOS does not clamp an off-screen location. |
+| Drag and clicks | Drag event types while a button is down. Click state on every down and up; the event number is optional. | Without click state there is no double-click. A posted click does activate a background app on 27. |
+| Keys | Inverted table, ISO swap keyed on the receiving Mac's keyboard type, modifier flags (including the left/right device bits) on every event. | The HID-state source merges held modifiers anyway. The keyboard-type field on a posted event does not change characters, so the ISO swap must be in the table. Untested on an ISO Mac. |
+| Repeat | Made on the receiver at the System Settings delay and interval, with the autorepeat field set. | The wire drops repeats (`src/session.rs:595-599`), and macOS does not repeat a held posted key. Defaults read 225/30 ms, AppKit reports 250/33 ms; pick one. |
+| Caps Lock | `IOHIDSetModifierLockState` on an `IOHIDSystem` connection. | Keycode 57 only sets the event flag, so letters and the real lock disagree. |
+| Unmapped keys | PrintScreen becomes F13. Drop ScrollLock, Pause and F21 to F24. | F14 and F15 never reach apps. F16 to F19 are untested. |
+| Media keys | NX_SYSDEFINED subtype 8. | Volume and brightness both work; brightness stepped on the external display with the lid closed. |
+| Scroll | Line units for a wheel, pixel units for continuous scrolling. | No phase or momentum on the wire (`src/session.rs:103-104`). macOS accepts posted phases and momentum, so the wire could carry them later. |
+| Wake | `IOPMAssertionDeclareUserActivity` on Prepare. | Not tested yet (spike I skipped it). |
 
 **Handoff answers, in-process:**
 - Snapshot: the display rectangles plus the cursor position.
@@ -459,7 +459,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 
 1. Phase 0 first: it is tiny and removes the one-way defaults.
 2. Then Phase 1: it is the first thing asked for, and it makes new features land once, in shared code.
-3. Alongside Phase 1: a throwaway `inject.c` spike on macOS 27 **(Mac)**. It is the biggest unknown and touches none of Phase 1's files.
+3. Alongside Phase 1: a throwaway injection spike on macOS 27 **(Mac)**. It is the biggest unknown and touches none of Phase 1's files. Done 2026-09-28 as spike I: passed.
 4. Then Phases 2, 3 and 4. Most of Phase 3 can be built on Linux before Phase 2 lands, but its acceptance needs a Mac that receives.
 
 Move shared code a piece at a time: the endpoint in Phase 2, the handoff client in Phase 3. The Linux orchestration is `daemon.rs` at 1969 lines. The Mac side is `native.rs`, `link.rs`, `sharing.rs` and `macos/mod.rs`, 3437 lines together. How much they overlap is not measured, so no big-bang rewrite.
