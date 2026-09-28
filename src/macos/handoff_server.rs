@@ -250,8 +250,9 @@ struct Lease {
     session_id: u64,
     token: u64,
     renewed: Instant,
-    /// The display generation the entry was placed in.
+    /// The display generation the entry was placed in, and its displays.
     generation: u32,
+    geometry: Geometry,
     edge: ArmedEdge,
     /// Where the pointer left, once it has.
     returned: Option<u32>,
@@ -346,7 +347,8 @@ impl<D: Desk> HandoffServer<D> {
         else {
             return DesktopResponse::unavailable("Not a desktop handoff");
         };
-        // Read first, so a display change while this runs ends the handoff.
+        // Read first, so any display change while this runs is checked
+        // against the displays the entry was placed in.
         let generation = self.desk.generation();
         let planned = self.desk.geometry().and_then(|geometry| {
             let armed = ArmedEdge::new(&geometry, edge, start, end)?;
@@ -377,6 +379,7 @@ impl<D: Desk> HandoffServer<D> {
                 token,
                 renewed: Instant::now(),
                 generation,
+                geometry: geometry.clone(),
                 edge: armed,
                 returned: None,
                 _guard: guard,
@@ -543,8 +546,21 @@ impl<D: Desk> HandoffServer<D> {
     /// its session closes. True if one ended.
     pub fn expire_at(&self, now: Instant) -> bool {
         let generation = self.desk.generation();
+        // macOS can report a reconfiguration that leaves every display where
+        // it was, as waking one may. Only one that moved them ends the handoff.
+        let reconfigured = self
+            .lease()
+            .as_ref()
+            .is_some_and(|lease| lease.generation != generation);
+        let geometry = reconfigured.then(|| self.desk.geometry().ok()).flatten();
         let expired = self.lease().take_if(|lease| {
-            now.saturating_duration_since(lease.renewed) >= LEASE || lease.generation != generation
+            if lease.generation != generation {
+                if geometry.as_ref() != Some(&lease.geometry) {
+                    return true;
+                }
+                lease.generation = generation;
+            }
+            now.saturating_duration_since(lease.renewed) >= LEASE
         });
         let Some(expired) = expired else {
             return false;
@@ -784,6 +800,13 @@ mod tests {
         DesktopResponse::unavailable(reason)
     }
 
+    /// Moves this Mac's displays, as macOS reports a reconfiguration.
+    fn rearrange(desk: &FakeDesk, geometry: Geometry) {
+        let mut fake = desk.state();
+        fake.geometry = Some(geometry);
+        fake.generation += 1;
+    }
+
     #[tokio::test]
     async fn a_handoff_enters_polls_returns_and_finishes() {
         let (server, desk, ownership) = setup(single());
@@ -941,9 +964,13 @@ mod tests {
         let poll = |token| server.request("linux", 1, DesktopRequest::Poll { token });
         assert_eq!(poll(7).await, unavailable(ENDED));
 
-        // A display change ends the next request's handoff.
+        // A reconfiguration that leaves the displays where they were keeps
+        // the handoff, and a display change ends the next request's.
         server.request("linux", 1, prepare(8)).await;
         desk.state().generation += 1;
+        assert_eq!(poll(8).await, DesktopResponse::Active);
+        assert_eq!(ownership.controller().as_deref(), Some("linux"));
+        rearrange(&desk, desktop(&[(0, 0, 2560, 1440)]));
         assert_eq!(poll(8).await, unavailable(ENDED));
         assert_eq!(desk.state().closed.len(), 2);
 
@@ -967,7 +994,7 @@ mod tests {
             async move { server.watch().await }
         });
         server.request("linux", 1, prepare(10)).await;
-        desk.state().generation += 1;
+        rearrange(&desk, single());
         tokio::time::sleep(LEASE_CHECK + Duration::from_millis(50)).await;
         assert_eq!(ownership.controller(), None);
         assert_eq!(desk.state().closed.len(), 4);
@@ -1036,7 +1063,7 @@ mod tests {
             async move { server.request("linux", 1, prepare(9)).await }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
-        desk.state().generation += 1;
+        rearrange(&desk, desktop(&[(0, 0, 2560, 1440)]));
         assert!(server.expire_at(Instant::now()));
         assert_eq!(
             preparing.await.unwrap(),
