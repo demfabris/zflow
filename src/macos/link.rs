@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
@@ -1002,12 +1003,13 @@ impl Session {
         // A new session holds nothing yet.
         layouts.peer_has = None;
         layouts.offer(&self.handle);
-        let mut ready = if self.sends {
-            self.snapshot(state).await
-        } else {
+        // The peer's input keeps flowing while its desktop is read, so the
+        // answer is awaited next to it. Only crossings wait for it.
+        let mut snapshot = self.ask(inbound);
+        let mut ready = false;
+        if !self.sends {
             state.send_replace(LinkState::Connected);
-            false
-        };
+        }
         let mut retry = FIRST_SNAPSHOT_RETRY;
         loop {
             if ready {
@@ -1016,8 +1018,10 @@ impl Session {
             tokio::select! {
                 command = commands.recv() => match command {
                     None => return Served::Stopped,
-                    Some(Command::Retry) if self.sends => ready = self.snapshot(state).await,
-                    Some(Command::Retry) => {}
+                    Some(Command::Retry) => {
+                        ready = false;
+                        snapshot = snapshot.or_else(|| self.ask(inbound));
+                    }
                     Some(Command::Inbound(theirs)) => {
                         // A peer that connects later lost its connection,
                         // so its new one replaces this one.
@@ -1060,10 +1064,15 @@ impl Session {
                         drop(status);
                         if failed {
                             // The receiver may have changed; check it before the next crossing.
-                            ready = self.snapshot(state).await;
+                            ready = false;
+                            snapshot = snapshot.or_else(|| self.ask(inbound));
                         }
                     }
                 },
+                response = answered(&mut snapshot) => {
+                    snapshot = None;
+                    ready = show(state, response);
+                }
                 event = self.events.recv() => match event.map(|event| event.kind) {
                     Some(SessionEventKind::Closed { reason }) => return Served::Lost(reason),
                     Some(SessionEventKind::Desktop { request, reply }) => {
@@ -1082,34 +1091,29 @@ impl Session {
                     None => return Served::Lost("input session closed".into()),
                 },
                 Ok(()) = layouts.kept.changed() => layouts.offer(&self.handle),
-                () = tokio::time::sleep(retry), if !ready && self.sends => {
-                    ready = self.snapshot(state).await;
-                    retry = (retry * 2).min(SNAPSHOT_RETRY);
+                () = tokio::time::sleep(retry), if !ready && snapshot.is_none() && self.sends => {
+                    // Nothing is asked while the peer controls this Mac, so
+                    // the next try comes as soon as it lets go.
+                    snapshot = self.ask(inbound);
+                    if snapshot.is_some() {
+                        retry = (retry * 2).min(SNAPSHOT_RETRY);
+                    }
                 }
             }
         }
     }
 
-    /// Reads the receiver's desktop into the link state.
-    async fn snapshot(&mut self, state: &watch::Sender<LinkState>) -> bool {
-        let geometry = self
-            .handle
-            .desktop_request(DesktopRequest::Snapshot)
-            .await
-            .and_then(|response| {
-                response.validate()?;
-                match response {
-                    DesktopResponse::Snapshot { geometry, .. } => Ok(geometry),
-                    DesktopResponse::Unavailable { reason } => bail!("{reason}"),
-                    _ => bail!("Unexpected response from the other computer"),
-                }
-            });
-        let ready = geometry.is_ok();
-        state.send_replace(match geometry {
-            Ok(geometry) => LinkState::Ready(geometry),
-            Err(error) => LinkState::Down(format!("{error:#}")),
-        });
-        ready
+    /// Asks for the receiver's desktop, unless it takes no input from this
+    /// Mac, or controls it and so refuses while it sends. Dropping the
+    /// answer before it comes closes the session.
+    fn ask(&self, inbound: &Inbound) -> Option<Snapshot> {
+        if !self.sends || inbound.controls() {
+            return None;
+        }
+        let handle = self.handle.clone();
+        Some(Box::pin(async move {
+            handle.desktop_request(DesktopRequest::Snapshot).await
+        }))
     }
 
     /// Closes the session and waits briefly for the close to leave.
@@ -1133,6 +1137,36 @@ impl Session {
         };
         let _ = tokio::time::timeout(CLOSE_GRACE, closed).await;
     }
+}
+
+/// A desktop snapshot on its way back from the receiver.
+type Snapshot = Pin<Box<dyn Future<Output = Result<DesktopResponse>> + Send>>;
+
+/// The answer to the snapshot in flight. Never ready without one.
+async fn answered(snapshot: &mut Option<Snapshot>) -> Result<DesktopResponse> {
+    match snapshot {
+        Some(snapshot) => snapshot.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Puts the receiver's desktop into the link state. True if it can be
+/// crossed into.
+fn show(state: &watch::Sender<LinkState>, response: Result<DesktopResponse>) -> bool {
+    let geometry = response.and_then(|response| {
+        response.validate()?;
+        match response {
+            DesktopResponse::Snapshot { geometry, .. } => Ok(geometry),
+            DesktopResponse::Unavailable { reason } => bail!("{reason}"),
+            _ => bail!("Unexpected response from the other computer"),
+        }
+    });
+    let ready = geometry.is_ok();
+    state.send_replace(match geometry {
+        Ok(geometry) => LinkState::Ready(geometry),
+        Err(error) => LinkState::Down(format!("{error:#}")),
+    });
+    ready
 }
 
 /// Race the peer's pinned addresses, then discovered receivers after a short
@@ -1197,6 +1231,7 @@ mod tests {
         },
         transport::{accept_input, input_server_config},
     };
+    use tokio::sync::oneshot;
 
     fn geometry() -> Geometry {
         Geometry {
@@ -1233,6 +1268,9 @@ mod tests {
         effects: mpsc::UnboundedReceiver<(u64, ReceiverEffect)>,
         closed: mpsc::UnboundedReceiver<u64>,
         layouts: mpsc::UnboundedReceiver<SharedLayout>,
+        /// While set, desktop requests wait in `held` for the test to answer.
+        hold: Arc<std::sync::atomic::AtomicBool>,
+        held: mpsc::UnboundedReceiver<(DesktopRequest, oneshot::Sender<DesktopResponse>)>,
         _endpoint: Endpoint,
     }
 
@@ -1248,6 +1286,9 @@ mod tests {
         let (effects_tx, effects) = mpsc::unbounded_channel();
         let (closed_tx, closed) = mpsc::unbounded_channel();
         let (layouts_tx, layouts) = mpsc::unbounded_channel();
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (held_tx, held) = mpsc::unbounded_channel();
+        let holding = hold.clone();
         let accepting = endpoint.clone();
         tokio::spawn(async move {
             while let Some(incoming) = accepting.accept().await {
@@ -1267,11 +1308,21 @@ mod tests {
                     continue;
                 };
                 let _ = sessions_tx.send(session);
-                let (effects_tx, closed_tx, layouts_tx) =
-                    (effects_tx.clone(), closed_tx.clone(), layouts_tx.clone());
+                let (effects_tx, closed_tx, layouts_tx, held_tx) = (
+                    effects_tx.clone(),
+                    closed_tx.clone(),
+                    layouts_tx.clone(),
+                    held_tx.clone(),
+                );
+                let holding = holding.clone();
                 tokio::spawn(async move {
                     while let Some(event) = events.recv().await {
                         match event.kind {
+                            SessionEventKind::Desktop { request, reply }
+                                if holding.load(std::sync::atomic::Ordering::SeqCst) =>
+                            {
+                                let _ = held_tx.send((request, reply));
+                            }
                             SessionEventKind::Desktop { request, reply } => {
                                 let _ = reply.send(answer(request));
                             }
@@ -1302,6 +1353,8 @@ mod tests {
             effects,
             closed,
             layouts,
+            hold,
+            held,
             _endpoint: endpoint,
         }
     }
@@ -1391,7 +1444,11 @@ mod tests {
             .await
             .unwrap();
         let state = watch::channel(LinkState::Connecting).0;
-        assert!(session.snapshot(&state).await);
+        let response = session
+            .handle
+            .desktop_request(DesktopRequest::Snapshot)
+            .await;
+        assert!(show(&state, response));
         assert_eq!(*state.borrow(), LinkState::Ready(geometry()));
         let mut opened = Vec::new();
         let mut sessions = BTreeSet::new();
@@ -1811,6 +1868,78 @@ mod tests {
         }
         drop(links);
         drop(receiver);
+    }
+
+    /// The next desktop request the fake computer holds, if one comes.
+    fn held(
+        server: &tokio::runtime::Runtime,
+        receiver: &mut Receiver,
+        within: Duration,
+    ) -> Option<(DesktopRequest, oneshot::Sender<DesktopResponse>)> {
+        server
+            .block_on(async { tokio::time::timeout(within, receiver.held.recv()).await })
+            .ok()
+            .flatten()
+    }
+
+    #[test]
+    fn the_peers_input_does_not_wait_for_its_desktop() {
+        let Pair {
+            mut links,
+            mut receiver,
+            fake,
+            server,
+            directories: _directories,
+            ..
+        } = pair(|_| {});
+        let linux = server.block_on(receiver.sessions.recv()).unwrap();
+        receiver
+            .hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        links.retry();
+        let (request, reply) = held(&server, &mut receiver, Duration::from_secs(2))
+            .expect("the Mac asked for the desktop");
+        assert!(matches!(request, DesktopRequest::Snapshot));
+        // The peer takes control before it answers, as when it dials and
+        // activates at once. The Mac gives up on an answer after 1 s.
+        linux.begin_outbound(activation(&linux)).unwrap();
+        linux.capture(key(KeyState::Pressed)).unwrap();
+        posted(&fake, "key 0 down", Duration::from_millis(800));
+        let smaller = Geometry {
+            monitors: vec![Rect {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720,
+            }],
+        };
+        let _ = reply.send(DesktopResponse::Snapshot {
+            geometry: smaller.clone(),
+            position: Point { x: 0, y: 0 },
+        });
+        wait_until(&mut links, |links| {
+            links
+                .states()
+                .any(|(_, state)| state == LinkState::Ready(smaller.clone()))
+        });
+
+        // The peer refuses snapshots while it sends, so none is asked.
+        links.retry();
+        assert!(
+            held(&server, &mut receiver, Duration::from_millis(300)).is_none(),
+            "asked while controlled"
+        );
+        linux.capture(key(KeyState::Released)).unwrap();
+        server
+            .block_on(linux.end_outbound(SessionCloseReason::LocalRelease))
+            .unwrap();
+        let (request, reply) = held(&server, &mut receiver, Duration::from_secs(2))
+            .expect("asked again once the peer let go");
+        let _ = reply.send(answer(request));
+        wait_until(&mut links, ready);
+        assert!(!linux.is_closed());
+        assert!(receiver.closed.try_recv().is_err());
+        drop(links);
     }
 
     #[test]

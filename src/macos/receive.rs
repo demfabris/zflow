@@ -615,6 +615,15 @@ impl Inbound {
         });
     }
 
+    /// Whether this session's peer controls this Mac, or holds its desktop
+    /// for a handoff.
+    pub fn controls(&self) -> bool {
+        self.receiving
+            .ownership
+            .controller()
+            .is_some_and(|peer| peer == self.peer)
+    }
+
     /// Posts one batch of the peer's input, or says why not, which closes
     /// the session.
     pub async fn effects(
