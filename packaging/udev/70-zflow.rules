@@ -11,3 +11,14 @@ ACTION=="add|change", SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="zflow", MODE="
 ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/bustype}=="0006", ATTRS{id/vendor}=="1209", ATTRS{id/product}=="5a01", ATTRS{name}=="zflow remote keyboard", ATTRS{phys}=="zflow/remote/keyboard", ENV{ZFLOW_VIRTUAL_DEVICE}="1", ENV{ZFLOW_DEVICE_ROLE}="remote-keyboard", ENV{ZFLOW_CAPTURE_EXCLUDE}="1", ENV{ID_SEAT}="seat0", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1", ENV{ID_INPUT_KEYBOARD}="1"
 ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/bustype}=="0006", ATTRS{id/vendor}=="1209", ATTRS{id/product}=="5a02", ATTRS{name}=="zflow remote pointer", ATTRS{phys}=="zflow/remote/pointer", ENV{ZFLOW_VIRTUAL_DEVICE}="1", ENV{ZFLOW_DEVICE_ROLE}="remote-pointer", ENV{ZFLOW_CAPTURE_EXCLUDE}="1", ENV{ID_SEAT}="seat0", ENV{ID_INPUT}="1", ENV{ID_INPUT_MOUSE}="1"
 ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/bustype}=="0006", ATTRS{id/vendor}=="1209", ATTRS{id/product}=="5a03", ATTRS{name}=="zflow remote touchpad", ATTRS{phys}=="zflow/remote/touchpad", ENV{ZFLOW_VIRTUAL_DEVICE}="1", ENV{ZFLOW_DEVICE_ROLE}="remote-touchpad", ENV{ZFLOW_CAPTURE_EXCLUDE}="1", ENV{ID_SEAT}="seat0", ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHPAD}="1", ENV{ID_INPUT_TOUCHPAD_INTEGRATION}="external"
+
+# Let the zflow account read every keyboard, mouse, touchpad, pointing stick
+# and trackball, so an empty capture_devices list can capture them all. This
+# replaces group input on those nodes; the compositor still opens them through
+# logind. zflow's own devices above are excluded. A remapper such as keyd
+# holds its source device, and zflow captures the remapper's output instead.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ENV{ZFLOW_CAPTURE_EXCLUDE}!="1", ENV{ID_INPUT_KEYBOARD}=="1", ENV{ZFLOW_CAPTURE}="1", GROUP="zflow", MODE="0640"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ENV{ZFLOW_CAPTURE_EXCLUDE}!="1", ENV{ID_INPUT_MOUSE}=="1", ENV{ZFLOW_CAPTURE}="1", GROUP="zflow", MODE="0640"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ENV{ZFLOW_CAPTURE_EXCLUDE}!="1", ENV{ID_INPUT_TOUCHPAD}=="1", ENV{ZFLOW_CAPTURE}="1", GROUP="zflow", MODE="0640"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ENV{ZFLOW_CAPTURE_EXCLUDE}!="1", ENV{ID_INPUT_POINTINGSTICK}=="1", ENV{ZFLOW_CAPTURE}="1", GROUP="zflow", MODE="0640"
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ENV{ZFLOW_CAPTURE_EXCLUDE}!="1", ENV{ID_INPUT_TRACKBALL}=="1", ENV{ZFLOW_CAPTURE}="1", GROUP="zflow", MODE="0640"

@@ -163,7 +163,7 @@ On Linux, physical devices stay on their normal kernel path while zflow is idle.
 Each input source follows four routing states:
 
 1. **Idle**: no grabs exist. Local input flows normally. A daemon crash, restart, or package upgrade in this state cannot affect local input, and a restarted daemon is immediately fully functional.
-2. **Arming**: zflow has selected and authenticated a peer and an activation was requested (hotkey chord, or a portal edge event). For the hotkey path, zflowd waits until every key and button across the capture set is neutral (verified through EVIOCGKEY and tracked state), then takes EVIOCGRAB on every node in the set, all or none. EBUSY or any failure releases acquired grabs and returns to Idle with a diagnostic.
+2. **Arming**: zflow has selected and authenticated a peer and an activation was requested (hotkey chord, or a portal edge event). For the hotkey path, zflowd waits until every key and button across the capture set is neutral (verified through EVIOCGKEY and tracked state), then takes EVIOCGRAB on every node in the set, all or none. EBUSY or any failure releases acquired grabs and returns to Idle with a diagnostic. One exception: with no configured devices the set is every keyboard, mouse and touchpad, and a node another program already grabbed (EBUSY) is skipped and never released, since it was never zflow's. A remapper such as keyd holds its source that way and re-emits on a virtual node, which zflow grabs instead. Arming then succeeds if at least one node was grabbed; any other failure still releases the whole set.
 3. **Remote**: grabbed physical events serialize to the peer. The local escape chord works without network cooperation because the daemon reads every event.
 4. **Releasing**: zflow queues a terminal state when the connection remains live, ungrabs the set at a complete SYN_REPORT boundary, and the physical devices return to normal kernel consumers. The receiver cleans up through that terminal state or its lease and lifecycle rules.
 
@@ -453,9 +453,9 @@ Linux uses evdev for physical capture and uinput for remote injection. EVIOCGRAB
 
 zflowd grabs the configured capture set on demand at the Arming transition and releases it when Remote ends, per the Input ownership section. While Idle it holds no grabs and reads the set only to detect the activation chord and track state. This keeps the daemon out of the local input path, keeps upgrades and restarts harmless, and lets a hotplugged device join the set without a reboot; the cost is the bounded arming leak, measured by the backbone matrix.
 
-zflowd runs as a dedicated service account unless a platform test proves that root is required. The account may read selected evdev nodes and open /dev/uinput. Membership in the broad input group grants keylogger-level access, so installers MUST NOT add interactive users to it.
+zflowd runs as a dedicated service account unless a platform test proves that root is required. The account may read keyboard and pointer evdev nodes and open /dev/uinput. Membership in the broad input group grants keylogger-level access, so installers MUST NOT add interactive users to it.
 
-The installer ensures that uinput exists as a built-in driver or loaded module, grants zflowd write access to /dev/uinput, read access to selected evdev nodes, and write access only to nodes that need negotiated LED feedback. It verifies those permissions after a cold boot.
+The installer ensures that uinput exists as a built-in driver or loaded module, grants zflowd write access to /dev/uinput, read access to every keyboard and pointer evdev node, and write access only to nodes that need negotiated LED feedback. It verifies those permissions after a cold boot.
 
 The service starts from multi-user.target and retries network discovery without blocking the display manager on network-online.target. When pre-login support is enabled, zflowd orders before the enabled display-manager unit and uses Type=notify. It sends READY=1 only after /dev/uinput is accessible, the baseline virtual devices exist, and their matching udev add events expose the required properties, so a pre-login client can receive input before the greeter appears. Network availability does not delay readiness. A daemon start at any later time is equally functional; no state depends on starting before the session.
 
@@ -487,7 +487,7 @@ libinput requires udev classification and device-specific properties; a uinput n
 
 ### Capture
 
-A capture set is all-or-none: at Arming, zflowd opens and grabs every event node in the configured logical set, and EVIOCGRAB returning EBUSY or any setup failure releases the whole set and returns to Idle with a diagnostic.
+A configured capture set is all-or-none: at Arming, zflowd opens and grabs every event node in the configured logical set, and EVIOCGRAB returning EBUSY or any setup failure releases the whole set and returns to Idle with a diagnostic. With no configured devices, zflowd captures every keyboard, mouse and touchpad except its own virtual devices, and skips a node that returns EBUSY, as the Input ownership section describes.
 
 The daemon handles:
 

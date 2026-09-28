@@ -733,11 +733,34 @@ fn doctor_linux(config: &Config, failed: &mut bool) {
     }
 
     let selection = if config.input.capture_devices.is_empty() {
-        // Receiving never reads local devices; only sending from here needs them.
-        println!(
-            "ok  capture selection: none, so this computer only receives (select devices to send from it)"
-        );
-        None
+        // No selectors captures every keyboard and pointer. Receiving never
+        // reads local devices, so a computer without one only warns.
+        match crate::runtime::diagnose_capture_selection(&[]) {
+            Ok(selection) => {
+                if selection.is_complete() {
+                    println!(
+                        "ok  capture selection: every keyboard and pointer, {} event node(s)",
+                        selection.selected_paths.len()
+                    );
+                } else {
+                    println!(
+                        "warn capture selection: no keyboard or pointer could be opened, so this computer only receives"
+                    );
+                }
+                if selection.scan_failures > 0 {
+                    println!(
+                        "warn input scan: {} event node(s) could not be inspected",
+                        selection.scan_failures
+                    );
+                }
+                Some(selection)
+            }
+            Err(error) => {
+                *failed = true;
+                println!("fail capture selection: {error}");
+                None
+            }
+        }
     } else {
         match crate::runtime::diagnose_capture_selection(&config.input.capture_devices) {
             Ok(selection)

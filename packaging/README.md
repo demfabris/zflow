@@ -162,15 +162,28 @@ The installer keeps two administrator-managed files on upgrades:
 - `/etc/zflow/zflow.toml`
 - `/etc/udev/rules.d/71-zflow-capture.rules`
 
-`zflow setup` maintains the capture rule with stable device attributes. Each
-selected event node receives group `zflow` and mode `0640`. The service account
-does not join the broad `input` group. Pass every selected device in one setup
+The package-owned `70-zflow.rules` gives group `zflow`, mode `0640` and
+`ZFLOW_CAPTURE=1` to every keyboard, mouse, touchpad, pointing stick and
+trackball event node, except zflow's own virtual devices. With
+`capture_devices` empty, the default, the daemon captures all of them and
+skips any that another program already grabbed. This changes the owning group
+of every keyboard and mouse node from `input` to `zflow`, so a tool that read
+them through membership in `input` loses access. The compositor opens devices
+through logind and is not affected. The service account does not join the
+broad `input` group.
+
+`zflow setup --device` narrows capture to chosen devices. It maintains the
+capture rule with stable device attributes, and each selected event node
+receives group `zflow` and mode `0640`, which also covers a device udev does
+not class as a keyboard or pointer. Pass every selected device in one setup
 command by repeating `--device`.
 
-Run the installer from the repository root:
+Run the installer from the repository root, then check the host. The setup
+lines are only needed to narrow capture:
 
 ```sh
 ./scripts/install.sh
+sudo /usr/local/bin/zflow doctor
 sudo /usr/local/bin/zflow devices
 sudo /usr/local/bin/zflow setup \
   --device /dev/input/eventX \

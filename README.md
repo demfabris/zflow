@@ -225,7 +225,14 @@ permission rules from app bundles. See [Apple's local-network guidance](https://
 
 ## Install and select devices
 
-After installing zflow on both Linux machines:
+With `capture_devices` empty, the default, a Linux machine that sends
+captures every keyboard, mouse, and touchpad. The packaged udev rule lets the
+zflow account read them. A device another program already grabbed is skipped:
+keyd, for example, holds the physical keyboard and types through `keyd virtual
+keyboard`, and zflow captures that one instead. `sudo zflow doctor` lists what
+it would capture.
+
+To capture only some devices, list them:
 
 ```sh
 sudo zflow devices
@@ -243,6 +250,9 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger --action=change --subsystem-match=input
 sudo zflow doctor
 ```
+
+A listed device must be free: if another program grabbed it, every crossing
+fails. List the remapper's virtual device instead.
 
 Raw touchpad forwarding is experimental. Enable it on both machines. A running
 daemon applies it without a restart: it creates the virtual touchpad and ends
