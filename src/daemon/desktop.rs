@@ -117,6 +117,17 @@ impl Hub {
         self.local.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// This desktop's monitors and pointer, from GNOME.
+    pub(super) async fn snapshot(&self) -> DesktopResponse {
+        self.call(DesktopRequest::Snapshot).await
+    }
+
+    /// Puts the pointer at `position` on this desktop.
+    pub(super) async fn warp(&self, position: crate::desktop::Point) -> DesktopResponse {
+        self.call_scoped(AgentRequest::Local(LocalRequest::Warp { position }), None)
+            .await
+    }
+
     /// The computer whose edge the pointer pushed against, if any.
     pub(super) fn edge_peer(&self, edge: Edge, position: u32) -> Option<String> {
         self.local_state()

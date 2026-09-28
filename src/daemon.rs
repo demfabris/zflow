@@ -45,6 +45,7 @@ use crate::{
 };
 
 const SESSION_EVENT_CAPACITY: usize = 1_024;
+mod crossing;
 mod desktop;
 mod peer_view;
 const ACCEPT_EVENT_CAPACITY: usize = 64;
@@ -135,6 +136,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         dialed: Mutex::new(BTreeMap::new()),
         nearby: Mutex::new(BTreeMap::new()),
         layout: Mutex::new(None),
+        crossing: Mutex::new(()),
         metrics_history: Mutex::new(BTreeMap::new()),
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
@@ -352,6 +354,8 @@ struct Shared {
     nearby: Mutex<BTreeMap<String, Vec<SocketAddr>>>,
     /// The newest layout this computer has seen from any peer.
     layout: Mutex<Option<crate::desktop::SharedLayout>>,
+    /// Held while a crossing started from an edge runs.
+    crossing: Mutex<()>,
     metrics_history: Mutex<BTreeMap<String, crate::metrics::SessionMetricsSnapshot>>,
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
@@ -462,20 +466,11 @@ impl Shared {
     /// Places a barrier on each edge of this computer's tile that touches a
     /// paired computer. Without a layout, crossings start only from the chord.
     async fn apply_layout(self: &Arc<Self>) {
-        // Never hold the layout while waiting for another lock.
-        let layout = self.layout.lock().await.clone();
-        let edges = match layout {
-            Some(layout) => {
-                let keys = peer_keys(&*self.config.read().await);
-                desktop::outbound_edges(&crate::app::layout_model::Layout::from_shared(
-                    &layout,
-                    &self.identity_fingerprint,
-                    "This computer",
-                    &keys,
-                ))
-            }
-            None => Vec::new(),
-        };
+        let edges = self
+            .local_layout()
+            .await
+            .map(|layout| desktop::outbound_edges(&layout))
+            .unwrap_or_default();
         tracing::info!(edges = edges.len(), "outbound edges placed");
         desktop::set_edges(self, edges);
     }
@@ -548,8 +543,8 @@ impl Shared {
         };
         let shared = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = shared.activate(&peer).await {
-                tracing::info!(%error, %peer, "edge crossing did not start");
+            if let Err(error) = shared.cross(edge, position).await {
+                tracing::info!(error = %format_args!("{error:#}"), %peer, "edge crossing ended");
             }
         });
     }

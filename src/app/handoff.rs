@@ -1,11 +1,17 @@
-use anyhow::{Result, ensure};
+//! Where a crossing enters the other computer and where it comes back.
+//! The Mac finds the edge by watching its cursor; Linux by a GNOME barrier.
 
-use crate::desktop::{Edge, FRACTION_MAX, Geometry, Point, Rect, ReturnMapping};
+use anyhow::{Result, bail, ensure};
 
-use super::layout_model::Layout;
+use crate::desktop::{
+    DesktopRequest, DesktopResponse, Edge, FRACTION_MAX, Geometry, MAX_TOKEN, Point, Rect,
+    ReturnMapping,
+};
+
+use super::layout_model::{Layout, Transition};
 
 #[derive(Clone, Debug)]
-pub(super) struct Handoff {
+pub(crate) struct Handoff {
     pub peer: String,
     pub edge: Edge,
     pub start: u32,
@@ -13,17 +19,77 @@ pub(super) struct Handoff {
     pub position: u32,
     pub expected_width: u32,
     pub expected_height: u32,
+    /// Where the Mac's cursor may travel while the crossing is prepared.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub entry_region: Rect,
     pub return_mapping: ReturnMapping,
 }
 
 impl Handoff {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn matches_geometry(&self, geometry: &Geometry) -> bool {
         self.return_mapping.geometry == *geometry
     }
+
+    /// Asks the other computer to put its cursor at the entry point.
+    // The Mac still uses its own copies of this and the checks below until it
+    // switches over (ROADMAP change 10).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn prepare(&self, token: u64) -> DesktopRequest {
+        DesktopRequest::Prepare {
+            token,
+            edge: self.edge,
+            start: self.start,
+            end: self.end,
+            position: self.position,
+        }
+    }
+
+    /// Checks that the other computer prepared a desktop of the size the
+    /// layout expects, so the crossing lands where the layout shows it.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn check_prepared(&self, response: DesktopResponse) -> Result<()> {
+        response.validate()?;
+        match response {
+            DesktopResponse::Prepared { geometry, .. } => {
+                let bounds = geometry.bounds()?;
+                ensure!(
+                    bounds.width == self.expected_width && bounds.height == self.expected_height,
+                    "the other computer's desktop changed size; refresh and save the computer layout before sharing"
+                );
+                Ok(())
+            }
+            DesktopResponse::Unavailable { reason } => {
+                bail!("the other computer's desktop is unavailable: {reason}")
+            }
+            _ => bail!("the other computer did not prepare its desktop for input"),
+        }
+    }
 }
 
-pub(super) fn validate(layout: &Layout, geometry: &Geometry) -> Result<()> {
+/// A token for one crossing's desktop requests.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn token() -> Result<u64> {
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow::anyhow!("could not create a desktop handoff token: {error}"))?;
+    Ok((u64::from_ne_bytes(random) & MAX_TOKEN).max(1))
+}
+
+/// Checks the other computer's answer to Finish.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn check_finished(response: Result<DesktopResponse>) -> Result<()> {
+    match response? {
+        DesktopResponse::Finished => Ok(()),
+        DesktopResponse::Unavailable { reason } => {
+            bail!("the other computer could not finish the desktop handoff: {reason}")
+        }
+        _ => bail!("the other computer did not confirm the desktop handoff cleanup"),
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn validate(layout: &Layout, geometry: &Geometry) -> Result<()> {
     layout.validate()?;
     geometry.validate()?;
     let locals: Vec<_> = layout
@@ -35,19 +101,58 @@ pub(super) fn validate(layout: &Layout, geometry: &Geometry) -> Result<()> {
     let bounds = geometry.bounds()?;
     ensure!(
         locals[0].width == bounds.width && locals[0].height == bounds.height,
-        "The Mac desktop changed. Waiting for its updated layout"
+        "This computer's desktop changed. Waiting for its updated layout"
     );
     ensure!(
         layout
             .transitions()
             .iter()
             .any(|t| layout.monitors[t.source].peer.is_none()),
-        "Drag a paired computer until its edge touches this Mac"
+        "Drag a paired computer until its edge touches this computer"
     );
     Ok(())
 }
 
-pub(super) fn crossing(
+/// The crossing for a push against `edge` at `position`, a fraction of this
+/// desktop along that edge, as a GNOME barrier reports it.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn from_edge(
+    layout: &Layout,
+    geometry: &Geometry,
+    edge: Edge,
+    position: u32,
+) -> Option<Handoff> {
+    let bounds = geometry.bounds().ok()?;
+    let along = f64::from(position.min(FRACTION_MAX)) / f64::from(FRACTION_MAX);
+    let offset = |span: u32| (along * f64::from(span)).floor().min(f64::from(span - 1)) as i32;
+    let current = match edge {
+        Edge::Left => Point {
+            x: bounds.x,
+            y: bounds.y + offset(bounds.height),
+        },
+        Edge::Right => Point {
+            x: bounds.x + bounds.width as i32 - 1,
+            y: bounds.y + offset(bounds.height),
+        },
+        Edge::Top => Point {
+            x: bounds.x + offset(bounds.width),
+            y: bounds.y,
+        },
+        Edge::Bottom => Point {
+            x: bounds.x + offset(bounds.width),
+            y: bounds.y + bounds.height as i32 - 1,
+        },
+    };
+    layout
+        .transitions()
+        .iter()
+        .filter(|t| layout.monitors[t.source].peer.is_none() && t.edge == edge)
+        .find(|t| (t.source_start..=t.source_end).contains(&along))
+        .and_then(|transition| handoff_at(layout, geometry, transition, current))
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn crossing(
     layout: &Layout,
     geometry: &Geometry,
     previous: Point,
@@ -61,7 +166,6 @@ pub(super) fn crossing(
         if layout.monitors[transition.source].peer.is_some() {
             continue;
         }
-        let peer = layout.monitors[transition.target].peer.as_ref()?;
         let local_edge = transition.edge;
         let (entered, along) = match local_edge {
             Edge::Left => (
@@ -90,33 +194,44 @@ pub(super) fn crossing(
         if !entered || along < transition.source_start || along >= transition.source_end {
             continue;
         }
-        let return_mapping = ReturnMapping {
-            edge: local_edge,
-            local_start: transition.source_start,
-            local_end: transition.source_end,
-            remote_start: transition.target_start,
-            remote_end: transition.target_end,
-            geometry: geometry.clone(),
-        };
-        return Some(Handoff {
-            peer: peer.clone(),
-            edge: opposite(local_edge),
-            start: fraction(transition.target_start),
-            end: fraction(transition.target_end),
-            position: return_mapping.fraction(current).ok()?,
-            expected_width: layout.monitors[transition.target].width,
-            expected_height: layout.monitors[transition.target].height,
-            entry_region: entry_region(
-                geometry,
-                local_edge,
-                transition.source_start,
-                transition.source_end,
-                current,
-            )?,
-            return_mapping,
-        });
+        return handoff_at(layout, geometry, &transition, current);
     }
     None
+}
+
+/// The crossing through `transition` for a cursor at `current` on its edge.
+fn handoff_at(
+    layout: &Layout,
+    geometry: &Geometry,
+    transition: &Transition,
+    current: Point,
+) -> Option<Handoff> {
+    let peer = layout.monitors[transition.target].peer.as_ref()?;
+    let return_mapping = ReturnMapping {
+        edge: transition.edge,
+        local_start: transition.source_start,
+        local_end: transition.source_end,
+        remote_start: transition.target_start,
+        remote_end: transition.target_end,
+        geometry: geometry.clone(),
+    };
+    Some(Handoff {
+        peer: peer.clone(),
+        edge: opposite(transition.edge),
+        start: fraction(transition.target_start),
+        end: fraction(transition.target_end),
+        position: return_mapping.fraction(current).ok()?,
+        expected_width: layout.monitors[transition.target].width,
+        expected_height: layout.monitors[transition.target].height,
+        entry_region: entry_region(
+            geometry,
+            transition.edge,
+            transition.source_start,
+            transition.source_end,
+            current,
+        )?,
+        return_mapping,
+    })
 }
 
 fn entry_region(
@@ -283,6 +398,60 @@ mod tests {
         assert!(handoff.entry_region.contains(Point { x: 999, y: 539 }));
         assert!(!handoff.entry_region.contains(Point { x: 999, y: 299 }));
         assert!(!handoff.entry_region.contains(Point { x: 990, y: 550 }));
+    }
+
+    #[test]
+    fn an_edge_push_finds_the_same_crossing_as_the_cursor_does() {
+        let (layout, geometry) = setup();
+        let watched = crossing(
+            &layout,
+            &geometry,
+            Point { x: 990, y: 550 },
+            Point { x: 999, y: 550 },
+        )
+        .unwrap();
+        // Ubuntu touches the lower half of the right edge; y 550 is 75% down.
+        let pushed = from_edge(&layout, &geometry, Edge::Right, 750_000).unwrap();
+        assert_eq!(pushed.peer, watched.peer);
+        assert_eq!(
+            (pushed.edge, pushed.start, pushed.end, pushed.position),
+            (watched.edge, watched.start, watched.end, watched.position)
+        );
+        assert_eq!(
+            pushed.return_mapping.position(pushed.position).unwrap(),
+            Point { x: 996, y: 550 }
+        );
+        assert!(
+            from_edge(&layout, &geometry, Edge::Right, 100_000).is_none(),
+            "no computer there"
+        );
+        assert!(from_edge(&layout, &geometry, Edge::Left, 750_000).is_none());
+
+        let prepared = |width, height| DesktopResponse::Prepared {
+            geometry: Geometry {
+                monitors: vec![Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
+            },
+            position: Point { x: 3, y: 500 },
+        };
+        pushed.check_prepared(prepared(1000, 1000)).unwrap();
+        assert!(
+            pushed.check_prepared(prepared(1000, 900)).is_err(),
+            "resized desktop"
+        );
+        assert!(
+            pushed
+                .check_prepared(DesktopResponse::unavailable("locked"))
+                .unwrap_err()
+                .to_string()
+                .contains("locked")
+        );
+        assert!((1..=MAX_TOKEN).contains(&token().unwrap()));
+        assert!(pushed.prepare(token().unwrap()).validate().is_ok());
     }
 
     #[test]
