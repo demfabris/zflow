@@ -134,6 +134,11 @@ async fn desktop_command(
             shared.apply_config_locked(config, true).await?;
             Ok(DesktopReply::Ack)
         }
+        Request::SetClipboard { share } => {
+            config.clipboard.share = share;
+            shared.apply_config_locked(config, true).await?;
+            Ok(DesktopReply::Ack)
+        }
         Request::Forget { name } => {
             if config.peers.remove(&name).is_none() {
                 bail!("Unknown computer {name}");

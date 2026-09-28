@@ -91,6 +91,9 @@ impl Service {
             Request::SetSwitching { pause_at_edges } => {
                 crate::peer_view::request(&DaemonRequest::SetSwitching { pause_at_edges }).await?;
             }
+            Request::SetClipboard { share } => {
+                crate::peer_view::request(&DaemonRequest::SetClipboard { share }).await?;
+            }
             Request::Pair { address, code } => {
                 let remote = address
                     .as_deref()
@@ -214,6 +217,7 @@ fn snapshot(
         nearby: nearby.records.into_values().collect(),
         pause_at_edges: daemon.as_ref().ok().map(|daemon| daemon.pause_at_edges),
         shortcuts,
+        share_clipboard: daemon.as_ref().ok().map(|daemon| daemon.share_clipboard),
         autostart: Some(autostart_enabled()?),
         config_path: CONFIG_PATH.into(),
         platform: (),
@@ -610,12 +614,14 @@ mod tests {
         let up = snapshot(
             Ok(crate::peer_view::DesktopStatus {
                 layout: Some(layout.clone()),
+                share_clipboard: true,
                 ..status
             }),
             &State::default(),
         )
         .unwrap();
         assert_eq!(up.layout, Some(layout));
+        assert_eq!(up.share_clipboard, Some(true));
 
         let down = snapshot(
             Err(anyhow::anyhow!("Start the zflow system service")),
@@ -627,6 +633,7 @@ mod tests {
         assert_eq!(down.health[0].level, Level::Error);
         assert_eq!(down.health[0].detail, "Start the zflow system service");
         assert!(down.peers.is_empty() && down.shortcuts.is_empty() && down.layout.is_none());
+        assert_eq!(down.share_clipboard, None);
     }
 
     #[test]

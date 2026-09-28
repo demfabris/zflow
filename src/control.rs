@@ -78,8 +78,29 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
+    write_message_within(writer, message, MAX_CONTROL_MESSAGE).await
+}
+
+pub async fn read_message<R, T>(reader: &mut R) -> Result<T, ControlError>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    read_message_within(reader, MAX_CONTROL_MESSAGE).await
+}
+
+/// [`write_message`] for the one stream that allows larger messages.
+pub async fn write_message_within<W, T>(
+    writer: &mut W,
+    message: &T,
+    limit: usize,
+) -> Result<(), ControlError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
     let payload = serde_json::to_vec(message).map_err(ControlError::Encode)?;
-    if payload.len() > MAX_CONTROL_MESSAGE {
+    if payload.len() > limit {
         return Err(ControlError::TooLarge(payload.len()));
     }
     writer.write_u32(payload.len() as u32).await?;
@@ -88,13 +109,14 @@ where
     Ok(())
 }
 
-pub async fn read_message<R, T>(reader: &mut R) -> Result<T, ControlError>
+/// [`read_message`] for the one stream that allows larger messages.
+pub async fn read_message_within<R, T>(reader: &mut R, limit: usize) -> Result<T, ControlError>
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
     let length = reader.read_u32().await? as usize;
-    if length > MAX_CONTROL_MESSAGE {
+    if length > limit {
         return Err(ControlError::TooLarge(length));
     }
     let mut payload = vec![0; length];

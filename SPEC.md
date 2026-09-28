@@ -68,7 +68,8 @@ zflow MUST:
 | AWDL suppression during sessions (macOS, opt-in) | planned, mechanism proven | Consent flow + re-apply loop |
 | QoS marking | provisional | Radio and energy matrix |
 | Automatic path failover | planned | Candidate-racing failure matrix |
-| Clipboard and file transfer | deferred | Separate bulk transport |
+| Clipboard text and PNG images, with the pointer | Linux built; macOS planned | Phase 4 acceptance in ROADMAP.md |
+| File transfer | deferred | Separate bulk transport |
 
 Linux pre-login scope begins in real-root userspace once zflowd is active. Graphical-greeter support begins when the display manager starts; VT keyboard support may begin earlier. Firmware, initramfs, LUKS, macOS FileVault preboot, and other environments where zflow code cannot run remain excluded.
 
@@ -214,9 +215,14 @@ The receiver MUST release state from the prior epoch before accepting a new epoc
 | Input control | One reliable ordered bidirectional stream | key and button transitions, ownership, touch lifecycle, state snapshots, acknowledgements, terminal anchors |
 | Motion state | QUIC datagrams | cumulative pointer and scroll state, complete touch snapshots |
 | Probe | QUIC datagrams | application probe and echo data |
-| Bulk | separate best-effort QUIC connection and socket | clipboard or file data after v1 |
+| Clipboard | one unidirectional QUIC stream per transfer, below the control stream's priority | one clip |
+| Bulk | separate best-effort QUIC connection and socket | file data after v1 |
 
 Input control MUST NOT share a stream with clipboard or file data. If zflow applies a socket service class, bulk traffic MUST use an unmarked endpoint.
+
+### Clipboard
+
+The clipboard goes with the pointer and moves at no other time. The computer the pointer leaves sends its clipboard to the one it enters: a sender reads its own clipboard once its crossing reaches the other computer, by edge or chord, and a computer that was being controlled reads its clipboard when that control ends, by return, escape chord or lease end. Nothing reads the clipboard while the pointer stays put, and a crossing never waits for a clip. A clip is one representation: UTF-8 text if the clipboard has text, else one PNG image. Files never go. A clip holds at most 3 MiB (`MAX_CLIP_BYTES`); a larger clipboard stays where it is, and that computer shows a notice. Each computer opts in for itself with `[clipboard] share`, off by default: it sends only with its own switch on and keeps what arrives only with its own switch on. Each transfer is its own stream on the input connection, and QUIC sends datagrams ahead of stream data, so a large clip does not hold up input. A newer clip cancels one still on its way, and a bad or oversized clip ends only its own stream. Each computer remembers, per peer, the last clip it sent there and the last one that peer gave it, so a clip never bounces back. Logs name only a clip's kind and size.
 
 QUIC retransmission cannot deliver an event after connection death. The receiver owns failure recovery.
 
