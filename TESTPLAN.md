@@ -96,12 +96,13 @@ Checks:
 8. **Keyboard modes.** Set **Keys from ubuntu** to each mode. Standard keys:
    Super+C copies. PC key positions: Alt+C copies. Mac shortcuts: Ctrl+C copies
    in TextEdit and interrupts `sleep 100` in Terminal.
-9. **Scroll.** A notched wheel scrolls in line mode. On a hi-res wheel, if one
-   is available, compare how far one detent scrolls against the notched wheel,
-   and judge whether one line per detent feels slow: CG counts a posted line as
-   about 10 px, and Barrier and Deskflow post 3 lines per detent. Record the
-   horizontal direction and the natural-scrolling setting. **Reverse
-   scrolling** turns both axes around.
+9. **Scroll.** Every scroll posts as pixels, 30 per detent (Deskflow's 3 lines
+   of about 10 px). Judge the distance per detent in Safari and TextEdit, then
+   spin the wheel fast: it scrolls as far per detent as slowly, since nothing
+   accelerates the wheel yet.
+   On a hi-res wheel, if one is available, a detent scrolls as far as on the
+   notched wheel. Record the horizontal direction and the natural-scrolling
+   setting. **Reverse scrolling** turns both axes around.
 10. **Media and function keys.** Volume up, down and mute; play/pause in Music;
     brightness (record what happens). PrintScreen arrives as F13 in
     Karabiner-EventViewer or the probe window; ScrollLock and Pause arrive as

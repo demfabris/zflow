@@ -284,7 +284,7 @@ The baseline is CGEventPost from the logged-in app, which is what Deskflow and l
 | Caps Lock | `IOHIDSetModifierLockState` on an `IOHIDSystem` connection. | Keycode 57 only sets the event flag, so letters and the real lock disagree. |
 | Unmapped keys | PrintScreen becomes F13. Drop ScrollLock, Pause and F21 to F24. | F14 and F15 never reach apps. F16 to F19 are untested. |
 | Media keys | NX_SYSDEFINED subtype 8. | Volume and brightness both work; brightness stepped on the external display with the lid closed. |
-| Scroll | Line units for a wheel, pixel units for continuous scrolling. | No phase or momentum on the wire (`src/session.rs:103-104`). macOS accepts posted phases and momentum, so the wire could carry them later. |
+| Scroll | Pixel units only, 30 px per detent (Deskflow's 3 lines of 10 px), with the part under a pixel carried on each axis. | Playout hands over the wheel in batches of any size, so the distance must depend only on the total. No phase or momentum on the wire (`src/session.rs:103-104`). macOS accepts posted phases and momentum, so the wire could carry them later. |
 | Wake | `IOPMAssertionDeclareUserActivity` on Prepare. | Not tested yet (spike I skipped it). |
 
 **Handoff answers, in-process:**
@@ -424,7 +424,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 - **Risks:** macOS 27 posting quirks; pointer feel; Caps Lock; a firewall prompt; duplicate connections.
 - **Status (2026-09-28):** built on branch `mac-receiver`; the live sitting has not run.
   - Done:
-    - The injector: `inject.c` and `media.m` post, and `inject.rs` turns receiver effects into Mac events, with the pointer curve and clamp, click state, drags, flags, the ISO swap, receiver-made repeat, Caps Lock through IOKit, media keys, line and pixel scroll, and release on every exit path the app sees.
+    - The injector: `inject.c` and `media.m` post, and `inject.rs` turns receiver effects into Mac events, with the pointer curve and clamp, click state, drags, flags, the ISO swap, receiver-made repeat, Caps Lock through IOKit, media keys, pixel scroll, and release on every exit path the app sees.
     - Receiving over the session the Mac dials and over connections peers open. The Mac listens on `transport.listen` and keeps one session per computer with the shared dial rule.
     - One ownership guard: input goes one way at a time, and the Mac starts no crossing while controlled.
     - The desktop handoff server, so a Linux edge crossing enters and returns at the mapped point. The Mac's own crossings use the shared handoff functions.
@@ -436,6 +436,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - Known limits:
     - Held input stays down after SIGKILL of the Mac app, until the local key is pressed.
     - The pointer curve constants are untuned. `ZFLOW_MAC_POINTER` is a sitting-only knob.
+    - Scroll is 30 px per detent at any speed, with no wheel acceleration. The number is untuned.
     - The Mac reads every sender's scroll as 120 units per detent, so a Mac trackpad sender scrolls a Mac receiver slowly.
     - A connection that arrives during a crossing waits until the crossing ends.
     - With `experimental_touchpad` on both computers, a Linux sender may send contacts the Mac cannot post, and they are dropped.

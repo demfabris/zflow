@@ -1,5 +1,5 @@
 //! Pointer motion and scroll for posting on the Mac: the acceleration curve,
-//! keeping the cursor on a display, and wheel lines versus pixels.
+//! keeping the cursor on a display, and wheel units to pixels.
 
 use std::{
     str::FromStr,
@@ -20,9 +20,9 @@ const MIN_INTERVAL_MS: f64 = 1.0;
 const MAX_INTERVAL_MS: f64 = 50.0;
 /// Scroll on the wire counts 120 units to a detent, as Linux does.
 const WHEEL_DETENT: i64 = 120;
-/// CoreGraphics' default scale from lines to pixels (CGEvent.h), so a detent
-/// scrolls as far in pixels as it does as a line.
-const PIXELS_PER_LINE: i64 = 10;
+/// How far a detent scrolls. Deskflow posts 3 lines a detent, and
+/// CoreGraphics counts a line as 10 pixels (CGEvent.h).
+const PIXELS_PER_DETENT: i64 = 30;
 
 /// How motion from a peer is scaled. `speed` is libinput's setting, -1 to 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,58 +174,41 @@ pub fn clamp_to_displays(point: CursorPosition, displays: &[DesktopRect]) -> Cur
         .unwrap_or(point)
 }
 
-/// A scroll to post, with the wire's signs. macOS accelerates lines as it
-/// does a real wheel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scroll {
-    Lines { x: i32, y: i32 },
-    Pixels { x: i32, y: i32 },
-}
-
-/// Posts whole detents as lines and everything else as pixels, a line's
-/// worth per detent.
+/// Turns wheel units into pixels to post. Each scroll posts how far the
+/// rounded running total moved, so the part under a pixel carries, and the
+/// distance depends only on the total, not on how playout batched it.
 #[derive(Clone, Debug, Default)]
-pub struct ScrollSplit {
-    /// Units since the last whole detent on each axis. A high-resolution
-    /// wheel stays in pixels until it lines up with a detent again.
-    pending: (i64, i64),
-    /// The part under a pixel on each axis, in 120ths of a pixel, carried so
-    /// small steps still add up.
-    remainder: (i64, i64),
+pub struct ScrollScale {
+    /// Wheel units since the activation began, on each axis.
+    total: (i64, i64),
 }
 
-impl ScrollSplit {
+impl ScrollScale {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
-    pub fn split(&mut self, x: i64, y: i64) -> Option<Scroll> {
-        if x == 0 && y == 0 {
-            return None;
-        }
-        if self.pending == (0, 0) && x % WHEEL_DETENT == 0 && y % WHEEL_DETENT == 0 {
-            return Some(Scroll::Lines {
-                x: wheel(x / WHEEL_DETENT),
-                y: wheel(y / WHEEL_DETENT),
-            });
-        }
-        self.pending = (
-            (self.pending.0 + x % WHEEL_DETENT) % WHEEL_DETENT,
-            (self.pending.1 + y % WHEEL_DETENT) % WHEEL_DETENT,
-        );
-        let x = pixels(&mut self.remainder.0, x);
-        let y = pixels(&mut self.remainder.1, y);
-        (x != 0 || y != 0).then_some(Scroll::Pixels { x, y })
+    /// Pixels to post, with the wire's signs, or `None` while neither axis
+    /// has moved a whole pixel.
+    pub fn pixels(&mut self, x: i64, y: i64) -> Option<(i32, i32)> {
+        let x = advance(&mut self.total.0, x);
+        let y = advance(&mut self.total.1, y);
+        (x != 0 || y != 0).then_some((x, y))
     }
 }
 
-/// Whole pixels for `units` of wheel, keeping the part under a pixel.
-fn pixels(remainder: &mut i64, units: i64) -> i32 {
-    let scaled = units
-        .saturating_mul(PIXELS_PER_LINE)
-        .saturating_add(*remainder);
-    *remainder = scaled % WHEEL_DETENT;
-    wheel(scaled / WHEEL_DETENT)
+/// Adds `units` to an axis' total and returns the whole pixels it moved.
+fn advance(total: &mut i64, units: i64) -> i32 {
+    let before = total_pixels(*total);
+    *total = total.saturating_add(units);
+    wheel(total_pixels(*total) - before)
+}
+
+/// Pixels for a total of wheel units, rounded half away from zero so both
+/// directions scroll alike.
+fn total_pixels(units: i64) -> i64 {
+    let scaled = units.saturating_mul(PIXELS_PER_DETENT);
+    scaled.saturating_add(scaled.signum() * (WHEEL_DETENT / 2)) / WHEEL_DETENT
 }
 
 /// Scroll event fields are 32-bit; an absurd value is clamped.
@@ -235,6 +218,8 @@ fn wheel(value: i64) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn at(start: Instant, ms: u64) -> Instant {
@@ -417,54 +402,85 @@ mod tests {
         );
     }
 
-    #[test]
-    fn whole_detents_scroll_lines() {
-        let mut split = ScrollSplit::default();
-        assert_eq!(split.split(0, 120), Some(Scroll::Lines { x: 0, y: 1 }));
-        assert_eq!(split.split(0, 240), Some(Scroll::Lines { x: 0, y: 2 }));
-        assert_eq!(split.split(0, -120), Some(Scroll::Lines { x: 0, y: -1 }));
-        assert_eq!(split.split(120, 0), Some(Scroll::Lines { x: 1, y: 0 }));
-        assert_eq!(split.split(-240, 0), Some(Scroll::Lines { x: -2, y: 0 }));
-        assert_eq!(split.split(0, 0), None);
+    /// Every pixel a stream of scrolls posts, summed on each axis.
+    fn scrolled(steps: impl IntoIterator<Item = (i64, i64)>) -> (i64, i64) {
+        let mut scale = ScrollScale::default();
+        steps
+            .into_iter()
+            .filter_map(|(x, y)| scale.pixels(x, y))
+            .fold((0, 0), |(sum_x, sum_y), (x, y)| {
+                (sum_x + i64::from(x), sum_y + i64::from(y))
+            })
     }
 
     #[test]
-    fn partial_detents_scroll_a_line_of_pixels_per_detent_until_they_line_up() {
-        // A high-resolution Linux wheel sends 15 units a step.
-        let mut split = ScrollSplit::default();
-        let steps: Vec<_> = (0..8).map(|_| split.split(0, 15)).collect();
-        let step = |y| Some(Scroll::Pixels { x: 0, y });
-        assert_eq!(steps, [1, 1, 1, 2, 1, 1, 1, 2].map(step));
-        assert_eq!(split.split(0, 120), Some(Scroll::Lines { x: 0, y: 1 }));
+    fn a_detent_scrolls_30_pixels() {
+        let mut scale = ScrollScale::default();
+        assert_eq!(scale.pixels(0, 120), Some((0, 30)));
+        assert_eq!(scale.pixels(0, -240), Some((0, -60)));
+        assert_eq!(scale.pixels(120, 0), Some((30, 0)));
+        assert_eq!(scale.pixels(-120, 360), Some((-30, 90)));
+        assert_eq!(scale.pixels(0, 0), None);
+    }
 
-        assert_eq!(split.split(-60, 0), Some(Scroll::Pixels { x: -5, y: 0 }));
-        assert_eq!(split.split(-120, 0), Some(Scroll::Pixels { x: -10, y: 0 }));
-        assert_eq!(split.split(-60, 0), Some(Scroll::Pixels { x: -5, y: 0 }));
-        assert_eq!(split.split(-120, 0), Some(Scroll::Lines { x: -1, y: 0 }));
+    #[test]
+    fn distance_does_not_depend_on_how_scroll_was_batched() {
+        // Ten detents down and three right: one detent at a time, bunched as
+        // playout sends them when they come fast, cut at odd places by
+        // catch-up, and with the axes interleaved and partly undone.
+        let slow: Vec<_> = [(0, 120); 10].into_iter().chain([(120, 0); 3]).collect();
+        let fast = vec![(0, 600), (360, 600)];
+        let cut = vec![(0, 67), (0, 53), (7, 473), (0, 7), (353, 600)];
+        let mixed = vec![(15, 1), (0, 119), (-15, 240), (361, -7), (-1, 847)];
+        for stream in [slow, fast, cut, mixed] {
+            assert_eq!(scrolled(stream.clone()), (90, 300), "{stream:?}");
+            let reversed = stream.iter().map(|&(x, y)| (-x, -y));
+            assert_eq!(scrolled(reversed), (-90, -300), "{stream:?}");
+        }
+    }
+
+    #[test]
+    fn high_resolution_steps_add_up_like_detents() {
+        // A high-resolution Linux wheel sends 15 units a step, 3.75 pixels.
+        assert_eq!(scrolled([(0, 15); 80]), scrolled([(0, 120); 10]));
+        assert_eq!(scrolled([(-15, 0); 80]), (-300, 0));
+        let mut scale = ScrollScale::default();
+        let steps: Vec<_> = (0..8).map(|_| scale.pixels(0, 15)).collect();
+        let step = |y| Some((0, y));
+        assert_eq!(steps, [4, 4, 3, 4, 4, 4, 3, 4].map(step));
 
         // Steps under a pixel post nothing until they add up, either way.
-        assert_eq!(split.split(0, 9), None);
-        assert_eq!(split.split(0, 9), step(1));
-        assert_eq!(split.split(0, -6), None);
-        for _ in 0..9 {
-            assert_eq!(split.split(0, 12), step(1));
-        }
-        assert_eq!(split.split(0, 120), Some(Scroll::Lines { x: 0, y: 1 }));
+        let mut scale = ScrollScale::default();
+        assert_eq!(scale.pixels(0, 1), None);
+        assert_eq!(scale.pixels(0, 1), step(1));
+        assert_eq!(scale.pixels(0, -2), step(-1));
+        assert_eq!(scale.pixels(0, -1), None);
 
-        split.split(0, 7);
-        split.reset();
-        assert_eq!(split.split(0, 120), Some(Scroll::Lines { x: 0, y: 1 }));
+        scale.pixels(0, 7);
+        scale.reset();
+        assert_eq!(scale.pixels(0, 1), None);
+    }
+
+    proptest! {
+        /// However a stream is cut up, it scrolls as far as its total at
+        /// once, and turned around it scrolls exactly as far back.
+        #[test]
+        fn any_stream_scrolls_as_far_as_its_total(
+            steps in prop::collection::vec((-600_i64..=600, -600_i64..=600), 0..64),
+        ) {
+            let total = steps
+                .iter()
+                .fold((0, 0), |(x, y), &(dx, dy)| (x + dx, y + dy));
+            let distance = scrolled(steps.iter().copied());
+            prop_assert_eq!(distance, scrolled([total]));
+            let reversed = steps.iter().map(|&(x, y)| (-x, -y));
+            prop_assert_eq!(scrolled(reversed), (-distance.0, -distance.1));
+        }
     }
 
     #[test]
     fn absurd_scroll_is_clamped() {
-        let mut split = ScrollSplit::default();
-        assert_eq!(
-            split.split(i64::MAX, i64::MIN),
-            Some(Scroll::Pixels {
-                x: i32::MAX,
-                y: i32::MIN
-            })
-        );
+        let mut scale = ScrollScale::default();
+        assert_eq!(scale.pixels(i64::MAX, i64::MIN), Some((i32::MAX, i32::MIN)));
     }
 }

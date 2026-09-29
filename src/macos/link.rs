@@ -1832,7 +1832,7 @@ mod tests {
             "the peer's Alt is Cmd in PC positions: {log:?}"
         );
         assert!(
-            log.iter().any(|line| line == "scroll lines 0,-1"),
+            log.iter().any(|line| line == "scroll 0,-30"),
             "the peer's scrolling is turned around: {log:?}"
         );
 
