@@ -33,9 +33,11 @@ pub enum Profile {
     Flat { speed: f64 },
 }
 
+/// One count moves one point. The adaptive curve felt accelerated in the
+/// first sitting, so it is opt-in.
 impl Default for Profile {
     fn default() -> Self {
-        Self::Adaptive { speed: 0.0 }
+        Self::Flat { speed: 0.0 }
     }
 }
 
@@ -222,6 +224,8 @@ mod tests {
 
     use super::*;
 
+    const ADAPTIVE: Profile = Profile::Adaptive { speed: 0.0 };
+
     fn at(start: Instant, ms: u64) -> Instant {
         start + Duration::from_millis(ms)
     }
@@ -262,9 +266,26 @@ mod tests {
     }
 
     #[test]
+    fn the_default_moves_a_point_per_count_at_any_pace() {
+        assert_eq!("flat:0".parse::<Profile>().unwrap(), Profile::default());
+        // The same 400 counts trickled every 8 ms, bunched every 50 ms, and
+        // all at once.
+        let start = Instant::now();
+        let travel = |step: i64, every: u64| {
+            let mut acceleration = Acceleration::new(Profile::default());
+            (0..400 / step)
+                .map(|n| acceleration.apply(step, -step, at(start, n as u64 * every)))
+                .fold((0, 0), |(x, y), (dx, dy)| (x + dx, y + dy))
+        };
+        for (step, every) in [(4, 8), (100, 50), (400, 0)] {
+            assert_eq!(travel(step, every), (400, -400));
+        }
+    }
+
+    #[test]
     fn steady_fast_motion_reaches_the_maximum() {
         let start = Instant::now();
-        let mut acceleration = Acceleration::new(Profile::default());
+        let mut acceleration = Acceleration::new(ADAPTIVE);
         acceleration.apply(40, 0, start);
         acceleration.apply(40, 0, at(start, 8));
         assert_eq!(acceleration.apply(40, 0, at(start, 16)), (80, 0));
@@ -297,7 +318,7 @@ mod tests {
     fn speed_resets_after_a_pause() {
         let start = Instant::now();
         let fast = |pause: u64| {
-            let mut acceleration = Acceleration::new(Profile::default());
+            let mut acceleration = Acceleration::new(ADAPTIVE);
             for step in 0..3 {
                 acceleration.apply(40, 0, at(start, step * 8));
             }
@@ -308,14 +329,14 @@ mod tests {
         assert_eq!(fast(290), 76);
         assert_eq!(fast(301), 38);
 
-        let mut acceleration = Acceleration::new(Profile::default());
+        let mut acceleration = Acceleration::new(ADAPTIVE);
         assert_eq!(acceleration.apply(40, 0, start), (38, 0));
     }
 
     #[test]
     fn no_motion_changes_nothing() {
         let start = Instant::now();
-        let mut acceleration = Acceleration::new(Profile::default());
+        let mut acceleration = Acceleration::new(ADAPTIVE);
         acceleration.apply(40, 0, start);
         acceleration.apply(40, 0, at(start, 8));
         assert_eq!(acceleration.apply(0, 0, at(start, 12)), (0, 0));

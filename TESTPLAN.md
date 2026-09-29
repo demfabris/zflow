@@ -77,8 +77,9 @@ Checks:
    prompt. `avahi-browse -rt _zflow._udp` on Ubuntu shows the Mac on port 43119.
    Check that Local Network access still lets connections in (TN3179).
 2. **Chord.** The Mac shows "Controlled by ubuntu". Judge the feel with a slow,
-   precise move and a fast flick across 3008 pt. If needed, retune with
-   `ZFLOW_MAC_POINTER=adaptive:SPEED` or `flat:SPEED` in the `open --env` line.
+   precise move and a fast flick across 3008 pt. Motion is one point per count
+   (`flat:0`). If needed, retune with `ZFLOW_MAC_POINTER=adaptive:SPEED` or
+   `flat:SPEED` in the `open --env` line.
 3. **Clicks.** Single click. Double-click selects a word and triple-click a
    paragraph in TextEdit. Right-click opens a menu. Middle-click on a link in
    Safari opens a new tab. The side buttons go back and forward in Safari. A

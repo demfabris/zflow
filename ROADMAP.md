@@ -28,7 +28,7 @@ Tags: **exists**, **partial**, **missing**. "Guess" marks anything not proven by
 | 4 | Monitor layout: shared or per machine? | **Shared.** Tiles keyed by key fingerprint, newest version wins. Needs `zflow/3`. |
 | 5 | Order? | **Phase 0, then Phase 1**, with a Mac injection spike alongside Phase 1. |
 | 6 | Clipboard? | **Text and images, synced when the pointer crosses, in Phase 4. Never files.** |
-| 7 | Mac pointer acceleration? | **A curve in Rust.** Spike I showed posted motion is not accelerated. A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
+| 7 | Mac pointer acceleration? | **None by default: one count moves one point.** Spike I showed posted motion is not accelerated. A libinput-style curve in Rust felt accelerated in the first sitting, so it is opt-in through `ZFLOW_MAC_POINTER`. A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
 | 8 | Protocol bumps? | **One batched `zflow/3` bump, no `zflow/2` fallback.** New desktop commands are strict JSON anyway. |
 
 ---
@@ -100,7 +100,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 |---|---|---|---|---|---|
 | Reverse scroll per peer | per axis | missing | missing | build (small) | Natural scrolling on the Mac against Linux settings is the usual mismatch. Apply it on the receiver. |
 | Scroll speed per peer | 0.1 to 10 | missing | missing | skip | Reversing is what people need. |
-| Pointer speed | open request | The Mac receiver needs a curve | libinput accelerates the virtual pointer (guess) | build (Mac, no UI at first) | |
+| Pointer speed | open request | The Mac receiver moves one point per count; a curve is opt-in | libinput accelerates the virtual pointer (guess) | build (Mac, no UI at first) | |
 | Hi-res wheel | yes | Pixel deltas | exists (`src/linux/mapping.rs:368-381`) | have | |
 | Trackpad gestures | no ([#2905](https://github.com/deskflow/deskflow/issues/2905)) | Raw contacts to Linux, experimental | receives them | have (Mac to Linux); skip (Linux to Mac) | No public macOS API. |
 | Linux laptop touchpad as the sender | yes, through EIS | n/a | Raw contacts only (`src/linux/touch.rs`) | skip for now | Section 3. |
@@ -277,7 +277,7 @@ The baseline is CGEventPost from the logged-in app, which is what Deskflow and l
 | Area | Design | Gotcha |
 |---|---|---|
 | Event source | HID system-state source, posted at the HID tap, suppression interval 0, local events permitted. | The Mac's own trackpad kept working with every source tried, including the default one, while events were posted every 8 ms. The deprecated system-wide suppression calls are not needed. |
-| Pointer | Current cursor plus the delta after a curve, clamped to the displays and snapped to the nearest one. Also set the delta fields. | Linux sends raw deltas (`src/session.rs:97`). CGEventPost places the cursor at the event location 1:1, with no acceleration; delta fields alone do not move it. macOS does not clamp an off-screen location. |
+| Pointer | Current cursor plus the delta, one point per count, clamped to the displays and snapped to the nearest one. Also set the delta fields. A libinput-style curve is opt-in. | Linux sends raw deltas (`src/session.rs:97`). CGEventPost places the cursor at the event location 1:1, with no acceleration; delta fields alone do not move it. macOS does not clamp an off-screen location. |
 | Drag and clicks | Drag event types while a button is down. Click state on every down and up; the event number is optional. | Without click state there is no double-click. A posted click does activate a background app on 27. |
 | Keys | Inverted table, ISO swap keyed on the receiving Mac's keyboard type, modifier flags (including the left/right device bits) on every event. | The HID-state source merges held modifiers anyway. The keyboard-type field on a posted event does not change characters, so the ISO swap must be in the table. Untested on an ISO Mac. |
 | Repeat | Made on the receiver at the System Settings delay and interval, with the autorepeat field set. | The wire drops repeats (`src/session.rs:595-599`), and macOS does not repeat a held posted key. Defaults read 225/30 ms, AppKit reports 250/33 ms; pick one. |
@@ -424,7 +424,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 - **Risks:** macOS 27 posting quirks; pointer feel; Caps Lock; a firewall prompt; duplicate connections.
 - **Status (2026-09-28):** built on branch `mac-receiver`; the live sitting has not run.
   - Done:
-    - The injector: `inject.c` and `media.m` post, and `inject.rs` turns receiver effects into Mac events, with the pointer curve and clamp, click state, drags, flags, the ISO swap, receiver-made repeat, Caps Lock through IOKit, media keys, pixel scroll, and release on every exit path the app sees.
+    - The injector: `inject.c` and `media.m` post, and `inject.rs` turns receiver effects into Mac events, with the pointer clamp and an opt-in curve, click state, drags, flags, the ISO swap, receiver-made repeat, Caps Lock through IOKit, media keys, pixel scroll, and release on every exit path the app sees.
     - Receiving over the session the Mac dials and over connections peers open. The Mac listens on `transport.listen` and keeps one session per computer with the shared dial rule.
     - One ownership guard: input goes one way at a time, and the Mac starts no crossing while controlled.
     - The desktop handoff server, so a Linux edge crossing enters and returns at the mapped point. The Mac's own crossings use the shared handoff functions.
@@ -435,7 +435,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - The sitting still has to prove (TESTPLAN.md, "Two-way input sitting, Mac side"): pointer feel, click and drag behavior, typing with repeat at the system rate, Caps Lock, media keys, scroll distance per detent, the Mac's own devices while controlled, release within 1 s after killing zflowd, every exit path, wake, AWDL, duplicate connections, the firewall and Local Network behavior on the listener, and that Mac-to-Linux crossings still work.
   - Known limits:
     - Held input stays down after SIGKILL of the Mac app, until the local key is pressed.
-    - The pointer curve constants are untuned. `ZFLOW_MAC_POINTER` is a sitting-only knob.
+    - Motion is one point per count by default (`flat:0`, chosen in the first sitting), whatever the sender's mouse DPI. `ZFLOW_MAC_POINTER=adaptive:<speed>` opts into the untuned curve; it is a sitting-only knob.
     - Scroll is 30 px per detent at any speed, with no wheel acceleration. The number is untuned.
     - The Mac reads every sender's scroll as 120 units per detent, so a Mac trackpad sender scrolls a Mac receiver slowly.
     - A connection that arrives during a crossing waits until the crossing ends.

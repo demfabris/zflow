@@ -1978,10 +1978,10 @@ mod tests {
     }
 
     #[test]
-    fn motion_is_accelerated() {
+    fn adaptive_motion_is_accelerated() {
         let start = Instant::now();
         let fake = FakeBackend::default();
-        let mut core = InjectorCore::new(fake.clone(), Profile::default());
+        let mut core = InjectorCore::new(fake.clone(), Profile::Adaptive { speed: 0.0 });
         core.apply(vec![opened()], None, start).unwrap();
         fake.take_log();
         for step in 0..3 {
