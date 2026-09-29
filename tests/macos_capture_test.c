@@ -65,6 +65,7 @@ static bool connected;
 static bool background;
 static int hide_count;
 static int tap_calls;
+static int motion_taps;
 static bool tap_available;
 static int tap_enables;
 // The window server's answer to the Accessibility probe's throwaway tap.
@@ -382,6 +383,13 @@ static CFMachPortRef fake_tap(CGEventTapLocation location,
                              CGEventTapPlacement placement,
                              CGEventTapOptions options, CGEventMask mask,
                              CGEventTapCallBack callback, void *context) {
+  if (callback == motion_callback) {
+    assert(location == kCGSessionEventTap && placement == kCGTailAppendEventTap);
+    assert(options == kCGEventTapOptionListenOnly && context == NULL);
+    assert(mask == CGEventMaskBit(kCGEventMouseMoved));
+    motion_taps++;
+    return tap_available ? CFMachPortCreate(NULL, idle_port, NULL, NULL) : NULL;
+  }
   assert(location == kCGHIDEventTap);
   if (callback == pass_event) {
     assert(placement == kCGTailAppendEventTap && options == kCGEventTapOptionDefault);
@@ -857,6 +865,58 @@ static void iso_key_tests(void) {
   g_event_tap = NULL;
 }
 
+static CGEventRef move_by(int64_t dx, int64_t dy) {
+  CGEventRef move = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, CGPointMake(0, 500),
+                                            kCGMouseButtonLeft);
+  assert(move);
+  CGEventSetIntegerValueField(move, kCGMouseEventDeltaX, dx);
+  CGEventSetIntegerValueField(move, kCGMouseEventDeltaY, dy);
+  return move;
+}
+
+static void wait_for_motion_watch_to_end(void) {
+  CFMachPortInvalidate(g_motion_tap);
+  while (atomic_load(&g_motion_watching)) sched_yield();
+  assert(g_motion_tap == NULL);
+}
+
+static void motion_tests(void) {
+  ZFlowMacMotion motion;
+  assert(!zflow_mac_motion_take(&motion) && !zflow_mac_motion_take(NULL));
+  // The Mac's own moves add up until the next take.
+  CGEventRef move = move_by(-2, 1);
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  // A peer's moves, which inject.c marks, are not the Mac's own.
+  CGEventRef posted = move_by(-100, 0);
+  CGEventSetIntegerValueField(posted, kCGEventSourceUserData, ZFLOW_POSTED_MARK);
+  assert(motion_callback(NULL, kCGEventMouseMoved, posted, NULL) == posted);
+  assert(motion_callback(NULL, kCGEventTapDisabledByTimeout, move, NULL) == move);
+  assert(zflow_mac_motion_take(&motion) == 1);
+  assert(motion.dx == -4.0 && motion.dy == 2.0 && motion.age_ns < 1000000000ULL);
+  assert(!zflow_mac_motion_take(&motion));
+  CGEventRef right = move_by(3, 0);
+  assert(motion_callback(NULL, kCGEventMouseMoved, right, NULL) == right);
+  assert(zflow_mac_motion_take(&motion) == 1 && motion.dx == 3.0 && motion.dy == 0.0);
+  assert(motion_callback(NULL, kCGEventMouseMoved, posted, NULL) == posted);
+  assert(!zflow_mac_motion_take(&motion));
+  CFRelease(move);
+  CFRelease(posted);
+  CFRelease(right);
+
+  // One listen-only tap on its own thread; a refusal starts nothing.
+  tap_available = false;
+  assert(zflow_mac_motion_watch() == -1 && !atomic_load(&g_motion_watching));
+  assert(motion_taps == 1 && g_motion_tap == NULL);
+  tap_available = true;
+  assert(zflow_mac_motion_watch() == 0 && zflow_mac_motion_watch() == 0);
+  assert(motion_taps == 2);
+  // macOS invalidates the tap after sleep; the next watch starts over.
+  wait_for_motion_watch_to_end();
+  assert(zflow_mac_motion_watch() == 0 && motion_taps == 3);
+  wait_for_motion_watch_to_end();
+}
+
 int main(void) {
   // A capture thread that misses its stop hangs the join. Fail instead.
   alarm(30);
@@ -881,6 +941,8 @@ int main(void) {
   assert(zflow_mac_capture_pause_requested() == 0);
   assert(tap_calls == taps + 1 && call_count == 0);
   assert(!g_thread_valid);
+  // Last: its thread runs the faked run loop, which other tests count.
+  motion_tests();
   puts("macOS cursor lifecycle and event-filter tests passed (fake cursor APIs)");
   return 0;
 }

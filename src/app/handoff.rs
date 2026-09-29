@@ -1,5 +1,6 @@
 //! Where a crossing enters the other computer and where it comes back.
-//! The Mac finds the edge by watching its cursor; Linux by a GNOME barrier.
+//! The Mac finds the edge by watching its cursor and its own pointer's
+//! pushes; Linux by a GNOME barrier.
 
 use anyhow::{Result, bail, ensure};
 
@@ -145,6 +146,8 @@ pub(crate) fn from_edge(
         .and_then(|transition| handoff_at(layout, geometry, transition, current))
 }
 
+/// The crossing for a pointer that moves from `previous` onto an edge at
+/// `current`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn crossing(
     layout: &Layout,
@@ -153,44 +156,87 @@ pub(crate) fn crossing(
     current: Point,
 ) -> Option<Handoff> {
     let bounds = geometry.bounds().ok()?;
-    if !contains(geometry, previous) || !contains(geometry, current) {
+    if !contains(geometry, previous) {
+        return None;
+    }
+    reaching(layout, geometry, current, |edge| {
+        !touches(&bounds, edge, previous)
+    })
+}
+
+/// The crossing for a pointer held on an edge at `current` while it pushes
+/// on by `dx` and `dy`. macOS keeps reporting motion when the cursor cannot
+/// move, as GNOME reports a push against a barrier.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn pushed(
+    layout: &Layout,
+    geometry: &Geometry,
+    current: Point,
+    dx: f64,
+    dy: f64,
+) -> Option<Handoff> {
+    reaching(layout, geometry, current, |edge| match edge {
+        Edge::Left => dx < 0.0,
+        Edge::Right => dx > 0.0,
+        Edge::Top => dy < 0.0,
+        Edge::Bottom => dy > 0.0,
+    })
+}
+
+/// The crossing for a pointer at `current` on this desktop's `edge`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn on_edge(
+    layout: &Layout,
+    geometry: &Geometry,
+    edge: Edge,
+    current: Point,
+) -> Option<Handoff> {
+    reaching(layout, geometry, current, |wanted| wanted == edge)
+}
+
+/// The crossing for a pointer at `current` on one of the `wanted` edges,
+/// where the layout puts another computer.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn reaching(
+    layout: &Layout,
+    geometry: &Geometry,
+    current: Point,
+    wanted: impl Fn(Edge) -> bool,
+) -> Option<Handoff> {
+    let bounds = geometry.bounds().ok()?;
+    if !contains(geometry, current) {
         return None;
     }
     for transition in layout.transitions() {
-        if layout.monitors[transition.source].peer.is_some() {
+        let edge = transition.edge;
+        if layout.monitors[transition.source].peer.is_some()
+            || !wanted(edge)
+            || !touches(&bounds, edge, current)
+        {
             continue;
         }
-        let local_edge = transition.edge;
-        let (entered, along) = match local_edge {
-            Edge::Left => (
-                current.x <= bounds.x + 1 && previous.x > bounds.x + 1,
-                f64::from(current.y - bounds.y) / f64::from(bounds.height),
-            ),
-            Edge::Right => {
-                let edge = bounds.x + bounds.width as i32 - 2;
-                (
-                    current.x >= edge && previous.x < edge,
-                    f64::from(current.y - bounds.y) / f64::from(bounds.height),
-                )
-            }
-            Edge::Top => (
-                current.y <= bounds.y + 1 && previous.y > bounds.y + 1,
-                f64::from(current.x - bounds.x) / f64::from(bounds.width),
-            ),
-            Edge::Bottom => {
-                let edge = bounds.y + bounds.height as i32 - 2;
-                (
-                    current.y >= edge && previous.y < edge,
-                    f64::from(current.x - bounds.x) / f64::from(bounds.width),
-                )
-            }
+        let (offset, span) = match edge {
+            Edge::Left | Edge::Right => (current.y - bounds.y, bounds.height as i32),
+            Edge::Top | Edge::Bottom => (current.x - bounds.x, bounds.width as i32),
         };
-        if !entered || along < transition.source_start || along >= transition.source_end {
+        let along = f64::from(offset) / f64::from(span);
+        if along < transition.source_start || along >= transition.source_end {
             continue;
         }
         return handoff_at(layout, geometry, &transition, current);
     }
     None
+}
+
+/// Whether `point` is on `edge`'s outermost two points.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn touches(bounds: &Rect, edge: Edge, point: Point) -> bool {
+    match edge {
+        Edge::Left => point.x <= bounds.x + 1,
+        Edge::Right => point.x >= bounds.x + bounds.width as i32 - 2,
+        Edge::Top => point.y <= bounds.y + 1,
+        Edge::Bottom => point.y >= bounds.y + bounds.height as i32 - 2,
+    }
 }
 
 /// The crossing through `transition` for a cursor at `current` on its edge.
@@ -482,6 +528,30 @@ mod tests {
         );
         assert!((1..=MAX_TOKEN).contains(&token().unwrap()));
         assert!(pushed.prepare(token().unwrap()).validate().is_ok());
+    }
+
+    #[test]
+    fn a_push_out_through_a_held_edge_crosses_like_the_approach() {
+        let (layout, geometry) = setup();
+        let held = Point { x: 999, y: 550 };
+        let watched = crossing(&layout, &geometry, Point { x: 990, y: 550 }, held).unwrap();
+        let pushed = pushed(&layout, &geometry, held, 0.5, 3.0).unwrap();
+        assert_eq!(
+            (pushed.peer, pushed.edge, pushed.position),
+            (watched.peer, watched.edge, watched.position)
+        );
+        assert_eq!(pushed.entry_region, watched.entry_region);
+        assert_eq!(pushed.return_mapping.edge, Edge::Right);
+        let push = |at, dx, dy| super::pushed(&layout, &geometry, at, dx, dy).is_some();
+        assert!(!push(held, -1.0, 0.0), "back inside");
+        assert!(!push(held, 0.0, 5.0), "along the edge");
+        assert!(!push(Point { x: 990, y: 550 }, 4.0, 0.0), "not on the edge");
+        assert!(
+            !push(Point { x: 999, y: 100 }, 4.0, 0.0),
+            "no computer there"
+        );
+        assert!(on_edge(&layout, &geometry, Edge::Right, held).is_some());
+        assert!(on_edge(&layout, &geometry, Edge::Left, held).is_none());
     }
 
     #[test]

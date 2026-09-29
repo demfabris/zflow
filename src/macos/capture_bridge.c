@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #define ZFLOW_QUEUE_CAPACITY 1024
 #define ZFLOW_MAX_CONTACTS 5
@@ -138,6 +139,116 @@ int zflow_mac_input_is_neutral(void) {
   CGEventFlags held = kCGEventFlagMaskShift | kCGEventFlagMaskControl |
       kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand | kCGEventFlagMaskSecondaryFn;
   return (CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & held) == 0;
+}
+
+// inject.c marks every event it posts with this, so a peer's motion is not
+// taken for the Mac's own.
+#define ZFLOW_POSTED_MARK 0x7A666C6F77LL
+
+// The Mac's own pointer motion since the last take, in points.
+typedef struct {
+  double dx, dy;
+  // How long ago the last move came.
+  uint64_t age_ns;
+} ZFlowMacMotion;
+
+static pthread_mutex_t g_motion_lock = PTHREAD_MUTEX_INITIALIZER;
+static ZFlowMacMotion g_motion;
+static bool g_motion_pending;
+static uint64_t g_motion_at;
+static pthread_mutex_t g_motion_watch_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic bool g_motion_watching;
+static CFMachPortRef g_motion_tap;
+
+// A move's deltas are the device's motion after acceleration, not the
+// cursor's: macOS reports them even while the cursor is held against a
+// screen edge, where its location stays put. Capture reads the same fields
+// while the cursor is frozen.
+static CGEventRef motion_callback(CGEventTapProxy proxy, CGEventType type,
+                                  CGEventRef event, void *context) {
+  (void)proxy;
+  (void)context;
+  if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+    // Listening holds nothing back, so it can always resume.
+    if (g_motion_tap) CGEventTapEnable(g_motion_tap, true);
+    return event;
+  }
+  if (type != kCGEventMouseMoved ||
+      CGEventGetIntegerValueField(event, kCGEventSourceUserData) == ZFLOW_POSTED_MARK)
+    return event;
+  pthread_mutex_lock(&g_motion_lock);
+  if (!g_motion_pending) g_motion.dx = g_motion.dy = 0;
+  g_motion.dx += CGEventGetDoubleValueField(event, kCGMouseEventDeltaX);
+  g_motion.dy += CGEventGetDoubleValueField(event, kCGMouseEventDeltaY);
+  g_motion_at = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  g_motion_pending = true;
+  pthread_mutex_unlock(&g_motion_lock);
+  return event;
+}
+
+// Returns 1 and the motion since the last take, or 0 when there was none.
+int zflow_mac_motion_take(ZFlowMacMotion *motion) {
+  if (!motion) return 0;
+  pthread_mutex_lock(&g_motion_lock);
+  bool pending = g_motion_pending;
+  if (pending) {
+    *motion = g_motion;
+    motion->age_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_motion_at;
+  }
+  g_motion_pending = false;
+  pthread_mutex_unlock(&g_motion_lock);
+  return pending ? 1 : 0;
+}
+
+static void *motion_thread(void *context) {
+  CFRunLoopSourceRef source = context;
+  CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+  CGEventTapEnable(g_motion_tap, true);
+  // Runs until macOS invalidates the tap, as after sleep or a session
+  // switch, which leaves the loop nothing to run. The next watch starts over.
+  while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false) != kCFRunLoopRunFinished) {
+  }
+  CFMachPortInvalidate(g_motion_tap);
+  CFRelease(source);
+  CFRelease(g_motion_tap);
+  g_motion_tap = NULL;
+  atomic_store(&g_motion_watching, false);
+  return NULL;
+}
+
+// Watches the Mac's own pointer motion from a listen-only tap on its own
+// thread, unless one runs already. 0 when watching, -1 when macOS refused.
+// A refused tap leaks a Mach port inside CoreGraphics, so callers must not
+// retry quickly.
+int zflow_mac_motion_watch(void) {
+  if (atomic_load(&g_motion_watching)) return 0;
+  pthread_mutex_lock(&g_motion_watch_lock);
+  if (atomic_load(&g_motion_watching)) {
+    pthread_mutex_unlock(&g_motion_watch_lock);
+    return 0;
+  }
+  CFMachPortRef tap = CGEventTapCreate(
+      kCGSessionEventTap, kCGTailAppendEventTap, kCGEventTapOptionListenOnly,
+      CGEventMaskBit(kCGEventMouseMoved), motion_callback, NULL);
+  CFRunLoopSourceRef source = tap ? CFMachPortCreateRunLoopSource(NULL, tap, 0) : NULL;
+  g_motion_tap = tap;
+  // Set first: the thread clears it when it ends, which can be at once.
+  atomic_store(&g_motion_watching, true);
+  pthread_t thread;
+  int status = source && pthread_create(&thread, NULL, motion_thread, source) == 0 ? 0 : -1;
+  if (status == 0) {
+    pthread_detach(thread);
+  } else {
+    atomic_store(&g_motion_watching, false);
+    if (source) CFRelease(source);
+    if (tap) {
+      CFMachPortInvalidate(tap);
+      CFRelease(tap);
+    }
+    g_motion_tap = NULL;
+  }
+  pthread_mutex_unlock(&g_motion_watch_lock);
+  return status;
 }
 
 typedef struct { float x, y; } MTPoint;
