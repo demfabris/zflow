@@ -28,6 +28,8 @@ pub(crate) enum Contents {
     Clip(ClipKind, Vec<u8>),
     /// Over [`MAX_CLIP_BYTES`], so only its size was read.
     TooLarge(usize),
+    /// macOS would ask the person first, or refuses, so it was not read.
+    NotAllowed,
 }
 
 /// This Mac's pasteboard. Tests use `FakePasteboard`.
@@ -38,6 +40,9 @@ pub(crate) trait Pasteboard: Send + Sync + 'static {
     /// Puts `clip` on the pasteboard beside zflow's marker, and returns the
     /// change count after it.
     fn write(&self, clip: &Clip) -> Result<i64>;
+    /// Reads it once now if macOS has never asked the person about zflow
+    /// reading it, so that alert shows while they are here. Does not wait.
+    fn ask(&self);
 }
 
 /// The general pasteboard, reached on the main thread by pasteboard.m.
@@ -45,6 +50,11 @@ pub(crate) struct MacPasteboard;
 
 const KIND_EMPTY: u32 = 0;
 const KIND_UNCHANGED: u32 = 3;
+const KIND_NOT_ALLOWED: u32 = 4;
+
+/// What Checks shows while macOS keeps zflow from reading the pasteboard.
+const NOT_ALLOWED: &str = "Clipboard not shared: allow zflow in System Settings > \
+    Privacy & Security > Paste from Other Apps";
 
 impl Pasteboard for MacPasteboard {
     fn read(&self, ours: Option<i64>) -> Result<Contents> {
@@ -75,6 +85,7 @@ impl Pasteboard for MacPasteboard {
         });
         Ok(match (kind, bytes) {
             (KIND_UNCHANGED, _) => Contents::Unchanged,
+            (KIND_NOT_ALLOWED, _) => Contents::NotAllowed,
             (KIND_EMPTY, _) => Contents::Empty,
             (_, None) if length > MAX_CLIP_BYTES => Contents::TooLarge(length),
             (_, None) => Contents::Empty,
@@ -104,6 +115,16 @@ impl Pasteboard for MacPasteboard {
         }
         Ok(count)
     }
+
+    fn ask(&self) {
+        // The app's tests turn sharing on with this pasteboard, and must
+        // leave the person's clipboard alone.
+        if cfg!(test) {
+            return;
+        }
+        // SAFETY: a null name means the general pasteboard.
+        unsafe { zflow_mac_pasteboard_ask(std::ptr::null()) }
+    }
 }
 
 /// What a read means for the peer the pointer went to.
@@ -112,6 +133,8 @@ enum Outgoing {
     Send(Clip),
     /// Over the limit, so the person hears why nothing went.
     TooLarge(usize),
+    /// Not read, so the person hears how to allow it.
+    NotAllowed,
     Nothing,
 }
 
@@ -121,7 +144,8 @@ struct State {
     echoes: BTreeMap<String, Echo>,
     /// The change count this Mac's last write left, and the clip it wrote.
     written: Option<(i64, Clip)>,
-    /// Why the last clipboard read went nowhere, while it was too large.
+    /// Why the last clipboard read went nowhere, while it was too large or
+    /// not allowed.
     notice: Option<String>,
 }
 
@@ -137,6 +161,7 @@ impl State {
             },
             Contents::Empty => return Ok(Outgoing::Nothing),
             Contents::TooLarge(bytes) => return Ok(Outgoing::TooLarge(bytes)),
+            Contents::NotAllowed => return Ok(Outgoing::NotAllowed),
             Contents::Clip(_, data) if data.is_empty() => return Ok(Outgoing::Nothing),
             Contents::Clip(_, data) if data.len() > MAX_CLIP_BYTES => {
                 return Ok(Outgoing::TooLarge(data.len()));
@@ -175,7 +200,11 @@ impl Clipboard {
     }
 
     pub fn set_share(&self, share: bool) {
-        self.share.store(share, Ordering::Relaxed);
+        let shared = self.share.swap(share, Ordering::Relaxed);
+        if share && !shared {
+            // The person is at this Mac now, unlike at a crossing.
+            self.pasteboard.ask();
+        }
         if !share {
             self.state().notice = None;
         }
@@ -218,6 +247,10 @@ impl Clipboard {
             Ok(Outgoing::TooLarge(bytes)) => {
                 tracing::info!(%peer, bytes, "clipboard too large to share");
                 self.state().notice = Some(crate::clipboard::too_large(bytes));
+            }
+            Ok(Outgoing::NotAllowed) => {
+                tracing::info!(%peer, "clipboard not shared: macOS does not let zflow read it");
+                self.state().notice = Some(NOT_ALLOWED.into());
             }
             Ok(Outgoing::Nothing) => self.state().notice = None,
             Err(error) => {
@@ -265,6 +298,7 @@ unsafe extern "C" {
         change_count: *mut i64,
     ) -> i32;
     fn zflow_mac_pasteboard_free(data: *mut u8);
+    fn zflow_mac_pasteboard_ask(name: *const c_char);
     fn zflow_mac_pasteboard_write(
         name: *const c_char,
         kind: u32,
@@ -287,6 +321,9 @@ pub(crate) struct FakeBoard {
     pub count: i64,
     pub reads: usize,
     pub writes: Vec<Clip>,
+    /// macOS keeps zflow from reading it.
+    pub not_allowed: bool,
+    pub asks: usize,
 }
 
 #[cfg(test)]
@@ -311,6 +348,9 @@ impl Pasteboard for FakePasteboard {
         if ours == Some(board.count) {
             return Ok(Contents::Unchanged);
         }
+        if board.not_allowed {
+            return Ok(Contents::NotAllowed);
+        }
         Ok(match &board.contents {
             None => Contents::Empty,
             Some((_, data)) if data.len() > MAX_CLIP_BYTES => Contents::TooLarge(data.len()),
@@ -324,6 +364,10 @@ impl Pasteboard for FakePasteboard {
         board.count += 1;
         board.writes.push(clip.clone());
         Ok(board.count)
+    }
+
+    fn ask(&self) {
+        self.board().asks += 1;
     }
 }
 
@@ -345,6 +389,7 @@ mod tests {
         assert_eq!(outgoing(Contents::Empty), Outgoing::Nothing);
         assert_eq!(outgoing(clip("")), Outgoing::Nothing, "empty text");
         assert_eq!(outgoing(Contents::Unchanged), Outgoing::Nothing);
+        assert_eq!(outgoing(Contents::NotAllowed), Outgoing::NotAllowed);
         let over = MAX_CLIP_BYTES + 1;
         assert_eq!(outgoing(Contents::TooLarge(over)), Outgoing::TooLarge(over));
         let large = Contents::Clip(ClipKind::Text, vec![b'a'; over]);
@@ -428,6 +473,43 @@ mod tests {
         clipboard.send_to("linux", |clip| sent.push(clip));
         clipboard.send_to("linux", |clip| sent.push(clip));
         assert_eq!(sent[1..], [text("copied here")]);
+    }
+
+    #[test]
+    fn turning_sharing_on_lets_macos_ask_and_a_refusal_is_explained() {
+        let fake = FakePasteboard::default();
+        let clipboard = Clipboard::new(Arc::new(fake.clone()));
+        // Only turning it on asks: at startup, on resume, or from the switch.
+        clipboard.set_share(true);
+        clipboard.set_share(true);
+        assert_eq!(fake.board().asks, 1);
+        clipboard.set_share(false);
+        clipboard.set_share(true);
+        assert_eq!(fake.board().asks, 2);
+
+        fake.copy(ClipKind::Text, b"copied here");
+        fake.board().not_allowed = true;
+        let mut sent = Vec::new();
+        clipboard.send_to("linux", |clip| sent.push(clip));
+        assert!(sent.is_empty());
+        assert_eq!(
+            clipboard.notice().as_deref(),
+            Some(
+                "Clipboard not shared: allow zflow in System Settings > \
+                 Privacy & Security > Paste from Other Apps"
+            )
+        );
+        // Once allowed, the next crossing sends it and the warning goes.
+        fake.board().not_allowed = false;
+        clipboard.send_to("linux", |clip| sent.push(clip));
+        assert_eq!(sent, [text("copied here")]);
+        assert_eq!(clipboard.notice(), None);
+
+        // A clip this Mac wrote itself still goes on, since it needs no read.
+        fake.board().not_allowed = true;
+        blocking(|| clipboard.keep("linux", text("from linux")));
+        clipboard.send_to("desk", |clip| sent.push(clip));
+        assert_eq!(sent[1..], [text("from linux")]);
     }
 
     #[test]

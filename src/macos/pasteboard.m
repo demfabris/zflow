@@ -20,6 +20,17 @@ enum {
   ZFLOW_CLIP_PNG = 2,
   // The change count was still the one the caller wrote, so nothing was read.
   ZFLOW_CLIP_UNCHANGED = 3,
+  // macOS would ask the person first, or refuses, so nothing was read.
+  ZFLOW_CLIP_NOT_ALLOWED = 4,
+};
+
+// NSPasteboardAccessBehavior's values, as numbers: the type is newer than
+// the oldest macOS a plain cargo build targets.
+enum {
+  ACCESS_DEFAULT = 0,
+  ACCESS_ASK = 1,
+  ACCESS_ALWAYS_ALLOW = 2,
+  ACCESS_ALWAYS_DENY = 3,
 };
 
 // Written beside every clip zflow puts on the pasteboard, so clipboard
@@ -83,6 +94,25 @@ static NSData *png_from_tiff(NSData *tiff) {
   return converted ? png : nil;
 }
 
+// How macOS treats zflow reading `board` on its own. Main thread only.
+static NSInteger access_behavior(NSPasteboard *board) {
+  if (@available(macOS 15.4, *)) return board.accessBehavior;
+  return ACCESS_ALWAYS_ALLOW;
+}
+
+// Tests replace it, since a named pasteboard always allows reading.
+static NSInteger (*zflow_access_behavior)(NSPasteboard *) = access_behavior;
+
+// Whether a crossing reads a pasteboard macOS treats this way. Named ones
+// always allow it. On the general one, `Ask` would put an alert on the
+// screen the person just left at every crossing, and `AlwaysDeny` finds
+// nothing, so both wait until the person allows zflow in System Settings.
+// Before macOS has ever asked (`Default`) the read goes ahead: that first
+// alert is what lists zflow there, and a Mac that never asks just works.
+static bool may_read(NSInteger behavior) {
+  return behavior == ACCESS_ALWAYS_ALLOW || behavior == ACCESS_DEFAULT;
+}
+
 // What zflow shares from `board`: UTF-8 text if there is any, else a PNG,
 // else a TIFF, with `tiff` set. Nothing when the copy is marked concealed or
 // transient. Main thread only.
@@ -106,7 +136,8 @@ static NSData *clip_on(NSPasteboard *board, uint32_t *kind, bool *tiff) {
 // Reads the pasteboard `name`, or the general one when it is NULL: UTF-8
 // text if there is any, else a PNG, else a TIFF turned into a PNG, and
 // nothing from a password manager. When the change count is still
-// `*unchanged_at`, reads nothing and says so in `kind`.
+// `*unchanged_at`, or macOS would not let zflow read it quietly, reads
+// nothing and says so in `kind`.
 // `length` is the clip's size; `data` gets a copy only when that is at most
 // `limit`, to free with zflow_mac_pasteboard_free. Returns 0, or -1 when the
 // main thread did not answer in time or an image could not be converted.
@@ -132,6 +163,10 @@ int zflow_mac_pasteboard_read(const char *name, const int64_t *unchanged_at, siz
         found_kind = ZFLOW_CLIP_UNCHANGED;
         return;
       }
+      if (!may_read(zflow_access_behavior(board))) {
+        found_kind = ZFLOW_CLIP_NOT_ALLOWED;
+        return;
+      }
       found = clip_on(board, &found_kind, &tiff);
     });
     if (!answered) return -1;
@@ -150,6 +185,26 @@ int zflow_mac_pasteboard_read(const char *name, const int64_t *unchanged_at, siz
 
 void zflow_mac_pasteboard_free(uint8_t *data) {
   free(data);
+}
+
+// Reads the pasteboard `name`, or the general one when it is NULL, as a
+// crossing would, if macOS has never asked the person about zflow reading
+// it. Its one alert then shows while they are at this Mac, not at a
+// crossing, and lists zflow in System Settings. Returns at once and leaves
+// the read to the main thread.
+void zflow_mac_pasteboard_ask(const char *name) {
+  @autoreleasepool {
+    NSString *board_name = name ? [NSString stringWithUTF8String:name] : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      @autoreleasepool {
+        NSPasteboard *board = pasteboard_named(board_name);
+        if (zflow_access_behavior(board) != ACCESS_DEFAULT) return;
+        uint32_t kind = ZFLOW_CLIP_EMPTY;
+        bool tiff = false;
+        (void)clip_on(board, &kind, &tiff);
+      }
+    });
+  }
 }
 
 // Puts `length` bytes of `kind`, text or PNG, on the pasteboard `name`, or the

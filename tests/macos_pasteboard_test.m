@@ -15,6 +15,29 @@ static const uint8_t PNG_SIGNATURE[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '
 static NSPasteboard *board;
 static const char *board_name;
 
+// Text that is only produced when something reads it, so a check can tell
+// whether a call read the pasteboard.
+@interface LazyText : NSObject <NSPasteboardItemDataProvider>
+@property int reads;
+@end
+
+@implementation LazyText
+- (void)pasteboard:(NSPasteboard *)pasteboard
+                  item:(NSPasteboardItem *)item
+    provideDataForType:(NSPasteboardType)type {
+  (void)pasteboard;
+  self.reads++;
+  [item setString:@"lazy" forType:type];
+}
+@end
+
+// What macOS pretends to do about zflow reading the pasteboard.
+static NSInteger pretended;
+static NSInteger pretend(NSPasteboard *unused) {
+  (void)unused;
+  return pretended;
+}
+
 typedef struct {
   int status;
   uint32_t kind;
@@ -198,6 +221,56 @@ static void *checks(void *unused) {
       assert(board.changeCount == image_written);
       assert(![board.types containsObject:NSPasteboardTypeString]);
     });
+
+    // A named pasteboard never asks, and the values match AppKit's.
+    assert(ACCESS_DEFAULT == NSPasteboardAccessBehaviorDefault);
+    assert(ACCESS_ASK == NSPasteboardAccessBehaviorAsk);
+    assert(ACCESS_ALWAYS_ALLOW == NSPasteboardAccessBehaviorAlwaysAllow);
+    assert(ACCESS_ALWAYS_DENY == NSPasteboardAccessBehaviorAlwaysDeny);
+    on_main_thread(^{
+      assert(access_behavior(board) == ACCESS_ALWAYS_ALLOW);
+    });
+    LazyText *lazy = [LazyText new];
+    __block int64_t copied = 0;
+    on_main_thread(^{
+      NSPasteboardItem *item = [NSPasteboardItem new];
+      assert([item setDataProvider:lazy forTypes:@[ NSPasteboardTypeString ]]);
+      [board clearContents];
+      assert([board writeObjects:@[ item ]]);
+      copied = board.changeCount;
+    });
+    zflow_access_behavior = pretend;
+    // While macOS would ask at every read, or refuses, a crossing reads
+    // nothing, says why, and still knows its own write. Turning sharing on
+    // reads nothing either.
+    for (int refusal = 0; refusal < 2; refusal++) {
+      pretended = refusal == 0 ? ACCESS_ASK : ACCESS_ALWAYS_DENY;
+      Read held = read_board(NULL, 1024);
+      assert(held.status == 0 && held.kind == ZFLOW_CLIP_NOT_ALLOWED);
+      assert(!held.data && held.length == 0 && held.count == copied);
+      assert(read_board(&copied, 1024).kind == ZFLOW_CLIP_UNCHANGED);
+      zflow_mac_pasteboard_ask(board_name);
+      on_main_thread(^{
+      });
+      assert(lazy.reads == 0);
+    }
+    // Once allowed, there is nothing to ask.
+    pretended = ACCESS_ALWAYS_ALLOW;
+    zflow_mac_pasteboard_ask(board_name);
+    on_main_thread(^{
+    });
+    assert(lazy.reads == 0);
+    // Before macOS has ever asked, turning sharing on reads once, on the
+    // main thread and without waiting, and a crossing reads too.
+    pretended = ACCESS_DEFAULT;
+    zflow_mac_pasteboard_ask(board_name);
+    on_main_thread(^{
+    });
+    assert(lazy.reads == 1);
+    Read first = read_board(NULL, 1024);
+    assert(first.kind == ZFLOW_CLIP_TEXT);
+    assert([first.data isEqualToData:[@"lazy" dataUsingEncoding:NSUTF8StringEncoding]]);
+    zflow_access_behavior = access_behavior;
 
     dispatch_async(dispatch_get_main_queue(), ^{
       CFRunLoopStop(CFRunLoopGetMain());
