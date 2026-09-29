@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     config::Config,
-    desktop::{MAX_SHARED_TILES, SharedLayout, Tile},
+    desktop::SharedLayout,
     identity::Identity,
     macos::{self, Advertiser, LinkState, Links, LocalNetwork},
 };
@@ -612,7 +612,7 @@ impl NativeApp {
             return Ok(());
         };
         let next = match &self.shared.draft.layout {
-            Some(kept) => refreshed(kept, &own, size),
+            Some(kept) => kept.with_own_size(&own, size.0, size.1),
             None => next_version(None).and_then(|version| {
                 let keys = peer_keys(self.document.saved());
                 let first = self.layout.draft.to_shared(version, &own, &keys);
@@ -865,36 +865,6 @@ fn next_version(kept: Option<&SharedLayout>) -> Option<u64> {
     kept.map_or(0, |kept| kept.version).checked_add(1)
 }
 
-/// A new version of `kept`, edited by this Mac (`own`), in which this Mac's
-/// tile has its desktop's `size`. A layout from a computer that has not seen
-/// this Mac yet gets this Mac's tile to the right of the others. None when
-/// nothing changes.
-fn refreshed(kept: &SharedLayout, own: &str, size: (u32, u32)) -> Option<SharedLayout> {
-    if kept.tiles.iter().any(|tile| tile.key == own) {
-        return kept.with_own_size(own, size.0, size.1);
-    }
-    if kept.tiles.len() >= MAX_SHARED_TILES {
-        return None;
-    }
-    let right = kept
-        .tiles
-        .iter()
-        .map(|tile| i64::from(tile.x) + i64::from(tile.width))
-        .max()
-        .unwrap_or(0);
-    let mut next = kept.clone();
-    next.tiles.push(Tile {
-        key: own.to_owned(),
-        x: i32::try_from(right).ok()?,
-        y: 0,
-        width: size.0,
-        height: size.1,
-    });
-    next.version = next_version(Some(kept))?;
-    next.editor = own.to_owned();
-    next.validate().ok().map(|()| next)
-}
-
 fn retry() -> Action {
     Action {
         label: "Retry".into(),
@@ -993,6 +963,7 @@ fn link_health(peers: &[Peer], refused: &[String]) -> Option<Health> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desktop::Tile;
 
     #[test]
     fn helper_readiness_does_not_restart_sharing() {
@@ -1238,43 +1209,6 @@ mod tests {
         let kept = app.shared.draft.layout.clone().unwrap();
         assert_eq!((kept.version, &kept.editor), (4, &own));
         assert_eq!(kept.tiles[1].x, -1920);
-    }
-
-    #[test]
-    fn this_mac_adds_its_own_tile_and_writes_only_its_own_size() {
-        let key = |n: u8| format!("{n:064x}");
-        let kept = SharedLayout {
-            version: 5,
-            editor: key(2),
-            tiles: vec![Tile {
-                key: key(2),
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080,
-            }],
-        };
-        // A layout from a computer that has not seen this Mac yet. The
-        // peer's tile keeps the size that peer wrote.
-        let next = refreshed(&kept, &key(1), (3008, 1692)).unwrap();
-        assert_eq!((next.version, &next.editor), (6, &key(1)));
-        let places: Vec<_> = next
-            .tiles
-            .iter()
-            .map(|tile| (tile.key.clone(), tile.x, tile.width))
-            .collect();
-        assert_eq!(places, [(key(2), 0, 1920), (key(1), 1920, 3008)]);
-        assert!(refreshed(&next, &key(1), (3008, 1692)).is_none());
-        let resized = refreshed(&next, &key(1), (1512, 982)).unwrap();
-        assert_eq!((resized.version, resized.tiles[1].width), (7, 1512));
-
-        // Versions stop where JSON numbers stop being exact.
-        assert_eq!(next_version(None), Some(1));
-        let last = SharedLayout {
-            version: crate::desktop::MAX_TOKEN,
-            ..next
-        };
-        assert!(refreshed(&last, &key(1), (1512, 982)).is_none());
     }
 
     #[test]
