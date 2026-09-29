@@ -440,8 +440,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - A connection that arrives during a crossing waits until the crossing ends.
     - With `experimental_touchpad` on both computers, a Linux sender may send contacts the Mac cannot post, and they are dropped.
     - Secure fields, full-screen apps and games are untested.
-    - A computer paired after the shared layout exists gets a tile at the right end of the row. After the next merge of `linux-edge-sending`, the Mac should place it with `SharedLayout::with_tiles_for` like Linux.
-    - Clipboard sharing and pause at edges are not on the Mac yet (Phase 4).
+    - Clipboard sharing and pause at edges are on the Mac too (Phase 4 items). The Mac reads the clipboard only when macOS allows it without asking; otherwise Checks says to allow zflow under Paste from Other Apps. Whether macOS 27 still shows an alert at crossings is for the sitting.
 
 ### Phase 3: Linux sends by edge, plus the shared layout
 
