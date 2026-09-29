@@ -395,6 +395,42 @@ mod tests {
     }
 
     #[test]
+    fn only_a_prepared_desktop_of_the_expected_size_and_a_finish_pass() {
+        let (layout, geometry) = setup();
+        let handoff = from_edge(&layout, &geometry, Edge::Right, 750_000).unwrap();
+        let prepared = |width, height| DesktopResponse::Prepared {
+            geometry: Geometry {
+                monitors: vec![Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
+            },
+            position: Point { x: 0, y: 0 },
+        };
+        handoff.check_prepared(prepared(1000, 1000)).unwrap();
+        assert!(
+            handoff.check_prepared(prepared(1200, 1000)).is_err(),
+            "the desktop changed size"
+        );
+        assert!(handoff.check_prepared(DesktopResponse::Active).is_err());
+        assert!(
+            handoff
+                .check_prepared(DesktopResponse::unavailable("locked"))
+                .is_err()
+        );
+        check_finished(Ok(DesktopResponse::Finished)).unwrap();
+        for response in [
+            DesktopResponse::Active,
+            DesktopResponse::unavailable("gone"),
+        ] {
+            assert!(check_finished(Ok(response)).is_err());
+        }
+        assert!(check_finished(Err(anyhow::anyhow!("timed out"))).is_err());
+    }
+
+    #[test]
     fn an_edge_push_finds_the_same_crossing_as_the_cursor_does() {
         let (layout, geometry) = setup();
         let watched = crossing(
