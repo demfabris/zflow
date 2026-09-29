@@ -146,6 +146,11 @@ pub(crate) fn from_edge(
         .and_then(|transition| handoff_at(layout, geometry, transition, current))
 }
 
+/// How far from the desktop's corners a crossing stops, so a push into a
+/// corner, such as a hot corner, stays here. GNOME's barriers stop as far.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const DEAD_CORNER: i32 = 8;
+
 /// The crossing for a pointer that moves from `previous` onto an edge at
 /// `current`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -195,7 +200,7 @@ pub(crate) fn on_edge(
 }
 
 /// The crossing for a pointer at `current` on one of the `wanted` edges,
-/// where the layout puts another computer.
+/// clear of the corners, where the layout puts another computer.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn reaching(
     layout: &Layout,
@@ -220,7 +225,11 @@ fn reaching(
             Edge::Top | Edge::Bottom => (current.x - bounds.x, bounds.width as i32),
         };
         let along = f64::from(offset) / f64::from(span);
-        if along < transition.source_start || along >= transition.source_end {
+        if offset < DEAD_CORNER
+            || offset >= span - DEAD_CORNER
+            || along < transition.source_start
+            || along >= transition.source_end
+        {
             continue;
         }
         return handoff_at(layout, geometry, &transition, current);
@@ -552,6 +561,50 @@ mod tests {
         );
         assert!(on_edge(&layout, &geometry, Edge::Right, held).is_some());
         assert!(on_edge(&layout, &geometry, Edge::Left, held).is_none());
+    }
+
+    #[test]
+    fn the_desktop_corners_stay_here() {
+        let (layout, geometry) = setup();
+        // The Mac's lower right corner is at y 799; eight points up still
+        // counts as the corner.
+        let from = |y| Point { x: 990, y };
+        let to = |y| Point { x: 999, y };
+        assert!(crossing(&layout, &geometry, from(792), to(792)).is_none());
+        assert!(pushed(&layout, &geometry, to(799), 1.0, 1.0).is_none());
+        assert!(crossing(&layout, &geometry, from(791), to(791)).is_some());
+        assert!(pushed(&layout, &geometry, to(791), 1.0, 0.0).is_some());
+
+        // Every corner of a desktop with a computer all along each edge.
+        let mut layout = layout;
+        layout.monitors[0].width = 1000;
+        let geometry = Geometry {
+            monitors: vec![Rect {
+                x: -200,
+                y: -300,
+                width: 1000,
+                height: 1000,
+            }],
+        };
+        // Where the other computer is, a corner, and the first point clear
+        // of it.
+        let cases = [
+            ((-1000, 0), (-200, -300), (-200, -292)),
+            ((1000, 0), (799, 699), (799, 691)),
+            ((0, -1000), (799, -300), (791, -300)),
+            ((0, 1000), (-200, 699), (-192, 699)),
+        ];
+        for ((x, y), corner, clear) in cases {
+            layout.monitors[1].x = x;
+            layout.monitors[1].y = y;
+            let push = |(x, y)| {
+                [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+                    .into_iter()
+                    .any(|edge| on_edge(&layout, &geometry, edge, Point { x, y }).is_some())
+            };
+            assert!(!push(corner), "{corner:?}");
+            assert!(push(clear), "{clear:?}");
+        }
     }
 
     #[test]

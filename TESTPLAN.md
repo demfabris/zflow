@@ -170,9 +170,10 @@ Checks:
     before then starts nothing, and nothing reconnects when the switch
     changes (no "input link connected" line). Turn it off: the next push
     crosses at once.
-23. **Pushes.** Flick Mac to Ubuntu and back several times, fast: a flick
-    into the Mac's edge crosses, and a cursor left resting against that edge
-    crosses with the next push. Push with Cmd held: the pointer stays, and
+23. **Pushes and corners.** Flick Mac to Ubuntu and back several times, fast:
+    a flick into the Mac's edge crosses, and a cursor left resting against
+    that edge crosses with the next push. A push within 8 points of a
+    desktop corner never does. Push with Cmd held: the pointer stays, and
     after letting go it has to leave the edge before a push crosses.
 
 Known before the sitting: the Mac reads every sender's scroll as 120 units per

@@ -635,6 +635,8 @@ mod tests {
         // computer's part of it, until it leaves the edge.
         let desk = Point { x: 1919, y: 800 };
         assert_eq!(reach(desk, push(2.0, 5)), None);
+        assert_eq!(reach(Point { x: 1919, y: 1075 }, None), None, "a corner");
+        assert_eq!(reach(desk, push(2.0, 5)).as_deref(), Some("desk"));
     }
 
     #[test]

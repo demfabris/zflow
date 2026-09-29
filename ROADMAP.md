@@ -77,7 +77,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 | Lock the pointer to the current computer | Scroll Lock toggle | missing | missing | build (small) | A menu item on both. |
 | Switch delay | Off, or 250 ms | missing | missing | build (small) | One "pause at edges" toggle, off by default. |
 | Double tap | Off, or 250 ms | missing | missing | skip | The delay covers the same need. |
-| Dead corners | Per-corner checkboxes | missing | missing | build (tiny, no setting) | A fixed few-pixel dead zone at corners. It protects the GNOME hot corner. |
+| Dead corners | Per-corner checkboxes | exists: 8 points (`handoff.rs`) | exists: 8 px (`extension.js`) | have | A fixed dead zone at the desktop's corners, no setting. It protects the hot corners. |
 | No crossing while a button is held | yes | exists (`sharing.rs:261`, `capture_bridge.c:132-141`) | n/a yet | have | |
 | Require a modifier to cross | Mouse Without Borders | no | no | skip | Conflicts with the rule that modifiers must be up. |
 | Relative moves for games | option | Always relative on the wire (`src/session.rs:97`) | same | have | |
@@ -488,7 +488,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - Mac media keys.
   - Open logs.
 - **Status (2026-09-28):** started on Linux, on branch `linux-edge-sending`.
-  - Done: dead corners (outbound barriers stop 8 px short of the desktop's corners), pause at edges (`[switching] pause_at_edges`, `set_switching`, 250 ms rest against a barrier on Linux), and reverse scrolling per computer. `reverse_scroll` is on the peer record, in `set_peer` and in the snapshot; the Linux daemon turns that peer's scroll around, and the settings window has the switch. The Mac injector and Mac UI pick it up in Phase 2.
+  - Done: dead corners (outbound barriers stop 8 px short of the desktop's corners, and the Mac's crossings 8 points short), pause at edges (`[switching] pause_at_edges`, `set_switching`, 250 ms rest against a barrier on Linux), and reverse scrolling per computer. `reverse_scroll` is on the peer record, in `set_peer` and in the snapshot; the Linux daemon turns that peer's scroll around, and the settings window has the switch. The Mac injector and Mac UI pick it up in Phase 2.
   - Clipboard on Linux: done, merged into `linux-edge-sending`. The computer the pointer leaves sends its clipboard to the one it enters, as SPEC.md's Clipboard section says. `[clipboard] share` and the Share Clipboard switch (`set_clipboard`) turn it on for one computer. The GNOME extension reads and writes the clipboard through `St.Clipboard` in two D-Bus methods only the agent may call, and shows the over-limit notice. The agent carries clips to the service as base64 on its own stream, which alone allows messages that large. The Mac side (`NSPasteboard` and its switch) is pending.
 - **Acceptance:**
   - Text and PNG copy/paste work both ways.
