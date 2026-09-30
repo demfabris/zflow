@@ -113,9 +113,12 @@ async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Res
         crate::desktop::BUS_NAME,
     )
     .await?;
-    let snapshot = call(&proxy, &DesktopRequest::Snapshot)
-        .await
-        .context(ENABLE)?;
+    let snapshot = call(
+        &proxy,
+        &crate::peer_view::AgentRequest::Handoff(DesktopRequest::Snapshot),
+    )
+    .await
+    .context(ENABLE)?;
     if let DesktopResponse::Unavailable { reason } = snapshot {
         anyhow::bail!("{reason}");
     }
@@ -151,16 +154,77 @@ async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Res
     };
     tracing::info!("desktop agent ready");
 
-    let report = async |terminal| {
-        let request = crate::peer_view::Request::Focus { terminal };
+    let report = async |request: crate::peer_view::Request| {
         if let Err(error) = crate::peer_view::request(&request).await {
-            tracing::debug!(error = %format_args!("{error:#}"), "desktop focus not sent");
+            tracing::debug!(error = %format_args!("{error:#}"), "desktop report not sent");
         }
     };
+    let mut awake = IdleInhibitor::default();
     // The daemon forgets the focus when this stream closes, however this ends.
-    tokio::select! {
-        result = serve(&mut stream, &proxy, &bus, &owner) => result,
-        result = forward_focus(connection, &proxy, owner.as_str(), report) => result,
+    let result = tokio::select! {
+        result = serve(&mut stream, &proxy, &bus, &owner, &mut awake) => result,
+        result = forward_signals(connection, &proxy, owner.as_str(), report) => result,
+    };
+    // Without the service nothing would show the pointer again or hear a push.
+    awake.set(connection, false).await;
+    for request in [
+        crate::peer_view::LocalRequest::Sending { active: false },
+        crate::peer_view::LocalRequest::Edges {
+            edges: Vec::new(),
+            pause_ms: 0,
+        },
+    ] {
+        let _ = call(&proxy, &crate::peer_view::AgentRequest::Local(request)).await;
+    }
+    result
+}
+
+/// Keeps GNOME from treating the session as idle while this computer's
+/// input goes to another one. Grabbed devices send GNOME nothing, so it
+/// would otherwise blank and lock the screen. gnome-session drops the
+/// inhibitor if the agent exits.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct IdleInhibitor(Option<u32>);
+
+#[cfg(target_os = "linux")]
+impl IdleInhibitor {
+    const IDLE: u32 = 8;
+
+    async fn set(&mut self, connection: &zbus::Connection, active: bool) {
+        // The service waits for this request, so a slow gnome-session must not
+        // hold it up.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            let proxy = zbus::Proxy::new(
+                connection,
+                "org.gnome.SessionManager",
+                "/org/gnome/SessionManager",
+                "org.gnome.SessionManager",
+            )
+            .await?;
+            match (active, self.0) {
+                (true, None) => {
+                    let reason = "Controlling another computer";
+                    self.0 = Some(
+                        proxy
+                            .call("Inhibit", &("zflow", 0_u32, reason, Self::IDLE))
+                            .await?,
+                    );
+                }
+                (false, Some(cookie)) => {
+                    self.0 = None;
+                    proxy.call::<_, _, ()>("Uninhibit", &(cookie,)).await?;
+                }
+                _ => {}
+            }
+            Ok::<_, zbus::Error>(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, active, "GNOME idle inhibitor not changed"),
+            Err(_) => tracing::warn!(active, "GNOME idle inhibitor timed out"),
+        }
     }
 }
 
@@ -171,46 +235,152 @@ async fn serve(
     proxy: &zbus::Proxy<'_>,
     bus: &zbus::fdo::DBusProxy<'_>,
     owner: &zbus::names::OwnedUniqueName,
+    awake: &mut IdleInhibitor,
 ) -> anyhow::Result<()> {
-    use crate::desktop::{DesktopRequest, DesktopResponse};
+    use crate::control::{read_message_within, write_message_within};
+    use crate::desktop::DesktopResponse;
+    use crate::peer_view::{AgentReply, AgentRequest, LocalRequest, MAX_AGENT_MESSAGE};
     loop {
-        let request: DesktopRequest = crate::control::read_message(stream).await?;
+        let request: AgentRequest = read_message_within(stream, MAX_AGENT_MESSAGE).await?;
         request.validate()?;
-        let response = match call(proxy, &request).await {
-            Ok(response) => response,
+        if let AgentRequest::Local(LocalRequest::Sending { active }) = request {
+            awake.set(proxy.connection(), active).await;
+        }
+        let reply = match request {
+            AgentRequest::Local(LocalRequest::ReadClipboard) => {
+                read_clipboard(proxy).await.map(AgentReply::Clipboard)
+            }
+            AgentRequest::Local(LocalRequest::WriteClipboard { kind, data }) => {
+                write_clipboard(proxy, kind, data)
+                    .await
+                    .map(|()| AgentReply::Desktop(DesktopResponse::Finished))
+            }
+            request => call(proxy, &request).await.map(AgentReply::Desktop),
+        };
+        let reply = match reply {
+            Ok(reply) => reply,
             Err(error) => {
                 // A restarted Shell has a new unique name; start over to find and check it.
                 anyhow::ensure!(
                     bus.name_has_owner(owner.into()).await?,
                     "GNOME Shell restarted"
                 );
-                DesktopResponse::unavailable(format!("GNOME integration unavailable: {error}"))
+                AgentReply::Desktop(DesktopResponse::unavailable(format!(
+                    "GNOME integration unavailable: {error}"
+                )))
             }
         };
-        crate::control::write_message(stream, &response).await?;
+        write_message_within(stream, &reply, MAX_AGENT_MESSAGE).await?;
     }
 }
 
-/// Reports whether a terminal has focus, first as it is now and then on every
-/// change, so Mac shortcuts can use Ctrl+Shift there. Returns only on error.
+/// GNOME waits up to a second for the app that copied to hand the clipboard
+/// over. The service waits longer than this for the agent.
 #[cfg(target_os = "linux")]
-async fn forward_focus(
+const CLIPBOARD_CALL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Reads the clipboard through the extension, as one clip: text if there is
+/// any, else a PNG. The extension names a clip over the limit
+/// "too_large:<bytes>" and keeps its bytes.
+#[cfg(target_os = "linux")]
+async fn read_clipboard(
+    proxy: &zbus::Proxy<'_>,
+) -> anyhow::Result<crate::peer_view::ClipboardContents> {
+    use crate::clipboard::{ClipKind, MAX_CLIP_BYTES};
+    use crate::peer_view::{ClipData, ClipboardContents};
+    use anyhow::Context;
+    let started = std::time::Instant::now();
+    let (kind, data): (String, Vec<u8>) =
+        tokio::time::timeout(CLIPBOARD_CALL, proxy.call("ReadClipboard", &())).await??;
+    let bytes = data.len();
+    let clip = |kind| {
+        if bytes > MAX_CLIP_BYTES {
+            ClipboardContents::TooLarge { bytes }
+        } else {
+            ClipboardContents::Clip {
+                kind,
+                data: ClipData(data),
+            }
+        }
+    };
+    let contents = match kind.as_str() {
+        "text" => clip(ClipKind::Text),
+        "png" => clip(ClipKind::Png),
+        "empty" => ClipboardContents::Empty,
+        other => ClipboardContents::TooLarge {
+            bytes: other
+                .strip_prefix("too_large:")
+                .and_then(|bytes| bytes.parse().ok())
+                .context("GNOME named an unknown clipboard kind")?,
+        },
+    };
+    tracing::debug!(
+        kind = kind.as_str(),
+        bytes,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "GNOME clipboard read"
+    );
+    Ok(contents)
+}
+
+/// Puts a clip on the clipboard through the extension, after checking its
+/// bytes are what `kind` says.
+#[cfg(target_os = "linux")]
+async fn write_clipboard(
+    proxy: &zbus::Proxy<'_>,
+    kind: crate::clipboard::ClipKind,
+    data: crate::peer_view::ClipData,
+) -> anyhow::Result<()> {
+    use crate::clipboard::{Clip, ClipKind};
+    let started = std::time::Instant::now();
+    let clip = Clip::new(kind, data.0)?;
+    let name = match clip.kind() {
+        ClipKind::Text => "text",
+        ClipKind::Png => "png",
+    };
+    tokio::time::timeout(
+        CLIPBOARD_CALL,
+        proxy.call::<_, _, ()>("WriteClipboard", &(name, clip.data())),
+    )
+    .await??;
+    tracing::debug!(
+        kind = name,
+        bytes = clip.data().len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "GNOME clipboard written"
+    );
+    Ok(())
+}
+
+/// Reports whether a terminal has focus, first as it is now and then on every
+/// change, so Mac shortcuts can use Ctrl+Shift there. Also reports the pointer
+/// pushing against an edge that leads to another computer. Returns only on
+/// error.
+#[cfg(target_os = "linux")]
+async fn forward_signals(
     connection: &zbus::Connection,
     proxy: &zbus::Proxy<'_>,
     owner: &str,
-    mut report: impl AsyncFnMut(bool),
+    mut report: impl AsyncFnMut(crate::peer_view::Request),
 ) -> anyhow::Result<()> {
+    use crate::peer_view::Request;
     use anyhow::Context;
     use zbus::{MatchRule, MessageStream, message::Type};
-    // The extension sends this only to the agent. Anyone can address the
-    // agent, so accept it only from Shell.
-    let changes = MatchRule::builder()
-        .msg_type(Type::Signal)
-        .sender(owner)?
-        .path(crate::desktop::OBJECT_PATH)?
-        .interface(crate::desktop::BUS_NAME)?
-        .member("FocusChanged")?
-        .build();
+    // The extension sends these only to the agent. Anyone can address the
+    // agent, so accept them only from Shell.
+    let from_shell = |member| {
+        Ok::<_, zbus::Error>(
+            MatchRule::builder()
+                .msg_type(Type::Signal)
+                .sender(owner)?
+                .path(crate::desktop::OBJECT_PATH)?
+                .interface(crate::desktop::BUS_NAME)?
+                .member(member)?
+                .build(),
+        )
+    };
+    let changes = from_shell("FocusChanged")?;
+    let hits = from_shell("EdgeHit")?;
     let owners = MatchRule::builder()
         .msg_type(Type::Signal)
         .sender("org.freedesktop.DBus")?
@@ -220,13 +390,26 @@ async fn forward_focus(
         .build();
     // Subscribe before asking, so no change falls in between.
     let mut changes = MessageStream::for_match_rule(changes, connection, None).await?;
+    let mut hits = MessageStream::for_match_rule(hits, connection, None).await?;
     let mut owners = MessageStream::for_match_rule(owners, connection, None).await?;
-    let mut terminal = focus(proxy).await;
+    // None after an edge hit, which leaves the focus as it was.
+    let mut terminal = Some(focus(proxy).await);
     loop {
-        report(terminal).await;
+        if let Some(terminal) = terminal {
+            report(Request::Focus { terminal }).await;
+        }
         terminal = tokio::select! {
             message = next_message(&mut changes) => {
-                message.context("The session bus closed")??.body().deserialize::<bool>()?
+                Some(message.context("The session bus closed")??.body().deserialize::<bool>()?)
+            }
+            message = next_message(&mut hits) => {
+                let message = message.context("The session bus closed")??;
+                let (edge, position): (String, u32) = message.body().deserialize()?;
+                match serde_json::from_value(edge.into()) {
+                    Ok(edge) => report(Request::EdgeHit { edge, position }).await,
+                    Err(error) => tracing::debug!(%error, "unknown edge from GNOME"),
+                }
+                None
             }
             message = next_message(&mut owners) => {
                 let message = message.context("The session bus closed")??;
@@ -234,11 +417,14 @@ async fn forward_focus(
                 let (_, _, new): (&str, &str, &str) = body.deserialize()?;
                 // Shell drops the name while the extension is off, such as
                 // on the lock screen, and takes it again after.
-                match new {
+                Some(match new {
                     "" => false,
-                    new if new == owner => focus(proxy).await,
+                    // Shell turns the extension back on after unlocking, and it
+                    // starts without barriers. A new connection makes the
+                    // service send them again.
+                    new if new == owner => anyhow::bail!("The zflow GNOME extension restarted"),
                     _ => anyhow::bail!("GNOME Shell restarted"),
-                }
+                })
             }
         };
     }
@@ -278,10 +464,10 @@ async fn focus(proxy: &zbus::Proxy<'_>) -> bool {
 #[cfg(target_os = "linux")]
 async fn call(
     proxy: &zbus::Proxy<'_>,
-    request: &crate::desktop::DesktopRequest,
+    request: &crate::peer_view::AgentRequest,
 ) -> anyhow::Result<crate::desktop::DesktopResponse> {
     let started = std::time::Instant::now();
-    let operation = crate::session::desktop_operation(request);
+    let operation = request.operation();
     tracing::trace!(operation, "GNOME desktop RPC started");
     let result = async {
         // The extension refuses an agent from another API level with "Update zflow".
@@ -673,6 +859,163 @@ mod tests {
         );
     }
 
+    /// The extension's clipboard as the agent sees it over D-Bus: one kind
+    /// and its bytes.
+    struct ClipboardShell {
+        clipboard: Arc<Mutex<(String, Vec<u8>)>>,
+        calls: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[zbus::interface(name = "org.gnome.Shell.Extensions.Zflow")]
+    impl ClipboardShell {
+        fn call(&self, json: &str) -> String {
+            let request = serde_json::from_str(json).unwrap();
+            self.calls.lock().unwrap().push(request);
+            r#"{"status":"finished"}"#.into()
+        }
+        fn read_clipboard(&self) -> (String, Vec<u8>) {
+            self.clipboard.lock().unwrap().clone()
+        }
+        fn write_clipboard(&self, kind: String, data: Vec<u8>) {
+            *self.clipboard.lock().unwrap() = (kind, data);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private bus: dbus-run-session -- cargo test app::desktop::tests -- --ignored"]
+    async fn whole_clips_cross_the_service_stream_and_handoff_replies_stay_the_same() {
+        use crate::clipboard::{ClipKind, MAX_CLIP_BYTES};
+        use crate::control::{read_message_within, write_message_within};
+        use crate::desktop::{BUS_NAME, DesktopRequest, OBJECT_PATH};
+        use crate::peer_view::{
+            AgentReply, AgentRequest, ClipData, ClipboardContents, LocalRequest, MAX_AGENT_MESSAGE,
+        };
+        let _turn = SHELL_NAME.lock().await;
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(MAX_CLIP_BYTES, 7);
+        let clipboard = Arc::new(Mutex::new(("png".to_owned(), png.clone())));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let shell = zbus::connection::Builder::session()
+            .unwrap()
+            .serve_at(
+                OBJECT_PATH,
+                ClipboardShell {
+                    clipboard: clipboard.clone(),
+                    calls: calls.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        shell.request_name(BUS_NAME).await.unwrap();
+        let owner = shell.unique_name().unwrap().to_owned();
+        let agent = zbus::Connection::session().await.unwrap();
+        let proxy = zbus::Proxy::new(&agent, owner.clone(), OBJECT_PATH, BUS_NAME)
+            .await
+            .unwrap();
+        let bus = zbus::fdo::DBusProxy::new(&agent).await.unwrap();
+        let (mut service, mut stream) = tokio::net::UnixStream::pair().unwrap();
+        let mut awake = IdleInhibitor::default();
+        let asking = async {
+            let mut ask = async |request: AgentRequest| -> serde_json::Value {
+                write_message_within(&mut service, &request, MAX_AGENT_MESSAGE)
+                    .await
+                    .unwrap();
+                read_message_within(&mut service, MAX_AGENT_MESSAGE)
+                    .await
+                    .unwrap()
+            };
+            let reply =
+                |value: serde_json::Value| serde_json::from_value::<AgentReply>(value).unwrap();
+            let read = AgentRequest::Local(LocalRequest::ReadClipboard);
+            let set = |kind: &str, data: Vec<u8>| *clipboard.lock().unwrap() = (kind.into(), data);
+
+            // A whole clip is larger than any other local message.
+            let value = ask(read.clone()).await;
+            assert!(value.to_string().len() > crate::control::MAX_CONTROL_MESSAGE);
+            assert_eq!(
+                reply(value),
+                AgentReply::Clipboard(ClipboardContents::Clip {
+                    kind: ClipKind::Png,
+                    data: ClipData(png),
+                })
+            );
+            let text = vec![b'a'; MAX_CLIP_BYTES];
+            let write = |kind, data: &[u8]| {
+                AgentRequest::Local(LocalRequest::WriteClipboard {
+                    kind,
+                    data: ClipData(data.to_vec()),
+                })
+            };
+            assert_eq!(
+                ask(write(ClipKind::Text, &text)).await,
+                serde_json::json!({"status": "finished"})
+            );
+            assert_eq!(
+                *clipboard.lock().unwrap(),
+                ("text".to_owned(), text.clone())
+            );
+            // Bytes that are not what they claim never reach GNOME.
+            let refused = ask(write(ClipKind::Png, b"GIF89a")).await;
+            assert_eq!(refused["status"], "unavailable");
+            assert!(refused["reason"].as_str().unwrap().contains("not a PNG"));
+            assert_eq!(clipboard.lock().unwrap().0, "text");
+
+            set("too_large:5242880", Vec::new());
+            assert_eq!(
+                reply(ask(read.clone()).await),
+                AgentReply::Clipboard(ClipboardContents::TooLarge { bytes: 5 << 20 })
+            );
+            set("text", vec![b'a'; MAX_CLIP_BYTES + 1]);
+            assert_eq!(
+                reply(ask(read.clone()).await),
+                AgentReply::Clipboard(ClipboardContents::TooLarge {
+                    bytes: MAX_CLIP_BYTES + 1
+                }),
+                "the agent holds the limit too"
+            );
+            set("empty", Vec::new());
+            assert_eq!(
+                reply(ask(read.clone()).await),
+                AgentReply::Clipboard(ClipboardContents::Empty)
+            );
+            set("gif", vec![1]);
+            let unknown = ask(read.clone()).await;
+            assert!(
+                unknown["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown clipboard kind")
+            );
+
+            // A notice goes through the JSON call; handoff replies are as before.
+            let notice = crate::clipboard::too_large(5 << 20);
+            let finished = serde_json::json!({"status": "finished"});
+            let local = LocalRequest::Notify {
+                message: notice.clone(),
+            };
+            assert_eq!(ask(AgentRequest::Local(local)).await, finished);
+            assert_eq!(
+                ask(AgentRequest::Handoff(DesktopRequest::Snapshot)).await,
+                finished
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                [
+                    serde_json::json!({"command": "notify", "message": notice, "api": crate::app::gnome::API}),
+                    serde_json::json!({"command": "snapshot", "api": crate::app::gnome::API}),
+                ]
+            );
+        };
+        tokio::select! {
+            result = serve(&mut stream, &proxy, &bus, &owner, &mut awake) => {
+                panic!("the agent stopped serving: {result:?}")
+            }
+            () = asking => {}
+        }
+    }
+
     struct FocusShell;
 
     #[zbus::interface(name = "org.gnome.Shell.Extensions.Zflow")]
@@ -704,6 +1047,7 @@ mod tests {
         let owner = shell.unique_name().unwrap().to_owned();
         let impostor = zbus::Connection::session().await.unwrap();
         let (sent, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let (hit, mut hits) = tokio::sync::mpsc::unbounded_channel();
         let forward = tokio::spawn({
             let agent = agent.clone();
             let owner = owner.clone();
@@ -713,11 +1057,19 @@ mod tests {
                     .unwrap();
                 // Not an async closure: its future would borrow `sent`, and
                 // tokio::spawn cannot prove that Send.
-                let report = move |terminal| {
-                    sent.send(terminal).unwrap();
+                let report = move |request| {
+                    match request {
+                        crate::peer_view::Request::Focus { terminal } => {
+                            sent.send(terminal).unwrap()
+                        }
+                        crate::peer_view::Request::EdgeHit { edge, position } => {
+                            hit.send((edge, position)).unwrap()
+                        }
+                        other => panic!("unexpected report {other:?}"),
+                    }
                     std::future::ready(())
                 };
-                forward_focus(&agent, &proxy, owner.as_str(), report).await
+                forward_signals(&agent, &proxy, owner.as_str(), report).await
             }
         });
         let emit = async |from: &zbus::Connection, terminal: bool| {
@@ -744,6 +1096,28 @@ mod tests {
             .unwrap();
         emit(&shell, false).await;
         assert_eq!(reports.recv().await, Some(false), "only Shell is heard");
+        let push = async |from: &zbus::Connection, edge: &str, position: u32| {
+            from.emit_signal(
+                agent.unique_name(),
+                OBJECT_PATH,
+                BUS_NAME,
+                "EdgeHit",
+                &(edge, position),
+            )
+            .await
+            .unwrap();
+        };
+        push(&impostor, "left", 1).await;
+        push(&shell, "right", 500_000).await;
+        assert_eq!(
+            hits.recv().await,
+            Some((crate::desktop::Edge::Right, 500_000)),
+            "only Shell's edge hits reach the service"
+        );
+        assert!(
+            reports.try_recv().is_err(),
+            "an edge hit is not a focus change"
+        );
         emit(&shell, true).await;
         assert_eq!(reports.recv().await, Some(true));
         shell.release_name(BUS_NAME).await.unwrap();
@@ -752,17 +1126,10 @@ mod tests {
             Some(false),
             "no extension, no terminal"
         );
+        // A returning extension has lost its barriers; reconnecting resends them.
         shell.request_name(BUS_NAME).await.unwrap();
-        assert_eq!(
-            reports.recv().await,
-            Some(true),
-            "asks again when it returns"
-        );
-        shell.release_name(BUS_NAME).await.unwrap();
-        impostor.request_name(BUS_NAME).await.unwrap();
-        assert_eq!(reports.recv().await, Some(false));
         let error = forward.await.unwrap().unwrap_err();
-        assert_eq!(format!("{error:#}"), "GNOME Shell restarted");
+        assert_eq!(format!("{error:#}"), "The zflow GNOME extension restarted");
         assert_eq!(reports.recv().await, None);
     }
 }

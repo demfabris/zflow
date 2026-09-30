@@ -68,7 +68,8 @@ zflow MUST:
 | AWDL suppression during sessions (macOS, opt-in) | planned, mechanism proven | Consent flow + re-apply loop |
 | QoS marking | provisional | Radio and energy matrix |
 | Automatic path failover | planned | Candidate-racing failure matrix |
-| Clipboard and file transfer | deferred | Separate bulk transport |
+| Clipboard text and PNG images, with the pointer | Linux built; macOS planned | Phase 4 acceptance in ROADMAP.md |
+| File transfer | deferred | Separate bulk transport |
 
 Linux pre-login scope begins in real-root userspace once zflowd is active. Graphical-greeter support begins when the display manager starts; VT keyboard support may begin earlier. Firmware, initramfs, LUKS, macOS FileVault preboot, and other environments where zflow code cannot run remain excluded.
 
@@ -163,9 +164,13 @@ On Linux, physical devices stay on their normal kernel path while zflow is idle.
 Each input source follows four routing states:
 
 1. **Idle**: no grabs exist. Local input flows normally. A daemon crash, restart, or package upgrade in this state cannot affect local input, and a restarted daemon is immediately fully functional.
-2. **Arming**: zflow has selected and authenticated a peer and an activation was requested (hotkey chord, or a portal edge event). For the hotkey path, zflowd waits until every key and button across the capture set is neutral (verified through EVIOCGKEY and tracked state), then takes EVIOCGRAB on every node in the set, all or none. EBUSY or any failure releases acquired grabs and returns to Idle with a diagnostic.
+2. **Arming**: zflow has selected and authenticated a peer and an activation was requested (hotkey chord, or a portal edge event). For the hotkey path, zflowd waits until every key and button across the capture set is neutral (verified through EVIOCGKEY and tracked state), then takes EVIOCGRAB on every node in the set, all or none. EBUSY or any failure releases acquired grabs and returns to Idle with a diagnostic. One exception: with no configured devices the set is every keyboard, mouse and touchpad, and a node another program already grabbed (EBUSY) is skipped and never released, since it was never zflow's. A remapper such as keyd holds its source that way and re-emits on a virtual node, which zflow grabs instead. Arming then succeeds if at least one node was grabbed; any other failure still releases the whole set.
 3. **Remote**: grabbed physical events serialize to the peer. The local escape chord works without network cooperation because the daemon reads every event.
 4. **Releasing**: zflow queues a terminal state when the connection remains live, ungrabs the set at a complete SYN_REPORT boundary, and the physical devices return to normal kernel consumers. The receiver cleans up through that terminal state or its lease and lifecycle rules.
+
+**Edge crossings on GNOME**: the GNOME extension places a barrier on each outer edge that the layout connects to a paired computer. A push against one makes zflowd prepare that peer's desktop at the matching entry point, then arm exactly as for the chord, and poll the peer until the pointer leaves through the peer's edge. It then puts the pointer at the matching point here, gives input back and finishes the handoff. The chord still activates without preparing the peer. With "Pause at edges" on (`[switching] pause_at_edges`), a push crosses only after the pointer rests 250 ms against the barrier, and leaving the barrier first cancels it. While this computer sends, the extension hides the pointer and the desktop agent holds a gnome-session idle inhibitor, because grabbed devices give GNOME no input and it would otherwise lock the screen. Only zflowd can ask for barriers, pointer moves or hiding; these are local agent requests that no input session can carry.
+
+**One direction at a time**: a computer MUST NOT start sending while another computer controls it, and MUST refuse a peer's activation while its own capture set is Arming, Remote, or Releasing. When two computers cross toward each other at once, each refuses the other and both stay local; the user crosses again.
 
 **Accepted arming race**: between chord detection and a successful grab, the compositor may observe the tail of the chord and in-flight motion. Arming at neutral bounds the leak to the chord itself plus sub-frame motion; the worst user-visible effect is the chord firing a local binding or a few pixels of local cursor motion at switch time. Setup tests the chosen chord and reports known local conflicts. The Linux backbone matrix measures leakage and freezes an acceptance threshold.
 
@@ -191,6 +196,10 @@ The decoder MUST:
 
 Payloads are the core model types in postcard behind a three-byte header (magic and family); desktop metadata is JSON. The logical model below is fixed for the first prototype.
 
+### Shared layout
+
+Every paired computer keeps one arrangement of all their desktops. Tiles are keyed by key fingerprint, because each computer names the others differently, and hold at most 16 computers so one desktop message carries the whole layout. Each edit raises the layout's version and records its editor's fingerprint; the higher (version, editor) wins, so both ends keep the same layout without a coordinator. A computer sends its layout when a session starts and after each change, keeps a newer one it receives, passes it on to its other peers, and answers an older one with its own. A computer drops tiles for keys it has not paired, so a forgotten computer never returns through a peer's copy, and it computes its own crossing edges from its own tile. A computer paired after the layout exists gets a tile beside the tile of the computer that paired it, to the right, left, below or above, whichever is free, as a new version from that computer. A computer that adopts a layout without its own tile adds it beside the first tile, at its own desktop's size.
+
 Authenticated session negotiation selects the maximum datagram size, input capabilities, pointer units, scroll fields, contact limit, receiver lease, and checkpoint bound. A required capability mismatch prevents activation.
 
 ### Identity, epoch, generation, and activation
@@ -206,9 +215,14 @@ The receiver MUST release state from the prior epoch before accepting a new epoc
 | Input control | One reliable ordered bidirectional stream | key and button transitions, ownership, touch lifecycle, state snapshots, acknowledgements, terminal anchors |
 | Motion state | QUIC datagrams | cumulative pointer and scroll state, complete touch snapshots |
 | Probe | QUIC datagrams | application probe and echo data |
-| Bulk | separate best-effort QUIC connection and socket | clipboard or file data after v1 |
+| Clipboard | one unidirectional QUIC stream per transfer, below the control stream's priority | one clip |
+| Bulk | separate best-effort QUIC connection and socket | file data after v1 |
 
 Input control MUST NOT share a stream with clipboard or file data. If zflow applies a socket service class, bulk traffic MUST use an unmarked endpoint.
+
+### Clipboard
+
+The clipboard goes with the pointer and moves at no other time. The computer the pointer leaves sends its clipboard to the one it enters: a sender reads its own clipboard once its crossing reaches the other computer, by edge or chord, and a computer that was being controlled reads its clipboard when that control ends, by return, escape chord or lease end. Nothing reads the clipboard while the pointer stays put, and a crossing never waits for a clip. A clip is one representation: UTF-8 text if the clipboard has text, else one PNG image. Files never go. A clip holds at most 3 MiB (`MAX_CLIP_BYTES`); a larger clipboard stays where it is, and that computer shows a notice. Each computer opts in for itself with `[clipboard] share`, off by default: it sends only with its own switch on and keeps what arrives only with its own switch on. Each transfer is its own stream on the input connection, and QUIC sends datagrams ahead of stream data, so a large clip does not hold up input. A newer clip cancels one still on its way, and a bad or oversized clip ends only its own stream. Each computer remembers, per peer, the last clip that peer had from it or gave it, and sends only a different one, so a clip never bounces back. Logs name only a clip's kind and size.
 
 QUIC retransmission cannot deliver an event after connection death. The receiver owns failure recovery.
 
@@ -445,9 +459,9 @@ Linux uses evdev for physical capture and uinput for remote injection. EVIOCGRAB
 
 zflowd grabs the configured capture set on demand at the Arming transition and releases it when Remote ends, per the Input ownership section. While Idle it holds no grabs and reads the set only to detect the activation chord and track state. This keeps the daemon out of the local input path, keeps upgrades and restarts harmless, and lets a hotplugged device join the set without a reboot; the cost is the bounded arming leak, measured by the backbone matrix.
 
-zflowd runs as a dedicated service account unless a platform test proves that root is required. The account may read selected evdev nodes and open /dev/uinput. Membership in the broad input group grants keylogger-level access, so installers MUST NOT add interactive users to it.
+zflowd runs as a dedicated service account unless a platform test proves that root is required. The account may read keyboard and pointer evdev nodes and open /dev/uinput. Membership in the broad input group grants keylogger-level access, so installers MUST NOT add interactive users to it.
 
-The installer ensures that uinput exists as a built-in driver or loaded module, grants zflowd write access to /dev/uinput, read access to selected evdev nodes, and write access only to nodes that need negotiated LED feedback. It verifies those permissions after a cold boot.
+The installer ensures that uinput exists as a built-in driver or loaded module, grants zflowd write access to /dev/uinput, read access to every keyboard and pointer evdev node, and write access only to nodes that need negotiated LED feedback. It verifies those permissions after a cold boot.
 
 The service starts from multi-user.target and retries network discovery without blocking the display manager on network-online.target. When pre-login support is enabled, zflowd orders before the enabled display-manager unit and uses Type=notify. It sends READY=1 only after /dev/uinput is accessible, the baseline virtual devices exist, and their matching udev add events expose the required properties, so a pre-login client can receive input before the greeter appears. Network availability does not delay readiness. A daemon start at any later time is equally functional; no state depends on starting before the session.
 
@@ -479,7 +493,7 @@ libinput requires udev classification and device-specific properties; a uinput n
 
 ### Capture
 
-A capture set is all-or-none: at Arming, zflowd opens and grabs every event node in the configured logical set, and EVIOCGRAB returning EBUSY or any setup failure releases the whole set and returns to Idle with a diagnostic.
+A configured capture set is all-or-none: at Arming, zflowd opens and grabs every event node in the configured logical set, and EVIOCGRAB returning EBUSY or any setup failure releases the whole set and returns to Idle with a diagnostic. With no configured devices, zflowd captures every keyboard, mouse and touchpad except its own virtual devices, and skips a node that returns EBUSY, as the Input ownership section describes.
 
 The daemon handles:
 
@@ -637,7 +651,7 @@ Pairing MUST authenticate the transcript through one reviewed method:
 
 Blind trust on first use is insufficient because it cannot detect a first-connection MITM. [RFC 7469](https://www.rfc-editor.org/rfc/rfc7469.html) documents that limitation.
 
-zflow uses SPAKE2 (`zflow-pair/4`, through the RustCrypto `spake2` crate: the magic-wormhole variant, not exactly RFC 9382). The listening peer shows a random six-digit setup code and the user types it on the initiating peer. Knowing the code is not enough: after both proofs, the listener's user allows or declines the peer, shown by its sanitized name and address, and nothing is saved before Allow. A code seen over someone's shoulder or in a screen share therefore cannot pair silently. Over the unpinned pairing TLS connection, the initiator sends its offer and its SPAKE2 message; the listener answers with its own. The SPAKE2 identities are both presented SPKIs. Proof keys come from HKDF-SHA256 over the SPAKE2 secret, salted with the connection's TLS exporter value. Each proof is an HMAC-SHA256 over the exporter value, both SPKIs, both encoded offers, and both SPAKE2 messages. The initiator proves first. The listener verifies before it answers, so each connection tests one guess at the code. A listener stops after three wrong codes, which bounds an active attacker to three chances in a million per displayed code, plus one per attempt the initiator makes toward an address the attacker controls. A relay between two TLS sessions fails because the exporter values and SPKIs differ on each side. After Allow, the listener saves the peer and then tells the initiator whether it did; the connection keeps alive while the user decides, for up to two minutes. The initiator saves only after a yes, so a listener that could not save is never trusted one way. Pairing a known key again only refreshes its addresses, which repairs the rare case where the initiator fails to save after the listener did.
+zflow uses SPAKE2 (`zflow-pair/4`, through the RustCrypto `spake2` crate: the magic-wormhole variant, not exactly RFC 9382). The listening peer shows a random six-digit setup code and the user types it on the initiating peer. Knowing the code is not enough: after both proofs, the listener's user allows or declines the peer, shown by its sanitized name and address, and nothing is saved before Allow. A code seen over someone's shoulder or in a screen share therefore cannot pair silently. Over the unpinned pairing TLS connection, the initiator sends its offer and its SPAKE2 message; the listener answers with its own. The SPAKE2 identities are both presented SPKIs. Proof keys come from HKDF-SHA256 over the SPAKE2 secret, salted with the connection's TLS exporter value. Each proof is an HMAC-SHA256 over the exporter value, both SPKIs, both encoded offers, and both SPAKE2 messages. The initiator proves first. The listener verifies before it answers, so each connection tests one guess at the code. A listener stops after three wrong codes, which bounds an active attacker to three chances in a million per displayed code, plus one per attempt the initiator makes toward an address the attacker controls. A relay between two TLS sessions fails because the exporter values and SPKIs differ on each side. After Allow, the listener saves the peer and then tells the initiator whether it did; the connection keeps alive while the user decides, for up to two minutes. The initiator saves only after a yes, so a listener that could not save is never trusted one way. A new pairing lets either computer control the other; pre-login permission stays off. Pairing a known key again only refreshes its addresses, which repairs the rare case where the initiator fails to save after the listener did.
 
 After confirmation, zflow pins the peer's public identity key or SPKI rather than a replaceable leaf certificate. It supports revocation and identity rotation through a new authenticated pairing.
 
@@ -650,10 +664,9 @@ Each peer has revocable capabilities:
 - connect;
 - receive normal-session input;
 - send normal-session input;
-- inject before login;
-- use clipboard when that feature exists.
+- inject before login.
 
-Pre-login injection defaults off. A local logged-in user must grant it.
+Clipboard sharing is a setting of each computer, not of each peer (see Clipboard). Pre-login injection defaults off. A local logged-in user must grant it.
 
 QUIC 0-RTT MUST NOT carry pairing, input, control, permission, or session-takeover messages because an attacker can replay 0-RTT application data. See [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html#section-9.2).
 
@@ -718,7 +731,7 @@ As of 2026-08-31, implementation steps 0 through 5 are code-complete and pass th
 8. Add portal/EIS capture and test desktop edge switching.
 9. Build the signed macOS daemon and Aqua agent for logged-in capture/injection, including flagged raw-contact capture.
 10. Run CoreHID, LoginWindow, touch, and path-failover experiments as separate gates.
-11. Add a best-effort bulk connection before clipboard work.
+11. Add a best-effort bulk connection before file transfer work.
 
 Release matrices from TESTPLAN.md gate each beta along the way.
 

@@ -28,7 +28,7 @@ Tags: **exists**, **partial**, **missing**. "Guess" marks anything not proven by
 | 4 | Monitor layout: shared or per machine? | **Shared.** Tiles keyed by key fingerprint, newest version wins. Needs `zflow/3`. |
 | 5 | Order? | **Phase 0, then Phase 1**, with a Mac injection spike alongside Phase 1. |
 | 6 | Clipboard? | **Text and images, synced when the pointer crosses, in Phase 4. Never files.** |
-| 7 | Mac pointer acceleration? | **A curve in Rust.** A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
+| 7 | Mac pointer acceleration? | **A curve in Rust.** Spike I showed posted motion is not accelerated. A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
 | 8 | Protocol bumps? | **One batched `zflow/3` bump, no `zflow/2` fallback.** New desktop commands are strict JSON anyway. |
 
 ---
@@ -61,7 +61,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 
 | Feature | Deskflow | Mac | Linux | Verdict | Why |
 |---|---|---|---|---|---|
-| Layout editor | 5x3 grid | exists (`ComputerLayout.swift`) | missing (`settings.js:36`) | build | Needed for sending from Linux. |
+| Layout editor | 5x3 grid | exists (`ComputerLayout.swift`) | exists (`settings.js`, drag or arrow keys) | have | Both edit the shared layout. |
 | Partial edge links | Text config only | exists (`src/app/layout_model.rs:98-146`) | shared code | have | |
 | One layout for all machines | The server's | One per Mac | none | build | Decision 4. |
 | Per-monitor tiles | none ([#6257](https://github.com/deskflow/deskflow/issues/6257)) | partial: the type allows several tiles per peer (`layout_model.rs:13-31`), but the app builds one bounding box per computer (`native.rs:436-477`) | none | skip | Entry already snaps to the nearest monitor (`extension.js:175-190`). Portal barriers only work on outer edges (`SPEC.md:518`). |
@@ -109,8 +109,8 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 
 | Feature | Deskflow | Mac | Linux | Verdict | Why |
 |---|---|---|---|---|---|
-| Clipboard text | yes | missing (`SPEC.md:71`) | missing | build (Phase 4) | Sync it only when the pointer crosses. |
-| Clipboard images | yes, 3 MiB cap | missing | missing | build after text | Capped, no UI. |
+| Clipboard text | yes | missing (`SPEC.md:71`) | exists (Phase 4) | build (Phase 4) | Sync it only when the pointer crosses. |
+| Clipboard images | yes, 3 MiB cap | missing | exists: PNG, 3 MiB cap (Phase 4) | build after text | Capped, no UI. |
 | Primary selection | yes | n/a | missing | skip | |
 | Files | Removed in v1.22 ([PR #8569](https://github.com/deskflow/deskflow/pull/8569)) | no | no | skip | |
 | Screensaver sync | always on | Locking the Mac turns on Secure Input, which ends the crossing (`src/macos/mod.rs:46`) | The seat gate refuses input while locked (`src/daemon.rs:1033-1050`) | have (partial) | |
@@ -263,7 +263,7 @@ Cost: the network-facing account can read every keyboard. To reduce that, open d
 
 ## 4. Mac receiver (Mac)
 
-The baseline is CGEventPost from the logged-in app, which is what Deskflow and lan-mouse do. No new process is needed.
+The baseline is CGEventPost from the logged-in app, which is what Deskflow and lan-mouse do. No new process is needed. Spike I (2026-09-28, `spikes/i-mac-inject/RESULT.md`) passed on this Mac: the gotchas below are measured unless marked (guess).
 
 **Reusable pieces:**
 - The receiver state machine (`src/core/receiver.rs`) and playout (`src/session/receive.rs`).
@@ -276,16 +276,16 @@ The baseline is CGEventPost from the logged-in app, which is what Deskflow and l
 
 | Area | Design | Gotcha |
 |---|---|---|
-| Event source | HID system-state source, posted at the HID tap. | Set the suppression interval to 0 and permit local events. Otherwise the Mac's own trackpad stalls. |
-| Pointer | Current cursor plus the delta after a curve, clamped to the displays and snapped to the nearest one. Also set the delta fields. | Linux sends raw deltas (`src/session.rs:97`), and CGEventPost does not accelerate them (guess). |
-| Drag and clicks | Drag event types while a button is down. Click state, and the event number on macOS 27. | Without these there is no double-click, and background windows do not focus on 27. |
-| Keys | Inverted table, ISO swap, modifier flags (including the left/right device bits) on every event. | Without flags, Cmd+click breaks. |
-| Repeat | Made on the receiver at the System Settings delay and interval. | The wire drops repeats (`src/session.rs:595-599`). |
-| Caps Lock | Post keycode 57; fall back to `IOHIDSetModifierLockState` (guess). | |
-| Unmapped keys | PrintScreen, ScrollLock and Pause become F13 to F15. Drop F21 to F24. | |
-| Media keys | NX_SYSDEFINED subtype 8. | Brightness may only drive the built-in display (guess). |
-| Scroll | Line units for a wheel, pixel units for continuous scrolling. | No phase or momentum on the wire (`src/session.rs:103-104`). |
-| Wake | `IOPMAssertionDeclareUserActivity` on Prepare. | Test display wake on macOS 27. |
+| Event source | HID system-state source, posted at the HID tap, suppression interval 0, local events permitted. | The Mac's own trackpad kept working with every source tried, including the default one, while events were posted every 8 ms. The deprecated system-wide suppression calls are not needed. |
+| Pointer | Current cursor plus the delta after a curve, clamped to the displays and snapped to the nearest one. Also set the delta fields. | Linux sends raw deltas (`src/session.rs:97`). CGEventPost places the cursor at the event location 1:1, with no acceleration; delta fields alone do not move it. macOS does not clamp an off-screen location. |
+| Drag and clicks | Drag event types while a button is down. Click state on every down and up; the event number is optional. | Without click state there is no double-click. A posted click does activate a background app on 27. |
+| Keys | Inverted table, ISO swap keyed on the receiving Mac's keyboard type, modifier flags (including the left/right device bits) on every event. | The HID-state source merges held modifiers anyway. The keyboard-type field on a posted event does not change characters, so the ISO swap must be in the table. Untested on an ISO Mac. |
+| Repeat | Made on the receiver at the System Settings delay and interval, with the autorepeat field set. | The wire drops repeats (`src/session.rs:595-599`), and macOS does not repeat a held posted key. Defaults read 225/30 ms, AppKit reports 250/33 ms; pick one. |
+| Caps Lock | `IOHIDSetModifierLockState` on an `IOHIDSystem` connection. | Keycode 57 only sets the event flag, so letters and the real lock disagree. |
+| Unmapped keys | PrintScreen becomes F13. Drop ScrollLock, Pause and F21 to F24. | F14 and F15 never reach apps. F16 to F19 are untested. |
+| Media keys | NX_SYSDEFINED subtype 8. | Volume and brightness both work; brightness stepped on the external display with the lid closed. |
+| Scroll | Line units for a wheel, pixel units for continuous scrolling. | No phase or momentum on the wire (`src/session.rs:103-104`). macOS accepts posted phases and momentum, so the wire could carry them later. |
+| Wake | `IOPMAssertionDeclareUserActivity` on Prepare. | Not tested yet (spike I skipped it). |
 
 **Handoff answers, in-process:**
 - Snapshot: the display rectangles plus the cursor position.
@@ -314,7 +314,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 | 1 | Status: Ready / Controlling X / Controlled by X / Paused / Needs attention | Title plus badge | `snapshot.status` (`native.rs:522-541`, `client.js:15-25`) | yes | yes |
 | 2 | Input sharing | Switch | `set_sharing` | menu only | yes |
 | 3 | Health | Rows with fix buttons | `snapshot.health[]`, `retry` | yes (popover, `SettingsView.swift:114-204`) | one error row (`settings.js:47-51`) |
-| 4 | Computers: layout | Drag tiles | `move_tile` (`native.rs:151-177`) | yes | no |
+| 4 | Computers: layout | Drag tiles | `move_tile` (`native.rs:151-177`) | yes | yes |
 | 5 | Peer row: name and state | Subtitle | `snapshot.peers[].state` (`native.rs:505-518`, `daemon/peer_view.rs:103-117`) | names only (`Core.swift:35`) | yes (the `settings.js:106` label is backwards) |
 | 6 | Can control this computer | Switch | `set_peer {allow_control}` (new) | no | root CLI only (`src/control.rs:32-35`) |
 | 7 | Keys from this computer | Dropdown | `set_peer {keyboard}` | no | yes |
@@ -324,7 +324,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 | 11 | Pause at edges | Switch | `set_switching` (new) | no | no |
 | 12 | Shortcuts | Read-only rows | `snapshot.shortcuts` | hint only (`SettingsView.swift:186`) | no |
 | 13 | Start at login | Switch | Mac: Swift SMAppService (`Services.swift:106-126`); Linux: `set_autostart` (`gnome.rs:240-262`) | yes | yes |
-| 14 | Share clipboard (Phase 4) | Switch | `set_clipboard` | no | no |
+| 14 | Share clipboard (Phase 4) | Switch | `set_clipboard` | no | yes |
 | 15 | Advanced configuration | Mac: button; Linux: path text (the file is root-owned) | none | yes | text only (`settings.js:52`) |
 
 ### Bottom section, Mac
@@ -393,6 +393,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - No GUI text names a role or an OS.
 - **Size:** about 8 files, 150 to 250 LOC. No wire change.
 - **Risk:** low.
+- **Status (2026-09-28):** done on Linux. `set_peer` also sets `receive_normal`, which is how an old record becomes two-way. The GNOME agent still takes `set_keyboard` from extensions.gnome.org copies that lag the package. The Mac side is done too: the Mac build, clippy, Rust, Swift and C checks passed with no code changes. The Swift views no longer name Linux or a role, and the errors the Mac window shows say "the other computer" instead of "the receiver". The Mac still refuses input until Phase 2 (`src/macos/mod.rs:657-671`), so its copy does not claim it can be controlled.
 
 ### Phase 1: one API, one GUI
 
@@ -403,6 +404,12 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - The `peer_view` rejection tests still pass.
 - **Size:** about 14 files, 900 to 1300 lines changed.
 - **Risk:** churn. No new features in this phase.
+- **Status (2026-09-28):** the Linux half is done on branch `one-settings-api`.
+  - `src/app/api.rs` holds `Snapshot<P>` (the platform section is a type parameter), `Status`, `Peer`, `Health` and one `Request` enum. Status titles and peer row text come from Rust.
+  - The GNOME agent, panel and settings window use it. Health rows and shortcut rows show on Linux. Nearby records carry `pair_address`, so the 43120 rewrite in `settings.js` is gone.
+  - The GNOME API level went from 1 to 2, because the snapshot changed shape. Phase 3 needs no second raise if it ships in the same release.
+  - Items 8 and 11 wait for Phase 4, since they are new features.
+  - The Mac half is done too. `native.rs` builds `api::Snapshot<MacPlatform>` and matches `api::Request`. Link errors are `unreachable` peers with the error as their text, plus a "Paired computers" health row with Retry. That row is also an error when no paired computer takes input from this Mac. Missing Accessibility, a failed crossing, layout and configuration errors are health rows too, so the status says "Needs attention" for them. The Allow button for Accessibility is only in the "This Mac" section. The layout check waits until a computer connects, since a new one has no tile yet. The Mac platform struct carries Accessibility, Local Network and Reduce Wi-Fi lag for the "This Mac" section; the app adds the helper and Move to Applications. The Mac hides "Can control this computer" and the keyboard picker until Phase 2. A missing Wi-Fi helper no longer makes the status "Needs attention", since sharing works without it.
 
 ### Phase 2: the Mac receives (Mac)
 
@@ -430,6 +437,23 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A layout edit shows up on the other machine within 2 s.
 - **Size:** about 15 files, 1500 to 2000 LOC.
 - **Risks:** barrier hits from local motion; held keys at the edge; remappers; extension review; wider device access.
+- **Status (2026-09-28):** in progress on branch `linux-edge-sending`.
+  - Done:
+    - Capture-all: an empty `capture_devices` list captures every keyboard and pointer, and a device another program grabbed (EBUSY) is skipped.
+    - The daemon half of change 9, and the rule for two computers dialing each other at once (`identity::wins_simultaneous_dial`).
+    - GNOME edge barriers: a push sends `edge_hit`. While sending, the pointer is hidden and an idle inhibitor is held. The barriers come back after unlocking, and they stop 8 px short of the desktop's corners (Phase 4's dead corners).
+    - Change 10: the pure handoff parts are shared in `src/app/handoff.rs`, and `src/daemon/crossing.rs` drives a crossing: Prepare at the matching entry point, arm, Poll until the pointer leaves the other computer, warp back and Finish. A push made with a key or button held gives up after 400 ms instead of crossing later.
+    - Each computer writes its own tile size into the shared layout. A resize keeps the sides that touch a neighbour.
+    - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
+    - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
+    - A computer paired after the layout exists gets a tile beside this one (`SharedLayout::with_tiles_for`), and so does one missing from a layout a peer sent.
+  - Left:
+    - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
+    - The live checks in TESTPLAN.md, "Two-way input sitting".
+  - Known limits:
+    - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
+    - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
+    - With three or more computers where not every pair is paired, an edit on one computer drops the tiles of computers it has not paired. A computer that paired them puts them back beside itself, but not where they were. SPEC's rule against resurrecting forgotten computers causes this; peer-to-peer hops (Phase 4) need a rule that keeps third-party tiles.
 
 ### Phase 4: the Deskflow extras
 
@@ -442,6 +466,9 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A Mac "switch to next computer" chord.
   - Mac media keys.
   - Open logs.
+- **Status (2026-09-28):** started on Linux, on branch `linux-edge-sending`.
+  - Done: dead corners (outbound barriers stop 8 px short of the desktop's corners), pause at edges (`[switching] pause_at_edges`, `set_switching`, 250 ms rest against a barrier on Linux), and reverse scrolling per computer. `reverse_scroll` is on the peer record, in `set_peer` and in the snapshot; the Linux daemon turns that peer's scroll around, and the settings window has the switch. The Mac injector and Mac UI pick it up in Phase 2.
+  - Clipboard on Linux: done, merged into `linux-edge-sending`. The computer the pointer leaves sends its clipboard to the one it enters, as SPEC.md's Clipboard section says. `[clipboard] share` and the Share Clipboard switch (`set_clipboard`) turn it on for one computer. The GNOME extension reads and writes the clipboard through `St.Clipboard` in two D-Bus methods only the agent may call, and shows the over-limit notice. The agent carries clips to the service as base64 on its own stream, which alone allows messages that large. The Mac side (`NSPasteboard` and its switch) is pending.
 - **Acceptance:**
   - Text and PNG copy/paste work both ways.
   - A 5 MiB clip is refused with a notice, without disconnecting.
@@ -459,7 +486,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 
 1. Phase 0 first: it is tiny and removes the one-way defaults.
 2. Then Phase 1: it is the first thing asked for, and it makes new features land once, in shared code.
-3. Alongside Phase 1: a throwaway `inject.c` spike on macOS 27 **(Mac)**. It is the biggest unknown and touches none of Phase 1's files.
+3. Alongside Phase 1: a throwaway injection spike on macOS 27 **(Mac)**. It is the biggest unknown and touches none of Phase 1's files. Done 2026-09-28 as spike I: passed.
 4. Then Phases 2, 3 and 4. Most of Phase 3 can be built on Linux before Phase 2 lands, but its acceptance needs a Mac that receives.
 
 Move shared code a piece at a time: the endpoint in Phase 2, the handoff client in Phase 3. The Linux orchestration is `daemon.rs` at 1969 lines. The Mac side is `native.rs`, `link.rs`, `sharing.rs` and `macos/mod.rs`, 3437 lines together. How much they overlap is not measured, so no big-bang rewrite.

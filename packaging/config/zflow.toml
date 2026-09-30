@@ -6,6 +6,8 @@ state_dir = "/var/lib/zflow"
 control_socket = "/run/zflow/zflowd.sock"
 
 [input]
+# Empty means every keyboard, mouse and touchpad. List devices with
+# `zflow setup --device` to capture only those.
 capture_devices = []
 activation_chord = ["KEY_LEFTCTRL", "KEY_LEFTMETA", "KEY_F12"]
 escape_chord = ["KEY_LEFTCTRL", "KEY_LEFTMETA", "KEY_BACKSPACE"]

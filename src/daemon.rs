@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use quinn::Endpoint;
 use tokio::{
     net::UnixListener,
@@ -28,7 +28,9 @@ use crate::{
         ActivationId, InputCapability, KeyboardMode, ReceiverEffect, SessionCloseReason,
         SessionContext, SessionEpoch, TransportGeneration,
     },
-    discovery::{Advertisement, Discovery, DiscoveryError},
+    discovery::{
+        Advertisement, Discovery, DiscoveryError, DiscoveryEvent, local_unicast_addresses,
+    },
     identity::{Identity, encode_hex},
     linux::{InjectionGate, OwnershipPhase, SeatState, watch_primary_seat},
     runtime::{
@@ -43,6 +45,8 @@ use crate::{
 };
 
 const SESSION_EVENT_CAPACITY: usize = 1_024;
+mod clipboard;
+mod crossing;
 mod desktop;
 mod peer_view;
 const ACCEPT_EVENT_CAPACITY: usize = 64;
@@ -54,6 +58,14 @@ const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_METRICS_HISTORY: usize = 128;
 const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAX_LOCAL_CLIENTS: usize = 64;
+/// Nearby zflow computers kept as extra dial candidates, like the Mac app's list.
+const MAX_NEARBY: usize = 64;
+/// The shared layout this computer keeps, in its state directory.
+const LAYOUT_FILE: &str = "layout.json";
+/// A paired computer's tile has this size until that computer writes its own.
+const PEER_TILE_SIZE: (u32, u32) = (1920, 1080);
+/// The largest snap distance a move may ask for, in layout units, as on the Mac.
+const MAX_SNAP: u32 = 2048;
 /// Logind answers Unknown when a reply is slow or races a property change.
 /// Such a short Unknown holds injection and keeps the last definite state for
 /// authorization, so it does not end a live crossing.
@@ -126,18 +138,25 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         server_config: RwLock::new(server_config),
         runtime: runtime.control(),
         sessions: Mutex::new(BTreeMap::new()),
+        dialed: Mutex::new(BTreeMap::new()),
+        nearby: Mutex::new(BTreeMap::new()),
+        layout: Mutex::new(None),
+        crossing: Mutex::new(()),
         metrics_history: Mutex::new(BTreeMap::new()),
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
         inbound_owner: Mutex::new(None),
+        clipboard_echo: Mutex::new(BTreeMap::new()),
         desktop: desktop::Hub::default(),
         seat,
         seat_gate: RwLock::new(initial_seat),
         session_events,
     });
+    desktop::start_local_sync(shared.clone());
     if let Err(error) = peer_view::start(shared.clone()) {
         tracing::warn!(%error, "desktop metadata API unavailable");
     }
+    shared.restore_layout().await;
     let mut discovery = start_discovery(&config, shared.endpoint.local_addr()?);
     let daemon_uid = nix::unistd::geteuid().as_raw();
     let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
@@ -260,6 +279,37 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                     Err(error) => tracing::warn!(%error, "mDNS monitoring stopped"),
                 }
                 stop_discovery(&mut discovery).await;
+                shared.nearby.lock().await.clear();
+            }
+            event = next_discovery_event(discovery.as_ref()), if discovery.is_some() => {
+                match event {
+                    Ok(DiscoveryEvent::Candidate(candidate)) => {
+                        let Some(instance) = candidate.ephemeral_instance_id() else {
+                            continue;
+                        };
+                        let local = local_unicast_addresses().unwrap_or_default();
+                        let addresses = if candidate.is_compatible() {
+                            remote_addresses(candidate.socket_addresses(), &local)
+                        } else {
+                            Vec::new()
+                        };
+                        let mut nearby = shared.nearby.lock().await;
+                        let instance = instance.to_string();
+                        if addresses.is_empty() {
+                            nearby.remove(&instance);
+                        } else if nearby.len() < MAX_NEARBY || nearby.contains_key(&instance) {
+                            nearby.insert(instance, addresses);
+                        }
+                    }
+                    Ok(DiscoveryEvent::Removed(instance)) => {
+                        shared.nearby.lock().await.remove(&instance.to_string());
+                    }
+                    Ok(DiscoveryEvent::Stopped) | Err(_) => {
+                        tracing::warn!("mDNS browsing stopped");
+                        stop_discovery(&mut discovery).await;
+                        shared.nearby.lock().await.clear();
+                    }
+                }
             }
             _ = discovery_retry.tick(), if discovery.is_none() => {
                 let config = shared.config.read().await.clone();
@@ -303,10 +353,22 @@ struct Shared {
     server_config: RwLock<Option<InputServerConfig>>,
     runtime: LinuxRuntimeControl,
     sessions: Mutex<BTreeMap<String, SessionHandle>>,
+    /// Sessions this computer dialed, by id, with when the dial finished.
+    dialed: Mutex<BTreeMap<u64, Instant>>,
+    /// Addresses of compatible zflow computers on the network, by mDNS
+    /// instance. A dial also tries these, with the peer's pinned key, so a
+    /// peer whose address changed is still found.
+    nearby: Mutex<BTreeMap<String, Vec<SocketAddr>>>,
+    /// The newest layout this computer has seen from any peer.
+    layout: Mutex<Option<crate::desktop::SharedLayout>>,
+    /// Held while a crossing started from an edge runs.
+    crossing: Mutex<()>,
     metrics_history: Mutex<BTreeMap<String, crate::metrics::SessionMetricsSnapshot>>,
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
     inbound_owner: Mutex<Option<(String, u64)>>,
+    /// Per peer, the clip last sent to it and the one it last gave here.
+    clipboard_echo: Mutex<BTreeMap<String, crate::clipboard::Echo>>,
     desktop: desktop::Hub,
     seat: watch::Receiver<SeatState>,
     /// The inbound injection gate, kept current by `watch_seat`.
@@ -385,11 +447,271 @@ impl Shared {
             session.close(SessionCloseReason::PermissionRevoked);
             bail!("peer {peer} authorization changed during connection setup");
         }
+        self.require_not_controlled().await?;
         self.runtime
             .send(RuntimeCommand::Activate {
                 peer: peer.to_owned(),
             })
             .map_err(|error| anyhow!(error))
+    }
+
+    /// Reads the layout this computer kept last time.
+    async fn restore_layout(self: &Arc<Self>) {
+        let path = self.config.read().await.daemon.state_dir.join(LAYOUT_FILE);
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<crate::desktop::SharedLayout>(&bytes)
+                .map_err(anyhow::Error::from)
+                .and_then(|layout| layout.validate().map(|()| layout))
+            {
+                Ok(layout) => *self.layout.lock().await = Some(layout),
+                Err(error) => tracing::warn!(%error, "saved layout ignored"),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(%error, "saved layout not read"),
+        }
+        self.place_new_peers().await;
+        self.apply_layout().await;
+    }
+
+    /// Gives each paired computer the layout lacks a tile beside this one,
+    /// such as one paired after the computers were arranged, and tells the
+    /// other computers. Without a layout there is nothing to add to: the
+    /// first one places every paired computer.
+    async fn place_new_peers(&self) {
+        let keys = peer_keys(&*self.config.read().await);
+        let current = self.layout.lock().await.clone();
+        let Some(placed) = current.and_then(|layout| {
+            layout.with_tiles_for(
+                &self.identity_fingerprint,
+                keys.values().map(String::as_str),
+                PEER_TILE_SIZE,
+            )
+        }) else {
+            return;
+        };
+        let version = placed.version;
+        if self.keep_layout(placed, None).await {
+            tracing::info!(version, "paired computer placed in the layout");
+        }
+    }
+
+    /// Places a barrier on each edge of this computer's tile that touches a
+    /// paired computer. Without a layout, crossings start only from the chord.
+    async fn apply_layout(&self) {
+        let edges = self
+            .local_layout()
+            .await
+            .map(|layout| desktop::outbound_edges(&layout))
+            .unwrap_or_default();
+        tracing::info!(edges = edges.len(), "outbound edges placed");
+        let pause = self.config.read().await.switching.pause_at_edges;
+        desktop::set_edges(self, edges, pause);
+    }
+
+    /// Sends a peer the layout this computer keeps, if it has one.
+    async fn offer_layout(&self, session: &SessionHandle) {
+        let layout = self.layout.lock().await.clone();
+        if let Some(layout) = layout
+            && let Err(error) = session.send_layout(layout)
+        {
+            tracing::debug!(%error, peer = %session.peer(), "layout not sent");
+        }
+    }
+
+    /// Keeps whichever of this computer's layout and a peer's is newer. A
+    /// newer one is saved and passed to the other peers; a peer with an older
+    /// one gets this computer's back.
+    async fn merge_layout(
+        self: &Arc<Self>,
+        from: &str,
+        session_id: u64,
+        layout: crate::desktop::SharedLayout,
+    ) {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(from)
+            .filter(|session| session.id() == session_id)
+            .cloned();
+        let current = self.layout.lock().await.clone();
+        if let Some(current) = &current
+            && !layout.is_newer_than(current)
+        {
+            if current.is_newer_than(&layout)
+                && let Some(session) = session
+            {
+                self.offer_layout(&session).await;
+            }
+            return;
+        }
+        let version = layout.version;
+        if !self.keep_layout(layout, Some(session_id)).await {
+            return;
+        }
+        tracing::info!(peer = %from, version, "layout adopted");
+        // A computer paired here but not there has no tile in it yet.
+        self.place_new_peers().await;
+        // The other computer may not know this desktop's size yet.
+        let shared = self.clone();
+        tokio::spawn(async move {
+            if let crate::desktop::DesktopResponse::Snapshot { geometry, .. } =
+                shared.desktop.snapshot().await
+            {
+                shared.fit_own_tile(&geometry).await;
+            }
+        });
+    }
+
+    /// Uses `layout` from now on if it is newer than the one kept, saves it,
+    /// and sends it to every peer except the session it came from. Returns
+    /// whether it was kept: another task may have kept a newer one first.
+    async fn keep_layout(&self, layout: crate::desktop::SharedLayout, origin: Option<u64>) -> bool {
+        {
+            let mut current = self.layout.lock().await;
+            if current
+                .as_ref()
+                .is_some_and(|current| !layout.is_newer_than(current))
+            {
+                return false;
+            }
+            *current = Some(layout.clone());
+        }
+        self.save_layout(&layout).await;
+        self.apply_layout().await;
+        let others: Vec<_> = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter(|session| Some(session.id()) != origin)
+            .cloned()
+            .collect();
+        for session in others {
+            self.offer_layout(&session).await;
+        }
+        true
+    }
+
+    /// Writes this computer's own tile size, from its GNOME desktop, into
+    /// the shared layout, and tells the other computers.
+    pub(super) async fn fit_own_tile(&self, geometry: &crate::desktop::Geometry) {
+        let Ok(bounds) = geometry.bounds() else {
+            return;
+        };
+        let current = self.layout.lock().await.clone();
+        let Some(resized) = current.and_then(|layout| {
+            layout.with_own_size(&self.identity_fingerprint, bounds.width, bounds.height)
+        }) else {
+            return;
+        };
+        let version = resized.version;
+        if self.keep_layout(resized, None).await {
+            tracing::info!(
+                width = bounds.width,
+                height = bounds.height,
+                version,
+                "this computer's tile resized"
+            );
+        }
+    }
+
+    /// Writes `layout` to the state directory, so it outlives a restart.
+    async fn save_layout(&self, layout: &crate::desktop::SharedLayout) {
+        let path = self.config.read().await.daemon.state_dir.join(LAYOUT_FILE);
+        let saved = serde_json::to_string(layout)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| crate::config::save_text(&path, &text).map_err(Into::into));
+        if let Err(error) = saved {
+            tracing::warn!(%error, "layout not saved; still using it until restart");
+        }
+    }
+
+    /// The layout this computer keeps, or, before anyone arranged the
+    /// computers, the one it would start from. Starting one asks GNOME for
+    /// this desktop's size.
+    async fn layout_or_initial(&self) -> Result<crate::desktop::SharedLayout> {
+        if let Some(layout) = self.layout.lock().await.clone() {
+            return Ok(layout);
+        }
+        let geometry = match self.desktop.snapshot().await {
+            crate::desktop::DesktopResponse::Snapshot { geometry, .. } => geometry,
+            crate::desktop::DesktopResponse::Unavailable { reason } => bail!("{reason}"),
+            _ => bail!("GNOME did not describe this desktop"),
+        };
+        let bounds = geometry.bounds()?;
+        let initial = initial_layout(
+            &self.identity_fingerprint,
+            bounds.width,
+            bounds.height,
+            &peer_keys(&*self.config.read().await),
+        )?;
+        // Keep it, so later requests do not ask GNOME again. Version 0 gives
+        // way to any layout a peer arranged.
+        self.keep_layout(initial, None).await;
+        self.layout
+            .lock()
+            .await
+            .clone()
+            .context("the layout was not kept")
+    }
+
+    /// What the settings window arranges. None while there is no layout and
+    /// GNOME cannot describe this desktop.
+    pub(super) async fn layout_status(&self) -> Option<crate::app::layout_model::Layout> {
+        let layout = self.layout_or_initial().await.ok()?;
+        let keys = peer_keys(&*self.config.read().await);
+        Some(layout_view(&layout, &self.identity_fingerprint, &keys))
+    }
+
+    /// Moves one computer, as the settings window asks, and tells the
+    /// other computers. The first move also starts the layout.
+    pub(super) async fn move_tile(
+        self: &Arc<Self>,
+        id: &str,
+        x: i32,
+        y: i32,
+        tolerance: u32,
+    ) -> Result<()> {
+        let current = self.layout_or_initial().await?;
+        let keys = peer_keys(&*self.config.read().await);
+        let moved = with_tile_moved(
+            &current,
+            &self.identity_fingerprint,
+            &keys,
+            id,
+            (x, y),
+            tolerance,
+        )?;
+        let version = moved.version;
+        ensure!(
+            self.keep_layout(moved, None).await,
+            "The layout changed on another computer; try again"
+        );
+        tracing::info!(%id, version, "tile moved");
+        Ok(())
+    }
+
+    /// Starts a crossing toward the computer behind the edge the pointer
+    /// pushed against. The usual activation checks apply.
+    fn edge_hit(self: &Arc<Self>, edge: crate::desktop::Edge, position: u32) {
+        let Some(peer) = self.desktop.edge_peer(edge, position) else {
+            return;
+        };
+        let shared = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = shared.cross(edge, position).await {
+                tracing::info!(error = %format_args!("{error:#}"), %peer, "edge crossing ended");
+            }
+        });
+    }
+
+    /// A computer that another one controls does not send its own input.
+    async fn require_not_controlled(&self) -> Result<()> {
+        match &*self.inbound_owner.lock().await {
+            Some((peer, _)) => bail!("{peer} is controlling this computer"),
+            None => Ok(()),
+        }
     }
 
     async fn ensure_session(
@@ -400,15 +722,17 @@ impl Shared {
         if let Some(existing) = self.sessions.lock().await.get(peer).cloned() {
             return Ok(existing);
         }
-        if record.addresses.is_empty() {
-            bail!("peer {peer} has no configured input address");
+        let mut addresses = record.addresses.clone();
+        addresses.extend(self.nearby.lock().await.values().flatten());
+        if addresses.is_empty() {
+            bail!("peer {peer} has no configured input address and none was found nearby");
         }
         let policy_generation = self.policy_generation.load(Ordering::Acquire);
         let connection = race_connect(
             &self.endpoint,
             &self.identity,
             record.spki_der()?,
-            &record.addresses,
+            &addresses,
         )
         .await?;
         let generation = self.allocate_generation()?;
@@ -436,13 +760,37 @@ impl Shared {
             session.close(SessionCloseReason::PermissionRevoked);
             bail!("peer {peer} authorization changed during connection negotiation");
         }
+        let wins = wins_dial(&config, &self.identity_fingerprint, peer);
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get(peer).cloned() {
-            session.close(SessionCloseReason::Superseded);
-            return Ok(existing);
+            // Either this computer dialed twice at once, or the peer dialed
+            // while this computer did.
+            let own = self.dialed.lock().await.contains_key(&existing.id());
+            if own || !wins {
+                session.close(SessionCloseReason::Superseded);
+                return Ok(existing);
+            }
+            existing.close(SessionCloseReason::Superseded);
         }
         sessions.insert(peer.to_owned(), session.clone());
+        self.dialed
+            .lock()
+            .await
+            .insert(session.id(), Instant::now());
+        drop(sessions);
+        self.offer_layout(&session).await;
         Ok(session)
+    }
+
+    /// Whether this computer's own dial to `peer` just finished and wins
+    /// over a connection the peer dialed at the same moment.
+    async fn keeps_own_dial(&self, peer: &str) -> bool {
+        let Some(session) = self.sessions.lock().await.get(peer).cloned() else {
+            return false;
+        };
+        let dialed_at = self.dialed.lock().await.get(&session.id()).copied();
+        keeps_own_dial(dialed_at, Instant::now())
+            && wins_dial(&*self.config.read().await, &self.identity_fingerprint, peer)
     }
 
     async fn accept_connection(self: &Arc<Self>, connection: InputConnection) -> Result<()> {
@@ -452,6 +800,10 @@ impl Shared {
             let config = self.config.read().await;
             peer_name_for_spki(&config, connection.peer_spki())?
         };
+        if self.keeps_own_dial(&peer).await {
+            connection.close();
+            bail!("{peer} dialed while this computer did; keeping this computer's connection");
+        }
         // A peer that reconnects after a silent network loss would otherwise
         // wait for its old session's idle timeout. This connection is the same
         // authenticated peer, so the old session goes first, and its close
@@ -489,10 +841,17 @@ impl Shared {
                 if session.is_closed() {
                     bail!("peer {peer} input session ended during setup");
                 }
+                let own_dial = self.keeps_own_dial(&peer).await;
                 let mut sessions = self.sessions.lock().await;
                 match sessions.get(&peer) {
                     None => {
-                        sessions.insert(peer, session);
+                        sessions.insert(peer, session.clone());
+                        drop(sessions);
+                        self.offer_layout(&session).await;
+                        return Ok(());
+                    }
+                    Some(_) if own_dial => {
+                        session.close(SessionCloseReason::Superseded);
                         return Ok(());
                     }
                     Some(old) => old.close(SessionCloseReason::Superseded),
@@ -542,6 +901,8 @@ impl Shared {
             .cloned()
             .with_context(|| format!("peer {peer} was revoked before capture armed"))?;
         require_outbound_permission(&*self.config.read().await, peer, &record)?;
+        // The runtime may have been arming when a peer took control.
+        self.require_not_controlled().await?;
         let session = self
             .sessions
             .lock()
@@ -796,18 +1157,23 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
                 session.record_arming_to_grab(changed_at.saturating_duration_since(started_at));
                 session.record_switch_time_leakage(arming_leakage_events);
             }
-            if let Err(error) = shared.begin_outbound(&peer).await {
-                tracing::warn!(%error, %peer, "outbound session could not start");
-                shared
-                    .runtime
-                    .send_critical(
-                        RuntimeCommand::Release {
-                            transport_live: false,
-                        },
-                        TERMINAL_SEND_TIMEOUT,
-                    )
-                    .await
-                    .map_err(|error| anyhow!(error))?;
+            desktop::set_sending(shared, true);
+            match shared.begin_outbound(&peer).await {
+                // The pointer left for `peer`, so the clipboard goes along.
+                Ok(()) => shared.share_clipboard(&peer),
+                Err(error) => {
+                    tracing::warn!(%error, %peer, "outbound session could not start");
+                    shared
+                        .runtime
+                        .send_critical(
+                            RuntimeCommand::Release {
+                                transport_live: false,
+                            },
+                            TERMINAL_SEND_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|error| anyhow!(error))?;
+                }
             }
         }
         RuntimeEvent::OwnershipChanged {
@@ -816,6 +1182,7 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
         } => {
             *shared.arming_started.lock().await = None;
             *shared.active_outbound.lock().await = None;
+            desktop::set_sending(shared, false);
         }
         RuntimeEvent::OwnershipChanged { .. } => {}
         RuntimeEvent::TerminalRequested => {
@@ -1049,13 +1416,31 @@ fn receiver_authorized(config: &Config, peer: &str, gate: InjectionGate) -> bool
     }
 }
 
+/// Whether a batch leaves its activation closed. One batch can close an
+/// activation and open the next, so the last of those effects decides.
+fn ends_closed(effects: &[ReceiverEffect]) -> bool {
+    effects
+        .iter()
+        .rev()
+        .find_map(|effect| match effect {
+            ReceiverEffect::ActivationOpened(_) => Some(false),
+            ReceiverEffect::ActivationClosed { .. } => Some(true),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 fn claim_inbound(
     owner: &mut Option<(String, u64)>,
     peer: &str,
     session_id: u64,
     authorized: bool,
+    local: OwnershipPhase,
 ) -> bool {
+    // Grabbed or arming devices mean this computer is sending, and it is
+    // never controlled at the same time.
     if !authorized
+        || local != OwnershipPhase::Idle
         || owner.as_ref().is_some_and(|(current_peer, current_id)| {
             current_peer != peer || *current_id != session_id
         })
@@ -1064,6 +1449,17 @@ fn claim_inbound(
     }
     *owner = Some((peer.to_owned(), session_id));
     true
+}
+
+/// Turns a peer's scrolling around, for a Mac with natural scrolling against
+/// a desktop without it. Pointer motion stays as it is.
+fn reverse_scrolling(effects: &mut [ReceiverEffect]) {
+    for effect in effects {
+        if let ReceiverEffect::Motion { delta, .. } = effect {
+            delta.scroll_x = -delta.scroll_x;
+            delta.scroll_y = -delta.scroll_y;
+        }
+    }
 }
 
 fn is_release(effect: &ReceiverEffect) -> bool {
@@ -1104,6 +1500,108 @@ fn require_outbound_permission(config: &Config, peer: &str, record: &PeerConfig)
         bail!("peer {peer} is not allowed to receive input");
     }
     Ok(())
+}
+
+/// A dial counts as simultaneous with the peer's while it is younger than a
+/// connection attempt. A peer that dials in later lost its connection, so its
+/// new one replaces whatever was there.
+fn keeps_own_dial(dialed_at: Option<Instant>, now: Instant) -> bool {
+    dialed_at.is_some_and(|at| now.saturating_duration_since(at) < CONNECT_TIMEOUT)
+}
+
+fn wins_dial(config: &Config, local_fingerprint: &str, peer: &str) -> bool {
+    config
+        .peers
+        .get(peer)
+        .and_then(|record| record.fingerprint_hex().ok())
+        .is_some_and(|theirs| crate::identity::wins_simultaneous_dial(local_fingerprint, &theirs))
+}
+
+/// Each paired computer's key fingerprint, by its name here.
+fn peer_keys(config: &Config) -> BTreeMap<String, String> {
+    config
+        .peers
+        .iter()
+        .filter_map(|(name, peer)| Some((name.clone(), peer.fingerprint_hex().ok()?)))
+        .collect()
+}
+
+/// This computer's view of a shared layout: its own tile is "local", and
+/// paired computers carry their names here.
+fn layout_view(
+    layout: &crate::desktop::SharedLayout,
+    own: &str,
+    keys: &BTreeMap<String, String>,
+) -> crate::app::layout_model::Layout {
+    crate::app::layout_model::Layout::from_shared(layout, own, "This computer", keys)
+}
+
+/// The layout to start from before anyone arranged the computers: this
+/// computer's tile, then each paired computer to its right. It is version 0,
+/// so the first edit makes version 1.
+fn initial_layout(
+    own: &str,
+    width: u32,
+    height: u32,
+    keys: &BTreeMap<String, String>,
+) -> Result<crate::desktop::SharedLayout> {
+    let mut seen = std::collections::BTreeSet::from([own]);
+    let peers = keys
+        .values()
+        .filter(|key| seen.insert(key.as_str()))
+        .map(|key| (key.as_str(), PEER_TILE_SIZE));
+    let mut x: i32 = 0;
+    let tiles = std::iter::once((own, (width, height)))
+        .chain(peers)
+        .take(crate::desktop::MAX_SHARED_TILES)
+        .map(|(key, (width, height))| {
+            let tile = crate::desktop::Tile {
+                key: key.to_owned(),
+                x,
+                y: 0,
+                width,
+                height,
+            };
+            x = x.saturating_add(i32::try_from(width).unwrap_or(i32::MAX));
+            tile
+        })
+        .collect();
+    let layout = crate::desktop::SharedLayout {
+        version: 0,
+        editor: own.to_owned(),
+        tiles,
+    };
+    layout
+        .validate()
+        .context("This desktop is too large for the layout")?;
+    Ok(layout)
+}
+
+/// A new version of `layout`, edited by this computer, with the tile `id` of
+/// its view at (x, y), or against an edge within `tolerance` of there. Tiles
+/// of computers not paired here are left out, as in any layout it writes.
+fn with_tile_moved(
+    layout: &crate::desktop::SharedLayout,
+    own: &str,
+    keys: &BTreeMap<String, String>,
+    id: &str,
+    (x, y): (i32, i32),
+    tolerance: u32,
+) -> Result<crate::desktop::SharedLayout> {
+    let mut view = layout_view(layout, own, keys);
+    let index = view
+        .monitors
+        .iter()
+        .position(|monitor| monitor.id == id)
+        .with_context(|| format!("The layout has no computer {id}"))?;
+    let (x, y) = view
+        .snap_move(index, x, y, tolerance.min(MAX_SNAP) as i32)
+        .context("Computers cannot overlap")?;
+    view.monitors[index].x = x;
+    view.monitors[index].y = y;
+    let moved = view.to_shared(layout.version.saturating_add(1), own, keys);
+    moved.validate()?;
+    Ok(moved)
 }
 
 fn eligible_outbound_peers(config: &Config) -> Vec<String> {
@@ -1224,13 +1722,14 @@ fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {
     if !config.transport.discovery {
         return None;
     }
-    // Advertise only: the daemon has no use for other computers' records.
+    // Browsing finds a paired computer whose address changed.
     let result = (|| {
         let mut discovery = Discovery::new()?;
         discovery.register(Advertisement::new(
             listen.port(),
             advertised_capabilities(config),
         )?)?;
+        discovery.browse()?;
         Ok::<_, anyhow::Error>(discovery)
     })();
     match result {
@@ -1262,6 +1761,25 @@ async fn stop_discovery(discovery: &mut Option<Discovery>) {
             Err(_) => tracing::warn!("mDNS shutdown timed out"),
         }
     }
+}
+
+async fn next_discovery_event(
+    discovery: Option<&Discovery>,
+) -> Result<DiscoveryEvent, DiscoveryError> {
+    discovery
+        .expect("select guard requires discovery")
+        .next_event()
+        .await
+}
+
+/// A record's addresses without this computer's own, which include its own
+/// advertisement coming back.
+fn remote_addresses(addresses: &[SocketAddr], local: &[std::net::IpAddr]) -> Vec<SocketAddr> {
+    addresses
+        .iter()
+        .filter(|address| !address.ip().is_loopback() && !local.contains(&address.ip()))
+        .copied()
+        .collect()
 }
 
 async fn next_discovery_error(
@@ -1347,6 +1865,11 @@ impl Shared {
                     }
                 }
             }
+            SessionEventKind::Clipboard { clip } => self.keep_clipboard(event.peer, clip),
+            SessionEventKind::Layout { layout } => {
+                self.merge_layout(&event.peer, event.session_id, layout)
+                    .await;
+            }
             SessionEventKind::OutboundEnded => {
                 let active = self.active_outbound.lock().await.clone();
                 if active.as_ref().is_some_and(|active| {
@@ -1389,6 +1912,7 @@ impl Shared {
                     remove_session_if_current(&mut sessions, &event.peer, event.session_id);
                     final_metrics
                 };
+                self.dialed.lock().await.remove(&event.session_id);
                 if let Some(final_metrics) = final_metrics {
                     let mut history = self.metrics_history.lock().await;
                     if !history.contains_key(&event.peer) && history.len() == MAX_METRICS_HISTORY {
@@ -1428,7 +1952,7 @@ impl Shared {
     }
 
     async fn route_receiver_effects(
-        &self,
+        self: &Arc<Self>,
         peer: &str,
         session_id: u64,
         effects: Vec<ReceiverEffect>,
@@ -1451,13 +1975,12 @@ impl Shared {
         };
 
         let gate = *self.seat_gate.read().await;
-        let (admission, keyboard) = {
+        let (admission, keyboard, reverse_scroll) = {
             let config = self.config.read().await;
-            let keyboard = config
-                .peers
-                .get(peer)
-                .map_or(KeyboardMode::Standard, |record| record.keyboard);
-            (admit(&config, peer, gate), keyboard)
+            let record = config.peers.get(peer);
+            let keyboard = record.map_or(KeyboardMode::Standard, |record| record.keyboard);
+            let reverse_scroll = record.is_some_and(|record| record.reverse_scroll);
+            (admit(&config, peer, gate), keyboard, reverse_scroll)
         };
         let permitted = admission != Admission::Refuse;
         if opens {
@@ -1467,7 +1990,8 @@ impl Shared {
                 return Ok(false);
             }
             let mut owner = self.inbound_owner.lock().await;
-            if !claim_inbound(&mut owner, peer, session_id, permitted) {
+            let local = self.runtime.status().ownership;
+            if !claim_inbound(&mut owner, peer, session_id, permitted, local) {
                 drop(owner);
                 self.close_session(peer, session_id, SessionCloseReason::Superseded)
                     .await;
@@ -1475,10 +1999,11 @@ impl Shared {
             }
         }
 
-        let closed = effects
-            .iter()
-            .any(|effect| matches!(effect, ReceiverEffect::ActivationClosed { .. }));
-        let (deliver, mut rejected) = admitted_effects(effects, admission);
+        let closed = ends_closed(&effects);
+        let (mut deliver, mut rejected) = admitted_effects(effects, admission);
+        if reverse_scroll {
+            reverse_scrolling(&mut deliver);
+        }
         if !deliver.is_empty() {
             let safety_release = deliver.iter().all(is_safety_release);
             let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
@@ -1529,6 +2054,8 @@ impl Shared {
                 .is_some_and(|(owner_peer, owner_id)| owner_peer == peer && *owner_id == session_id)
             {
                 *owner = None;
+                // The pointer went back to `peer`, so the clipboard goes along.
+                self.share_clipboard(peer);
             }
         }
         if rejected {
@@ -1624,6 +2151,10 @@ impl Shared {
                 session.close(SessionCloseReason::PermissionRevoked);
             }
         }
+        // Pairing, forgetting or renaming a computer changes which tiles have
+        // a computer behind them here.
+        self.place_new_peers().await;
+        self.apply_layout().await;
         Ok(())
     }
 
@@ -1745,13 +2276,127 @@ mod tests {
     }
 
     #[test]
+    fn the_last_activation_effect_in_a_batch_decides_the_owner() {
+        let session = SessionContext {
+            session_epoch: SessionEpoch([1; 16]),
+            transport_generation: TransportGeneration(1),
+            activation_id: ActivationId(1),
+        };
+        let opened = ReceiverEffect::ActivationOpened(session);
+        let closed = ReceiverEffect::ActivationClosed {
+            session,
+            reason: SessionCloseReason::LocalRelease,
+        };
+        assert!(!ends_closed(&[]));
+        assert!(!ends_closed(std::slice::from_ref(&opened)));
+        assert!(!ends_closed(&[closed.clone(), opened.clone()]));
+        assert!(ends_closed(&[opened, closed]));
+    }
+
+    #[test]
     fn denied_activation_cannot_claim_the_inbound_owner() {
+        let idle = OwnershipPhase::Idle;
         let mut owner = None;
-        assert!(!claim_inbound(&mut owner, "denied", 1, false));
+        assert!(!claim_inbound(&mut owner, "denied", 1, false, idle));
         assert_eq!(owner, None);
-        assert!(claim_inbound(&mut owner, "authorized", 2, true));
+        assert!(claim_inbound(&mut owner, "authorized", 2, true, idle));
         assert_eq!(owner, Some(("authorized".to_owned(), 2)));
-        assert!(!claim_inbound(&mut owner, "denied", 1, true));
+        assert!(!claim_inbound(&mut owner, "denied", 1, true, idle));
+    }
+
+    #[test]
+    fn nearby_records_drop_this_computers_own_addresses() {
+        let own = "192.0.2.5".parse().unwrap();
+        let addresses: Vec<SocketAddr> = ["192.0.2.5:43119", "127.0.0.1:43119", "192.0.2.9:43119"]
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        assert_eq!(
+            remote_addresses(&addresses, &[own]),
+            ["192.0.2.9:43119".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn only_a_fresh_dial_by_the_lower_fingerprint_is_kept() {
+        let now = Instant::now();
+        assert!(keeps_own_dial(Some(now - Duration::from_secs(1)), now));
+        assert!(!keeps_own_dial(Some(now - CONNECT_TIMEOUT), now));
+        assert!(!keeps_own_dial(None, now));
+
+        let dir = tempfile::tempdir().unwrap();
+        let peer = Identity::load_or_create(dir.path()).unwrap();
+        let mut config = Config::default();
+        config.peers.insert(
+            "mac".into(),
+            PeerConfig::from_spki(peer.spki(), vec![], PeerPermissions::default()).unwrap(),
+        );
+        let theirs = peer.fingerprint_hex();
+        let lower = "0".repeat(theirs.len());
+        let higher = "f".repeat(theirs.len());
+        assert!(wins_dial(&config, &lower, "mac"));
+        assert!(!wins_dial(&config, &higher, "mac"));
+        assert!(!wins_dial(&config, &lower, "unknown"));
+    }
+
+    #[test]
+    fn reversed_scrolling_leaves_pointer_motion_alone() {
+        use crate::core::{MotionDelta, MotionSequence};
+        let motion = |dx, scroll_y| ReceiverEffect::Motion {
+            delta: MotionDelta {
+                dx,
+                dy: 0,
+                scroll_x: 3,
+                scroll_y,
+            },
+            through_sequence: MotionSequence(1),
+        };
+        let mut effects = vec![motion(5, -120), motion(-2, 0)];
+        reverse_scrolling(&mut effects);
+        assert_eq!(
+            effects,
+            vec![
+                ReceiverEffect::Motion {
+                    delta: MotionDelta {
+                        dx: 5,
+                        dy: 0,
+                        scroll_x: -3,
+                        scroll_y: 120
+                    },
+                    through_sequence: MotionSequence(1),
+                },
+                ReceiverEffect::Motion {
+                    delta: MotionDelta {
+                        dx: -2,
+                        dy: 0,
+                        scroll_x: -3,
+                        scroll_y: 0
+                    },
+                    through_sequence: MotionSequence(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_computer_that_is_sending_refuses_to_be_controlled() {
+        for local in [
+            OwnershipPhase::Arming,
+            OwnershipPhase::Remote,
+            OwnershipPhase::Releasing,
+        ] {
+            let mut owner = None;
+            assert!(!claim_inbound(&mut owner, "mac", 1, true, local));
+            assert_eq!(owner, None);
+        }
+        let mut owner = None;
+        assert!(claim_inbound(
+            &mut owner,
+            "mac",
+            1,
+            true,
+            OwnershipPhase::Idle
+        ));
     }
 
     #[test]
@@ -1769,6 +2414,7 @@ mod tests {
                     inject_prelogin: false,
                 },
                 keyboard: KeyboardMode::Standard,
+                reverse_scroll: false,
             },
         );
         assert!(receiver_authorized(
@@ -1857,6 +2503,7 @@ mod tests {
                     inject_prelogin: false,
                 },
                 keyboard: KeyboardMode::Standard,
+                reverse_scroll: false,
             },
         );
         config
@@ -1965,5 +2612,99 @@ mod tests {
         let (injected, refused) = admitted_effects(effects(), Admission::Inject);
         assert!(!refused);
         assert_eq!(injected.len(), 5);
+    }
+
+    fn fingerprint(n: u8) -> String {
+        format!("{n:064x}")
+    }
+
+    #[test]
+    fn the_first_layout_puts_each_paired_computer_right_of_this_one() {
+        let own = fingerprint(1);
+        let keys = BTreeMap::from([
+            ("mac".to_owned(), fingerprint(2)),
+            ("desk".to_owned(), fingerprint(3)),
+            // One computer paired twice gets one tile.
+            ("mac again".to_owned(), fingerprint(2)),
+        ]);
+        let layout = initial_layout(&own, 2560, 1440, &keys).unwrap();
+        assert_eq!((layout.version, &layout.editor), (0, &own));
+        let tiles: Vec<_> = layout
+            .tiles
+            .iter()
+            .map(|t| (t.key.clone(), t.x, t.y, t.width, t.height))
+            .collect();
+        assert_eq!(
+            tiles,
+            [
+                (own.clone(), 0, 0, 2560, 1440),
+                (fingerprint(3), 2560, 0, 1920, 1080),
+                (fingerprint(2), 4480, 0, 1920, 1080),
+            ]
+        );
+        assert_eq!(
+            initial_layout(&own, 2560, 1440, &BTreeMap::new())
+                .unwrap()
+                .tiles
+                .len(),
+            1,
+            "nothing paired yet"
+        );
+        let many: BTreeMap<_, _> = (2..40).map(|n| (n.to_string(), fingerprint(n))).collect();
+        assert_eq!(
+            initial_layout(&own, 2560, 1440, &many).unwrap().tiles.len(),
+            crate::desktop::MAX_SHARED_TILES
+        );
+        assert!(
+            initial_layout(
+                &own,
+                crate::app::layout_model::MAX_DIMENSION + 1,
+                1440,
+                &keys
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_move_snaps_and_makes_a_version_this_computer_edited() {
+        let own = fingerprint(1);
+        let keys = BTreeMap::from([("mac".to_owned(), fingerprint(2))]);
+        let mut layout = initial_layout(&own, 2560, 1440, &keys).unwrap();
+        // A peer made the last version, and it still holds a computer that
+        // is not paired here.
+        layout.version = 7;
+        layout.editor = fingerprint(9);
+        layout.tiles.push(crate::desktop::Tile {
+            key: fingerprint(5),
+            x: 0,
+            y: 5000,
+            width: 100,
+            height: 100,
+        });
+        let at = |layout: &crate::desktop::SharedLayout, key: &str| {
+            let tile = layout.tiles.iter().find(|t| t.key == key).unwrap();
+            (tile.x, tile.y)
+        };
+
+        // Dropped 20 units into this computer, it snaps against its left edge.
+        let moved = with_tile_moved(&layout, &own, &keys, "peer:mac", (-1900, 40), 150).unwrap();
+        assert_eq!((moved.version, &moved.editor), (8, &own));
+        assert_eq!(at(&moved, &fingerprint(2)), (-1920, 40));
+        assert_eq!(at(&moved, &own), (0, 0));
+        assert_eq!(moved.tiles.len(), 2, "the unpaired computer is left out");
+        // This computer's own tile moves by its view's id.
+        let moved = with_tile_moved(&moved, &own, &keys, "local", (0, 1100), 0).unwrap();
+        assert_eq!((moved.version, at(&moved, &own)), (9, (0, 1100)));
+
+        // A huge tolerance is capped rather than read as a negative one.
+        assert!(with_tile_moved(&layout, &own, &keys, "peer:mac", (-1900, 40), u32::MAX).is_ok());
+        let error = with_tile_moved(&layout, &own, &keys, "peer:desk", (0, 0), 0).unwrap_err();
+        assert!(
+            error.to_string().contains("no computer peer:desk"),
+            "{error}"
+        );
+        let error = with_tile_moved(&layout, &own, &keys, "peer:mac", (100, 100), 0).unwrap_err();
+        assert!(error.to_string().contains("overlap"), "{error}");
     }
 }

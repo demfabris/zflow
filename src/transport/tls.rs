@@ -26,7 +26,7 @@ use crate::identity::Identity;
 
 use super::TransportError;
 
-pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/2";
+pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/3";
 pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/4";
 const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 const INPUT_IDLE_TIMEOUT_MS: u32 = 15_000;
@@ -323,7 +323,8 @@ fn input_server_transport_config() -> quinn::TransportConfig {
 fn datagram_transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config
-        .max_concurrent_uni_streams(0_u8.into())
+        // Each clipboard transfer is one stream, and one at a time.
+        .max_concurrent_uni_streams(1_u8.into())
         .datagram_receive_buffer_size(Some(64 * 1_024))
         // A small Quinn queue bounds already-submitted stale data. The
         // application keeps one additional latest-wins slot and counts every

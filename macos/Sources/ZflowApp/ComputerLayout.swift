@@ -3,10 +3,8 @@ import SwiftUI
 struct ComputerLayout: View {
   var computers: [Computer]
   var move: (Computer, Int, Int, Int) -> Void
-  var forget: (String) -> Void
   @State private var dragging: String?
   @State private var translation = CGSize.zero
-  @State private var forgetting: Computer?
 
   var body: some View {
     GeometryReader { area in
@@ -24,19 +22,6 @@ struct ComputerLayout: View {
           accessibleComputer(computer, scale: scale, origin: origin)
         }
       }.clipped()
-    }
-    .confirmationDialog(
-      "Forget \(forgetting?.label ?? "computer")?",
-      isPresented: Binding(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }),
-      titleVisibility: .visible
-    ) {
-      Button("Forget Computer", role: .destructive) {
-        if let name = forgetting?.peer { forget(name) }
-        forgetting = nil
-      }
-      Button("Cancel", role: .cancel) { forgetting = nil }
-    } message: {
-      Text("You will need to pair again to share input with this computer.")
     }
   }
 
@@ -81,11 +66,6 @@ struct ComputerLayout: View {
   ) -> some View {
     positionedComputer(computer, scale: scale, origin: origin)
       .gesture(dragGesture(for: computer, scale: scale))
-      .contextMenu {
-        if computer.peer != nil {
-          Button("Forget Computer…", role: .destructive) { forgetting = computer }
-        }
-      }
   }
 
   private func dragGesture(for computer: Computer, scale: CGFloat) -> some Gesture {

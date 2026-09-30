@@ -61,6 +61,8 @@ pub enum TransportError {
     PairingCodeMismatch,
     #[error("peer sent an invalid pairing key exchange")]
     PairingKeyExchange,
+    #[error("clipboard stream failed: {0}")]
+    Clipboard(String),
 }
 
 impl From<quinn::ConnectionError> for TransportError {

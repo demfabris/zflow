@@ -28,8 +28,8 @@ struct OnboardingView: View {
   private var facts: SetupFacts {
     SetupFacts(
       needsMove: AppLocation.main.needsMove && !movedOn,
-      accessibility: model.snapshot?.accessibility ?? false,
-      localNetwork: model.snapshot?.localNetwork == "allowed",
+      accessibility: model.snapshot?.platform.accessibility ?? false,
+      localNetwork: model.snapshot?.platform.localNetwork == "allowed",
       peers: model.snapshot?.peers.count ?? 0)
   }
 
@@ -61,11 +61,11 @@ struct OnboardingView: View {
         if showing == .accessibility || showing == .localNetwork { bringToFront() }
       }
     }
-    .onChange(of: model.snapshot?.peers ?? []) { old, new in
+    .onChange(of: model.snapshot?.peerNames ?? []) { old, new in
       if let added = new.first(where: { !old.contains($0) }) { newestPeer = added }
     }
-    .onChange(of: model.snapshot?.status) { _, status in
-      if status == "sharing" && current == .tryIt { shared = true }
+    .onChange(of: model.snapshot?.status.state) { _, state in
+      if state == "controlling" && current == .tryIt { shared = true }
     }
     .onChange(of: model.snapshot?.pairing.state) { _, state in
       // Pairing saves the computer to the file; read it now instead of at
@@ -109,7 +109,7 @@ struct OnboardingView: View {
       case .accessibility:
         (
           "accessibility", "Allow Accessibility",
-          "zflow needs Accessibility access to send your keyboard and trackpad to the other computer."
+          "zflow needs Accessibility access to share your keyboard and trackpad with your other computers."
         )
       case .localNetwork:
         (
@@ -118,7 +118,7 @@ struct OnboardingView: View {
         )
       case .computers:
         (
-          "desktopcomputer", "Pair Your Linux Computer",
+          "desktopcomputer", "Pair Your Other Computer",
           "Computers running zflow on this network show up here. Pair one and type the code it shows."
         )
       case .tryIt:
@@ -170,7 +170,7 @@ struct OnboardingView: View {
 
   @ViewBuilder private var computers: some View {
     let nearby = model.snapshot?.nearby ?? []
-    let peers = model.snapshot?.peers ?? []
+    let peers = model.snapshot?.peerNames ?? []
     VStack(alignment: .leading, spacing: 12) {
       if !peers.isEmpty {
         status("Paired with \(peers.formatted(.list(type: .and))).", .done)
@@ -179,11 +179,10 @@ struct OnboardingView: View {
         ScrollView {
           VStack(spacing: 0) {
             ForEach(nearby) { computer in
-              // Receivers list IPv4 first and advertise their input port.
-              let address = computer.addresses.first.map(PairingView.pairingAddress)
+              let address = computer.pairAddress
               HStack {
                 Label(
-                  "Linux computer · \(address.map(PairingView.host) ?? "unknown address")",
+                  "Computer · \(address.map(PairingView.host) ?? "unknown address")",
                   systemImage: "desktopcomputer")
                 Spacer()
                 if let address, computer.compatible {
@@ -204,7 +203,7 @@ struct OnboardingView: View {
         status("Looking for computers on this network…", .waiting)
       } else {
         Text(
-          "Nothing found yet. Install zflow on your Linux computer; it shows up here once it runs."
+          "Nothing found yet. Install zflow on your other computer; it shows up here once it runs."
         )
         .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         HStack(alignment: .top) {
@@ -230,7 +229,7 @@ struct OnboardingView: View {
     let (text, state) = sharingStatus
     VStack(alignment: .leading, spacing: 10) {
       status(text, state)
-      if model.snapshot?.status == "paused" {
+      if model.snapshot?.status.state == "paused" {
         Button("Resume Sharing") {
           model.send(CoreRequest(command: "set_sharing", enabled: true))
         }
@@ -254,18 +253,19 @@ struct OnboardingView: View {
 
   private var sharingStatus: (String, Status) {
     guard let snapshot = model.snapshot else { return ("Starting zflow…", .waiting) }
-    let peer = newestPeer ?? snapshot.peers.first ?? "the other computer"
-    if snapshot.status == "sharing" {
-      return ("You're controlling \(peer). Move back to return.", .done)
+    let peer = newestPeer ?? snapshot.peerNames.first ?? "the other computer"
+    if snapshot.status.state == "controlling" {
+      return ("You're controlling \(snapshot.status.peer ?? peer). Move back to return.", .done)
     }
     if shared { return ("It works. Your pointer is back on this Mac.", .done) }
-    switch snapshot.status {
+    switch snapshot.status.state {
     case "ready": return ("Ready when you are.", .waiting)
     case "checking": return ("Connecting to \(peer)…", .waiting)
     case "paused": return ("Sharing is paused.", .problem)
     default:
-      if !snapshot.accessibility { return ("Allow Accessibility first.", .problem) }
-      return (snapshot.receiverError ?? snapshot.layoutError ?? snapshot.notice, .problem)
+      if !snapshot.platform.accessibility { return ("Allow Accessibility first.", .problem) }
+      let problem = snapshot.health.first { $0.level != "ok" }
+      return (problem?.detail ?? snapshot.status.title, .problem)
     }
   }
 
@@ -346,7 +346,7 @@ struct OnboardingView: View {
       var checks = 0
       while !Task.isCancelled && !facts.localNetwork {
         await model.perform(CoreRequest(command: "discover"), quiet: true)
-        checks = model.snapshot?.localNetwork == "blocked" ? checks + 1 : 0
+        checks = model.snapshot?.platform.localNetwork == "blocked" ? checks + 1 : 0
         blocked = checks > 4
         try? await Task.sleep(for: .seconds(1))
       }

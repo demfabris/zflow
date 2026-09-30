@@ -2,7 +2,7 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
-import {Client, compatible, statusText} from './client.js';
+import {Client, compatible, needsAttention, statusText} from './client.js';
 
 export class Indicator {
     constructor() {
@@ -33,10 +33,12 @@ export class Indicator {
         const title = statusText(snapshot);
         this._status.label.text = title;
         this._button.accessible_name = `zflow, ${title}`;
-        this._sharing.setToggleState(snapshot.daemon?.sharing ?? false);
-        this._sharing.setSensitive(!!snapshot.daemon && !this._busy);
-        this._icon.icon_name = !snapshot.daemon || !compatible(snapshot) || (snapshot.daemon.sharing && !snapshot.desktop_ready)
-            ? 'dialog-warning-symbolic' : snapshot.daemon.sharing ? 'input-mouse-symbolic' : 'media-playback-pause-symbolic';
+        // The service answers sharing as null while it cannot be reached.
+        const sharing = compatible(snapshot) ? snapshot.sharing : null;
+        this._sharing.setToggleState(sharing ?? false);
+        this._sharing.setSensitive(sharing !== null && !this._busy);
+        this._icon.icon_name = needsAttention(snapshot) ? 'dialog-warning-symbolic'
+            : sharing ? 'input-mouse-symbolic' : 'media-playback-pause-symbolic';
     }
 
     async _run(request) {

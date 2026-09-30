@@ -1,13 +1,14 @@
 //! Application services shared by the native Mac app and Linux desktop agent.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod api;
 #[cfg(target_os = "linux")]
 mod desktop;
 #[cfg(target_os = "linux")]
 pub mod desktop_agent;
 #[cfg(target_os = "linux")]
 pub mod gnome;
-#[cfg(target_os = "macos")]
-mod handoff;
+pub(crate) mod handoff;
 pub mod layout_model;
 pub mod model;
 #[cfg(target_os = "macos")]

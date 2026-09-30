@@ -4,7 +4,7 @@ import vm from 'node:vm';
 
 const timers = new Map();
 const calls = [];
-let snapshot = {daemon: {sharing: true, peers: {Mac: {}}, connected: [], receiving_from: 'Mac'}, desktop_ready: true};
+let snapshot = {api: 2, status: {state: 'controlled', peer: 'Mac', title: 'Controlled by Mac'}, sharing: true, health: []};
 const context = {
     GLib: {
         Variant: class { constructor(_type, value) { this.value = value; } },
@@ -19,7 +19,10 @@ const context = {
             call(_bus, _path, _interface, _method, parameters, _type, flags, _timeout, cancel, callback) {
                 const request = JSON.parse(parameters.value[0]);
                 calls.push({request, flags});
-                if (request.command === 'set_sharing') snapshot.daemon.sharing = request.enabled;
+                if (request.command === 'set_sharing') {
+                    snapshot.sharing = request.enabled;
+                    snapshot.status = {state: 'paused', peer: null, title: 'Paused'};
+                }
                 queueMicrotask(() => callback({call_finish() {
                     if (cancel.is_cancelled()) throw new Error('cancelled');
                     return {deep_unpack: () => [JSON.stringify(request.command === 'snapshot' ? snapshot : {ok: true})]};
@@ -53,20 +56,26 @@ for (const file of ['client', 'indicator']) {
 const panel = new context.TestIndicator();
 await new Promise(setImmediate);
 assert.equal(calls[0].flags, 1, 'panel reads must not override disabled login startup');
-assert.equal(panel._status.label.text, 'Receiving from Mac');
+assert.equal(panel._status.label.text, 'Controlled by Mac');
 await panel._run({command: 'set_sharing', enabled: false});
 await new Promise(setImmediate);
-assert.equal(panel._status.label.text, 'Sharing paused');
+assert.equal(panel._status.label.text, 'Paused');
 assert.equal(panel._sharing.state, false);
 assert.equal(panel._icon.icon_name, 'media-playback-pause-symbolic');
 // An agent from another API level gets "Update zflow" instead of a broken menu.
-snapshot.api = 2;
+snapshot.api = 3;
 await panel._client.refresh();
 assert.equal(panel._status.label.text, 'Update zflow');
 assert.equal(panel._icon.icon_name, 'dialog-warning-symbolic');
-snapshot.api = 1;
+snapshot.api = 2;
 await panel._client.refresh();
-assert.equal(panel._status.label.text, 'Sharing paused');
+assert.equal(panel._status.label.text, 'Paused');
+// A failing check warns even while the menu has nothing else to say.
+snapshot.health = [{id: 'service', level: 'error', title: 'Background service', detail: 'down', action: null}];
+snapshot.sharing = null;
+await panel._client.refresh();
+assert.equal(panel._icon.icon_name, 'dialog-warning-symbolic');
+assert.equal(panel._sharing.sensitive, false);
 panel.destroy();
 assert.equal(timers.size, 0, 'disable removes panel polling');
 assert.ok(panel._button.destroyed);

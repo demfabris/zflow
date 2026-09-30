@@ -333,7 +333,7 @@ async fn refusing_crossings<T>(
         tokio::select! {
             output = &mut work => return Some(output),
             command = commands.recv() => match command {
-                Some(command) => refuse(command, "the receiver is not connected"),
+                Some(command) => refuse(command, "the other computer is not connected"),
                 None => return None,
             },
         }
@@ -355,7 +355,7 @@ async fn wait_to_retry(
             Ok(()) = nearby.changed() => return true,
             command = commands.recv() => match command {
                 Some(Command::Retry) => return true,
-                Some(command) => refuse(command, "the receiver is not connected"),
+                Some(command) => refuse(command, "the other computer is not connected"),
                 None => return false,
             },
         }
@@ -461,7 +461,7 @@ impl Session {
                 command = commands.recv() => match command {
                     None => return None,
                     Some(Command::Retry) => ready = self.snapshot(state).await,
-                    Some(command) if !ready => refuse(command, "the receiver is not ready"),
+                    Some(command) if !ready => refuse(command, "the other computer is not ready"),
                     Some(Command::Cross { handoff, reduce_wifi_latency, stop, status }) => {
                         let context = self.next_context();
                         let activation = Activation {
@@ -500,7 +500,7 @@ impl Session {
                 match response {
                     DesktopResponse::Snapshot { geometry, .. } => Ok(geometry),
                     DesktopResponse::Unavailable { reason } => bail!("{reason}"),
-                    _ => bail!("Unexpected receiver response"),
+                    _ => bail!("Unexpected response from the other computer"),
                 }
             });
         let ready = geometry.is_ok();
@@ -662,7 +662,9 @@ mod tests {
                             SessionEventKind::Closed { .. } => {
                                 let _ = closed_tx.send(event.session_id);
                             }
-                            SessionEventKind::OutboundEnded => {}
+                            SessionEventKind::OutboundEnded
+                            | SessionEventKind::Layout { .. }
+                            | SessionEventKind::Clipboard { .. } => {}
                         }
                     }
                 });

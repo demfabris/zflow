@@ -1,45 +1,93 @@
+import AppKit
 import SwiftUI
 
+/// The top sections match the GNOME settings window, in the order of
+/// src/app/api.rs Snapshot. The last section is for this Mac only.
 struct SettingsView: View {
   @Bindable var model: AppModel
+  @State private var forgetting: String?
+
   var body: some View {
-    VStack(spacing: 0) {
-      HStack {
-        Text("zflow").font(.title2.weight(.semibold))
-        Spacer()
-        Button {
-          model.showingHealth.toggle()
-        } label: {
-          Label(
-            model.title,
-            systemImage: model.healthy ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
-          )
-          .foregroundStyle(model.healthy ? .green : .secondary)
-        }
-        .buttonStyle(.borderless)
-        .popover(isPresented: $model.showingHealth, arrowEdge: .bottom) {
-          HealthView(model: model).frame(width: 400).padding(20)
-        }
-      }.padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 18)
+    Group {
       if let snapshot = model.snapshot {
-        VStack(alignment: .leading, spacing: 12) {
-          HStack {
-            Text("Your computers").font(.headline)
-            Spacer()
-            Button("Pair Computer…", systemImage: "plus") {
-              // Browsing waits for a reason to ask macOS for Local Network access.
-              model.send(CoreRequest(command: "discover"))
-              model.showingPairing = true
+        form(snapshot)
+      } else {
+        VStack(spacing: 12) {
+          ContentUnavailableView(
+            "Settings could not load", systemImage: "exclamationmark.triangle",
+            description: Text(model.error ?? "Starting zflow…"))
+          Button("Try Again") { model.send(CoreRequest(command: "reload")) }
+        }
+        .frame(height: 320).padding(.bottom, 24)
+      }
+    }
+    .frame(width: 600)
+    .sheet(
+      isPresented: $model.showingPairing,
+      onDismiss: { model.send(CoreRequest(command: "pair_cancel")) },
+      content: { PairingView(model: model) }
+    )
+    .confirmationDialog(
+      "Forget \(forgetting ?? "computer")?",
+      isPresented: Binding(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }),
+      titleVisibility: .visible
+    ) {
+      Button("Forget Computer", role: .destructive) {
+        if let name = forgetting { model.send(CoreRequest(command: "forget", name: name)) }
+        forgetting = nil
+      }
+      Button("Cancel", role: .cancel) { forgetting = nil }
+    } message: {
+      Text(
+        "This stops input between the two computers and removes its trusted identity. Pair it again to reconnect."
+      )
+    }
+  }
+
+  private func form(_ snapshot: Snapshot) -> some View {
+    Form {
+      Section {
+        HStack(spacing: 10) {
+          let badge = Self.badge(snapshot.status.state)
+          Image(systemName: badge.0).font(.title).foregroundStyle(badge.1)
+          Text(snapshot.status.title).font(.title2.weight(.semibold))
+        }
+        .accessibilityElement(children: .combine)
+        Toggle(
+          isOn: Binding(
+            get: { snapshot.sharing == true },
+            set: { model.send(CoreRequest(command: "set_sharing", enabled: $0)) })
+        ) {
+          Text("Input Sharing")
+          Text("Allow input to move between paired computers.")
+        }
+        .disabled(snapshot.sharing == nil)
+      }
+      if !snapshot.health.isEmpty {
+        Section("Checks") {
+          ForEach(snapshot.health) { row in
+            CheckRow(title: row.title, detail: row.detail, level: row.level) {
+              if let action = row.action {
+                Button(action.label) { model.fix(action) }
+              }
             }
           }
+        }
+      }
+      // Requests that failed; checks that fail are in the section above.
+      if let message = model.error ?? model.services.error {
+        Section {
+          CheckRow(title: "Needs attention", detail: message, level: "warning") {}
+        }
+      }
+      Section("Computers") {
+        if let layout = snapshot.layout {
           ComputerLayout(
-            computers: snapshot.layout.monitors,
+            computers: layout.monitors,
             move: { computer, x, y, tolerance in
               model.send(
-                CoreRequest(command: "move", id: computer.id, x: x, y: y, tolerance: tolerance))
-            },
-            forget: { name in
-              model.send(CoreRequest(command: "forget", name: name))
+                CoreRequest(
+                  command: "move_tile", id: computer.id, x: x, y: y, tolerance: tolerance))
             }
           )
           .frame(height: 235)
@@ -49,156 +97,167 @@ struct SettingsView: View {
               : "Drag to match your desk. Touching edges let your pointer cross."
           )
           .font(.callout).foregroundStyle(.secondary)
-        }.padding(.horizontal, 24)
-        Form {
-          Section {
-            Toggle(
-              "Block AWDL while sharing",
-              isOn: Binding(
-                get: { snapshot.blockAwdl },
-                set: { model.send(CoreRequest(command: "set_awdl", enabled: $0)) }))
-            Text(
-              "Reduces Wi-Fi interference. AirDrop and Continuity may pause while you control another computer."
-            )
-            .font(.caption).foregroundStyle(.secondary)
-            if snapshot.blockAwdl && !model.services.helperReady {
-              LabeledContent(model.services.helperTitle) {
-                Button(model.services.helperAction) { model.fixHelper() }
-                  .disabled(model.services.helperBusy || !model.services.hasSigningTeam)
-              }
-              if !model.services.hasSigningTeam {
-                Text(model.services.helperDetail).font(.caption).foregroundStyle(.secondary)
-              }
+        }
+        // Control switch and keyboard picker wait until this Mac takes input (Phase 2).
+        ForEach(snapshot.peers) { peer in
+          LabeledContent {
+            Button("Forget \(peer.name)…", systemImage: "trash") { forgetting = peer.name }
+              .labelStyle(.iconOnly).buttonStyle(.borderless)
+              .help("Forget \(peer.name)")
+          } label: {
+            Label {
+              Text(peer.name)
+              Text(peer.detail).textSelection(.enabled)
+            } icon: {
+              Image(systemName: "display")
             }
           }
-          Section {
-            Toggle(
-              "Open at login",
-              isOn: Binding(
-                get: { model.services.loginEnabled },
-                set: { enabled in Task { await model.services.setLogin(enabled) } }))
+        }
+        HStack {
+          Spacer()
+          Button("Pair Computer…", systemImage: "plus") {
+            // Browsing waits for a reason to ask macOS for Local Network access.
+            model.send(CoreRequest(command: "discover"))
+            model.showingPairing = true
           }
-        }.formStyle(.grouped).scrollDisabled(true)
-          .frame(height: snapshot.blockAwdl && !model.services.helperReady ? 245 : 165)
-      } else {
-        ContentUnavailableView(
-          "Settings could not load", systemImage: "exclamationmark.triangle",
-          description: Text(model.error ?? "Starting zflow…")
+          .disabled(snapshot.sharing == nil)
+        }
+      }
+      if !snapshot.shortcuts.isEmpty {
+        Section("Shortcuts") {
+          ForEach(snapshot.shortcuts, id: \.title) { shortcut in
+            LabeledContent(shortcut.title) {
+              Text(shortcut.keys).monospaced().textSelection(.enabled)
+            }
+          }
+        }
+      }
+      Section {
+        Toggle(
+          "Start at Login",
+          isOn: Binding(
+            get: { model.services.loginEnabled },
+            set: { enabled in Task { await model.services.setLogin(enabled) } })
         )
-        .frame(height: 320)
-        Button("Try Again") { model.send(CoreRequest(command: "reload")) }
+        // A login item would point at the disk image or a temporary copy.
+        .disabled(AppLocation.main.needsMove)
+        LabeledContent("Advanced configuration") {
+          Button("Open Configuration…") { model.openConfig() }
+        }
+      } footer: {
+        Text("Changes save automatically.").font(.caption).foregroundStyle(.tertiary)
       }
-      if let message = model.error ?? model.services.error ?? model.snapshot?.configError {
-        HStack(alignment: .top) {
-          Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-          Text(message).font(.callout).textSelection(.enabled)
-          Spacer(minLength: 0)
-        }.padding(.horizontal, 24).padding(.bottom, 12)
+      Section("This Mac") {
+        MacRows(model: model, platform: snapshot.platform)
       }
-      Divider()
-      HStack {
-        Button("Open Configuration…") { model.openConfig() }.buttonStyle(.link)
-        Spacer()
-        Text("Changes save automatically").foregroundStyle(.tertiary).font(.caption)
-      }.padding(.horizontal, 24).padding(.vertical, 16)
     }
-    .frame(width: 600)
-    .sheet(
-      isPresented: $model.showingPairing,
-      onDismiss: { model.send(CoreRequest(command: "pair_cancel")) },
-      content: { PairingView(model: model) }
-    )
+    .formStyle(.grouped)
+    .frame(height: 640)
+  }
+
+  static func badge(_ state: String) -> (String, Color) {
+    switch state {
+    case "ready": ("checkmark.circle.fill", .green)
+    case "controlling", "controlled": ("arrow.left.arrow.right.circle.fill", .accentColor)
+    case "paused": ("pause.circle.fill", .secondary)
+    case "checking": ("clock.fill", .secondary)
+    case "setup": ("plus.circle.fill", .secondary)
+    default: ("exclamationmark.circle.fill", .orange)
+    }
   }
 }
 
-struct HealthView: View {
-  @Bindable var model: AppModel
+/// Accessibility, Local Network, Reduce Wi-Fi lag with its helper, and Move
+/// to Applications when zflow runs from somewhere it cannot stay.
+private struct MacRows: View {
+  var model: AppModel
+  var platform: MacPlatform
+
   var body: some View {
-    VStack(alignment: .leading, spacing: 18) {
-      Text(model.title).font(.title3.bold())
-      if let state = model.snapshot {
-        check(
-          "Accessibility",
-          detail: state.accessibility
-            ? "Keyboard and pointer access allowed."
-            : "Allow zflow to send keyboard and pointer input.", ready: state.accessibility
-        ) {
-          if !state.accessibility { Button("Allow…") { model.openAccessibility() } }
+    CheckRow(
+      title: "Accessibility",
+      detail: platform.accessibility
+        ? "Keyboard and pointer access allowed."
+        : "Allow zflow to share keyboard and pointer input.",
+      level: platform.accessibility ? "ok" : "error"
+    ) {
+      if !platform.accessibility { Button("Allow…") { model.openAccessibility() } }
+    }
+    let (network, networkLevel) = localNetwork
+    CheckRow(title: "Local Network", detail: network, level: networkLevel) {
+      if platform.localNetwork != "allowed" {
+        Button("Settings…") { model.openLocalNetwork() }
+      }
+    }
+    Toggle(
+      isOn: Binding(
+        get: { platform.blockAwdl },
+        set: { model.send(CoreRequest(command: "set_awdl", enabled: $0)) })
+    ) {
+      Text("Reduce Wi-Fi lag")
+      Text("Pauses AirDrop and Continuity while you control another computer.")
+    }
+    if platform.blockAwdl {
+      CheckRow(
+        title: model.services.helperTitle, detail: model.services.helperDetail,
+        level: model.services.helperReady ? "ok" : "warning"
+      ) {
+        if !model.services.helperReady {
+          Button(model.services.helperAction) { model.fixHelper() }
+            .disabled(model.services.helperBusy || !model.services.hasSigningTeam)
         }
-        if state.localNetwork == "unknown" {
-          HStack(alignment: .top) {
-            Image(systemName: "network").foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 4) {
-              Text("Local network").fontWeight(.medium)
-              Text("Allow zflow if nearby computers do not appear.").font(.callout).foregroundStyle(
-                .secondary)
-            }
-            Spacer()
-            Button("Settings…") { model.openLocalNetwork() }
-          }
-        } else {
-          check(
-            "Local network",
-            detail: state.localNetwork == "allowed"
-              ? "zflow can reach computers on this network."
-              : "Turn on zflow in Privacy & Security → Local Network.",
-            ready: state.localNetwork == "allowed"
-          ) {
-            if state.localNetwork != "allowed" {
-              Button("Settings…") { model.openLocalNetwork() }
-            }
-          }
+      }
+    }
+    if AppLocation.main.needsMove {
+      CheckRow(
+        title: "Move to Applications",
+        detail:
+          "zflow is running from a disk image or a temporary folder. Drag it into Applications, then open it from there.",
+        level: "warning"
+      ) {
+        Button("Show Applications") {
+          NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications"))
         }
-        if state.blockAwdl {
-          check(
-            model.services.helperTitle, detail: model.services.helperDetail,
-            ready: model.services.helperReady
-          ) {
-            if !model.services.helperReady {
-              Button(model.services.helperAction) { model.fixHelper() }
-                .disabled(model.services.helperBusy || !model.services.hasSigningTeam)
-            }
-          }
-        }
-        check(
-          "Receiver",
-          detail: state.receiverError
-            ?? (state.receiverChecked
-              ? "Authenticated and checked before sharing was armed."
-              : state.checking
-                ? "Checking the paired receiver…"
-                : "Pair a computer and allow access to check its receiver."),
-          ready: state.receiverChecked
-        ) {
-          if !state.peers.isEmpty && !state.receiverChecked {
-            Button("Retry") { model.send(CoreRequest(command: "retry")) }.disabled(state.checking)
-          }
-        }
-        if let issue = state.layoutError {
-          Text(issue).font(.callout).foregroundStyle(.secondary)
-        }
-        if let issue = state.configError {
-          Text(issue).font(.callout).foregroundStyle(.orange)
-          Button("Open Configuration…") { model.openConfig() }
-        }
-        Divider()
-        Text(state.notice).font(.callout).foregroundStyle(.secondary)
-        Text("Emergency return: ⌃⌘⌫").font(.caption)
       }
     }
   }
-  func check<Action: View>(
-    _ title: String, detail: String, ready: Bool, @ViewBuilder action: () -> Action
-  ) -> some View {
+
+  private var localNetwork: (String, String) {
+    switch platform.localNetwork {
+    case "allowed": ("zflow can reach computers on this network.", "ok")
+    case "blocked": ("Turn on zflow in Privacy & Security → Local Network.", "error")
+    default: ("Allow zflow if nearby computers do not appear.", "unknown")
+    }
+  }
+}
+
+/// One checked item: its state, what it means, and a fix when there is one.
+struct CheckRow<Action: View>: View {
+  var title: String
+  var detail: String
+  /// ok, warning or error; anything else has not been checked yet.
+  var level: String
+  @ViewBuilder var action: () -> Action
+
+  var body: some View {
     HStack(alignment: .top, spacing: 10) {
-      Image(systemName: ready ? "checkmark.circle.fill" : "exclamationmark.circle").foregroundStyle(
-        ready ? .green : .orange)
-      VStack(alignment: .leading, spacing: 4) {
-        Text(title).fontWeight(.medium)
-        Text(detail).font(.callout).foregroundStyle(.secondary)
+      Image(systemName: mark.0).foregroundStyle(mark.1)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(title)
+        Text(detail).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+          .fixedSize(horizontal: false, vertical: true)
       }
       Spacer(minLength: 4)
       action()
+    }
+  }
+
+  private var mark: (String, Color) {
+    switch level {
+    case "ok": ("checkmark.circle.fill", .green)
+    case "warning": ("exclamationmark.triangle.fill", .orange)
+    case "error": ("exclamationmark.circle.fill", .red)
+    default: ("circle.dashed", .secondary)
     }
   }
 }

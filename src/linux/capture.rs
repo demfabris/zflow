@@ -96,28 +96,60 @@ pub struct GrabError {
     pub rollback_failures: Vec<UngrabFailure>,
 }
 
-fn grab_transaction<T: GrabTarget>(targets: &mut [T]) -> Result<(), GrabError> {
+/// Grabs every target or none. With `skip_busy`, a target another program
+/// already grabbed (EBUSY) is skipped instead, as long as at least one other
+/// target is grabbed; the skipped paths are returned. A skipped target was
+/// never ours, so rollback never releases it.
+fn grab_transaction<T: GrabTarget>(
+    targets: &mut [T],
+    skip_busy: bool,
+) -> Result<Vec<PathBuf>, GrabError> {
+    let mut grabbed = Vec::with_capacity(targets.len());
+    let mut skipped = Vec::new();
     for index in 0..targets.len() {
-        if let Err(source) = targets[index].take_grab() {
-            let path = targets[index].target_path().to_owned();
-            let mut rollback_failures = Vec::new();
-            for target in targets[..index].iter_mut().rev() {
-                if let Err(error) = target.release_grab() {
-                    rollback_failures.push(UngrabFailure {
-                        path: target.target_path().to_owned(),
-                        error,
-                    });
-                }
+        let path = targets[index].target_path().to_owned();
+        match targets[index].take_grab() {
+            Ok(()) => grabbed.push(index),
+            Err(error) if skip_busy && error.raw_os_error() == Some(libc::EBUSY) => {
+                skipped.push(path);
             }
-            return Err(GrabError {
-                path,
-                source,
-                rolled_back: index,
-                rollback_failures,
+            Err(source) => return Err(roll_back(targets, &grabbed, path, source)),
+        }
+    }
+    if grabbed.is_empty()
+        && let Some(path) = skipped.pop()
+    {
+        return Err(GrabError {
+            path,
+            source: io::Error::from_raw_os_error(libc::EBUSY),
+            rolled_back: 0,
+            rollback_failures: Vec::new(),
+        });
+    }
+    Ok(skipped)
+}
+
+fn roll_back<T: GrabTarget>(
+    targets: &mut [T],
+    grabbed: &[usize],
+    path: PathBuf,
+    source: io::Error,
+) -> GrabError {
+    let mut rollback_failures = Vec::new();
+    for &index in grabbed.iter().rev() {
+        if let Err(error) = targets[index].release_grab() {
+            rollback_failures.push(UngrabFailure {
+                path: targets[index].target_path().to_owned(),
+                error,
             });
         }
     }
-    Ok(())
+    GrabError {
+        path,
+        source,
+        rolled_back: grabbed.len(),
+        rollback_failures,
+    }
 }
 
 #[derive(Debug, Error)]
@@ -236,6 +268,18 @@ impl CaptureSet {
         self.grabbed
     }
 
+    /// Takes every node's held keys from the kernel. A node another program
+    /// grabbed, as keyd grabs its source keyboard, sends zflow no events, so
+    /// a key held on it when zflow opened it would otherwise stay held here
+    /// and block every activation.
+    pub fn resync_held(&mut self) {
+        for node in &self.nodes {
+            if let Ok(held) = node.device.get_key_state() {
+                self.aggregate.resync_held(&node.path, held.iter());
+            }
+        }
+    }
+
     /// Performs fresh EVIOCGKEY checks over every node. Unlike the tracked
     /// state this closes the arming gap after startup or a dropped frame.
     pub fn kernel_is_neutral(&self) -> Result<bool, CaptureSetError> {
@@ -256,12 +300,17 @@ impl CaptureSet {
 
     /// Acquires every EVIOCGRAB or none. Neutrality is checked both before and
     /// after the transaction; an input racing the ioctl causes full rollback.
-    pub fn grab_all(&mut self) -> Result<(), CaptureSetError> {
+    ///
+    /// With `skip_busy`, used when capturing every keyboard and pointer, a
+    /// node another program already grabbed is left to it and returned. A
+    /// remapper such as keyd holds its source that way and re-emits on a
+    /// virtual node, which is grabbed instead.
+    pub fn grab_all(&mut self, skip_busy: bool) -> Result<Vec<PathBuf>, CaptureSetError> {
         if self.nodes.is_empty() {
             return Err(CaptureSetError::Empty);
         }
         if self.grabbed {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if !self.aggregate.is_neutral() || !self.aggregate.all_at_boundary() {
             return Err(CaptureSetError::NotNeutral);
@@ -269,11 +318,11 @@ impl CaptureSet {
         if !self.kernel_is_neutral()? {
             return Err(CaptureSetError::NotNeutral);
         }
-        grab_transaction(&mut self.nodes)?;
+        let skipped = grab_transaction(&mut self.nodes, skip_busy)?;
         self.grabbed = true;
 
         match self.kernel_is_neutral() {
-            Ok(true) => Ok(()),
+            Ok(true) => Ok(skipped),
             Ok(false) => {
                 let _ = self.ungrab_all();
                 Err(CaptureSetError::NotNeutral)
@@ -285,6 +334,8 @@ impl CaptureSet {
         }
     }
 
+    /// Releases only nodes this process grabbed. A node skipped as busy stays
+    /// with the program that holds it.
     pub fn ungrab_all(&mut self) -> Vec<UngrabFailure> {
         let mut failures = Vec::new();
         for node in self.nodes.iter_mut().rev() {
@@ -577,10 +628,31 @@ mod tests {
     #[derive(Debug)]
     struct FakeTarget {
         path: PathBuf,
-        fail_grab: bool,
+        /// The errno a grab fails with, such as EBUSY for a node another
+        /// program already grabbed.
+        grab_error: Option<i32>,
         fail_release: bool,
         grabbed: bool,
         releases: usize,
+    }
+
+    impl FakeTarget {
+        fn new(path: &str) -> Self {
+            Self {
+                path: path.into(),
+                grab_error: None,
+                fail_release: false,
+                grabbed: false,
+                releases: 0,
+            }
+        }
+
+        fn failing(path: &str, errno: i32) -> Self {
+            Self {
+                grab_error: Some(errno),
+                ..Self::new(path)
+            }
+        }
     }
 
     impl GrabTarget for FakeTarget {
@@ -589,8 +661,8 @@ mod tests {
         }
 
         fn take_grab(&mut self) -> io::Result<()> {
-            if self.fail_grab {
-                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            if let Some(errno) = self.grab_error {
+                return Err(io::Error::from_raw_os_error(errno));
             }
             self.grabbed = true;
             Ok(())
@@ -609,29 +681,11 @@ mod tests {
     #[test]
     fn grab_failure_rolls_back_every_earlier_device() {
         let mut targets = [
-            FakeTarget {
-                path: "one".into(),
-                fail_grab: false,
-                fail_release: false,
-                grabbed: false,
-                releases: 0,
-            },
-            FakeTarget {
-                path: "two".into(),
-                fail_grab: false,
-                fail_release: false,
-                grabbed: false,
-                releases: 0,
-            },
-            FakeTarget {
-                path: "three".into(),
-                fail_grab: true,
-                fail_release: false,
-                grabbed: false,
-                releases: 0,
-            },
+            FakeTarget::new("one"),
+            FakeTarget::new("two"),
+            FakeTarget::failing("three", libc::EPERM),
         ];
-        let error = grab_transaction(&mut targets).unwrap_err();
+        let error = grab_transaction(&mut targets, false).unwrap_err();
         assert_eq!(error.path, PathBuf::from("three"));
         assert_eq!(error.rolled_back, 2);
         assert!(targets.iter().all(|target| !target.grabbed));
@@ -643,25 +697,85 @@ mod tests {
     fn grab_failure_reports_a_failed_rollback_that_still_holds_the_device() {
         let mut targets = [
             FakeTarget {
-                path: "one".into(),
-                fail_grab: false,
                 fail_release: true,
-                grabbed: false,
-                releases: 0,
+                ..FakeTarget::new("one")
             },
-            FakeTarget {
-                path: "two".into(),
-                fail_grab: true,
-                fail_release: false,
-                grabbed: false,
-                releases: 0,
-            },
+            FakeTarget::failing("two", libc::EPERM),
         ];
 
-        let error = grab_transaction(&mut targets).unwrap_err();
+        let error = grab_transaction(&mut targets, false).unwrap_err();
 
         assert_eq!(error.rollback_failures.len(), 1);
         assert!(targets[0].grabbed);
         assert_eq!(targets[0].releases, 1);
+    }
+
+    #[test]
+    fn capture_all_skips_a_node_another_program_grabbed() {
+        // keyd holds the physical keyboard and types through its own node.
+        let mut targets = [
+            FakeTarget::new("keyd virtual keyboard"),
+            FakeTarget::failing("keyboard", libc::EBUSY),
+            FakeTarget::new("mouse"),
+        ];
+
+        let skipped = grab_transaction(&mut targets, true).unwrap();
+
+        assert_eq!(skipped, [PathBuf::from("keyboard")]);
+        assert!(targets[0].grabbed && targets[2].grabbed);
+        assert!(!targets[1].grabbed);
+        assert!(targets.iter().all(|target| target.releases == 0));
+    }
+
+    #[test]
+    fn configured_devices_still_roll_back_on_a_busy_node() {
+        let mut targets = [
+            FakeTarget::new("keyd virtual keyboard"),
+            FakeTarget::failing("keyboard", libc::EBUSY),
+            FakeTarget::new("mouse"),
+        ];
+
+        let error = grab_transaction(&mut targets, false).unwrap_err();
+
+        assert_eq!(error.path, PathBuf::from("keyboard"));
+        assert_eq!(error.source.raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(error.rolled_back, 1);
+        assert!(targets.iter().all(|target| !target.grabbed));
+        assert_eq!(targets[0].releases, 1);
+        assert_eq!(targets[2].releases, 0);
+    }
+
+    #[test]
+    fn capture_all_fails_when_every_node_is_busy() {
+        let mut targets = [
+            FakeTarget::failing("keyboard", libc::EBUSY),
+            FakeTarget::failing("mouse", libc::EBUSY),
+        ];
+
+        let error = grab_transaction(&mut targets, true).unwrap_err();
+
+        assert_eq!(error.source.raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(error.rolled_back, 0);
+        assert!(targets.iter().all(|target| target.releases == 0));
+    }
+
+    #[test]
+    fn rollback_releases_only_nodes_this_process_grabbed() {
+        let mut targets = [
+            FakeTarget::new("one"),
+            FakeTarget::failing("busy", libc::EBUSY),
+            FakeTarget::new("two"),
+            FakeTarget::failing("broken", libc::EIO),
+        ];
+
+        let error = grab_transaction(&mut targets, true).unwrap_err();
+
+        assert_eq!(error.path, PathBuf::from("broken"));
+        assert_eq!(error.rolled_back, 2);
+        assert!(targets.iter().all(|target| !target.grabbed));
+        assert_eq!(
+            targets.each_ref().map(|target| target.releases),
+            [1, 0, 1, 0]
+        );
     }
 }

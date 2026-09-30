@@ -16,6 +16,34 @@ use crate::{
 };
 
 impl SessionHandle {
+    /// Sends a clip to the peer in the background, cancelling one still on
+    /// its way. Input never waits for it.
+    pub fn send_clipboard(&self, clip: crate::clipboard::Clip) {
+        let clipboard = self.clipboard.clone();
+        let (peer, id) = (self.peer.clone(), self.id);
+        let task = tokio::spawn(async move {
+            if let Err(error) = clipboard.send(&clip).await {
+                tracing::info!(%peer, session_id = id, %error, "clip not sent");
+            }
+        });
+        let previous = self
+            .sending_clip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(task.abort_handle());
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+    }
+
+    /// Sends this computer's layout to the peer. Nothing answers it.
+    pub fn send_layout(&self, layout: crate::desktop::SharedLayout) -> Result<()> {
+        layout.validate()?;
+        self.commands
+            .try_send(SessionCommand::Layout(layout))
+            .map_err(|error| anyhow::anyhow!("layout not queued: {error}"))
+    }
+
     /// One scoped desktop operation. A timeout closes transport so a late warp cannot
     /// leave the source believing that a cancelled handoff completed.
     pub async fn desktop_request(
@@ -161,6 +189,9 @@ impl DesktopRelay {
                     self.waiter.take().context("Unexpected desktop response")?;
                 anyhow::ensure!(id == expected, "Desktop response ID does not match request");
                 let _ = reply.send(response);
+            }
+            DesktopMessage::Layout { layout } => {
+                reporter.emit(SessionEventKind::Layout { layout })?;
             }
         }
         Ok(())

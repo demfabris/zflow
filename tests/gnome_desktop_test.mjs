@@ -17,16 +17,39 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     const backend = {get_default_seat: () => seat};
     const watch = {};
     const emitted = [];
+    const notices = [];
     const display = {focus_window: null, handlers: new Map(),
         connect(name, fn) {this.handlers.set(name, fn); return 3;}, disconnect(id) {this.disconnected = id;}};
+    // St.Clipboard as GNOME Shell has it: the app that copied offers some
+    // types and hands the bytes over later, or never when `manual` is set.
+    // St frees the bytes as soon as the callback returns.
+    const clipboard = {offered: {}, manual: false, replies: [], asked: 0, written: [],
+        get_mimetypes(type) {assert.equal(type, 1); this.asked++; return Object.keys(this.offered);},
+        get_content(type, mimetype, callback) {
+            assert.equal(type, 1);
+            const data = this.offered[mimetype];
+            const reply = () => {
+                const bytes = data === undefined ? null : new context.GLib.Bytes(data);
+                callback(this, bytes);
+                bytes?.free();
+            };
+            if (this.manual) this.replies.push(reply);
+            else queueMicrotask(reply);
+        },
+        set_text(type, text) {assert.equal(type, 1); this.written.push(['text', text]);},
+        set_content(type, mimetype, bytes) {assert.equal(type, 1); this.written.push([mimetype, Array.from(bytes.toArray())]);},
+    };
     // GNOME 51 reaches the backend only through the stage context.
     const context = {
-        API: 1,
+        API: 2,
         Extension: class {},
         Indicator: class { destroy() {} },
+        TextDecoder,
         global: {backend: {capabilities: 1}, stage: {get_context: () => ({get_backend: () => backend})},
             display, get_pointer: () => [pointer.x, pointer.y]},
-        Main: {layoutManager: {monitors, connect(name, fn) {handlers.set(name, fn); return 1;}, disconnect() {}}},
+        Main: {layoutManager: {monitors, connect(name, fn) {handlers.set(name, fn); return 1;}, disconnect() {}},
+            notify(title, body) {notices.push([title, body]);}},
+        St: {Clipboard: {get_default: () => clipboard}, ClipboardType: {PRIMARY: 0, CLIPBOARD: 1}},
         GLib: {
             PRIORITY_DEFAULT: 0, PRIORITY_DEFAULT_IDLE: 0, SOURCE_CONTINUE: true, SOURCE_REMOVE: false,
             get_monotonic_time: () => now,
@@ -34,6 +57,12 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
             idle_add(_priority, fn) {queueMicrotask(fn); return next++;},
             Source: {remove(id) {timers.delete(id);}},
             Variant: class { constructor(_type, value) {this.value = value;} },
+            Bytes: class {
+                constructor(data) {this.data = Uint8Array.from(data);}
+                free() {this.data = null;}
+                get_size() {assert.ok(this.data, 'bytes used after St freed them'); return this.data.length;}
+                toArray() {assert.ok(this.data, 'bytes used after St freed them'); return this.data;}
+            },
         },
         Gio: {DBus: {session: {emit_signal(...args) {emitted.push(args);}}}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},
             BusNameOwnerFlags: {NONE: 0}, bus_own_name_on_connection: () => 1, bus_unown_name() {},
@@ -51,7 +80,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
             BarrierDirection: {POSITIVE_X: 1, NEGATIVE_X: 2, POSITIVE_Y: 4, NEGATIVE_Y: 8},
             Barrier: class {
                 constructor(properties) {this.properties = properties; barriers.push(this);}
-                connect(_name, fn) {this.hit = fn;}
+                connect(name, fn) {this[name] = fn;}
                 destroy() {this.destroyed = true;}
             },
         },
@@ -59,7 +88,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     vm.runInNewContext(source, context);
     const extension = new context.TestExtension();
     extension.enable();
-    return {extension, barriers, context, seat, backend, watch, handlers, timers, display, emitted, advance(ms) {
+    return {extension, barriers, context, seat, backend, watch, handlers, timers, display, emitted, clipboard, notices, advance(ms) {
         now += ms * 1000;
         for (const [id, timer] of timers) {
             if (timer.due > now) continue;
@@ -256,7 +285,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     await call(':1.99', {command: 'snapshot'});
     assert.equal(d.extension._lease, null);
     assert.equal(d.barriers.length, 0);
-    await call(':1.7', {command: 'snapshot'});
+    await call(':1.7', {command: 'snapshot', api: 2});
     d.watch.vanished();
     await call(':1.7', {command: 'snapshot'});
     const denied = 'org.freedesktop.DBus.Error.AccessDenied';
@@ -288,7 +317,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.context.Main.layoutManager.monitors.length = 0;
     assert.deepEqual({...await d.extension._request({command: 'focus'})}, {status: 'focus', terminal: true}, 'focus needs no monitors');
     const replies = [];
-    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus'})], {
+    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus', api: 2})], {
         get_sender: () => sender,
         return_dbus_error: name => replies.push(name),
         return_value: variant => replies.push(JSON.parse(variant.value[0]).terminal),
@@ -313,12 +342,14 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
         get_sender: () => ':1.7',
         return_value: variant => replies.push(JSON.parse(variant.value[0])),
     });
-    await call({command: 'snapshot', api: 2});
-    await call({command: 'snapshot', api: 0});
+    await call({command: 'snapshot', api: 3});
+    await call({command: 'snapshot', api: 1});
     await call({command: 'snapshot'});
+    await call({command: 'snapshot', api: 2});
     assert.match(replies[0].reason, /^Update zflow: its GNOME extension is older/);
     assert.match(replies[1].reason, /^Update zflow: the app is older/);
-    assert.equal(replies[2].status, 'snapshot', 'agents from before API levels speak API 1');
+    assert.match(replies[2].reason, /^Update zflow: the app is older/, 'agents from before API levels speak API 1');
+    assert.equal(replies[3].status, 'snapshot');
     d.extension.disable();
 }
 {
@@ -334,4 +365,208 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.extension.disable();
     assert.ok(removed.includes(101));
 }
-console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller, terminal focus, API and cleanup checks passed');
+{
+    // This computer's own edges: barriers that report each push once.
+    const d = desktop([{x: 0, y: 0, width: 1920, height: 1080}, {x: 1920, y: 0, width: 1280, height: 1024}]);
+    const tracker = {count: 0, inhibit_cursor_visibility() {this.count++;}, uninhibit_cursor_visibility() {this.count--;}};
+    d.context.global.backend.get_cursor_tracker = () => tracker;
+    await assert.rejects(d.extension._request({command: 'edges', edges: [{edge: 'right', start: 5, end: 5}]}), /Invalid outbound edges/);
+    await assert.rejects(d.extension._request({command: 'edges', edges: [{edge: 'middle', start: 0, end: 5}]}), /Invalid outbound edges/);
+    assert.equal((await d.extension._request({command: 'edges', edges: [{edge: 'right', start: 0, end: 1000000}]})).status, 'finished');
+    assert.equal(d.barriers.length, 1, 'only the monitor on the outer right edge');
+    const barrier = d.barriers[0];
+    assert.equal(barrier.properties.x1, 3200);
+    assert.equal(barrier.properties.y1, 8, 'the top corner of the desktop stays dead');
+    assert.equal(barrier.properties.y2, 1024, 'this monitor ends above the desktop corner');
+    assert.equal(barrier.properties.directions, 2, 'the pointer may come back in');
+    const hits = () => d.emitted.filter(args => args[3] === 'EdgeHit').map(args => [args[0], ...args[4].value]);
+    barrier.hit(barrier, {x: 3200, y: 540, event_id: 1});
+    barrier.hit(barrier, {x: 3200, y: 541, event_id: 1});
+    assert.deepEqual(hits(), [[':1.7', 'right', 500000]], 'one report per push, to the agent only');
+    barrier.hit(barrier, {x: 3200, y: 0, event_id: 2});
+    assert.deepEqual(hits().at(-1), [':1.7', 'right', 0]);
+    // While another computer controls this one, its return barrier answers.
+    await d.extension._request(prepare('right'));
+    barrier.hit(barrier, {x: 3200, y: 100, event_id: 3});
+    assert.equal(hits().length, 2);
+    await d.extension._request({command: 'finish', token: 7});
+    d.handlers.get('monitors-changed')();
+    assert.ok(barrier.destroyed && !d.barriers.at(-1).destroyed, 'a monitor change places the edges again');
+    // Sending hides the pointer once, and shows it again after.
+    await d.extension._request({command: 'sending', active: true});
+    await d.extension._request({command: 'sending', active: true});
+    assert.equal(tracker.count, 1);
+    await d.extension._request({command: 'sending', active: false});
+    assert.equal(tracker.count, 0);
+    await assert.rejects(d.extension._request({command: 'sending', active: 'yes'}), /Invalid sending state/);
+    assert.equal((await d.extension._request({command: 'warp', position: {x: 2000, y: 900}})).status, 'finished');
+    assert.deepEqual({...d.extension._snapshot().position}, {x: 2000, y: 900});
+    await assert.rejects(d.extension._request({command: 'warp', position: {x: 2000, y: 1050}}), /outside the monitors/);
+    const placed = d.barriers.length;
+    await d.extension._request({command: 'edges', edges: [{edge: 'right', start: 0, end: 1000000}]});
+    assert.equal(d.barriers.length, placed, 'the same edges keep their barriers and the push in progress');
+    await d.extension._request({command: 'sending', active: true});
+    d.watch.vanished();
+    assert.equal(tracker.count, 0, 'without the agent the pointer shows again');
+    assert.ok(d.barriers.every(b => b.destroyed), 'and no barrier is left');
+    d.watch.appeared(null, 'io.zflow.Desktop', ':1.7');
+    await d.extension._request({command: 'sending', active: true});
+    d.extension.disable();
+    assert.equal(tracker.count, 0, 'disable shows the pointer again');
+    assert.ok(d.barriers.every(b => b.destroyed));
+}
+{
+    // With a pause, a push crosses only after the pointer rests against the edge.
+    const d = desktop();
+    await d.extension._request({command: 'edges', edges: [{edge: 'left', start: 0, end: 1000000}], pause_ms: 250});
+    await assert.rejects(d.extension._request({command: 'edges', edges: [], pause_ms: 5000}), /Invalid outbound edges/);
+    const barrier = d.barriers[0];
+    const hits = () => d.emitted.filter(args => args[3] === 'EdgeHit').map(args => [...args[4].value]);
+    barrier.hit(barrier, {x: 0, y: 270, event_id: 1});
+    d.advance(200);
+    barrier.hit(barrier, {x: 0, y: 540, event_id: 1});
+    assert.deepEqual(hits(), [], 'still resting');
+    d.advance(50);
+    assert.deepEqual(hits(), [['left', 500000]], 'crosses where the pointer rests after the pause');
+    barrier.hit(barrier, {x: 0, y: 100, event_id: 2});
+    barrier.left();
+    d.advance(300);
+    assert.equal(hits().length, 1, 'leaving the edge cancels the crossing');
+    barrier.hit(barrier, {x: 0, y: 100, event_id: 3});
+    d.extension.disable();
+    d.advance(300);
+    assert.equal(hits().length, 1, 'disable drops a waiting push');
+    assert.equal(d.timers.size, 0);
+}
+// src/clipboard.rs MAX_CLIP_BYTES.
+const MAX_CLIP_BYTES = 3 * 1024 * 1024;
+const PNG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1];
+const utf8 = text => Array.from(new TextEncoder().encode(text));
+// The clipboard over D-Bus: what each call returned, as the agent would see it.
+function clipboardCalls(d) {
+    const replies = [];
+    const invocation = sender => ({
+        get_sender: () => sender,
+        return_dbus_error: (error, message) => replies.push({error, message}),
+        return_value: variant => replies.push(variant === null ? null : {kind: variant.value[0], data: variant.value[1]}),
+    });
+    const small = reply => reply?.data ? {...reply, data: Array.from(reply.data)} : reply;
+    return {
+        async read(sender = ':1.7') {
+            await d.extension.ReadClipboardAsync([], invocation(sender));
+            return small(replies.pop());
+        },
+        async write(kind, data, sender = ':1.7') {
+            await d.extension.WriteClipboardAsync([kind, Uint8Array.from(data)], invocation(sender));
+            return replies.pop();
+        },
+        replies,
+    };
+}
+{
+    // One kind per clip: text if there is any, else a PNG; never other types.
+    const d = desktop();
+    const {read} = clipboardCalls(d);
+    d.clipboard.offered = {'text/html': utf8('<b>hé</b>'), 'image/png': PNG, 'text/plain;charset=utf-8': utf8('hé')};
+    assert.deepEqual(await read(), {kind: 'text', data: utf8('hé')});
+    d.clipboard.offered = {'image/png': PNG, 'text/plain': utf8('plain')};
+    assert.deepEqual(await read(), {kind: 'text', data: utf8('plain')});
+    d.clipboard.offered = {'image/png': PNG, 'image/jpeg': [0xff, 0xd8]};
+    assert.deepEqual(await read(), {kind: 'png', data: PNG});
+    for (const offered of [{}, {'text/html': utf8('<b>hé</b>')}, {'text/plain;charset=utf-8': []}, {'x-special/gnome-copied-files': utf8('copy')}]) {
+        d.clipboard.offered = offered;
+        assert.deepEqual(await read(), {kind: 'empty', data: []}, JSON.stringify(Object.keys(offered)));
+    }
+    // An app that offers a type and then fails to hand it over leaves nothing to send.
+    d.clipboard.offered = {'image/png': undefined};
+    assert.deepEqual(await read(), {kind: 'empty', data: []});
+    // The limit is the same number as the service's; over it, only the size leaves.
+    d.clipboard.offered = {'image/png': new Uint8Array(MAX_CLIP_BYTES + 1)};
+    assert.deepEqual(await read(), {kind: `too_large:${MAX_CLIP_BYTES + 1}`, data: []});
+    d.extension.disable();
+}
+{
+    // A full clip still goes whole.
+    const d = desktop();
+    d.clipboard.offered = {'image/png': new Uint8Array(MAX_CLIP_BYTES)};
+    let reply;
+    await d.extension.ReadClipboardAsync([], {get_sender: () => ':1.7', return_value: variant => {reply = variant.value;}});
+    assert.equal(reply[0], 'png');
+    assert.equal(reply[1].length, MAX_CLIP_BYTES);
+    d.extension.disable();
+}
+{
+    // A stuck app gets a second, then the agent hears why; a late answer is dropped.
+    const d = desktop();
+    const {read, replies} = clipboardCalls(d);
+    d.clipboard.manual = true;
+    d.clipboard.offered = {'text/plain': utf8('late')};
+    const pending = read();
+    await new Promise(setImmediate);
+    d.advance(999);
+    await new Promise(setImmediate);
+    assert.equal(replies.length, 0, 'still waiting for the app');
+    d.advance(1);
+    const failed = await pending;
+    assert.equal(failed.error, 'org.freedesktop.DBus.Error.Failed');
+    assert.match(failed.message, /did not hand the clipboard over/);
+    d.clipboard.replies.shift()();
+    await new Promise(setImmediate);
+    assert.equal(replies.length, 0, 'the late answer goes nowhere');
+    // Turning the extension off ends a read that is still waiting.
+    const waiting = read();
+    await new Promise(setImmediate);
+    d.extension.disable();
+    assert.match((await waiting).message, /turned off/);
+    assert.equal(d.timers.size, 0, 'no clipboard timer is left');
+}
+{
+    // Only the agent reads or writes the clipboard.
+    const d = desktop();
+    const {read, write} = clipboardCalls(d);
+    d.clipboard.offered = {'text/plain;charset=utf-8': utf8('secret')};
+    const denied = 'org.freedesktop.DBus.Error.AccessDenied';
+    assert.equal((await read(':1.99')).error, denied);
+    assert.equal((await write('text', utf8('planted'), ':1.99')).error, denied);
+    assert.equal(d.clipboard.asked, 0, 'a stranger never makes the clipboard be read');
+    assert.deepEqual(d.clipboard.written, []);
+    d.watch.vanished();
+    assert.equal((await read(':1.7')).error, denied, 'nor does a caller once the agent is gone');
+    assert.equal(d.clipboard.asked, 0);
+    d.extension.disable();
+}
+{
+    // Writing puts text or a PNG on the clipboard, and nothing else.
+    const d = desktop();
+    const {write} = clipboardCalls(d);
+    assert.equal(await write('text', utf8('héllo')), null);
+    assert.equal(await write('png', PNG), null);
+    assert.deepEqual(d.clipboard.written, [['text', 'héllo'], ['image/png', PNG]]);
+    for (const [kind, data, reason] of [['text', [0xff, 0xfe], /./], ['gif', [1], /Unknown clip kind/],
+        ['text', [], /Invalid clip/], ['png', new Uint8Array(MAX_CLIP_BYTES + 1), /Invalid clip/]]) {
+        const refused = await write(kind, data);
+        assert.equal(refused.error, 'org.freedesktop.DBus.Error.InvalidArgs', kind);
+        assert.match(refused.message, reason);
+    }
+    assert.equal(d.clipboard.written.length, 2);
+    d.extension.disable();
+}
+{
+    // A notice from the service shows as a GNOME notification, even without monitors.
+    const d = desktop();
+    d.context.Main.layoutManager.monitors.length = 0;
+    const notice = 'Clipboard not shared: 5.0 MB is over the 3 MB limit';
+    assert.equal((await d.extension._request({command: 'notify', message: notice})).status, 'finished');
+    await d.extension._request({command: 'notify', message: 'x'.repeat(300)});
+    assert.deepEqual(d.notices, [['zflow', notice], ['zflow', 'x'.repeat(256)]]);
+    for (const message of [undefined, '', 7]) await assert.rejects(d.extension._request({command: 'notify', message}), /Invalid notice/);
+    const replies = [];
+    await d.extension.CallAsync([JSON.stringify({command: 'notify', message: 'hi', api: 2})], {
+        get_sender: () => ':1.99',
+        return_dbus_error: name => replies.push(name),
+    });
+    assert.deepEqual(replies, ['org.freedesktop.DBus.Error.AccessDenied']);
+    assert.equal(d.notices.length, 2, 'only the agent shows notices');
+    d.extension.disable();
+}
+console.log('GNOME desktop entry, return, geometry, stale requests, lease, monitor loss, placement, caller, terminal focus, outbound edges, pause at edges, pointer hiding, warp, clipboard read and write, notices, API and cleanup checks passed');

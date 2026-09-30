@@ -5,6 +5,7 @@ use std::{
 };
 
 use zflow::{
+    clipboard::{Clip, ClipKind, MAX_CLIP_BYTES},
     core::{
         ActivationId, ControlSequence, CumulativeMotion, MonotonicTimeMicros, MotionFrame,
         MotionSequence, ReliableControl, ReliableControlMessage, SessionContext, SessionEpoch,
@@ -483,4 +484,117 @@ async fn stopping_either_half_of_the_critical_stream_closes_the_connection() {
     tokio::time::timeout(Duration::from_secs(2), client.closed())
         .await
         .expect("critical stream STOP did not close the connection");
+}
+
+async fn input_pair() -> (
+    zflow::transport::InputChannels,
+    zflow::transport::InputChannels,
+    quinn::Endpoint,
+    quinn::Endpoint,
+) {
+    let (_client_directory, client_identity) = identity();
+    let (_server_directory, server_identity) = identity();
+    let client_config = input_client_config(&client_identity, server_identity.spki()).unwrap();
+    let server_config = input_server_config(&server_identity, client_identity.spki()).unwrap();
+    let server_endpoint = quinn::Endpoint::server(server_config.quinn_config(), LOOPBACK).unwrap();
+    let server_address = server_endpoint.local_addr().unwrap();
+    let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
+    let accept_endpoint = server_endpoint.clone();
+    let accept = tokio::spawn(async move {
+        let incoming = accept_endpoint.accept().await.unwrap();
+        accept_input(incoming, &server_config).await.unwrap()
+    });
+    let client = connect_input(&client_endpoint, server_address, &client_config)
+        .await
+        .unwrap();
+    let server = accept.await.unwrap();
+    (
+        client.into_channels(),
+        server.into_channels(),
+        client_endpoint,
+        server_endpoint,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clip_crosses_on_its_own_stream_beside_control() {
+    let (mut client, mut server, _client_endpoint, _server_endpoint) = input_pair().await;
+    let text = Clip::new(ClipKind::Text, "héllo".as_bytes().to_vec()).unwrap();
+    let (sent, received) = tokio::join!(client.clipboard.send(&text), server.clipboard.receive());
+    sent.unwrap();
+    assert_eq!(received.unwrap(), text);
+    // The other way round, and control still flows.
+    let png = Clip::new(ClipKind::Png, b"\x89PNG\r\n\x1a\nrest".to_vec()).unwrap();
+    let (sent, received) = tokio::join!(server.clipboard.send(&png), client.clipboard.receive());
+    sent.unwrap();
+    assert_eq!(received.unwrap(), png);
+    let control = ReliableControlMessage {
+        session: session(),
+        sequence: ControlSequence(1),
+        payload: ReliableControl::Enter,
+    };
+    client.control_send.send_control(&control).await.unwrap();
+    assert_eq!(
+        server.control_receive.receive().await.unwrap(),
+        InputControlMessage::Reliable(control)
+    );
+}
+
+/// A full clip must not delay pointer motion: QUIC writes datagrams ahead of
+/// stream data in each packet, and the clip's stream has a low priority.
+/// Loopback has no Wi-Fi queue, so this guards the ordering, not radio lag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn motion_stays_prompt_while_a_full_clip_transfers() {
+    let (client, server, _client_endpoint, _server_endpoint) = input_pair().await;
+    client.datagrams.configure_maximum(512).unwrap();
+    server.datagrams.configure_maximum(512).unwrap();
+    let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
+    image.resize(MAX_CLIP_BYTES, 0x5a);
+    let clip = Clip::new(ClipKind::Png, image).unwrap();
+    let zflow::transport::InputChannels {
+        clipboard: incoming,
+        datagrams: received,
+        ..
+    } = server;
+    let started = Instant::now();
+    let clipboard = client.clipboard.clone();
+    let transfer = tokio::spawn(async move { clipboard.send(&clip).await });
+    let receiving = tokio::spawn(async move { incoming.receive().await });
+    let datagrams = client.datagrams.clone();
+    let sender = tokio::spawn(async move {
+        for sequence in 1..=60_u64 {
+            let motion = MotionFrame {
+                session: session(),
+                motion_sequence: MotionSequence(sequence),
+                control_watermark: ControlSequence(0),
+                sender_capture_time: MonotonicTimeMicros(started.elapsed().as_micros() as u64),
+                totals: CumulativeMotion::new(sequence as i64, 0, 0, 0),
+                touch_snapshot: None,
+            };
+            datagrams.send_motion(&motion).unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+    // Motion is read while the clip is still on its way.
+    let mut worst = Duration::ZERO;
+    let mut during = 0;
+    while let Ok(Ok(InputDatagram::Motion(frame))) =
+        tokio::time::timeout(Duration::from_millis(200), received.receive()).await
+    {
+        let sent = Duration::from_micros(frame.sender_capture_time.0);
+        worst = worst.max(started.elapsed().saturating_sub(sent));
+        during += usize::from(!receiving.is_finished());
+        if frame.motion_sequence.0 == 60 {
+            break;
+        }
+    }
+    let clip = receiving.await.unwrap().unwrap();
+    assert_eq!(clip.data().len(), MAX_CLIP_BYTES);
+    transfer.await.unwrap().unwrap();
+    sender.await.unwrap();
+    assert!(during > 0, "no motion arrived while the clip was in flight");
+    // Unoptimized builds spend most of this on encrypting the clip, so give
+    // them more room. Motion stuck behind the whole transfer still fails.
+    let bound = Duration::from_millis(if cfg!(debug_assertions) { 60 } else { 20 });
+    assert!(worst < bound, "motion waited {worst:?} behind the clip");
 }

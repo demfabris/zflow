@@ -25,13 +25,20 @@ pub(super) struct NearbyRecord {
     pub instance: String,
     pub addresses: Vec<SocketAddr>,
     pub compatible: bool,
+    /// Where its pairing listener waits. Computers advertise their input
+    /// port, and pairing listens on another.
+    pub pair_address: Option<SocketAddr>,
 }
 
 impl NearbyRecord {
     fn from_candidate(candidate: UntrustedCandidate) -> Option<Self> {
+        let addresses = candidate.socket_addresses().to_vec();
         Some(Self {
             instance: candidate.ephemeral_instance_id()?.to_string(),
-            addresses: candidate.socket_addresses().to_vec(),
+            pair_address: addresses
+                .first()
+                .map(|address| SocketAddr::new(address.ip(), crate::pairing::DEFAULT_PAIRING_PORT)),
+            addresses,
             compatible: candidate.is_compatible(),
         })
     }
@@ -213,6 +220,7 @@ mod tests {
                     .unwrap(),
             ],
             compatible: true,
+            pair_address: None,
         }
     }
 
@@ -311,6 +319,10 @@ mod tests {
             let candidate = crate::discovery::parse_resolved_service(&service).unwrap();
             let record = NearbyRecord::from_candidate(candidate).unwrap();
             assert_eq!(record.compatible, compatible);
+            assert_eq!(
+                record.pair_address,
+                Some("192.0.2.1:43120".parse().unwrap())
+            );
         }
     }
 }

@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
 getrandom = { version = "0.3", features = ["std"] }
@@ -57,6 +58,8 @@ evdev = { git = "https://github.com/cmr/evdev", rev = "7fee138a341f73b81b9c4f8c5
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.23"
+# Paused time for handoff server tests.
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

@@ -55,20 +55,20 @@ struct PairingView: View {
             Text("On \(Self.host(target)), choose Allow.")
           }
         } else {
-          Text("On Linux, the code is in zflow under Pair Computer.").font(.callout)
+          Text("On the other computer, the code is in zflow under Pair Computer.").font(.callout)
             .foregroundStyle(.secondary)
         }
       } else {
-        Text("Choose the computer this Mac should control.").foregroundStyle(.secondary)
+        Text("Choose the computer to pair with.").foregroundStyle(.secondary)
         if let nearby = model.snapshot?.nearby, !nearby.isEmpty {
           VStack(alignment: .leading, spacing: 8) {
             ForEach(nearby) { candidate in
-              let address = candidate.addresses.first.map(Self.pairingAddress)
+              let address = candidate.pairAddress
               Button {
                 if let address { choose(address) }
               } label: {
                 Label(
-                  address.map { "Linux computer · \(Self.host($0))" } ?? "Nearby computer",
+                  address.map { "Computer · \(Self.host($0))" } ?? "Nearby computer",
                   systemImage: "display")
               }.disabled(!candidate.compatible || address == nil)
             }
@@ -81,7 +81,7 @@ struct PairingView: View {
             address.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         Button("Show a code on this Mac instead") {
-          model.send(CoreRequest(command: "pair_start"))
+          model.send(CoreRequest(command: "pair"))
         }.buttonStyle(.link)
       }
       if let error = pairing?.error ?? model.error {
@@ -116,13 +116,7 @@ struct PairingView: View {
   func submit(_ digits: String) {
     guard let target, digits.count == 6, !busy, submitted != digits else { return }
     submitted = digits
-    model.send(CoreRequest(command: "pair_start", address: target, code: digits))
-  }
-  /// Receivers advertise their input port; pairing listens on its own port
-  /// (DEFAULT_PAIRING_PORT in src/pairing.rs).
-  static func pairingAddress(_ advertised: String) -> String {
-    guard let separator = advertised.lastIndex(of: ":") else { return advertised }
-    return "\(advertised[..<separator]):43120"
+    model.send(CoreRequest(command: "pair", address: target, code: digits))
   }
   /// The address people recognize, without a port.
   static func host(_ address: String) -> String {
