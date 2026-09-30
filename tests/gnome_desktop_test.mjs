@@ -22,12 +22,17 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
         connect(name, fn) {this.handlers.set(name, fn); return 3;}, disconnect(id) {this.disconnected = id;}};
     // St.Clipboard as GNOME Shell has it: the app that copied offers some
     // types and hands the bytes over later, or never when `manual` is set.
+    // St frees the bytes as soon as the callback returns.
     const clipboard = {offered: {}, manual: false, replies: [], asked: 0, written: [],
         get_mimetypes(type) {assert.equal(type, 1); this.asked++; return Object.keys(this.offered);},
         get_content(type, mimetype, callback) {
             assert.equal(type, 1);
             const data = this.offered[mimetype];
-            const reply = () => callback(this, data === undefined ? null : new context.GLib.Bytes(data));
+            const reply = () => {
+                const bytes = data === undefined ? null : new context.GLib.Bytes(data);
+                callback(this, bytes);
+                bytes?.free();
+            };
             if (this.manual) this.replies.push(reply);
             else queueMicrotask(reply);
         },
@@ -54,8 +59,9 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
             Variant: class { constructor(_type, value) {this.value = value;} },
             Bytes: class {
                 constructor(data) {this.data = Uint8Array.from(data);}
-                get_size() {return this.data.length;}
-                toArray() {return this.data;}
+                free() {this.data = null;}
+                get_size() {assert.ok(this.data, 'bytes used after St freed them'); return this.data.length;}
+                toArray() {assert.ok(this.data, 'bytes used after St freed them'); return this.data;}
             },
         },
         Gio: {DBus: {session: {emit_signal(...args) {emitted.push(args);}}}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},

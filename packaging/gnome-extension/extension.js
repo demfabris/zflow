@@ -264,22 +264,22 @@ export default class ZflowExtension extends Extension {
     async _readClipboard() {
         const offered = St.Clipboard.get_default().get_mimetypes(St.ClipboardType.CLIPBOARD) ?? [];
         const [mimetype, kind] = CLIP_TYPES.find(([type]) => offered.includes(type)) ?? [];
-        const bytes = mimetype ? await this._clipboardContent(mimetype) : null;
-        const size = bytes?.get_size() ?? 0;
+        const {size, data} = mimetype ? await this._clipboardContent(mimetype) : {size: 0};
         if (!size) return ['empty', NO_BYTES];
         if (size > MAX_CLIP_BYTES) return [`too_large:${size}`, NO_BYTES];
-        return [kind, bytes.toArray()];
+        return [kind, data];
     }
 
-    // St hands the bytes over once the app that copied sends them all.
+    // St hands the bytes over once the app that copied sends them all, and
+    // frees them as soon as the callback returns, so they are copied out there.
     _clipboardContent(mimetype) {
         return new Promise((resolve, reject) => {
             const read = {
-                finish: (bytes, error) => {
+                finish: (clip, error) => {
                     if (!this._reads.delete(read)) return;
                     if (read.timer) GLib.Source.remove(read.timer);
                     if (error) reject(error);
-                    else resolve(bytes);
+                    else resolve(clip);
                 },
             };
             read.timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CLIP_WAIT_MS, () => {
@@ -288,7 +288,10 @@ export default class ZflowExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
             this._reads.add(read);
-            St.Clipboard.get_default().get_content(St.ClipboardType.CLIPBOARD, mimetype, (_clipboard, bytes) => read.finish(bytes));
+            St.Clipboard.get_default().get_content(St.ClipboardType.CLIPBOARD, mimetype, (_clipboard, bytes) => {
+                const size = bytes?.get_size() ?? 0;
+                read.finish({size, data: size && size <= MAX_CLIP_BYTES ? bytes.toArray() : NO_BYTES});
+            });
         });
     }
 
