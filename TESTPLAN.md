@@ -44,6 +44,13 @@ Checks:
   the barriers follow. Changing the Linux resolution logs "this computer's tile
   resized", and the Mac's tile for Linux follows.
 - **Chord:** Ctrl+Super+F12 still sends to the Mac without preparing its desktop.
+- **Live link:** with sharing paused on the Mac, Linux settings show the Mac as
+  Paired and `journalctl -u zflowd` shows no dial toward it. After resuming on
+  the Mac it shows Connected within seconds. Between two Linux computers, each
+  shows the other Connected. Stopping one's `zflowd` shows it as Paired on the
+  other, since its mDNS record goes away; starting it again shows Connected
+  within seconds. Blocking UDP 43119 on one shows it as Unreachable on the
+  other, and Retry dials at once instead of after the wait.
 
 ## Binary releases and Debian packaging, September 16
 

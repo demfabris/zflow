@@ -181,7 +181,10 @@ while the last valid configuration stays in use. Conflicting writes fail instead
 of overwriting an external edit.
 
 The GNOME window exposes sharing, pairing, keyboard modes, forgetting
-computers, **Share Clipboard**, and **Start at Login**. Its panel menu shows
+computers, **Share Clipboard**, and **Start at Login**. Each paired computer
+shows as Connected, Connecting, or why it cannot be reached, such as
+**Update zflow on desk** or **desk was reset or reinstalled. Pair it again.**
+A **Retry** button tries again without waiting. Its panel menu shows
 the current sender or receiver and a sharing switch. The extension
 preferences show the same GTK settings. Closing either window leaves the
 desktop agent running. Pairing closes when its dialog closes.
@@ -217,8 +220,13 @@ the updated layout arms.
 Pairing lists receivers advertised on the local network. Discovery does not
 verify identity; only the setup code shown on the receiver does. Manual
 addresses remain available. The Linux daemon advertises itself and also
-browses: when it dials a paired computer, it tries nearby addresses too, with
-that computer's pinned key, so a changed address does not break the link. macOS
+browses. While sharing is on, it keeps a connection open to each paired
+computer that mDNS shows listening at its saved address, and reconnects on the
+Mac app's schedule, so the first crossing does not wait for a handshake. A Mac
+only dials, so the daemon never dials one and uses the Mac's own connection.
+When a crossing or the chord finds no connection up, the daemon dials the saved
+address and nearby addresses too, with that computer's pinned key, so a changed
+address does not break the link. macOS
 asks for Local Network access the first time the Mac browses, so the Mac waits
 for the setup's Local Network step or **Pair Computer…** in Settings. Once a
 computer is paired, it browses from launch. Browsing then continues while the

@@ -51,10 +51,10 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 | Any machine controls any other | Not supported ([#5160](https://github.com/deskflow/deskflow/issues/5160)) | missing | partial | build | The main goal, and Deskflow's biggest gap. |
 | Three or more computers, pointer moves from peer to peer | The server routes between clients | partial. Crossing only starts from the local tile (`src/app/handoff.rs:61`) | same | build (Phase 4) | Needs a Returned reply that says which edge it left through. |
 | Wire compatibility with Barrier/Synergy | yes | no | no | skip | Different protocol by design. |
-| Reconnect | Fixed or backoff | exists (`src/app/native.rs:400`) | exists (`src/daemon.rs:448-503`) | have | |
-| Finds a peer whose IP changed | Several hostnames | exists: tries nearby addresses with the pinned key (`src/app/native.rs:414-420`) | partial: dials only saved addresses (`src/daemon.rs:395-410`) | improve | Both sides advertise and browse. |
+| Reconnect | Fixed or backoff | exists (`src/macos/link.rs`) | exists: a live link per peer on the Mac's schedule (`src/daemon/links.rs`, `src/link.rs`) | have | |
+| Finds a peer whose IP changed | Several hostnames | exists: tries nearby addresses with the pinned key (`src/macos/link.rs`) | partial: a crossing tries nearby addresses with the pinned key (`ensure_session`); the live link dials only a computer advertised at the saved address | improve | Both sides advertise and browse. |
 | Encryption and trust | TLS, fingerprint on first use | exists: QUIC, pinned key, 6-digit code plus Allow | exists | have | Stronger than Deskflow. |
-| Discovery | none | browses only (`src/app/nearby.rs`) | daemon advertises only (`src/daemon.rs:1227`); the desktop agent browses for the pairing dialog (`src/app/gnome.rs:24,80`) | improve | Needed so Linux can find a Mac. |
+| Discovery | none | browses only (`src/app/nearby.rs`) | the daemon advertises and browses (`start_discovery` in `src/daemon.rs`); the desktop agent browses for the pairing dialog (`src/app/nearby.rs`) | improve | Needed so Linux can find a Mac. |
 | Computer names | Must match on both ends, plus aliases | Host name at pairing | same | have; rename: skip | No name agreement needed. |
 
 ### Layout
@@ -158,7 +158,7 @@ Nothing below the GUI and the pairing defaults has a role:
 3. **Both machines cross at the same moment:** each refuses the other, and both stay local. The user pushes again. This fails safe, so no tie-break is needed.
 4. **A receiver's own devices keep working.** On the Mac this needs a suppression interval of 0.
 
-**Duplicate connections:** keep the connection dialed by the peer with the lower key fingerprint. Today the daemon keeps whichever finishes last (`src/daemon.rs:473-500`), which could flap once the Mac also accepts connections (guess).
+**Duplicate connections:** keep the connection dialed by the peer with the lower key fingerprint. The daemon does (`identity::wins_simultaneous_dial`); the Mac needs it once it accepts connections.
 
 ### Smallest code changes, by file (no wire change)
 
@@ -447,6 +447,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
     - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
     - A computer paired after the layout exists gets a tile beside this one (`SharedLayout::with_tiles_for`), and so does one missing from a layout a peer sent.
+    - Live links (`src/daemon/links.rs`): the daemon keeps a session to each peer it may send to, with the Mac's retry schedule (`src/link.rs`), so the first crossing reuses it. A session the peer dialed counts. It dials only where mDNS shows a zflow computer at the peer's saved address, so it never dials a Mac. GNOME shows each peer as Connected, Connecting or Unreachable with a reason, plus a "Paired computers" health row with Retry. The GNOME API level stays 2: the snapshot keeps its shape, and `connecting`, `unreachable` and health actions were already part of it.
   - Left:
     - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
     - The live checks in TESTPLAN.md, "Two-way input sitting".

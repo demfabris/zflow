@@ -383,6 +383,8 @@ zflow v1 uses application-level candidate racing:
 
 The prototype implements neither candidate racing nor SessionTakeover yet. A new input connection starts a new session.
 
+Each computer keeps one session to every paired peer it may send to, and a session either side dialed counts. A lost session that lasted at least 10 s is redialed at once; after a failed attempt or a shorter session the wait is 1, 2, 4 and 8 s, then 15 s. When both peers dial at once, both keep the connection dialed by the peer whose key fingerprint sorts first. The Linux daemon dials in the background only where mDNS shows a zflow computer at the peer's saved address, because a Mac only dials and never listens; a crossing with no session up still dials on demand.
+
 Endpoint::rebind does not implement simultaneous racing because it replaces an endpoint's socket for all connections.
 
 SessionTakeover names the prior generation, proposed next generation, random proposal nonce, last control sequence, final MotionAnchor, and authoritative held-state snapshot. The new connection cannot inject before TakeoverAccepted. Under one receiver lock, the receiver:
