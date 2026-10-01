@@ -62,7 +62,7 @@ the zflow window shows a banner with the step that is left: **Install**,
 Pass options after `bash -s --`:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.1.0 --no-launch
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.2.0 --no-launch
 ```
 
 Omit `--version` for the latest release. `--headless` skips GNOME integration.
@@ -70,7 +70,7 @@ Omit `--version` for the latest release. `--headless` skips GNOME integration.
 The script does not fall back to compiling if a release is unavailable.
 
 You can also download a `.deb` from [Releases](https://github.com/demfabris/zflow/releases)
-and install it with `sudo apt install ./zflow_0.1.0_amd64.deb` (use `arm64` on ARM).
+and install it with `sudo apt install ./zflow_0.2.0_amd64.deb` (use `arm64` on ARM).
 Then open zflow from Applications and follow its banner, or run
 `zflow desktop-agent --install` as yourself for the same setup the installer does.
 See [packaging/README.md](packaging/README.md) for migration from a source/archive

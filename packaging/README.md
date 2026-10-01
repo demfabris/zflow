@@ -3,7 +3,7 @@
 The root `install.sh` downloads release binaries for the detected OS and CPU,
 verifies the selected file against that release's `SHA256SUMS`, and installs it.
 It resolves `latest` to a specific tag before downloading either file. Use
-`--version v0.1.0` to select a release. A failed download, missing checksum, or
+`--version v0.2.0` to select a release. A failed download, missing checksum, or
 unsupported platform stops installation before requesting administrator access.
 On Linux, every system change then runs in one elevated shell. It copies the
 download to a root-owned directory and checks the checksum again before
@@ -33,6 +33,7 @@ downloads; they rely on the same GitHub/HTTPS trust as the artifacts.
 
 To build without publishing, dispatch the **Release** workflow with `publish`
 left off. To publish, update Cargo.toml/Cargo.lock to the intended version,
+list it with its protocols in `VERSIONS` in `src/transport/tls.rs`,
 commit and push, then either push its matching `vVERSION` tag or dispatch from
 `main` with `publish=true`. A dispatch from another branch builds but never
 publishes. Manual publication creates the tag at the workflow's commit.
