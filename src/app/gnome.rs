@@ -1,6 +1,6 @@
 //! Session service shared by the GNOME panel and GTK settings window.
 use super::{
-    api::{self, Health, Level, Peer, PeerState, Request, Shortcut, Status},
+    api::{self, Action, Health, Level, Peer, PeerState, Request, Shortcut, Status},
     desktop::DesktopReceiver,
     nearby::{BrowserStatus, NearbyBrowser},
     pairing::Pairing,
@@ -142,9 +142,10 @@ impl Service {
                 let running = super::desktop::install_extension(Some(&connection)).await?;
                 return Ok(serde_json::json!({"ok": true, "running": running}));
             }
-            // The agent restarts the desktop connection by itself.
-            Request::Retry
-            | Request::Reload
+            Request::Retry => {
+                crate::peer_view::request(&DaemonRequest::Retry {}).await?;
+            }
+            Request::Reload
             | Request::SetAwdl { .. }
             | Request::HelperReady { .. }
             | Request::AllowAccessibility
@@ -165,6 +166,7 @@ fn snapshot(
     let mut health = Vec::new();
     let (sharing, peers, shortcuts, layout) = match &daemon {
         Ok(daemon) => {
+            let peers = peers(daemon);
             health.push(Health::new(
                 "service",
                 Level::Ok,
@@ -182,9 +184,12 @@ fn snapshot(
                 "GNOME desktop",
                 state.receiver.status(),
             ));
+            if daemon.sharing {
+                health.extend(link_health(&peers, &daemon.links));
+            }
             (
                 Some(daemon.sharing),
-                peers(daemon),
+                peers,
                 shortcuts(daemon),
                 daemon.layout.clone(),
             )
@@ -207,8 +212,15 @@ fn snapshot(
             error,
         ));
     }
+    let connected = peers.iter().any(|peer| {
+        matches!(
+            peer.state,
+            PeerState::Connected | PeerState::ControllingThis | PeerState::ControlledFromHere
+        )
+    });
+    let checking = !connected && peers.iter().any(|peer| peer.state == PeerState::Connecting);
     Ok(api::Snapshot {
-        status: Status::new(sharing, &peers, &health, false),
+        status: Status::new(sharing, &peers, &health, checking),
         sharing,
         health,
         layout,
@@ -239,23 +251,86 @@ fn log_viewers() -> [(&'static str, &'static [&'static str]); 3] {
 }
 
 fn peers(daemon: &crate::peer_view::DesktopStatus) -> Vec<Peer> {
+    use crate::peer_view::LinkStatus;
     let is = |peer: &Option<String>, name: &str| peer.as_deref() == Some(name);
     daemon
         .peers
         .iter()
         .map(|(name, record)| {
-            let state = if is(&daemon.receiving_from, name) {
-                PeerState::ControllingThis
+            let (state, reason) = if is(&daemon.receiving_from, name) {
+                (PeerState::ControllingThis, None)
             } else if is(&daemon.sending_to, name) {
-                PeerState::ControlledFromHere
+                (PeerState::ControlledFromHere, None)
             } else if daemon.connected.contains(name) {
-                PeerState::Connected
+                (PeerState::Connected, None)
             } else {
-                PeerState::Paired
+                match daemon.links.get(name) {
+                    Some(LinkStatus::Connecting) => (PeerState::Connecting, None),
+                    Some(LinkStatus::Unreachable { reason, .. }) => {
+                        (PeerState::Unreachable, Some(reason))
+                    }
+                    // Not dialed: nothing listens where it was paired, as with a Mac.
+                    None => (PeerState::Paired, None),
+                }
             };
-            Peer::new(name, record, state)
+            let mut peer = Peer::new(name, record, state);
+            if let Some(reason) = reason {
+                peer.detail = reason.clone();
+            }
+            peer
         })
         .collect()
+}
+
+/// One row for the links to paired computers, with Retry while one cannot
+/// be reached. Each computer's own row says why. A computer that is asleep
+/// or away only warns; one a person has to update or pair again needs
+/// attention.
+fn link_health(
+    peers: &[Peer],
+    links: &std::collections::BTreeMap<String, crate::peer_view::LinkStatus>,
+) -> Option<Health> {
+    use crate::peer_view::LinkStatus;
+    if peers.is_empty() {
+        return None;
+    }
+    let down: Vec<_> = peers
+        .iter()
+        .filter(|peer| peer.state == PeerState::Unreachable)
+        .map(|peer| peer.name.as_str())
+        .collect();
+    let needs_fix = down.iter().any(|name| {
+        matches!(
+            links.get(*name),
+            Some(LinkStatus::Unreachable {
+                needs_fix: true,
+                ..
+            })
+        )
+    });
+    let title = "Paired computers";
+    Some(if !down.is_empty() {
+        Health {
+            action: Some(Action {
+                label: "Retry".into(),
+                command: "retry".into(),
+            }),
+            ..Health::new(
+                "computers",
+                if needs_fix {
+                    Level::Error
+                } else {
+                    Level::Warning
+                },
+                title,
+                format!("Cannot connect to {}", down.join(", ")),
+            )
+        }
+    } else if peers.iter().any(|peer| peer.state == PeerState::Connecting) {
+        Health::new("computers", Level::Ok, title, "Checking…")
+    } else {
+        Health::new("computers", Level::Ok, title, "No problems found.")
+    })
 }
 
 fn shortcuts(daemon: &crate::peer_view::DesktopStatus) -> Vec<Shortcut> {
@@ -559,8 +634,9 @@ mod tests {
 
     #[test]
     fn the_service_state_becomes_peer_and_health_rows() {
+        use crate::peer_view::LinkStatus;
         let mut config = crate::config::Config::default();
-        for name in ["desk", "mac", "old"] {
+        for name in ["desk", "laptop", "mac", "new", "old"] {
             config.peers.insert(
                 name.into(),
                 crate::config::PeerConfig {
@@ -577,23 +653,65 @@ mod tests {
                 },
             );
         }
+        let reinstalled = "Reset or reinstalled. Pair it again.";
         let status = crate::peer_view::DesktopStatus {
             receiving_from: Some("mac".into()),
             connected: vec!["desk".into(), "mac".into()],
+            links: [
+                (
+                    "laptop".into(),
+                    LinkStatus::Unreachable {
+                        reason: reinstalled.into(),
+                        needs_fix: true,
+                    },
+                ),
+                ("new".into(), LinkStatus::Connecting),
+                // A session wins over a stale link state.
+                ("desk".into(), LinkStatus::Connecting),
+            ]
+            .into(),
             ..crate::peer_view::DesktopStatus::from_config(&config)
         };
         let rows: Vec<_> = peers(&status)
             .into_iter()
-            .map(|peer| (peer.name, peer.state, peer.allow_control))
+            .map(|peer| (peer.name, peer.state, peer.detail, peer.allow_control))
             .collect();
+        let row = |name: &str, state, detail: &str, control| {
+            (name.to_owned(), state, detail.to_owned(), control)
+        };
         assert_eq!(
             rows,
             [
-                ("desk".into(), PeerState::Connected, true),
-                ("mac".into(), PeerState::ControllingThis, true),
-                ("old".into(), PeerState::Paired, false),
+                row("desk", PeerState::Connected, "Connected", true),
+                row("laptop", PeerState::Unreachable, reinstalled, true),
+                row(
+                    "mac",
+                    PeerState::ControllingThis,
+                    "Controlling this computer",
+                    true
+                ),
+                row("new", PeerState::Connecting, "Connecting…", true),
+                row("old", PeerState::Paired, "Paired", false),
             ]
         );
+        let health = link_health(&peers(&status), &status.links).unwrap();
+        assert_eq!(
+            (health.level, health.detail.as_str()),
+            (Level::Error, "Cannot connect to laptop")
+        );
+        assert_eq!(health.action.unwrap().command, "retry");
+        // A computer that is only asleep or away warns and keeps retrying.
+        let mut asleep = status.links.clone();
+        asleep.insert(
+            "laptop".into(),
+            LinkStatus::Unreachable {
+                reason: "input connection to 192.0.2.7:43119 timed out".into(),
+                needs_fix: false,
+            },
+        );
+        let health = link_health(&peers(&status), &asleep).unwrap();
+        assert_eq!(health.level, Level::Warning);
+        assert!(health.action.is_some());
         assert_eq!(
             shortcuts(&status)[1].keys,
             "Ctrl+Super+Backspace",
@@ -622,6 +740,12 @@ mod tests {
         .unwrap();
         assert_eq!(up.layout, Some(layout));
         assert_eq!(up.share_clipboard, Some(true));
+        // While sharing, a computer that cannot be reached is a problem.
+        assert!(
+            up.health
+                .iter()
+                .any(|row| row.id == "computers" && row.level == Level::Error)
+        );
 
         let down = snapshot(
             Err(anyhow::anyhow!("Start the zflow system service")),

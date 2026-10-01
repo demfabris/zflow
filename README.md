@@ -206,7 +206,13 @@ while the last valid configuration stays in use. Conflicting writes fail instead
 of overwriting an external edit.
 
 The GNOME window exposes sharing, pairing, keyboard modes, forgetting
-computers, **Share Clipboard**, and **Start at Login**. Its panel menu shows
+computers, **Share Clipboard**, and **Start at Login**. Each paired computer
+shows as Connected, Connecting, or why it cannot be reached, such as
+**Different zflow version. Update both computers.** or **Reset or
+reinstalled. Pair it again.** Only those two make the status say
+**Needs attention**; a computer that is asleep or away is a warning, and
+zflow keeps trying. A **Retry** button tries again without waiting. Its
+panel menu shows
 the current sender or receiver and a sharing switch. The extension
 preferences show the same GTK settings. Closing either window leaves the
 desktop agent running. Pairing closes when its dialog closes.
@@ -247,13 +253,18 @@ old arrangement before the updated layout arms.
 Pairing lists receivers advertised on the local network. Discovery does not
 verify identity; only the setup code shown on the receiver does. Manual
 addresses remain available. The Linux daemon advertises itself and also
-browses: when it dials a paired computer, it tries nearby addresses too, with
-that computer's pinned key, so a changed address does not break the link. The
+browses. While sharing is on, it keeps a connection open to each paired
+computer that mDNS shows listening at its saved address, and reconnects on the
+Mac app's schedule, so the first crossing does not wait for a handshake. The
 Mac advertises its input port the same way while it listens for paired
-computers. Pairing also saves every address the other computer has, VPN ones
-such as Tailscale's included, so paired computers still reach each other away
-from the network they paired on. A nearby computer running another zflow
-version stays in the list and says to update it. macOS
+computers, so the daemon keeps a connection to it too. When both computers
+dial at once, both keep the same one. When a crossing or the chord finds no
+connection up, the daemon dials the saved addresses and nearby addresses too,
+with that computer's pinned key, so a changed address does not break the link.
+Pairing saves every address the other computer has, VPN ones such as
+Tailscale's included, so paired computers still reach each other away from the
+network they paired on. A nearby computer running another zflow version stays
+in the list and says to update it. macOS
 asks for Local Network access the first time the Mac browses, so the Mac waits
 for the setup's Local Network step or **Pair Computer…** in Settings. Once a
 computer is paired, it browses from launch. Browsing then continues while the

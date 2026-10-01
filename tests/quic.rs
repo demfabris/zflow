@@ -368,11 +368,11 @@ async fn wrong_server_spki_pin_rejects_the_handshake() {
         accept_input(incoming, &accept_config).await
     });
 
-    assert!(
-        connect_input(&client_endpoint, server_address, &client_config)
-            .await
-            .is_err()
-    );
+    // A pinned key that no longer matches is how a reinstalled peer looks.
+    assert!(matches!(
+        connect_input(&client_endpoint, server_address, &client_config).await,
+        Err(TransportError::PeerIdentityMismatch)
+    ));
     assert!(
         tokio::time::timeout(Duration::from_secs(2), accept)
             .await
@@ -401,13 +401,13 @@ async fn wrong_client_spki_pin_is_rejected_by_the_server() {
     });
 
     let client = connect_input(&client_endpoint, server_address, &client_config).await;
-    assert!(
+    assert!(matches!(
         tokio::time::timeout(Duration::from_secs(2), accept)
             .await
             .unwrap()
-            .unwrap()
-            .is_err()
-    );
+            .unwrap(),
+        Err(TransportError::PeerIdentityMismatch)
+    ));
     if let Ok(client) = client {
         tokio::time::timeout(Duration::from_secs(2), client.closed())
             .await

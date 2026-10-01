@@ -74,8 +74,14 @@ impl From<quinn::ConnectionError> for TransportError {
             quinn::ConnectionError::TransportError(error) => Some(error.code),
             _ => None,
         };
+        // Alert 49 (access_denied) raised here is this computer's key check
+        // refusing the peer's key. Sent by the peer, it means the reverse,
+        // which stays a plain connection error.
+        let raised_here = matches!(error, quinn::ConnectionError::TransportError(_));
         if code == Some(quinn::TransportErrorCode::crypto(120)) {
             Self::InvalidAlpn
+        } else if raised_here && code == Some(quinn::TransportErrorCode::crypto(49)) {
+            Self::PeerIdentityMismatch
         } else {
             Self::Connection(error)
         }

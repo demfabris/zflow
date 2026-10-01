@@ -44,6 +44,13 @@ Checks:
   the barriers follow. Changing the Linux resolution logs "this computer's tile
   resized", and the Mac's tile for Linux follows.
 - **Chord:** Ctrl+Super+F12 still sends to the Mac without preparing its desktop.
+- **Live link:** with sharing paused on the Mac, Linux settings show the Mac as
+  Paired and `journalctl -u zflowd` shows no dial toward it. After resuming on
+  the Mac it shows Connected within seconds. Between two Linux computers, each
+  shows the other Connected. Stopping one's `zflowd` shows it as Paired on the
+  other, since its mDNS record goes away; starting it again shows Connected
+  within seconds. Blocking UDP 43119 on one shows it as Unreachable on the
+  other, and Retry dials at once instead of after the wait.
 
 ## Two-way input sitting, Mac side (ROADMAP Phase 2)
 
@@ -124,10 +131,10 @@ Checks:
 16. **AWDL.** With **Reduce Wi-Fi lag** on, `ifconfig awdl0` shows it down
     while controlled and back up afterwards.
 17. **Duplicates.** Turn Mac sharing off, then press Ctrl+Super+F12 on Ubuntu
-    at the moment you turn it back on: zflowd only dials the Mac from the chord
-    or an edge push, so restarting it makes no second dial. After 10 s there is
-    one session on each side (`zflow status`; zero or one "superseded" line),
-    and the chord still works. The link tests cover both dial orders.
+    at the moment you turn it back on, so the chord and zflowd's live link
+    dial the Mac while the Mac dials Ubuntu. After 10 s there is one session
+    on each side (`zflow status`; zero or one "superseded" line), and the
+    chord still works. The link tests cover both dial orders.
 18. **One way only.** Turn off Ubuntu's **Can control this computer** for the
     Mac. The Mac shows a "Paired computers" warning that ubuntu takes no input
     from this Mac, not "Needs attention", and the chord still controls the Mac.

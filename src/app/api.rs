@@ -108,8 +108,6 @@ pub(super) struct Peer {
     pub reverse_scroll: bool,
 }
 
-// Linux does not see connection attempts or link errors yet.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum PeerState {
