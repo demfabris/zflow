@@ -32,9 +32,6 @@ impl Handoff {
     }
 
     /// Asks the other computer to put its cursor at the entry point.
-    // The Mac still uses its own copies of this and the checks below until it
-    // switches over (ROADMAP change 10).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn prepare(&self, token: u64) -> DesktopRequest {
         DesktopRequest::Prepare {
             token,
@@ -47,7 +44,6 @@ impl Handoff {
 
     /// Checks that the other computer prepared a desktop of the size the
     /// layout expects, so the crossing lands where the layout shows it.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn check_prepared(&self, response: DesktopResponse) -> Result<()> {
         response.validate()?;
         match response {
@@ -68,7 +64,6 @@ impl Handoff {
 }
 
 /// A token for one crossing's desktop requests.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn token() -> Result<u64> {
     let mut random = [0_u8; 8];
     getrandom::fill(&mut random)
@@ -77,7 +72,6 @@ pub(crate) fn token() -> Result<u64> {
 }
 
 /// Checks the other computer's answer to Finish.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn check_finished(response: Result<DesktopResponse>) -> Result<()> {
     match response? {
         DesktopResponse::Finished => Ok(()),

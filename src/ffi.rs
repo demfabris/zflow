@@ -52,6 +52,8 @@ pub unsafe extern "C" fn zflow_app_create(
             .with_writer(std::io::stderr)
             .with_ansi(false)
             .try_init();
+        // Input a peer holds is let go if the app is told to quit by a signal.
+        crate::macos::install_exit_handlers();
         let mut app = NativeApp::open(path)?;
         let (commands, requests) = mpsc::channel::<(String, Reply)>();
         let thread = std::thread::Builder::new()

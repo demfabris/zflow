@@ -656,7 +656,9 @@ static CGEventRef event_callback(CGEventTapProxy proxy, CGEventType type,
               CGEventGetIntegerValueField(event, kCGScrollWheelEventScrollPhase),
               CGEventGetIntegerValueField(event, kCGScrollWheelEventMomentumPhase))) {
         captured.kind = ZFLOW_EVENT_MOTION;
-        captured.scroll_x = CGEventGetIntegerValueField(
+        // CoreGraphics counts left as positive; the wire counts right, as
+        // Linux does. Up is positive for both.
+        captured.scroll_x = -CGEventGetIntegerValueField(
             event, kCGScrollWheelEventPointDeltaAxis2);
         captured.scroll_y = CGEventGetIntegerValueField(
             event, kCGScrollWheelEventPointDeltaAxis1);

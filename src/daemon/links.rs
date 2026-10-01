@@ -3,9 +3,10 @@
 //! computer dialed counts, and while one is up nothing is dialed.
 //!
 //! A link dials only where mDNS shows a zflow computer listening at the
-//! peer's saved address. A Mac only dials and never advertises, so it is
-//! never dialed; its own link to this computer is the session. Crossings and
-//! the chord still dial on demand when no session is up.
+//! peer's saved address. A Mac advertises only while it listens, so one that
+//! does not is never dialed and its own link to this computer is the session.
+//! When both computers dial at once, both keep the same session. Crossings
+//! and the chord still dial on demand when no session is up.
 
 use super::*;
 use crate::{
@@ -107,7 +108,7 @@ fn linked_peers(config: &Config) -> BTreeMap<String, PeerConfig> {
 
 /// Where a link dials `record`: every address of each zflow computer that
 /// mDNS shows at one of its saved addresses. Empty when nothing listens
-/// there, which is how a Mac looks.
+/// there, as with a Mac that is not listening.
 fn link_addresses(record: &PeerConfig, nearby: &BTreeMap<String, Nearby>) -> Vec<SocketAddr> {
     let saved = |address: &SocketAddr| {
         record
@@ -216,7 +217,8 @@ async fn run<S: Sessions>(mut task: Task<S>, status: watch::Sender<Option<LinkSt
         let session = match &view {
             View::Session(id) => *id,
             // Nothing listens where the peer was paired: it is off, out of
-            // mDNS reach, or a Mac. A crossing can still dial it.
+            // mDNS reach, or a Mac that is not listening. A crossing can
+            // still dial it.
             View::Dial(addresses) if addresses.is_empty() => {
                 status.send_replace(None);
                 if !task.wait(&view, None).await {
@@ -392,7 +394,8 @@ mod tests {
             link_addresses(&record(), &around),
             ["192.0.2.7:43119", "[2001:db8::7]:43119"].map(|a| a.parse().unwrap())
         );
-        // A Mac never advertises, so its saved address matches nothing.
+        // A Mac that is not listening does not advertise, so its saved
+        // address matches nothing.
         let mac = nearby(&[("other", &["192.0.2.9:43119"])]);
         assert!(link_addresses(&record(), &mac).is_empty());
         // Pairing over a dual-stack socket can save a mapped address.
@@ -466,11 +469,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_link_waits_for_a_computer_that_does_not_listen_and_uses_its_session() {
-        // Only another computer advertises, as with a Mac whose link is down.
+        // Only another computer advertises, as with a Mac that is not
+        // listening.
         let mut test = harness(nearby(&[("other", &["192.0.2.9:43119"])]), None);
         test.link.retry.send(()).unwrap();
         tokio::time::sleep(Duration::from_secs(60)).await;
-        assert!(test.dials.try_recv().is_err(), "a Mac is never dialed");
+        assert!(
+            test.dials.try_recv().is_err(),
+            "a computer that is not listening is never dialed"
+        );
         assert_eq!(*test.link.status.borrow(), None);
 
         // The Mac's own link arrives; it is the session.

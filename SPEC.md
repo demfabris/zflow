@@ -4,6 +4,7 @@
 >
 > Implementation status: the headless Linux prototype is implemented. It is not yet a qualified alpha: the privileged, packaged two-host qualification run in [TESTPLAN.md](TESTPLAN.md) has not run.
 > September 16 implementation: macOS uses a native SwiftUI menu-bar app linked to the Rust core through a C ABI. Linux uses a headless desktop agent and GNOME extension for cursor placement and return barriers. AWDL suppression uses a signed, same-team XPC service registered through SMAppService. Live two-host and signed-helper qualification remain outstanding; broader portal and macOS receiver matrices below are future work.
+> September 28 implementation: the Mac app also receives. A paired computer controls the logged-in Mac through CGEventPost from the app's own process, over the same authenticated sessions the Mac uses to send. The two-way sitting in [TESTPLAN.md](TESTPLAN.md) has not run yet. The LoginWindow process model and virtual-HID backends below remain future work.
 >
 > v0.3 records three maintainer decisions after adversarial review: on-demand device grabs, raw-contact capture in the signed macOS baseline behind a flag, and the split of release matrices into [TESTPLAN.md](TESTPLAN.md).
 
@@ -60,7 +61,7 @@ zflow MUST:
 | Mid-session enrollment of new physical devices | v1 baseline | Linux backbone matrix |
 | GNOME and KDE edge switching | provisional | Portal/EIS capture soak |
 | wlroots and COSMIC edge switching | experiment | Layer-surface crossing matrix |
-| Logged-in macOS capture and injection | planned | Signed macOS session matrix |
+| Logged-in macOS capture and injection | provisional; injection built, not yet run live | Two-way input sitting, then signed macOS session matrix |
 | macOS lock-screen and LoginWindow target injection | experiment | Per-backend signed secure-field matrix |
 | macOS source capture during Secure Event Input | keyboard unsupported; pointer and scroll experiment | Per-event-class matrix |
 | Linux virtual touchpad and native target gestures | experiment | libinput and compositor matrix |
@@ -383,7 +384,7 @@ zflow v1 uses application-level candidate racing:
 
 The prototype implements neither candidate racing nor SessionTakeover yet. A new input connection starts a new session.
 
-Each computer keeps one session to every paired peer it may send to, and a session either side dialed counts. A lost session that lasted at least 10 s is redialed at once; after a failed attempt or a shorter session the wait is 1, 2, 4 and 8 s, then 15 s. When both peers dial at once, both keep the connection dialed by the peer whose key fingerprint sorts first. The Linux daemon dials in the background only where mDNS shows a zflow computer at the peer's saved address, because a Mac only dials and never listens; a crossing with no session up still dials on demand.
+Each computer keeps one session to every paired peer it may send to, and a session either side dialed counts. A lost session that lasted at least 10 s is redialed at once; after a failed attempt or a shorter session the wait is 1, 2, 4 and 8 s, then 15 s. When both peers dial at once, both keep the connection dialed by the peer whose key fingerprint sorts first. The Linux daemon dials in the background only where mDNS shows a zflow computer at the peer's saved address, so it dials a Mac only while the Mac listens and advertises its port; a crossing with no session up still dials on demand.
 
 Endpoint::rebind does not implement simultaneous racing because it replaces an endpoint's socket for all connections.
 
@@ -561,7 +562,24 @@ the other's exact identifier. The
 build script bundles and signs these executables with hardened runtime enabled;
 notarization and distribution qualification are separate release steps.
 
-The broader receiver and LoginWindow process model below is future work.
+The same process receives. It listens on `transport.listen` on its own QUIC
+endpoint for every paired computer that may connect, so a port in use only
+stops incoming connections, and it keeps one session per computer: when both
+computers dial at once, both keep the connection dialed by the computer whose
+key sorts first. A peer may control the Mac over either connection. One
+ownership guard keeps input going one way at a time. While the Mac sends or
+is about to, a peer's activation or desktop handoff is refused; while a peer
+controls the Mac or holds a handoff, no crossing starts from it. While it
+listens and may use the network, the Mac advertises its port over mDNS without
+Touch.
+
+Paired computers keep one shared layout. The newest version wins, each
+computer writes only its own tile's size, and every session gets the kept
+layout when it starts and after each change. The Mac arranges tiles on its own
+until it first connects, then keeps the shared layout in
+`NAME.shared-layout.toml` beside its configuration.
+
+The LoginWindow process model below is future work.
 
 A root LaunchDaemon owns networking, peer state, console-session arbitration, and the optional root-only Karabiner client. It never creates CGEvent taps or calls CGEventPost. A signed native Mach-O LaunchAgent owns CGEvent capture, filtering, and posting in each Aqua or LoginWindow session.
 
@@ -596,7 +614,20 @@ Secure Event Input protects keyboard entry from interceptors. zflow treats that 
 
 ### Injection
 
-Logged-in v1 uses CGEventPost for keyboard, pointer, and scroll. System-defined media decoding and replay remain empirical compatibility paths; a virtual-HID backend prefers real Consumer reports.
+Logged-in v1 uses CGEventPost for keyboard, pointer, and scroll. The Mac app posts from a dedicated input thread. Spike I measured the choices below on macOS 27; see `spikes/i-mac-inject/RESULT.md`.
+
+- Events come from a HID system-state source with a zero local-event suppression interval and post at the HID tap. The Mac's own keyboard and trackpad keep working while a peer controls it.
+- Only the event location moves the cursor, and macOS neither accelerates nor clamps it. The receiver applies a libinput-style adaptive curve to peer motion and clamps the result onto the nearest display. Scroll is not accelerated: whole 120-unit detents post as lines, and anything finer as pixels.
+- Clicks set the click-state field, which double and triple clicks need. Motion with a button held posts drag events.
+- Keys map from HID usages through one keycode table shared with capture. The swap of the keys left of 1 and left of Z on ISO keyboards lives in that table, keyed on the receiving Mac's keyboard type. PrintScreen posts F13. ScrollLock, Pause, and F21 to F24 have no Mac key, so the session drops and counts them as it does on Linux. Media keys post as NX_SYSDEFINED events.
+- macOS does not repeat a posted key, so the receiver repeats the last pressed key at this Mac's repeat rate.
+- Caps Lock flips the real lock through `IOHIDSetModifierLockState`; a posted keycode 57 only sets the flag.
+- Each peer has a keyboard mode. Mac shortcuts means Ctrl and Cmd trade places on this Mac, except in terminals.
+- A peer may inject when sharing is on, its record may connect and send, Accessibility lets zflow post, and the console session is unlocked. An injecting batch on a locked screen closes the session. Locking the screen while a peer controls this Mac releases its input and closes its session within 250 ms. With "Pause at edges" on, a Mac edge crossing waits until the pointer rests 250 ms against the edge, and leaving the edge first cancels it. With clipboard sharing on, the Mac reads the general pasteboard on the main thread, only at the two clipboard triggers and only when macOS allows it without asking. It writes received clips beside an `io.zflow.clip` marker and remembers the change count of its own write, so its own write is never read back as a new copy, and it never sends copies that password managers mark concealed or transient.
+- Held input is released when an activation closes, its session or lease ends, the peer is revoked or replaced, the app quits, or the app receives SIGTERM, SIGINT, or SIGHUP. Nothing can release it after SIGKILL of the app.
+- A desktop handoff places the cursor at the requested entry point, reports where the pointer leaves through the handoff edge, and wakes the display. Taking control also wakes it, since the chord sends no Prepare. With AWDL suppression enabled, the Mac holds an AWDL lease while a peer controls it.
+
+System-defined media decoding and replay remain empirical compatibility paths; a virtual-HID backend prefers real Consumer reports.
 
 The real-device experiment has two backends:
 

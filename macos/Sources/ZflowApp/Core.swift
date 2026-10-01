@@ -37,7 +37,11 @@ struct Snapshot: Decodable, Sendable {
   var peers: [Peer]
   var pairing: Pairing
   var nearby: [Nearby]
+  /// Whether the pointer rests against an edge for a moment before it crosses.
+  var pauseAtEdges: Bool?
   var shortcuts: [Shortcut]
+  /// Whether the clipboard goes along with the pointer.
+  var shareClipboard: Bool?
   /// Nil here: the app keeps the login item itself.
   var autostart: Bool?
   var configPath: String
@@ -56,8 +60,12 @@ struct Peer: Decodable, Identifiable, Sendable {
   /// paired, connecting, connected, controlling_this, controlled_from_here or unreachable.
   var state: String
   var detail: String
+  /// Whether it may control this Mac.
   var allowControl: Bool
+  /// standard, pc_positions or mac: how its keys act on this Mac.
   var keyboard: String
+  /// Whether its scrolling is turned around on this Mac.
+  var reverseScroll: Bool
   var id: String { name }
 }
 struct Health: Decodable, Identifiable, Sendable {
@@ -94,6 +102,11 @@ struct CoreRequest: Encodable, Sendable {
   var name: String?
   var code: String?
   var allow: Bool?
+  var allowControl: Bool?
+  var keyboard: String?
+  var reverseScroll: Bool?
+  var pauseAtEdges: Bool?
+  var share: Bool?
 }
 struct CoreResponse: Decodable {
   var snapshot: Snapshot?
@@ -127,7 +140,9 @@ actor CoreBridge {
   func request(_ request: CoreRequest) throws -> Snapshot {
     guard !closed else { throw AppError(message: "The sharing engine has stopped") }
     if handle == nil { handle = try CoreHandle(path: path) }
-    let data = try JSONEncoder().encode(request)
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    let data = try encoder.encode(request)
     let text = String(decoding: data, as: UTF8.self)
     let response = text.withCString { zflow_app_request(handle!.pointer, $0) }
     guard let response else { throw AppError(message: "The sharing engine returned no response") }

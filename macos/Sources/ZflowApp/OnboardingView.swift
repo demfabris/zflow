@@ -109,7 +109,7 @@ struct OnboardingView: View {
       case .accessibility:
         (
           "accessibility", "Allow Accessibility",
-          "zflow needs Accessibility access to share your keyboard and trackpad with your other computers."
+          "zflow needs Accessibility access to share your keyboard and trackpad with your other computers, and to let them control this Mac."
         )
       case .localNetwork:
         (
