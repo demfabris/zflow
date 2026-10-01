@@ -101,9 +101,13 @@ Checks:
     nothing.
 11. **Local devices while controlled.** The Mac's trackpad and keyboard work
     with no stall.
-12. **Exclusion.** While controlled, remote and local motion into the Mac's
-    edge toward Ubuntu starts nothing, and the log shows "edge crossings
-    skipped while controlled" once.
+12. **Exclusion.** While the chord controls the Mac, remote and local motion
+    into the Mac's edge toward Ubuntu starts nothing, and the log shows "edge
+    crossings skipped while controlled" once. When Ubuntu came in by an edge
+    push instead, the Mac's own trackpad pushed into that edge hands control
+    back to Ubuntu ("cursor reached the desktop handoff edge"). Pushing on
+    then crosses to Ubuntu ("pointer pushed against a held edge", then
+    "configured edge reached"); stopping at the edge stays on the Mac.
     After the escape chord, a Mac-to-Ubuntu edge crossing works. With the Mac
     crossed to Ubuntu, the Ubuntu chord is refused.
 13. **Release safety.** Hold Shift+A remotely, then
@@ -157,6 +161,10 @@ Checks:
     before then starts nothing, and nothing reconnects when the switch
     changes (no "input link connected" line). Turn it off: the next push
     crosses at once.
+23. **Pushes.** Flick Mac to Ubuntu and back several times, fast: a flick
+    into the Mac's edge crosses, and a cursor left resting against that edge
+    crosses with the next push. Push with Cmd held: the pointer stays, and
+    after letting go it has to leave the edge before a push crosses.
 
 Known before the sitting: the Mac reads every sender's scroll as 120 units per
 detent, so a Mac trackpad sending to a Mac receiver scrolls slowly. Only Mac to
