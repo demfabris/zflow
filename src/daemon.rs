@@ -487,6 +487,28 @@ impl Shared {
         self.apply_layout().await;
     }
 
+    /// Gives a computer paired again with a new key, after a reinstall, the
+    /// tile its old key had, instead of a new one beside this computer.
+    async fn move_reinstalled_tiles(&self, old: &Config) {
+        let before = peer_keys(old);
+        let after = peer_keys(&*self.config.read().await);
+        for (name, key) in &after {
+            let Some(old_key) = before.get(name).filter(|old_key| *old_key != key) else {
+                continue;
+            };
+            let current = self.layout.lock().await.clone();
+            let Some(moved) = current.and_then(|layout| {
+                layout.with_key_replaced(&self.identity_fingerprint, old_key, key)
+            }) else {
+                continue;
+            };
+            let version = moved.version;
+            if self.keep_layout(moved, None).await {
+                tracing::info!(version, peer = %name, "reinstalled computer kept its tile");
+            }
+        }
+    }
+
     /// Gives each paired computer the layout lacks a tile beside this one,
     /// such as one paired after the computers were arranged, and tells the
     /// other computers. Without a layout there is nothing to add to: the
@@ -2224,6 +2246,7 @@ impl Shared {
 
         // Pairing, forgetting or renaming a computer changes which tiles have
         // a computer behind them here.
+        self.move_reinstalled_tiles(&old).await;
         self.place_new_peers().await;
         self.apply_layout().await;
         Ok(())

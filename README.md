@@ -62,7 +62,7 @@ the zflow window shows a banner with the step that is left: **Install**,
 Pass options after `bash -s --`:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.1.0 --no-launch
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.2.0 --no-launch
 ```
 
 Omit `--version` for the latest release. `--headless` skips GNOME integration.
@@ -70,7 +70,7 @@ Omit `--version` for the latest release. `--headless` skips GNOME integration.
 The script does not fall back to compiling if a release is unavailable.
 
 You can also download a `.deb` from [Releases](https://github.com/demfabris/zflow/releases)
-and install it with `sudo apt install ./zflow_0.1.0_amd64.deb` (use `arm64` on ARM).
+and install it with `sudo apt install ./zflow_0.2.0_amd64.deb` (use `arm64` on ARM).
 Then open zflow from Applications and follow its banner, or run
 `zflow desktop-agent --install` as yourself for the same setup the installer does.
 See [packaging/README.md](packaging/README.md) for migration from a source/archive
@@ -228,8 +228,11 @@ computer that mDNS shows listening at its saved address, and reconnects on the
 Mac app's schedule, so the first crossing does not wait for a handshake. A Mac
 only dials, so the daemon never dials one and uses the Mac's own connection.
 When a crossing or the chord finds no connection up, the daemon dials the saved
-address and nearby addresses too, with that computer's pinned key, so a changed
-address does not break the link. macOS
+addresses and nearby addresses too, with that computer's pinned key, so a
+changed address does not break the link. Pairing saves every address the other
+computer has, VPN ones such as Tailscale's included, so paired computers still
+reach each other away from the network they paired on. A nearby computer
+running another zflow version stays in the list and says to update it. macOS
 asks for Local Network access the first time the Mac browses, so the Mac waits
 for the setup's Local Network step or **Pair Computer…** in Settings. Once a
 computer is paired, it browses from launch. Browsing then continues while the

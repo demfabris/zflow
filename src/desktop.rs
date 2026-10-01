@@ -466,6 +466,20 @@ impl SharedLayout {
         next.editor = own.to_owned();
         next.validate().ok().map(|()| next)
     }
+
+    /// A new version, edited by `own`, in which `new` takes over `old`'s
+    /// tile, as when a computer was reinstalled and paired again with a new
+    /// key. None when `old` has no tile or `new` already has one.
+    pub fn with_key_replaced(&self, own: &str, old: &str, new: &str) -> Option<Self> {
+        if self.tiles.iter().any(|tile| tile.key == new) {
+            return None;
+        }
+        let mut next = self.clone();
+        next.tiles.iter_mut().find(|tile| tile.key == old)?.key = new.to_owned();
+        next.version = self.version.checked_add(1)?;
+        next.editor = own.to_owned();
+        next.validate().ok().map(|()| next)
+    }
 }
 
 /// Where a new tile of `size` for `key` goes among `tiles`: beside `anchor`
@@ -625,6 +639,36 @@ mod tests {
             "no room for another computer"
         );
         assert!(full.with_own_size(&key(1), 1280, 720).is_none());
+    }
+
+    #[test]
+    fn a_reinstalled_computer_keeps_its_tile() {
+        let key = |n: usize| format!("{n:064x}");
+        let tile = |n, x| Tile {
+            key: key(n),
+            x,
+            y: 0,
+            width: 1000,
+            height: 800,
+        };
+        let layout = SharedLayout {
+            version: 3,
+            editor: key(1),
+            tiles: vec![tile(1, 0), tile(2, -1000), tile(3, 1000)],
+        };
+        let moved = layout.with_key_replaced(&key(1), &key(2), &key(4)).unwrap();
+        assert_eq!((moved.version, &moved.editor), (4, &key(1)));
+        assert_eq!(moved.tiles, [tile(1, 0), tile(4, -1000), tile(3, 1000)]);
+        assert!(
+            layout
+                .with_key_replaced(&key(1), &key(5), &key(4))
+                .is_none()
+        );
+        assert!(
+            layout
+                .with_key_replaced(&key(1), &key(2), &key(3))
+                .is_none()
+        );
     }
 
     #[test]

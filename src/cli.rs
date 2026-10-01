@@ -1431,10 +1431,14 @@ fn pair_connect(
 ) -> Result<()> {
     let config = Config::load(&path)?;
     let identity = load_or_create_identity(&config.daemon.state_dir)?;
+    let port = config.transport.listen.port();
     let offer = crate::pairing::make_offer(
         crate::pairing::local_device_label(),
-        config.transport.listen.port(),
-        advertised,
+        port,
+        advertised
+            .into_iter()
+            .chain(crate::pairing::this_host_candidates(port))
+            .collect(),
     )?;
     let code = match code {
         Some(code) => code,
@@ -1482,10 +1486,14 @@ fn pair_listen(
 ) -> Result<()> {
     let config = Config::load(&path)?;
     let identity = load_or_create_identity(&config.daemon.state_dir)?;
+    let port = config.transport.listen.port();
     let offer = crate::pairing::make_offer(
         crate::pairing::local_device_label(),
-        config.transport.listen.port(),
-        advertised,
+        port,
+        advertised
+            .into_iter()
+            .chain(crate::pairing::this_host_candidates(port))
+            .collect(),
     )?;
     let code = crate::pairing::SetupCode::generate()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1859,6 +1867,7 @@ N: Name=\"keyd virtual keyboard\"
             peer_spki: b"peer public key".to_vec(),
             peer_label: Some("desk".into()),
             peer_candidates: vec![address],
+            peer_ip: address.ip(),
         };
 
         store_paired_peer(&path, "desk".into(), &observation).unwrap();
