@@ -366,12 +366,17 @@ impl SharedLayout {
     }
 
     /// A new version in which the computer `key` gives its own tile the size
-    /// of its desktop. Each computer writes only its own size, so two never
-    /// edit the same tile. The sides that touch a neighbour stay where they
-    /// are, so the crossings stay; a tile that would still overlap another
-    /// moves to the right of the rest. A layout from a computer that never
-    /// had this one gets its tile beside the first tile, so an edge leads to
-    /// it. None when the size is already right or the layout is full.
+    /// of its desktop. A layout from a computer that never had this one gets
+    /// its tile beside the first tile, so an edge leads to it. None when the
+    /// size is already right or the layout is full.
+    ///
+    /// A resized tile keeps touching the tiles it touched, on the same sides
+    /// where it can, so the crossings stay. It keeps whichever corner still
+    /// allows that. When growing would overlap a tile, or shrinking would
+    /// leave a gap, the tiles past the side that moved slide with it: only
+    /// the ones in the way if that is enough, else all of them. With no room
+    /// for that, it goes beside a tile it touched, else beside any tile. Of
+    /// the ways that work, the one that moves the fewest tiles wins.
     pub fn with_own_size(&self, key: &str, width: u32, height: u32) -> Option<Self> {
         let Some(index) = self.tiles.iter().position(|tile| tile.key == key) else {
             if self.tiles.len() >= MAX_SHARED_TILES {
@@ -392,47 +397,129 @@ impl SharedLayout {
         if (old.width, old.height) == (width, height) {
             return None;
         }
-        let others = || {
-            self.tiles
-                .iter()
-                .enumerate()
-                .filter(move |(i, _)| *i != index)
-                .map(|(_, other)| other)
-        };
+        let before = &self.tiles;
+        let (w, h) = (i64::from(width), i64::from(height));
         let ((left, right), (top, bottom)) = (span(old.x, old.width), span(old.y, old.height));
-        let beside = |other: &Tile| {
-            let (other_top, other_bottom) = span(other.y, other.height);
-            other_top < bottom && other_bottom > top
+        // Every tile, with this one at the new size and its corner at (x, y).
+        let resized = |x: i64, y: i64| {
+            let mut tiles = before.clone();
+            let grown = Tile {
+                width,
+                height,
+                ..old.clone()
+            };
+            tiles[index] = shifted(&grown, x - left, y - top)?;
+            Some(tiles)
         };
-        let above_or_below = |other: &Tile| {
-            let (other_left, other_right) = span(other.x, other.width);
-            other_left < right && other_right > left
+        // How far `other` slides to stay against the side of this tile it is
+        // past, when this tile's corner goes to (x, y).
+        let slide = |x: i64, y: i64, other: &Tile| {
+            let ((l, r), (t, b)) = (span(other.x, other.width), span(other.y, other.height));
+            let dx = if l >= right {
+                x + w - right
+            } else if r <= left {
+                x - left
+            } else {
+                0
+            };
+            let dy = if t >= bottom {
+                y + h - bottom
+            } else if b <= top {
+                y - top
+            } else {
+                0
+            };
+            (dx, dy)
         };
-        let touches_left = others().any(|o| beside(o) && span(o.x, o.width).1 == left);
-        let touches_right = others().any(|o| beside(o) && i64::from(o.x) == right);
-        let touches_top = others().any(|o| above_or_below(o) && span(o.y, o.height).1 == top);
-        let touches_bottom = others().any(|o| above_or_below(o) && i64::from(o.y) == bottom);
-        let mut next = self.clone();
-        next.version = self.version.checked_add(1)?;
-        next.editor = key.to_owned();
-        let tile = &mut next.tiles[index];
-        if touches_right && !touches_left {
-            tile.x = i32::try_from(right - i64::from(width)).ok()?;
-        }
-        if touches_bottom && !touches_top {
-            tile.y = i32::try_from(bottom - i64::from(height)).ok()?;
-        }
-        tile.width = width;
-        tile.height = height;
-        let resized = next.tiles[index].clone();
-        if others().any(|other| overlaps(&resized, other)) {
-            let right = others()
-                .map(|other| other.x.saturating_add(other.width as i32))
-                .max()
-                .unwrap_or(0);
-            next.tiles[index].x = right;
-            next.tiles[index].y = 0;
-        }
+        let corners = [
+            (left, top),
+            (right - w, top),
+            (left, bottom - h),
+            (right - w, bottom - h),
+        ];
+        let pushed = corners.map(|(x, y)| {
+            let mut tiles = resized(x, y)?;
+            let mut moved = vec![false; tiles.len()];
+            moved[index] = true;
+            while let Some(hit) = (0..tiles.len()).find(|&j| {
+                !moved[j] && (0..tiles.len()).any(|i| moved[i] && overlaps(&tiles[i], &tiles[j]))
+            }) {
+                let (dx, dy) = slide(x, y, &before[hit]);
+                tiles[hit] = shifted(&tiles[hit], dx, dy)?;
+                moved[hit] = true;
+            }
+            Some(tiles)
+        });
+        let slid = corners.map(|(x, y)| {
+            let mut tiles = resized(x, y)?;
+            for (i, tile) in tiles.iter_mut().enumerate().filter(|(i, _)| *i != index) {
+                let (dx, dy) = slide(x, y, &before[i]);
+                *tile = shifted(tile, dx, dy)?;
+            }
+            Some(tiles)
+        });
+        let others = || before.iter().enumerate().filter(|(i, _)| *i != index);
+        let past_all = others()
+            .map(|(_, other)| span(other.x, other.width).1)
+            .max()
+            .unwrap_or(0);
+        let placed = others()
+            .flat_map(|(_, other)| beside(other, (w, h)))
+            .chain([(past_all, top)])
+            .map(|(x, y)| resized(x, y));
+        let touched = others().any(|(_, other)| touching(old, other).is_some());
+        // Contacts this tile keeps on the same side, then on any side, then
+        // whether it touches anything, then the other tiles' contacts kept,
+        // then the fewest tiles moved.
+        let score = |tiles: &[Tile]| {
+            let (mut same, mut any, mut rest) = (0, 0, 0);
+            for (i, a) in before.iter().enumerate() {
+                for (j, b) in before.iter().enumerate().skip(i + 1) {
+                    let Some(side) = touching(a, b) else {
+                        continue;
+                    };
+                    let now = touching(&tiles[i], &tiles[j]);
+                    if i == index || j == index {
+                        same += usize::from(now == Some(side));
+                        any += usize::from(now.is_some());
+                    } else {
+                        rest += usize::from(now == Some(side));
+                    }
+                }
+            }
+            let touches = touched
+                && (0..tiles.len())
+                    .any(|j| j != index && touching(&tiles[index], &tiles[j]).is_some());
+            let (x, y) = (i64::from(tiles[index].x), i64::from(tiles[index].y));
+            let kept_corner = (x == left || x + w == right) && (y == top || y + h == bottom);
+            let moved = usize::from(!kept_corner)
+                + others()
+                    .filter(|&(i, other)| (tiles[i].x, tiles[i].y) != (other.x, other.y))
+                    .count();
+            (same, any, touches, rest, std::cmp::Reverse(moved))
+        };
+        // Pairs that did not change keep whatever they had.
+        let apart = |tiles: &Vec<Tile>| {
+            (0..tiles.len()).all(|i| {
+                (i + 1..tiles.len()).all(|j| {
+                    (tiles[i] == before[i] && tiles[j] == before[j])
+                        || !overlaps(&tiles[i], &tiles[j])
+                })
+            })
+        };
+        let tiles = pushed
+            .into_iter()
+            .chain(slid)
+            .chain(placed)
+            .flatten()
+            .filter(apart)
+            // The first of the best.
+            .min_by_key(|tiles| std::cmp::Reverse(score(tiles)))?;
+        let next = Self {
+            version: self.version.checked_add(1)?,
+            editor: key.to_owned(),
+            tiles,
+        };
         next.validate().ok().map(|()| next)
     }
 
@@ -477,26 +564,15 @@ fn free_spot(
     key: &str,
     (width, height): (u32, u32),
 ) -> Option<Tile> {
-    use crate::app::layout_model::MAX_COORDINATE;
-    let tile = |x: i64, y: i64| {
-        let bounds = -i64::from(MAX_COORDINATE)..=i64::from(MAX_COORDINATE);
-        (bounds.contains(&x) && bounds.contains(&y)).then(|| Tile {
-            key: key.to_owned(),
-            x: x as i32,
-            y: y as i32,
-            width,
-            height,
-        })
+    let new = Tile {
+        key: key.to_owned(),
+        x: 0,
+        y: 0,
+        width,
+        height,
     };
-    let (w, h) = (i64::from(width), i64::from(height));
-    let beside = anchor.map_or_else(Vec::new, |a| {
-        let ((left, right), (top, bottom)) = (span(a.x, a.width), span(a.y, a.height));
-        vec![
-            (right, top),
-            (left - w, top),
-            (left, bottom),
-            (left, top - h),
-        ]
+    let spots = anchor.map_or_else(Vec::new, |a| {
+        beside(a, (i64::from(width), i64::from(height))).to_vec()
     });
     let past_all = tiles
         .iter()
@@ -504,11 +580,59 @@ fn free_spot(
         .max()
         .unwrap_or(0);
     let row = anchor.map_or(0, |a| i64::from(a.y));
-    beside
+    spots
         .into_iter()
         .chain([(past_all, row)])
-        .filter_map(|(x, y)| tile(x, y))
+        .filter_map(|(x, y)| shifted(&new, x, y))
         .find(|tile| !tiles.iter().any(|other| overlaps(tile, other)))
+}
+
+/// Where a tile of size (w, h) goes against each side of `anchor`: right,
+/// left, below and above, lined up with its top or left.
+fn beside(anchor: &Tile, (w, h): (i64, i64)) -> [(i64, i64); 4] {
+    let ((left, right), (top, bottom)) =
+        (span(anchor.x, anchor.width), span(anchor.y, anchor.height));
+    [
+        (right, top),
+        (left - w, top),
+        (left, bottom),
+        (left, top - h),
+    ]
+}
+
+/// `tile` moved by (dx, dy). None when that is off the canvas.
+fn shifted(tile: &Tile, dx: i64, dy: i64) -> Option<Tile> {
+    use crate::app::layout_model::MAX_COORDINATE;
+    let on_canvas = |at: i32, by: i64| {
+        let at = i64::from(at) + by;
+        (-i64::from(MAX_COORDINATE)..=i64::from(MAX_COORDINATE))
+            .contains(&at)
+            .then_some(at as i32)
+    };
+    Some(Tile {
+        x: on_canvas(tile.x, dx)?,
+        y: on_canvas(tile.y, dy)?,
+        ..tile.clone()
+    })
+}
+
+/// The side of `a` that `b` shares part of, if any.
+fn touching(a: &Tile, b: &Tile) -> Option<Edge> {
+    let ((al, ar), (at, ab)) = (span(a.x, a.width), span(a.y, a.height));
+    let ((bl, br), (bt, bb)) = (span(b.x, b.width), span(b.y, b.height));
+    let beside = at < bb && ab > bt;
+    let above_or_below = al < br && ar > bl;
+    if beside && ar == bl {
+        Some(Edge::Right)
+    } else if beside && br == al {
+        Some(Edge::Left)
+    } else if above_or_below && ab == bt {
+        Some(Edge::Bottom)
+    } else if above_or_below && bb == at {
+        Some(Edge::Top)
+    } else {
+        None
+    }
 }
 
 fn span(start: i32, size: u32) -> (i64, i64) {
@@ -628,6 +752,136 @@ mod tests {
     }
 
     #[test]
+    fn a_resized_tile_keeps_touching_its_neighbours() {
+        use crate::app::layout_model::{Layout, MAX_COORDINATE, MAX_DIMENSION};
+        let key = |n: usize| format!("{n:064x}");
+        let tile = |n, x, y, width, height| Tile {
+            key: key(n),
+            x,
+            y,
+            width,
+            height,
+        };
+        let apart = |layout: &SharedLayout| {
+            let tiles = &layout.tiles;
+            (0..tiles.len()).all(|i| tiles[i + 1..].iter().all(|b| !overlaps(&tiles[i], b)))
+        };
+        // Ubuntu's first layout: itself, then its paired computers to the
+        // right in name order, at a placeholder size.
+        let (ubuntu, mac, xps) = (1, 2, 3);
+        let row = SharedLayout {
+            version: 0,
+            editor: key(ubuntu),
+            tiles: vec![
+                tile(ubuntu, 0, 0, 2560, 1440),
+                tile(mac, 2560, 0, 1920, 1080),
+                tile(xps, 4480, 0, 1920, 1080),
+            ],
+        };
+        // The Mac writes its real size. It grows right and down, and xps
+        // slides right by as much, so all three still touch.
+        let grown = row.with_own_size(&key(mac), 3008, 1692).unwrap();
+        assert!(apart(&grown));
+        assert_eq!(
+            grown.tiles,
+            [
+                tile(ubuntu, 0, 0, 2560, 1440),
+                tile(mac, 2560, 0, 3008, 1692),
+                tile(xps, 5568, 0, 1920, 1080),
+            ]
+        );
+        let names = std::collections::BTreeMap::from([
+            ("macbook".to_owned(), key(mac)),
+            ("xps".to_owned(), key(xps)),
+        ]);
+        let on_ubuntu = Layout::from_shared(&grown, &key(ubuntu), "This computer", &names);
+        assert!(
+            on_ubuntu
+                .transitions()
+                .iter()
+                .any(|t| (t.source, t.target, t.edge) == (0, 1, Edge::Right)),
+            "Ubuntu keeps its edge to the Mac"
+        );
+        // Shrinking back pulls xps along, so no gap opens.
+        let shrunk = grown.with_own_size(&key(mac), 1920, 1080).unwrap();
+        assert_eq!(shrunk.tiles, row.tiles);
+
+        // Growing taller between a tile above and one below: the one above
+        // moves up, since the one below also touches Ubuntu.
+        let (above, below) = (4, 5);
+        let stacked = SharedLayout {
+            tiles: vec![
+                tile(ubuntu, 0, 0, 2560, 1440),
+                tile(mac, 2560, 0, 1920, 1080),
+                tile(above, 2560, -1080, 1920, 1080),
+                tile(below, 2560, 1080, 1920, 1080),
+            ],
+            ..row.clone()
+        };
+        let taller = stacked.with_own_size(&key(mac), 1920, 1692).unwrap();
+        assert!(apart(&taller));
+        assert_eq!(
+            taller.tiles[1..],
+            [
+                tile(mac, 2560, -612, 1920, 1692),
+                tile(above, 2560, -1692, 1920, 1080),
+                tile(below, 2560, 1080, 1920, 1080),
+            ]
+        );
+
+        // A full layout, four by four, with a tile inside it growing.
+        let grid = SharedLayout {
+            tiles: (0..MAX_SHARED_TILES)
+                .map(|n| {
+                    let (column, line) = ((n % 4) as i32, (n / 4) as i32);
+                    tile(n + 10, column * 1920, line * 1080, 1920, 1080)
+                })
+                .collect(),
+            ..row.clone()
+        };
+        let resized = grid.with_own_size(&key(15), 3008, 1692).unwrap();
+        assert!(apart(&resized));
+        assert_eq!(
+            (resized.tiles[5].width, resized.tiles[5].height),
+            (3008, 1692)
+        );
+        for n in [1, 4, 6, 9] {
+            assert_eq!(
+                touching(&resized.tiles[5], &resized.tiles[n]),
+                touching(&grid.tiles[5], &grid.tiles[n]),
+                "tile {n} still touches the same side"
+            );
+        }
+
+        // A row as wide as the canvas: nothing can slide out of the way, so
+        // the grown tile goes below the tile on its left, still touching it.
+        let mut x = -MAX_COORDINATE;
+        let wide = SharedLayout {
+            tiles: (0..14)
+                .map(|n| {
+                    let width = if n == 7 { 3000 } else { MAX_DIMENSION };
+                    let placed = tile(n + 10, x, 0, width, 1080);
+                    x += width as i32;
+                    placed
+                })
+                .collect(),
+            ..row
+        };
+        let squeezed = wide.with_own_size(&key(17), 4000, 1080).unwrap();
+        assert!(apart(&squeezed));
+        assert_eq!(squeezed.tiles[..7], wide.tiles[..7]);
+        assert_eq!(squeezed.tiles[8..], wide.tiles[8..]);
+        assert_eq!(
+            (squeezed.tiles[7].x, squeezed.tiles[7].y),
+            (wide.tiles[6].x, 1080)
+        );
+        assert_eq!(
+            touching(&squeezed.tiles[6], &squeezed.tiles[7]),
+            Some(Edge::Bottom)
+        );
+    }
+
+    #[test]
     fn a_full_shared_layout_fits_one_desktop_message_and_orders_versions() {
         let key = |n: usize| format!("{n:064x}");
         let tile = |n| Tile {
@@ -700,7 +954,8 @@ mod tests {
         assert_eq!((wider.tiles[0].x, wider.tiles[0].width), (-200, 1200));
         let narrower = small.with_own_size(&key(1), 600, 800).unwrap();
         assert_eq!((narrower.tiles[0].x, narrower.tiles[0].width), (400, 600));
-        // Squeezed between two neighbours, a grown tile moves past the others.
+        // Squeezed between two neighbours, a grown tile pushes the one it
+        // grows into, and keeps touching both.
         let mut middle = small.clone();
         middle.tiles.push(Tile {
             key: key(3),
@@ -710,7 +965,10 @@ mod tests {
             height: 800,
         });
         let crowded = middle.with_own_size(&key(1), 1200, 800).unwrap();
-        assert_eq!((crowded.tiles[0].x, crowded.tiles[0].y), (1500, 0));
+        assert_eq!(
+            crowded.tiles.iter().map(|tile| tile.x).collect::<Vec<_>>(),
+            [0, 1200, -300]
+        );
         let mut maxed = small.clone();
         maxed.version = MAX_TOKEN;
         assert!(
