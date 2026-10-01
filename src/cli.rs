@@ -1867,6 +1867,7 @@ N: Name=\"keyd virtual keyboard\"
             peer_spki: b"peer public key".to_vec(),
             peer_label: Some("desk".into()),
             peer_candidates: vec![address],
+            peer_ip: address.ip(),
         };
 
         store_paired_peer(&path, "desk".into(), &observation).unwrap();

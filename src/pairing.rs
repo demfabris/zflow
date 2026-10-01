@@ -113,6 +113,8 @@ pub struct PairingObservation {
     pub peer_spki: Vec<u8>,
     pub peer_label: Option<String>,
     pub peer_candidates: Vec<SocketAddr>,
+    /// Where this pairing came from, unlike candidates the peer only claims.
+    pub peer_ip: IpAddr,
 }
 
 /// A pairing that proved the setup code. Knowing the code is not enough to be
@@ -322,8 +324,9 @@ pub async fn begin(
 
 /// Saves the peer this pairing authenticated and returns its name, taken from
 /// the peer's host name. Either computer may control the other. Pairing a
-/// known computer again only refreshes its addresses, and a new key never
-/// replaces a trusted one.
+/// known computer again only refreshes its addresses. A new key replaces a
+/// trusted one only for the same computer after a reinstall: same name, at
+/// an address the old key used.
 pub fn add_paired_peer(
     config: &mut crate::config::Config,
     observation: &PairingObservation,
@@ -347,6 +350,22 @@ pub fn add_paired_peer(
         return Ok(name.clone());
     }
     let base = peer_name(observation.peer_label.as_deref());
+    // Two running computers never share an address, so a namesake elsewhere
+    // still gets its own entry below. Only the address the pairing came from
+    // counts: claimed ones such as a Docker bridge's repeat across computers.
+    // The reinstalled one keeps its settings and tile, but pre-login input
+    // was granted to the old key alone.
+    if let Some(existing) = config.peers.get_mut(&base)
+        && existing
+            .addresses
+            .iter()
+            .any(|address| address.ip().to_canonical() == observation.peer_ip)
+    {
+        existing.spki_der_hex = record.spki_der_hex;
+        existing.addresses = record.addresses;
+        existing.permissions.inject_prelogin = false;
+        return Ok(base);
+    }
     // A second computer with the same name gets a piece of its key's
     // fingerprint, so the two entries are told apart by what they are.
     let short = record.fingerprint_hex()?[..6].to_owned();
@@ -484,6 +503,7 @@ async fn complete(
         peer_spki,
         peer_label: peer_offer.device_label,
         peer_candidates,
+        peer_ip: remote_address.ip().to_canonical(),
     })
 }
 
@@ -722,13 +742,14 @@ mod tests {
     }
 
     #[test]
-    fn paired_peers_are_named_from_the_host_and_never_replace_trust() {
+    fn paired_peers_are_named_from_the_host_and_namesakes_stay_apart() {
         let (_other_directory, other) = identity();
         let (_directory, known) = identity();
         let observation = PairingObservation {
             peer_spki: known.spki().to_vec(),
             peer_label: Some("ubuntu".into()),
             peer_candidates: vec!["192.0.2.1:43119".parse().unwrap()],
+            peer_ip: "192.0.2.1".parse().unwrap(),
         };
         let mut config = crate::config::Config::default();
         assert_eq!(
@@ -763,15 +784,42 @@ mod tests {
         );
 
         // A different computer with the same host name gets its own entry,
-        // marked with part of its fingerprint, even if it hides characters.
+        // marked with part of its fingerprint, even if it hides characters,
+        // and even if it claims one of the known computer's addresses.
         let twin = PairingObservation {
             peer_spki: other.spki().to_vec(),
             peer_label: Some("ubun\u{200b}tu".into()),
+            peer_candidates: vec![
+                "192.0.2.1:43119".parse().unwrap(),
+                "192.0.2.9:43119".parse().unwrap(),
+            ],
             ..observation.clone()
         };
         let expected = format!("ubuntu ({})", &other.fingerprint_hex()[..6]);
         assert_eq!(add_paired_peer(&mut config, &twin).unwrap(), expected);
         assert_eq!(config.peers["ubuntu"].spki_der().unwrap(), known.spki());
+
+        // The same computer reinstalled, with a new key, pairing from where
+        // the old key was: it takes over its entry and settings, except
+        // pre-login input.
+        let (_reinstalled_directory, reinstalled) = identity();
+        {
+            let ubuntu = config.peers.get_mut("ubuntu").unwrap();
+            ubuntu.keyboard = crate::core::KeyboardMode::Mac;
+            ubuntu.permissions.inject_prelogin = true;
+        }
+        let again = PairingObservation {
+            peer_spki: reinstalled.spki().to_vec(),
+            peer_candidates: vec!["[::ffff:192.0.2.9]:43119".parse().unwrap()],
+            peer_ip: "192.0.2.9".parse().unwrap(),
+            ..observation.clone()
+        };
+        assert_eq!(add_paired_peer(&mut config, &again).unwrap(), "ubuntu");
+        assert_eq!(config.peers.len(), 2);
+        let ubuntu = &config.peers["ubuntu"];
+        assert_eq!(ubuntu.spki_der().unwrap(), reinstalled.spki());
+        assert_eq!(ubuntu.keyboard, crate::core::KeyboardMode::Mac);
+        assert!(!ubuntu.permissions.inject_prelogin);
 
         let mut fresh = crate::config::Config::default();
         let unnamed = PairingObservation {
