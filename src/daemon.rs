@@ -146,6 +146,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         arming_started: Mutex::new(None),
         active_outbound: Mutex::new(None),
         inbound_owner: Mutex::new(None),
+        chord_peer: Mutex::new(None),
         clipboard_echo: Mutex::new(BTreeMap::new()),
         desktop: desktop::Hub::default(),
         seat,
@@ -368,6 +369,8 @@ struct Shared {
     arming_started: Mutex<Option<(String, Instant)>>,
     active_outbound: Mutex<Option<ActiveOutbound>>,
     inbound_owner: Mutex<Option<(String, u64)>>,
+    /// The computer the activation chord picked last.
+    chord_peer: Mutex<Option<String>>,
     /// Per peer, the clip last sent to it and the one it last gave here.
     clipboard_echo: Mutex<BTreeMap<String, crate::clipboard::Echo>>,
     desktop: desktop::Hub,
@@ -1128,19 +1131,29 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
                 let config = shared.config.read().await;
                 eligible_outbound_peers(&config)
             };
-            if eligible.len() == 1 {
-                let shared = shared.clone();
-                let peer = eligible.into_iter().next().expect("one eligible peer");
-                tokio::spawn(async move {
-                    if let Err(error) = shared.activate(&peer).await {
-                        tracing::warn!(%error, %peer, "activation chord could not select peer");
-                    }
-                });
-            } else {
-                tracing::warn!(
-                    count = eligible.len(),
-                    "activation chord requires exactly one eligible peer"
-                );
+            let connected = shared
+                .sessions
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, session)| !session.is_closed())
+                .map(|(peer, _)| peer.clone())
+                .collect();
+            let mut last = shared.chord_peer.lock().await;
+            match chord_peer(&eligible, &connected, last.as_deref()) {
+                Some(peer) => {
+                    *last = Some(peer.clone());
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = shared.activate(&peer).await {
+                            tracing::warn!(%error, %peer, "activation chord could not select peer");
+                        }
+                    });
+                }
+                None => tracing::warn!(
+                    eligible = eligible.len(),
+                    "activation chord found no connected computer to send to"
+                ),
             }
         }
         RuntimeEvent::OwnershipChanged {
@@ -1609,6 +1622,31 @@ fn with_tile_moved(
     let moved = view.to_shared(layout.version.saturating_add(1), own, keys);
     moved.validate()?;
     Ok(moved)
+}
+
+/// The computer the activation chord sends to. Connected computers come
+/// first, in name order, and each press moves to the one after `last`. With
+/// none connected, a sole eligible computer is dialed.
+fn chord_peer(
+    eligible: &[String],
+    connected: &std::collections::BTreeSet<String>,
+    last: Option<&str>,
+) -> Option<String> {
+    let live: Vec<&String> = eligible
+        .iter()
+        .filter(|peer| connected.contains(*peer))
+        .collect();
+    let Some(first) = live.first() else {
+        return match eligible {
+            [only] => Some(only.clone()),
+            _ => None,
+        };
+    };
+    let next = live
+        .iter()
+        .find(|peer| last.is_some_and(|last| peer.as_str() > last))
+        .unwrap_or(first);
+    Some(next.to_string())
 }
 
 fn eligible_outbound_peers(config: &Config) -> Vec<String> {
@@ -2344,6 +2382,51 @@ mod tests {
         assert!(wins_dial(&config, &lower, "mac"));
         assert!(!wins_dial(&config, &higher, "mac"));
         assert!(!wins_dial(&config, &lower, "unknown"));
+    }
+
+    #[test]
+    fn the_chord_picks_a_connected_computer_and_cycles_through_them() {
+        use std::collections::BTreeSet;
+        fn names<T: FromIterator<String>>(names: &[&str]) -> T {
+            names.iter().map(|name| name.to_string()).collect()
+        }
+        let eligible: Vec<String> = names(&["mac", "ubuntu", "xps"]);
+        // The Mac is online and xps is off: the chord goes to the Mac.
+        let connected: BTreeSet<String> = names(&["mac"]);
+        assert_eq!(
+            chord_peer(&eligible, &connected, None).as_deref(),
+            Some("mac")
+        );
+        assert_eq!(
+            chord_peer(&eligible, &connected, Some("mac")).as_deref(),
+            Some("mac")
+        );
+        // With several online, each press moves to the next, in name order.
+        let connected: BTreeSet<String> = names(&["mac", "xps"]);
+        let mut last = None;
+        let picked: Vec<String> = (0..4)
+            .map(|_| {
+                let peer = chord_peer(&eligible, &connected, last.as_deref()).unwrap();
+                last = Some(peer.clone());
+                peer
+            })
+            .collect();
+        assert_eq!(picked, ["mac", "xps", "mac", "xps"]);
+        // A computer that went offline since the last press is skipped.
+        assert_eq!(
+            chord_peer(&eligible, &connected, Some("ubuntu")).as_deref(),
+            Some("xps")
+        );
+        // A connected computer that may not receive input is never picked.
+        assert_eq!(chord_peer(&[], &connected, None), None);
+        // Nobody online: a sole paired computer is still dialed, but the
+        // chord cannot guess between several.
+        let nobody = BTreeSet::new();
+        assert_eq!(
+            chord_peer(&names::<Vec<_>>(&["mac"]), &nobody, Some("mac")).as_deref(),
+            Some("mac")
+        );
+        assert_eq!(chord_peer(&eligible, &nobody, None), None);
     }
 
     #[test]
