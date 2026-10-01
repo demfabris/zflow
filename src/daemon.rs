@@ -170,6 +170,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         identity = %shared.identity_fingerprint,
         control_socket = %socket_path.display(),
         input_listen = %shared.endpoint.local_addr()?,
+        sharing = config.daemon.sharing,
         "headless input daemon started"
     );
 
@@ -1044,9 +1045,15 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
         Request::Status => Ok(Response::Status(Box::new(shared.status().await))),
         Request::ReloadConfig => {
             let _mutation = shared.config_mutation.lock().await;
-            shared
-                .apply_config_locked(Config::load(&shared.config_path)?, false)
-                .await?;
+            let config = Config::load(&shared.config_path)?;
+            let (was, sharing) = (
+                shared.config.read().await.daemon.sharing,
+                config.daemon.sharing,
+            );
+            shared.apply_config_locked(config, false).await?;
+            if was != sharing {
+                tracing::info!(sharing, was, source = "config reload", "input sharing set");
+            }
             Ok(Response::Ack)
         }
         Request::ListPeers => Ok(Response::Peers {

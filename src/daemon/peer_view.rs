@@ -104,7 +104,7 @@ async fn desktop_command(
         return Ok(DesktopReply::Ack);
     }
     let _mutation = shared.config_mutation.lock().await;
-    authorize_peer(stream, daemon_uid, shared.active_uid())?;
+    let uid = authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();
     match request {
         Request::Status {} => Ok(DesktopReply::Status(DesktopStatus {
@@ -125,8 +125,19 @@ async fn desktop_command(
             ..DesktopStatus::from_config(&config)
         })),
         Request::SetSharing { enabled } => {
+            let was = config.daemon.sharing;
             config.daemon.sharing = enabled;
             shared.apply_config_locked(config, true).await?;
+            // A pause nobody remembers asking for is hard to trace otherwise.
+            let pid = stream.peer_cred().ok().and_then(|caller| caller.pid());
+            tracing::info!(
+                sharing = enabled,
+                was,
+                source = "desktop app",
+                uid,
+                pid,
+                "input sharing set"
+            );
             Ok(DesktopReply::Ack)
         }
         Request::SetSwitching { pause_at_edges } => {

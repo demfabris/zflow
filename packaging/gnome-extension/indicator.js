@@ -15,7 +15,12 @@ export class Indicator {
         this._sharing = new PopupMenu.PopupSwitchMenuItem('Input Sharing', false);
         this._sharing.setSensitive(false);
         this._button.menu.addMenuItem(this._sharing);
-        this._sharing.connect('toggled', (_item, enabled) => this._run({command: 'set_sharing', enabled}));
+        // GNOME 50 emits toggled for setToggleState too, so only a person's
+        // flip may change sharing.
+        this._updating = false;
+        this._sharing.connect('toggled', (_item, enabled) => {
+            if (!this._updating) this._run({command: 'set_sharing', enabled});
+        });
         this._button.menu.addAction('Settings…', () => this._run({command: 'open_settings'}));
         this._busy = false;
         this._destroyed = false;
@@ -35,7 +40,9 @@ export class Indicator {
         this._button.accessible_name = `zflow, ${title}`;
         // The service answers sharing as null while it cannot be reached.
         const sharing = compatible(snapshot) ? snapshot.sharing : null;
+        this._updating = true;
         this._sharing.setToggleState(sharing ?? false);
+        this._updating = false;
         this._sharing.setSensitive(sharing !== null && !this._busy);
         this._icon.icon_name = needsAttention(snapshot) ? 'dialog-warning-symbolic'
             : sharing ? 'input-mouse-symbolic' : 'media-playback-pause-symbolic';
