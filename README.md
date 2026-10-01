@@ -218,7 +218,11 @@ Pairing lists receivers advertised on the local network. Discovery does not
 verify identity; only the setup code shown on the receiver does. Manual
 addresses remain available. The Linux daemon advertises itself and also
 browses: when it dials a paired computer, it tries nearby addresses too, with
-that computer's pinned key, so a changed address does not break the link. macOS
+that computer's pinned key, so a changed address does not break the link.
+Pairing also saves every address the other computer has, VPN ones such as
+Tailscale's included, so paired computers still reach each other away from
+the network they paired on. A nearby computer running another zflow version
+stays in the list and says to update it. macOS
 asks for Local Network access the first time the Mac browses, so the Mac waits
 for the setup's Local Network step or **Pair Computer…** in Settings. Once a
 computer is paired, it browses from launch. Browsing then continues while the

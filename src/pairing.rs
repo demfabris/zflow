@@ -176,14 +176,45 @@ pub fn make_offer(
         bail!("input port must be non-zero");
     }
     validate_label(device_label.as_deref())?;
+    let mut candidates = Vec::new();
+    for candidate in input_candidates {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates.truncate(crate::discovery::MAX_DISCOVERY_CANDIDATES);
     Ok(PairingOffer {
         device_label,
         input_port,
-        input_candidates: input_candidates
+        input_candidates: candidates
             .into_iter()
             .map(|candidate| candidate.to_string())
             .collect(),
     })
+}
+
+/// This computer's addresses on its input port. Sent while pairing, they let
+/// the other computer reach this one after either leaves the network they
+/// paired on, for example over Tailscale.
+pub fn this_host_candidates(input_port: u16) -> Vec<SocketAddr> {
+    let addresses = crate::discovery::local_unicast_addresses().unwrap_or_else(|error| {
+        tracing::debug!("could not list this computer's addresses: {error}");
+        Vec::new()
+    });
+    candidates_on_port(addresses, input_port)
+}
+
+fn candidates_on_port(addresses: Vec<IpAddr>, input_port: u16) -> Vec<SocketAddr> {
+    addresses
+        .into_iter()
+        // A link-local address only works on the link it came from, and the
+        // other computer refuses an IPv6 one without its interface scope.
+        .filter(|address| match address {
+            IpAddr::V4(address) => !address.is_link_local(),
+            IpAddr::V6(address) => !address.is_unicast_link_local(),
+        })
+        .map(|address| SocketAddr::new(address, input_port))
+        .collect()
 }
 
 pub struct PairingListener<'identity> {
@@ -269,7 +300,11 @@ pub async fn begin(
     input_port: u16,
     code: &SetupCode,
 ) -> Result<PairingSession> {
-    let offer = make_offer(local_device_label(), input_port, Vec::new())?;
+    let offer = make_offer(
+        local_device_label(),
+        input_port,
+        this_host_candidates(input_port),
+    )?;
     if let Some(remote) = remote {
         crate::discovery::UntrustedCandidate::explicit(remote)?;
         connect(identity, remote, &offer, code).await
@@ -534,6 +569,44 @@ mod tests {
                 .peer_candidates
                 .contains(&"127.0.0.1:43119".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn pairing_offers_every_address_the_other_computer_can_use() {
+        let addresses = [
+            "192.168.1.215",
+            "100.114.101.60",
+            "169.254.3.4",
+            "fe80::1",
+            "fd7a:115c:a1e0::1",
+        ]
+        .map(|address| address.parse().unwrap());
+        assert_eq!(
+            candidates_on_port(addresses.to_vec(), 43119),
+            [
+                "192.168.1.215:43119",
+                "100.114.101.60:43119",
+                "[fd7a:115c:a1e0::1]:43119",
+            ]
+            .map(|address| address.parse::<SocketAddr>().unwrap())
+        );
+
+        // The other computer rejects the whole offer over one bad candidate.
+        for candidate in this_host_candidates(43119) {
+            crate::discovery::UntrustedCandidate::explicit(candidate).unwrap();
+        }
+
+        let advertised: SocketAddr = "203.0.113.7:43119".parse().unwrap();
+        let many = std::iter::repeat_n(advertised, 2)
+            .chain((1..=20).map(|host| SocketAddr::from(([192, 0, 2, host], 43119))))
+            .collect();
+        let offer = make_offer(None, 43119, many).unwrap();
+        assert_eq!(
+            offer.input_candidates.len(),
+            crate::discovery::MAX_DISCOVERY_CANDIDATES
+        );
+        assert_eq!(offer.input_candidates[0], advertised.to_string());
+        assert_ne!(offer.input_candidates[1], advertised.to_string());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
