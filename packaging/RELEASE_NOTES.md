@@ -18,9 +18,10 @@ No Rust, Swift, Xcode, or C compiler is needed on the installing computer.
 Mac apps include Developer ID signatures and Apple's notarization ticket.
 You can install the optional AWDL helper from the app with administrator approval.
 
-Updates preserve configuration and pairing identities. Restarting the Linux
-service interrupts active sharing. Reboot Linux hosts once after updating from
-v0.1.0: its udev rule let logind give the desktop user write access to
+Updates preserve configuration and pairing identities. Computers on 0.2.0
+and v0.1.0 cannot connect, so update every computer; their pairings carry
+over. Restarting the Linux service interrupts active sharing. Reboot Linux
+hosts once after updating from v0.1.0: its udev rule let logind give the desktop user write access to
 `/dev/uinput`, and that access lasts until the next boot. The installer loads
 the GNOME extension and starts the desktop agent in your current session; if
 GNOME cannot fetch the extension from extensions.gnome.org, it installs the

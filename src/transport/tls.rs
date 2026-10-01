@@ -543,3 +543,29 @@ fn verify_rpk_signature(
     let spki = SubjectPublicKeyInfoDer::from(spki.as_ref());
     verify_tls13_signature_with_raw_key(message, &spki, dss, algorithms)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each version's protocols. Computers on different protocols cannot
+    /// pair or connect, so a protocol change needs a new version, or the
+    /// installer hands out one that cannot talk to a build from main.
+    const VERSIONS: &[(&str, &[u8], &[u8])] = &[
+        ("0.1.0", b"zflow/1", b"zflow-pair/1"),
+        ("0.2.0", b"zflow/3", b"zflow-pair/4"),
+    ];
+
+    #[test]
+    fn a_protocol_change_comes_with_a_new_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        let Some(&(_, input, pairing)) = VERSIONS.iter().find(|(known, ..)| *known == version)
+        else {
+            panic!("add version {version} and its protocols to VERSIONS");
+        };
+        assert!(
+            input == INPUT_ALPN_PROTOCOL && pairing == PAIRING_ALPN_PROTOCOL,
+            "version {version} already shipped other protocols; raise the version in Cargo.toml"
+        );
+    }
+}

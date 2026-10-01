@@ -24,7 +24,9 @@ use crate::{
 
 pub const SERVICE_TYPE: &str = "_zflow._udp.local.";
 pub const MAX_DISCOVERY_CANDIDATES: usize = 16;
-pub const MAX_TXT_PROPERTIES: usize = 2;
+/// What a record may carry. zflow sends two; the room is for keys a newer
+/// version adds, which this one skips so it can still list that computer.
+pub const MAX_TXT_PROPERTIES: usize = 8;
 pub const MAX_TXT_BYTES: usize = 384;
 
 const INSTANCE_PREFIX: &str = "zf-";
@@ -470,7 +472,9 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
             TXT_PROTOCOL | TXT_CAPABILITIES => {
                 return Err(CandidateParseError::DuplicateTxtProperty);
             }
-            _ => return Err(CandidateParseError::UnexpectedTxtProperty),
+            // Another version's key. Rejecting the record would hide that
+            // computer instead of showing that it needs an update.
+            _ => {}
         }
     }
 
@@ -494,9 +498,8 @@ fn parse_capabilities(value: &str) -> Result<InputCapabilities, CandidateParseEr
         return Err(CandidateParseError::InvalidCapabilities);
     }
     let mut capabilities = BTreeSet::new();
-    for name in value.split(',') {
-        let capability =
-            capability_from_name(name).ok_or(CandidateParseError::InvalidCapabilities)?;
+    // A name this version does not know is a capability from a newer one.
+    for capability in value.split(',').filter_map(capability_from_name) {
         if !capabilities.insert(capability) {
             return Err(CandidateParseError::InvalidCapabilities);
         }
@@ -615,8 +618,6 @@ pub enum CandidateParseError {
     TxtTooLarge,
     #[error("TXT property has an invalid value")]
     InvalidTxtValue,
-    #[error("unexpected TXT property")]
-    UnexpectedTxtProperty,
     #[error("duplicate TXT property")]
     DuplicateTxtProperty,
     #[error("missing TXT property {0}")]
@@ -741,28 +742,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parser_rejects_identity_bearing_and_oversized_txt() {
+    fn parse_txt_record(txt: &[(&str, &str)]) -> Result<UntrustedCandidate, CandidateParseError> {
         let id = test_instance();
-        let forbidden = ServiceInfo::new(
+        let service = ServiceInfo::new(
             SERVICE_TYPE,
             &id.to_string(),
             &id.hostname(),
             [IpAddr::V4(Ipv4Addr::LOCALHOST)].as_slice(),
             43_119,
-            &[("cap", "keyboard"), ("spki", "stable-key")][..],
+            txt,
         )
         .unwrap();
-        assert_eq!(
-            parse_candidate_fields(
-                forbidden.get_fullname(),
-                forbidden.get_hostname(),
-                vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 43_119))],
-                forbidden.get_properties(),
-            ),
-            Err(CandidateParseError::UnexpectedTxtProperty)
+        parse_candidate_fields(
+            service.get_fullname(),
+            service.get_hostname(),
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 43_119))],
+            service.get_properties(),
+        )
+    }
+
+    #[test]
+    fn computers_on_other_versions_stay_listed_as_incompatible() {
+        // What v0.1.0 announces. Rejecting its extra key hid it from the
+        // pairing list, so nobody was told to update it.
+        let old = parse_txt_record(&[
+            ("v", "1"),
+            ("cap", "keyboard,pointer,scroll"),
+            ("token", "0123abcd"),
+        ])
+        .unwrap();
+        assert!(!old.is_compatible());
+
+        let alpn = std::str::from_utf8(INPUT_ALPN_PROTOCOL).unwrap();
+        let newer =
+            parse_txt_record(&[("v", alpn), ("cap", "keyboard,hologram"), ("x", "y")]).unwrap();
+        assert!(newer.is_compatible());
+        assert!(
+            newer
+                .capability_summary()
+                .contains(InputCapability::Keyboard)
         );
 
+        assert_eq!(
+            parse_txt_record(&[("cap", "keyboard")]).err(),
+            Some(CandidateParseError::MissingTxtProperty("v"))
+        );
+    }
+
+    #[test]
+    fn parser_rejects_oversized_txt() {
+        let id = test_instance();
         let oversized_value = "x".repeat(MAX_TXT_BYTES);
         let oversized = ServiceInfo::new(
             SERVICE_TYPE,

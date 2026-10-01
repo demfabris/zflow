@@ -398,7 +398,7 @@ The user may plug in Ethernet or Thunderbolt mid-session. zflow may move the ses
 
 ### Discovery
 
-mDNS advertises an ephemeral instance identifier, the input ALPN as its protocol version, a capability summary, and connection candidates. It MUST NOT advertise a long-lived certificate fingerprint.
+mDNS advertises an ephemeral instance identifier, the input ALPN as its protocol version, a capability summary, and connection candidates. It MUST NOT advertise a long-lived certificate fingerprint. A browser skips TXT keys and capability names it does not know, so a computer on another version is listed as needing an update instead of disappearing.
 
 DNS-SD data remains untrusted until pairing or known-peer authentication completes. Long-lived identifiers in multicast records expose device identity to passive observers; [RFC 8882](https://www.rfc-editor.org/rfc/rfc8882.html#section-3.2) describes that privacy risk.
 
