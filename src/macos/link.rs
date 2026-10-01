@@ -25,6 +25,7 @@ use crate::{
     },
     desktop::{DesktopRequest, DesktopResponse, Geometry},
     identity::Identity,
+    link::{STABLE_SESSION, retry_delay},
     session::{SessionEvent, SessionEventKind, SessionHandle, SessionOptions, start_session},
     transport::{InputClientConfig, InputConnection, connect_input, input_client_config},
 };
@@ -38,8 +39,6 @@ const SNAPSHOT_RETRY: Duration = Duration::from_secs(5);
 // A receiver still replacing this peer's previous session refuses the first
 // snapshot for a few milliseconds, so retry quickly before backing off.
 const FIRST_SNAPSHOT_RETRY: Duration = Duration::from_millis(250);
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(15);
-const STABLE_SESSION: Duration = Duration::from_secs(10);
 // Long enough for the close to leave; the receiver refuses a second session
 // from this Mac while the old one is open.
 const CLOSE_GRACE: Duration = Duration::from_millis(100);
@@ -297,23 +296,14 @@ async fn run(
             }
             Err(error) => {
                 failures += 1;
-                let error = format!("{error:#}");
-                tracing::warn!(peer = %name, %error, failures, "input link could not connect");
-                state.send_replace(LinkState::Down(error));
+                tracing::warn!(peer = %name, error = %format_args!("{error:#}"), failures,
+                    "input link could not connect");
+                state.send_replace(LinkState::Down(crate::link::reason(&name, &error)));
             }
         }
         if !wait_to_retry(&mut commands, &mut nearby, retry_delay(failures)).await {
             return;
         }
-    }
-}
-
-/// Reconnects at once after a stable session drops, then backs off while
-/// attempts fail.
-fn retry_delay(failures: u32) -> Duration {
-    match failures {
-        0 => Duration::ZERO,
-        failures => Duration::from_secs(1 << (failures - 1).min(4)).min(MAX_RETRY_DELAY),
     }
 }
 
@@ -903,12 +893,6 @@ mod tests {
             }
         });
         drop(links);
-    }
-
-    #[test]
-    fn retries_start_at_once_and_back_off_to_a_cap() {
-        let delays = [0, 1, 2, 3, 4, 5, 40].map(retry_delay);
-        assert_eq!(delays, [0, 1, 2, 4, 8, 15, 15].map(Duration::from_secs));
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ pub mod discovery;
 #[cfg(target_os = "macos")]
 mod ffi;
 pub mod identity;
+pub mod link;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
