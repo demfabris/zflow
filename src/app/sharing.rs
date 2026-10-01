@@ -1,13 +1,13 @@
 use std::{
-    sync::{Mutex, atomic::AtomicU64},
-    time::Instant,
+    sync::atomic::AtomicU64,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 
 use crate::{
     config::Config,
-    desktop::{Geometry, Point, Rect},
+    desktop::{Geometry, Point},
     macos::{self, Crossing, Links, SourceStatus},
 };
 
@@ -17,6 +17,9 @@ use super::{
 };
 
 const READY: &str = "Ready on the Mac. Move through a configured edge to connect.";
+/// How long the pointer rests against an edge before it crosses, with pause
+/// at edges on. The Linux daemon waits as long.
+const EDGE_PAUSE: Duration = Duration::from_millis(250);
 const SECURE_INPUT_ON: &str = "Secure keyboard entry is on in a Mac app (a password field or \
     Terminal's Secure Keyboard Entry). Input stays on the Mac until it turns off.";
 
@@ -32,14 +35,82 @@ struct Running {
     started: Instant,
 }
 
+/// A push against an edge that crosses once it has lasted [`EDGE_PAUSE`].
+struct Resting {
+    /// Where the pointer was before it reached the edge.
+    from: Point,
+    peer: String,
+    since: Instant,
+}
+
+/// The pointer's way to an edge: where it was last, and a push waiting to
+/// cross.
+#[derive(Default)]
+struct Approach {
+    previous: Option<Point>,
+    resting: Option<Resting>,
+}
+
+impl Approach {
+    /// The crossing the pointer at `current` starts, if any. With `pause`,
+    /// the pointer has to stay against the edge for [`EDGE_PAUSE`] first,
+    /// and moving away from it cancels.
+    fn reached(
+        &mut self,
+        layout: &Layout,
+        geometry: &Geometry,
+        current: Point,
+        now: Instant,
+        pause: bool,
+    ) -> Option<Handoff> {
+        let previous = self.previous.replace(current);
+        if let Some(resting) = &mut self.resting {
+            // Measured from before the edge, so the pointer still counts as
+            // there while it pushes or slides along it.
+            match handoff::crossing(layout, geometry, resting.from, current) {
+                Some(handoff) if handoff.peer != resting.peer => {
+                    // Another computer's part of the edge starts over.
+                    resting.peer = handoff.peer;
+                    resting.since = now;
+                    return None;
+                }
+                Some(handoff) if now.duration_since(resting.since) >= EDGE_PAUSE => {
+                    self.resting = None;
+                    return Some(handoff);
+                }
+                Some(_) => return None,
+                None => {
+                    tracing::debug!("pointer left the edge before crossing");
+                    self.resting = None;
+                }
+            }
+        }
+        let from = previous?;
+        let handoff = handoff::crossing(layout, geometry, from, current)?;
+        if !pause {
+            return Some(handoff);
+        }
+        self.resting = Some(Resting {
+            from,
+            peer: handoff.peer,
+            since: now,
+        });
+        None
+    }
+}
+
 pub(super) struct Observer {
     enabled: bool,
     layout: Option<Layout>,
     running: Option<Running>,
-    previous: Option<Point>,
+    approach: Approach,
     secure_input_notice: bool,
+    /// The notice says a peer controls this Mac.
+    controlled: bool,
     pub notice: String,
     pub reduce_wifi_latency: bool,
+    /// The pointer rests against an edge for a moment before it crosses.
+    pub pause_at_edges: bool,
     pub pause_requested: bool,
 }
 
@@ -49,10 +120,12 @@ impl Default for Observer {
             enabled: false,
             layout: None,
             running: None,
-            previous: None,
+            approach: Approach::default(),
             secure_input_notice: false,
+            controlled: false,
             notice: "Sharing is off.".into(),
             reduce_wifi_latency: false,
+            pause_at_edges: false,
             pause_requested: false,
         }
     }
@@ -87,7 +160,7 @@ impl Observer {
             tracing::info!("edge sharing disarmed");
         }
         self.enabled = false;
-        self.previous = None;
+        self.approach = Approach::default();
         if let Some(running) = &self.running {
             tracing::info!(parent: &running.span, "sharing stop requested");
             let _ = running.crossing.stop.send(true);
@@ -97,8 +170,18 @@ impl Observer {
         }
     }
 
+    /// Stops arming with the current layout, and lets a crossing in progress
+    /// finish with its own. The app arms again with the new layout.
+    pub fn disarm(&mut self) {
+        if self.enabled {
+            tracing::info!("edge sharing disarmed for a new layout");
+        }
+        self.enabled = false;
+        self.approach = Approach::default();
+    }
+
     pub fn enable(&mut self, config: &Config, layout: &Layout) -> Result<()> {
-        let geometry = local_geometry()?;
+        let geometry = macos::desktop_geometry()?;
         handoff::validate(layout, &geometry)?;
         for transition in layout.transitions() {
             if layout.monitors[transition.source].peer.is_none() {
@@ -117,7 +200,7 @@ impl Observer {
             }
         }
         self.layout = Some(layout.clone());
-        self.previous = None;
+        self.approach = Approach::default();
         self.enabled = true;
         self.pause_requested = false;
         tracing::info!("edge sharing enabled");
@@ -126,6 +209,11 @@ impl Observer {
     }
 
     pub fn tick(&mut self, links: &Links) {
+        self.tick_with(links.controller(), links);
+    }
+
+    /// `controller` is the peer controlling this Mac, if any.
+    fn tick_with(&mut self, controller: Option<String>, links: &Links) {
         if self.running.is_some() {
             self.watch_crossing();
         }
@@ -135,13 +223,29 @@ impl Observer {
                 self.notice = READY.into();
             }
         }
+        if let Some(peer) = controller {
+            // Nothing crosses while a peer controls this Mac, and a cursor it
+            // leaves resting on an edge does not cross once it lets go.
+            self.approach = Approach::default();
+            if self.enabled && self.running.is_none() {
+                if !self.controlled {
+                    tracing::info!(%peer, "edge crossings skipped while controlled");
+                }
+                self.notice = format!("Controlled by {peer}");
+                self.controlled = true;
+            }
+            return;
+        }
+        if std::mem::take(&mut self.controlled) && self.enabled && self.running.is_none() {
+            self.notice = READY.into();
+        }
         if self.enabled
             && self.running.is_none()
             && let Err(error) = self.observe(links)
         {
             tracing::warn!(error = %format!("{error:#}"), "edge observation failed; sharing disabled");
             self.enabled = false;
-            self.previous = None;
+            self.approach = Approach::default();
             self.notice = format!("Sharing stopped: {error:#}");
         }
     }
@@ -168,7 +272,9 @@ impl Observer {
         let Some(running) = &mut self.running else {
             return;
         };
-        if !local_geometry().is_ok_and(|geometry| running.handoff.matches_geometry(&geometry)) {
+        if !macos::desktop_geometry()
+            .is_ok_and(|geometry| running.handoff.matches_geometry(&geometry))
+        {
             if !running.failed {
                 tracing::warn!(parent: &running.span, "crossing cancelled: Mac display geometry changed");
             }
@@ -225,7 +331,7 @@ impl Observer {
             return;
         };
         let _entered = running.span.enter();
-        self.previous = None;
+        self.approach = Approach::default();
         if !running.finished {
             tracing::error!("crossing worker stopped without reporting");
             self.enabled = false;
@@ -254,16 +360,18 @@ impl Observer {
 
     fn observe(&mut self, links: &Links) -> Result<()> {
         let layout = self.layout.as_ref().context("No saved layout")?;
-        let geometry = local_geometry()?;
+        let geometry = macos::desktop_geometry()?;
         handoff::validate(layout, &geometry)?;
         let position = macos::cursor_position()?;
         let current = Point {
             x: position.x.floor() as i32,
             y: position.y.floor() as i32,
         };
-        let previous = self.previous.replace(current);
-        let Some(handoff) =
-            previous.and_then(|previous| handoff::crossing(layout, &geometry, previous, current))
+        let now = Instant::now();
+        let pause = self.pause_at_edges;
+        let Some(handoff) = self
+            .approach
+            .reached(layout, &geometry, current, now, pause)
         else {
             return Ok(());
         };
@@ -288,19 +396,9 @@ impl Observer {
             start = handoff.start, end = handoff.end, position = handoff.position,
             remote_width = handoff.expected_width, remote_height = handoff.expected_height,
             entry_region = ?handoff.entry_region, "crossing geometry");
-        let options = macos::HandoffOptions {
-            return_mapping: handoff.return_mapping.clone(),
-            entry_region: handoff.entry_region,
-            edge: handoff.edge,
-            start: handoff.start,
-            end: handoff.end,
-            position: handoff.position,
-            expected_width: handoff.expected_width,
-            expected_height: handoff.expected_height,
-            entry_position: position,
-        };
         // The receiver status already says why a link is not ready.
-        let Some(crossing) = links.cross(&handoff.peer, options, self.reduce_wifi_latency) else {
+        let Some(crossing) = links.cross(handoff.clone(), position, self.reduce_wifi_latency)
+        else {
             tracing::info!(parent: &span, "receiver not ready; input stays on the Mac");
             return Ok(());
         };
@@ -327,51 +425,24 @@ impl Drop for Observer {
     }
 }
 
-static GEOMETRY: Mutex<Option<(u32, Geometry)>> = Mutex::new(None);
-
-/// The Mac desktop, read again only after macOS reconfigures a display or
-/// after `forget_geometry`.
-pub(super) fn local_geometry() -> Result<Geometry> {
-    let generation = macos::display_generation();
-    let mut cache = GEOMETRY.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some((cached, geometry)) = cache.as_ref()
-        && *cached == generation
-    {
-        return Ok(geometry.clone());
-    }
-    let geometry = Geometry {
-        monitors: macos::active_desktop_rectangles()?
-            .into_iter()
-            .map(|r| Rect {
-                x: r.x.round() as i32,
-                y: r.y.round() as i32,
-                width: r.width.round() as u32,
-                height: r.height.round() as u32,
-            })
-            .collect(),
-    };
-    geometry.validate()?;
-    *cache = Some((generation, geometry.clone()));
-    Ok(geometry)
-}
-
-/// Drops the cached desktop, in case a display change went unnoticed.
-pub(super) fn forget_geometry() {
-    *GEOMETRY.lock().unwrap_or_else(|error| error.into_inner()) = None;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop::{Edge, ReturnMapping};
+    use crate::desktop::{Edge, Rect, ReturnMapping};
+    use std::time::Duration;
     use tokio::sync::{mpsc, watch};
 
-    /// An armed observer running one crossing, fed `statuses` before the
-    /// crossing's channel closes.
-    fn finished(statuses: &[SourceStatus], report_end: bool) -> Observer {
+    /// An armed observer running one crossing, the crossing's status
+    /// sender, and whether it was told to stop.
+    fn crossing() -> (
+        Observer,
+        mpsc::UnboundedSender<SourceStatus>,
+        watch::Receiver<bool>,
+    ) {
         let mut observer = Observer::default();
         observer.enabled = true;
         let (status, events) = mpsc::unbounded_channel();
+        let (stop, stopped) = watch::channel(false);
         let geometry = Geometry {
             monitors: vec![Rect {
                 x: 0,
@@ -382,7 +453,7 @@ mod tests {
         };
         observer.running = Some(Running {
             crossing: Crossing {
-                stop: watch::channel(false).0,
+                stop,
                 status: events,
             },
             handoff: Handoff {
@@ -410,6 +481,13 @@ mod tests {
             span: tracing::Span::none(),
             started: Instant::now(),
         });
+        (observer, status, stopped)
+    }
+
+    /// An armed observer running one crossing, fed `statuses` before the
+    /// crossing's channel closes.
+    fn finished(statuses: &[SourceStatus], report_end: bool) -> Observer {
+        let (mut observer, status, _stopped) = crossing();
         for status in statuses {
             observer.record(status.clone());
         }
@@ -431,6 +509,131 @@ mod tests {
         assert!(observer.notice.contains("without returning"));
         let observer = finished(&[], false);
         assert!(!observer.is_enabled() && !observer.pause_requested);
+    }
+
+    #[test]
+    fn nothing_crosses_while_a_peer_controls_the_mac() {
+        let links = Links::with_backend(Default::default()).unwrap();
+        let mut observer = Observer::default();
+        observer.enabled = true;
+        observer.approach.previous = Some(Point { x: 1, y: 540 });
+        observer.tick_with(Some("linux".into()), &links);
+        // Observing would have disarmed this observer, which has no layout.
+        assert!(observer.is_enabled());
+        assert_eq!(observer.approach.previous, None);
+        assert_eq!(observer.notice, "Controlled by linux");
+    }
+
+    #[test]
+    fn a_new_layout_lets_the_crossing_in_progress_finish() {
+        let (mut observer, status, stopped) = crossing();
+        observer.disarm();
+        assert!(observer.has_session() && !observer.is_enabled());
+        assert!(!*stopped.borrow(), "the crossing goes on");
+        observer.record(SourceStatus::Returned { position: 0 });
+        observer.record(SourceStatus::Stopped);
+        drop(status);
+        observer.finish();
+        // Not a failure or a pause: the app arms again with the new layout.
+        assert!(!observer.has_session() && !observer.is_enabled());
+        assert!(!observer.pause_requested);
+    }
+
+    /// This Mac, 1920 x 1080, and linux and desk to its right, one above
+    /// the other, each half as tall.
+    fn edge() -> (Layout, Geometry) {
+        let monitor =
+            |id: &str, peer: Option<&str>, x, y, height| super::super::layout_model::Monitor {
+                id: id.into(),
+                label: id.into(),
+                peer: peer.map(Into::into),
+                x,
+                y,
+                width: 1920,
+                height,
+            };
+        let layout = Layout {
+            monitors: vec![
+                monitor("local", None, 0, 0, 1080),
+                monitor("peer:linux", Some("linux"), 1920, 0, 540),
+                monitor("peer:desk", Some("desk"), 1920, 540, 540),
+            ],
+        };
+        let geometry = Geometry {
+            monitors: vec![Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+        };
+        (layout, geometry)
+    }
+
+    #[test]
+    fn with_pause_at_edges_the_pointer_rests_250_ms_before_it_crosses() {
+        let (layout, geometry) = edge();
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let inside = Point { x: 1900, y: 100 };
+        let edge = Point { x: 1919, y: 100 };
+        let mut approach = Approach::default();
+        let mut reach = |point, ms, pause| {
+            let handoff = approach.reached(&layout, &geometry, point, at(ms), pause);
+            handoff.map(|handoff| handoff.peer)
+        };
+
+        // Off, it crosses as soon as the pointer gets there.
+        assert_eq!(reach(inside, 0, false), None);
+        assert_eq!(reach(edge, 10, false).as_deref(), Some("linux"));
+
+        // On, it crosses once the pointer has pushed there for 250 ms,
+        // sliding along the edge meanwhile, where the pointer is by then.
+        let lower = Point { x: 1919, y: 300 };
+        assert_eq!(reach(inside, 300, true), None);
+        assert_eq!(reach(edge, 310, true), None);
+        assert_eq!(reach(lower, 450, true), None);
+        assert_eq!(reach(lower, 559, true), None);
+        let handoff = approach.reached(&layout, &geometry, lower, at(560), true);
+        let position = |to| {
+            handoff::crossing(&layout, &geometry, inside, to)
+                .unwrap()
+                .position
+        };
+        assert_eq!(handoff.unwrap().position, position(lower));
+        assert_ne!(position(lower), position(edge));
+    }
+
+    #[test]
+    fn with_pause_at_edges_leaving_the_edge_cancels() {
+        let (layout, geometry) = edge();
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let inside = Point { x: 1900, y: 100 };
+        let edge = Point { x: 1919, y: 100 };
+        let mut approach = Approach::default();
+        let mut reach = |point, ms| {
+            let handoff = approach.reached(&layout, &geometry, point, at(ms), true);
+            handoff.map(|handoff| handoff.peer)
+        };
+        assert_eq!(reach(inside, 0), None);
+        assert_eq!(reach(edge, 10), None);
+        // Away at 200 ms, so the push never crosses.
+        assert_eq!(reach(inside, 210), None);
+        assert_eq!(reach(inside, 400), None);
+        // Coming back starts over.
+        assert_eq!(reach(edge, 500), None);
+        assert_eq!(reach(edge, 700), None);
+        assert_eq!(reach(edge, 750).as_deref(), Some("linux"));
+        // Sliding onto another computer's part of the edge starts over too.
+        assert_eq!(reach(inside, 800), None);
+        assert_eq!(reach(edge, 810), None);
+        assert_eq!(reach(Point { x: 1919, y: 800 }, 1000), None);
+        assert_eq!(reach(Point { x: 1919, y: 800 }, 1200), None);
+        assert_eq!(
+            reach(Point { x: 1919, y: 800 }, 1250).as_deref(),
+            Some("desk")
+        );
     }
 
     #[test]

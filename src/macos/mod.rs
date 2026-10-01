@@ -1,8 +1,15 @@
 //! macOS input source: native capture, and crossings over a receiver's session.
 
+mod advertise;
 mod awdl;
+mod clipboard;
+mod handoff_server;
+mod inject;
+mod keys;
 mod link;
 mod local_network;
+mod pointer;
+mod receive;
 
 use std::{
     ffi::CStr,
@@ -10,7 +17,7 @@ use std::{
     os::raw::c_char,
     path::PathBuf,
     pin::Pin,
-    sync::Once,
+    sync::{Arc, Mutex, Once, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -18,17 +25,20 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::{
+    app::handoff::{self, Handoff},
     capture::{
         CaptureFrame, CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS,
     },
     core::{
-        ContactId, HidUsage, MotionDelta, PointerButton, SessionCloseReason, SessionContext,
+        ContactId, MotionDelta, PointerButton, SessionCloseReason, SessionContext,
         SourceDimensions, TouchContact, TouchState, TouchTool,
     },
-    desktop::{DesktopRequest, DesktopResponse, Edge, Point, Rect, ReturnMapping},
+    desktop::{DesktopRequest, DesktopResponse, Geometry, Point, Rect},
     session::{SessionEvent, SessionEventKind, SessionHandle},
 };
 
+pub use advertise::Advertiser;
+pub(crate) use inject::{install_exit_handlers, supports_key};
 pub use link::{Crossing, LinkState, Links};
 pub use local_network::{LocalNetwork, local_network_access};
 
@@ -159,6 +169,39 @@ pub fn display_generation() -> u32 {
     unsafe { zflow_mac_display_generation() }
 }
 
+static GEOMETRY: Mutex<Option<(u32, Geometry)>> = Mutex::new(None);
+
+/// The Mac desktop in whole points, read again only after macOS
+/// reconfigures a display or after `forget_desktop_geometry`.
+pub fn desktop_geometry() -> Result<Geometry> {
+    let generation = display_generation();
+    let mut cache = GEOMETRY.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((cached, geometry)) = cache.as_ref()
+        && *cached == generation
+    {
+        return Ok(geometry.clone());
+    }
+    let geometry = Geometry {
+        monitors: active_desktop_rectangles()?
+            .into_iter()
+            .map(|r| Rect {
+                x: r.x.round() as i32,
+                y: r.y.round() as i32,
+                width: r.width.round() as u32,
+                height: r.height.round() as u32,
+            })
+            .collect(),
+    };
+    geometry.validate()?;
+    *cache = Some((generation, geometry.clone()));
+    Ok(geometry)
+}
+
+/// Drops the cached desktop, in case a display change went unnoticed.
+pub fn forget_desktop_geometry() {
+    *GEOMETRY.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
 pub fn input_is_neutral() -> bool {
     // SAFETY: this reads physical key, button and modifier state without capture.
     unsafe { zflow_mac_input_is_neutral() == 1 }
@@ -171,23 +214,12 @@ pub fn secure_input_enabled() -> bool {
     unsafe { zflow_mac_secure_input_enabled() == 1 }
 }
 
-#[derive(Clone, Debug)]
-pub struct HandoffOptions {
-    pub entry_position: CursorPosition,
-    pub entry_region: Rect,
-    pub return_mapping: ReturnMapping,
-    pub edge: Edge,
-    pub start: u32,
-    pub end: u32,
-    pub position: u32,
-    pub expected_width: u32,
-    pub expected_height: u32,
-}
-
 /// What one crossing borrows from its link.
 struct Activation<'a> {
     session: &'a SessionHandle,
     events: &'a mut mpsc::Receiver<SessionEvent>,
+    layouts: &'a mut link::LayoutRoute,
+    clipboard: &'a Arc<clipboard::Clipboard>,
     context: SessionContext,
     raw_touch: bool,
 }
@@ -196,16 +228,26 @@ type DesktopPoll<'a> = Pin<Box<dyn Future<Output = Result<DesktopResponse>> + Se
 
 /// Runs one crossing and reports how it ended. The status sender drops only
 /// after cleanup, so the observer rearms once the Mac owns input again.
+/// `entry_position` is where the cursor was when it reached the edge.
 /// Returns true when the crossing failed.
 async fn run_crossing(
     activation: Activation<'_>,
-    handoff: HandoffOptions,
+    handoff: Handoff,
+    entry_position: CursorPosition,
     reduce_wifi_latency: bool,
     mut stop: watch::Receiver<bool>,
     status: mpsc::UnboundedSender<SourceStatus>,
 ) -> bool {
     let started = Instant::now();
-    let result = cross(activation, handoff, reduce_wifi_latency, &mut stop, &status).await;
+    let result = cross(
+        activation,
+        handoff,
+        entry_position,
+        reduce_wifi_latency,
+        &mut stop,
+        &status,
+    )
+    .await;
     let outcome = match &result {
         Ok(returned) => {
             if let Some(position) = returned {
@@ -240,21 +282,24 @@ async fn run_crossing(
 /// request is awaited: dropping one closes the transport.
 async fn cross(
     mut activation: Activation<'_>,
-    mut handoff: HandoffOptions,
+    mut handoff: Handoff,
+    entry_position: CursorPosition,
     reduce_wifi_latency: bool,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<Option<u32>> {
-    refuse_waiting_events(activation.events)?;
+    let session = activation.session;
+    receive::answer_waiting_events(
+        activation.events,
+        |layout| activation.layouts.take(session, layout),
+        |clip| activation.clipboard.keep(session.peer(), clip),
+    )?;
     if stopped(stop) {
         return Ok(None);
     }
     let local_desktop = active_desktop_rectangles()?;
-    let mut random = [0_u8; 8];
-    getrandom::fill(&mut random)
-        .map_err(|error| anyhow!("could not create a desktop handoff token: {error}"))?;
-    let token = handoff_token(random);
-    let prepare = prepare_request(&mut handoff, token)?;
+    let token = handoff::token()?;
+    let prepare = prepare_request(&mut handoff, entry_position, token)?;
     let preparing = Instant::now();
     // Await Prepare even after Stop so Finish can use the same session.
     let (lease, prepared) = tokio::join!(
@@ -273,8 +318,7 @@ async fn cross(
         result = async {
             // The link's snapshot already showed the receiver handles desktop
             // requests, so a failure here is the session or the receiver.
-            validate_prepared(
-                &handoff,
+            handoff.check_prepared(
                 prepared.context("Could not prepare the other computer's desktop")?,
             )?;
             if stopped(stop) {
@@ -298,7 +342,7 @@ async fn cross(
         .await;
     }
     let finishing = Instant::now();
-    let finished = validate_finished(
+    let finished = handoff::check_finished(
         activation
             .session
             .desktop_request(DesktopRequest::Finish { token })
@@ -328,7 +372,11 @@ async fn acquire_lease(reduce_wifi_latency: bool) -> Result<Option<awdl::HeldLea
 }
 
 /// Samples the cursor again, since it kept moving after the edge was detected.
-fn prepare_request(handoff: &mut HandoffOptions, token: u64) -> Result<DesktopRequest> {
+fn prepare_request(
+    handoff: &mut Handoff,
+    entry_position: CursorPosition,
+    token: u64,
+) -> Result<DesktopRequest> {
     let current = cursor_position()?;
     let point = Point {
         x: current.x.floor() as i32,
@@ -345,17 +393,11 @@ fn prepare_request(handoff: &mut HandoffOptions, token: u64) -> Result<DesktopRe
         refreshed,
         current_x = current.x,
         current_y = current.y,
-        displacement_x = current.x - handoff.entry_position.x,
-        displacement_y = current.y - handoff.entry_position.y,
+        displacement_x = current.x - entry_position.x,
+        displacement_y = current.y - entry_position.y,
         "entry fraction sampled before desktop preparation"
     );
-    let request = DesktopRequest::Prepare {
-        token,
-        edge: handoff.edge,
-        start: handoff.start,
-        end: handoff.end,
-        position: handoff.position,
-    };
+    let request = handoff.prepare(token);
     request.validate()?;
     Ok(request)
 }
@@ -363,7 +405,7 @@ fn prepare_request(handoff: &mut HandoffOptions, token: u64) -> Result<DesktopRe
 /// Owns input on the receiver: activation, native capture, and release.
 async fn remote(
     activation: &mut Activation<'_>,
-    handoff: &HandoffOptions,
+    handoff: &Handoff,
     local_desktop: &[DesktopRect],
     token: u64,
     lease: &mut Option<awdl::HeldLease>,
@@ -432,7 +474,7 @@ impl Ended {
 #[allow(clippy::too_many_arguments)]
 async fn capture<'a>(
     activation: &mut Activation<'a>,
-    handoff: &HandoffOptions,
+    handoff: &Handoff,
     local_desktop: &[DesktopRect],
     token: u64,
     poll: &mut Option<DesktopPoll<'a>>,
@@ -458,6 +500,8 @@ async fn capture<'a>(
         "native capture started"
     );
     let _ = status.send(SourceStatus::Sharing);
+    // The pointer left for the peer, so the clipboard goes along.
+    activation.clipboard.share(activation.session);
     // Polling renews the receiver's handoff and reports its return edge.
     *poll = Some(poll_desktop(activation.session, token));
     let ended = forward(
@@ -505,7 +549,7 @@ async fn capture<'a>(
 }
 
 fn return_point(
-    handoff: &HandoffOptions,
+    handoff: &Handoff,
     local_desktop: &[DesktopRect],
     position: u32,
 ) -> Result<CursorPosition> {
@@ -525,7 +569,7 @@ fn return_point(
 async fn forward<'a>(
     capture: &mut MacCapture,
     activation: &mut Activation<'a>,
-    handoff: &HandoffOptions,
+    handoff: &Handoff,
     token: u64,
     poll: &mut Option<DesktopPoll<'a>>,
     lease: &mut Option<awdl::HeldLease>,
@@ -634,7 +678,11 @@ async fn forward<'a>(
                     let error = anyhow!("input session closed: {reason}");
                     return ended.failed("input session closed", error);
                 }
-                Some(kind) => refuse_inbound(kind),
+                Some(SessionEventKind::Layout { layout }) => activation.layouts.take(session, layout),
+                Some(SessionEventKind::Clipboard { clip }) => {
+                    activation.clipboard.keep(session.peer(), clip);
+                }
+                Some(kind) => receive::answer_while_sending(kind),
                 None => {
                     let error = anyhow!("input session event channel closed");
                     return ended.failed("input session closed", error);
@@ -653,43 +701,6 @@ async fn next_poll(poll: &mut Option<DesktopPoll<'_>>) -> Result<DesktopResponse
     response
 }
 
-/// The Mac only sends input. Refuse whatever a receiver would handle.
-fn refuse_inbound(kind: SessionEventKind) {
-    match kind {
-        SessionEventKind::Desktop { reply, .. } => {
-            let _ = reply.send(DesktopResponse::unavailable(
-                "Mac source cannot receive desktop handoffs",
-            ));
-        }
-        SessionEventKind::ReceiverEffects { applied, .. } => {
-            let _ = applied.send(Err(
-                "the Mac does not accept input from other computers".into()
-            ));
-        }
-        SessionEventKind::OutboundEnded
-        | SessionEventKind::Closed { .. }
-        | SessionEventKind::Layout { .. }
-        | SessionEventKind::Clipboard { .. } => {}
-    }
-}
-
-/// Answers events that arrived while the link was idle, including the
-/// OutboundEnded that trails the previous crossing's release.
-fn refuse_waiting_events(events: &mut mpsc::Receiver<SessionEvent>) -> Result<()> {
-    loop {
-        match events.try_recv() {
-            Ok(event) => {
-                if let SessionEventKind::Closed { reason } = event.kind {
-                    bail!("input session closed: {reason}");
-                }
-                refuse_inbound(event.kind);
-            }
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => bail!("input session closed"),
-        }
-    }
-}
-
 fn stopped(stop: &watch::Receiver<bool>) -> bool {
     *stop.borrow() || stop.has_changed().is_err()
 }
@@ -699,39 +710,6 @@ async fn stop_requested(stop: &mut watch::Receiver<bool>) {
         if *stop.borrow_and_update() || stop.changed().await.is_err() {
             return;
         }
-    }
-}
-
-fn validate_prepared(handoff: &HandoffOptions, response: DesktopResponse) -> Result<()> {
-    response.validate()?;
-    match response {
-        DesktopResponse::Prepared { geometry, .. } => {
-            let bounds = geometry.bounds()?;
-            if bounds.width != handoff.expected_width || bounds.height != handoff.expected_height {
-                bail!(
-                    "the other computer's desktop changed size; refresh and save the computer layout before sharing"
-                );
-            }
-            Ok(())
-        }
-        DesktopResponse::Unavailable { reason } => {
-            bail!("the other computer's desktop is unavailable: {reason}")
-        }
-        _ => bail!("the other computer did not prepare its desktop for input"),
-    }
-}
-
-fn handoff_token(random: [u8; 8]) -> u64 {
-    (u64::from_ne_bytes(random) & crate::desktop::MAX_TOKEN).max(1)
-}
-
-fn validate_finished(response: Result<DesktopResponse>) -> Result<()> {
-    match response? {
-        DesktopResponse::Finished => Ok(()),
-        DesktopResponse::Unavailable { reason } => {
-            bail!("the other computer could not finish the desktop handoff: {reason}")
-        }
-        _ => bail!("the other computer did not confirm the desktop handoff cleanup"),
     }
 }
 
@@ -770,7 +748,7 @@ fn native_frame(event: NativeEvent) -> Result<Option<CapturedDeviceFrame>> {
             ..CaptureFrame::default()
         },
         kind if kind == NativeEventKind::Key as u32 => {
-            let Some(usage) = mac_keycode_to_hid(event.code) else {
+            let Some(usage) = keys::mac_keycode_to_hid(event.code) else {
                 return Ok(None);
             };
             CaptureFrame {
@@ -867,129 +845,6 @@ fn pressed_state(pressed: u8) -> KeyState {
     } else {
         KeyState::Pressed
     }
-}
-
-fn mac_keycode_to_hid(code: u16) -> Option<HidUsage> {
-    let usage = match code {
-        0 => 0x04,
-        1 => 0x16,
-        2 => 0x07,
-        3 => 0x09,
-        4 => 0x0b,
-        5 => 0x0a,
-        6 => 0x1d,
-        7 => 0x1b,
-        8 => 0x06,
-        9 => 0x19,
-        10 => 0x64, // left of Z; capture_bridge.c swaps 10 and 50 on ISO keyboards
-        11 => 0x05,
-        12 => 0x14,
-        13 => 0x1a,
-        14 => 0x08,
-        15 => 0x15,
-        16 => 0x1c,
-        17 => 0x17,
-        18 => 0x1e,
-        19 => 0x1f,
-        20 => 0x20,
-        21 => 0x21,
-        22 => 0x23,
-        23 => 0x22,
-        24 => 0x2e,
-        25 => 0x26,
-        26 => 0x24,
-        27 => 0x2d,
-        28 => 0x25,
-        29 => 0x27,
-        30 => 0x30,
-        31 => 0x12,
-        32 => 0x18,
-        33 => 0x2f,
-        34 => 0x0c,
-        35 => 0x13,
-        36 => 0x28,
-        37 => 0x0f,
-        38 => 0x0d,
-        39 => 0x34,
-        40 => 0x0e,
-        41 => 0x33,
-        42 => 0x31,
-        43 => 0x36,
-        44 => 0x38,
-        45 => 0x11,
-        46 => 0x10,
-        47 => 0x37,
-        48 => 0x2b,
-        49 => 0x2c,
-        50 => 0x35, // left of 1; capture_bridge.c swaps 10 and 50 on ISO keyboards
-        51 => 0x2a,
-        53 => 0x29,
-        54 => 0xe7,
-        55 => 0xe3,
-        56 => 0xe1,
-        57 => 0x39,
-        58 => 0xe2,
-        59 => 0xe0,
-        60 => 0xe5,
-        61 => 0xe6,
-        62 => 0xe4,
-        64 => 0x6c, // F17
-        65 => 0x63,
-        67 => 0x55,
-        69 => 0x57,
-        71 => 0x53,
-        75 => 0x54,
-        76 => 0x58,
-        78 => 0x56,
-        79 => 0x6d, // F18
-        80 => 0x6e, // F19
-        81 => 0x67,
-        82 => 0x62,
-        83 => 0x59,
-        84 => 0x5a,
-        85 => 0x5b,
-        86 => 0x5c,
-        87 => 0x5d,
-        88 => 0x5e,
-        89 => 0x5f,
-        90 => 0x6f, // F20
-        91 => 0x60,
-        92 => 0x61,
-        93 => 0x89, // JIS yen
-        94 => 0x87, // JIS underscore (ro)
-        95 => 0x85, // JIS keypad comma
-        96 => 0x3e,
-        97 => 0x3f,
-        98 => 0x40,
-        99 => 0x3c,
-        100 => 0x41,
-        101 => 0x42,
-        102 => 0x91, // JIS eisu
-        103 => 0x44,
-        104 => 0x90, // JIS kana
-        105 => 0x68,
-        106 => 0x6b,
-        107 => 0x69,
-        109 => 0x43,
-        110 => 0x65, // context menu
-        111 => 0x45,
-        113 => 0x6a,
-        114 => 0x49,
-        115 => 0x4a,
-        116 => 0x4b,
-        117 => 0x4c,
-        118 => 0x3d,
-        119 => 0x4d,
-        120 => 0x3b,
-        121 => 0x4e,
-        122 => 0x3a,
-        123 => 0x50,
-        124 => 0x4f,
-        125 => 0x51,
-        126 => 0x52,
-        _ => return None,
-    };
-    Some(HidUsage::keyboard(usage))
 }
 
 #[repr(u32)]
@@ -1183,119 +1038,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_events_are_answered_and_a_closed_session_refuses_the_crossing() {
-        let event = |kind| SessionEvent {
-            session_id: 1,
-            peer: "linux".into(),
-            kind,
-        };
-        let (sender, mut events) = mpsc::channel(8);
-        let (reply, desktop) = tokio::sync::oneshot::channel();
-        sender
-            .send(event(SessionEventKind::OutboundEnded))
-            .await
-            .unwrap();
-        sender
-            .send(event(SessionEventKind::Desktop {
-                request: DesktopRequest::Snapshot,
-                reply,
-            }))
-            .await
-            .unwrap();
-        refuse_waiting_events(&mut events).unwrap();
-        assert!(matches!(
-            desktop.await.unwrap(),
-            DesktopResponse::Unavailable { .. }
-        ));
-        sender
-            .send(event(SessionEventKind::Closed {
-                reason: "lost".into(),
-            }))
-            .await
-            .unwrap();
-        assert!(refuse_waiting_events(&mut events).is_err());
-        drop(sender);
-        assert!(refuse_waiting_events(&mut events).is_err());
-    }
-
-    #[test]
-    fn handoff_tokens_fit_the_receiver_javascript_integer_range() {
-        assert_eq!(handoff_token([0; 8]), 1);
-        assert_eq!(handoff_token([u8::MAX; 8]), crate::desktop::MAX_TOKEN);
-        assert!(handoff_token([0x80; 8]) <= crate::desktop::MAX_TOKEN);
-    }
-
-    #[test]
-    fn handoff_requires_prepared_geometry_to_match_saved_target() {
-        let handoff = HandoffOptions {
-            return_mapping: crate::desktop::ReturnMapping {
-                geometry: crate::desktop::Geometry {
-                    monitors: vec![Rect {
-                        x: -100,
-                        y: 0,
-                        width: 100,
-                        height: 100,
-                    }],
-                },
-                edge: Edge::Right,
-                local_start: 0.0,
-                local_end: 1.0,
-                remote_start: 0.0,
-                remote_end: 1.0,
-            },
-            entry_position: CursorPosition { x: -1.0, y: 50.0 },
-            entry_region: Rect {
-                x: -9,
-                y: 0,
-                width: 9,
-                height: 100,
-            },
-            edge: Edge::Left,
-            start: 0,
-            end: crate::desktop::FRACTION_MAX,
-            position: 500_000,
-            expected_width: 2880,
-            expected_height: 1620,
-        };
-        let prepared = DesktopResponse::Prepared {
-            geometry: crate::desktop::Geometry {
-                monitors: vec![Rect {
-                    x: -2880,
-                    y: -200,
-                    width: 2880,
-                    height: 1620,
-                }],
-            },
-            position: Point { x: -2879, y: 610 },
-        };
-        assert!(validate_prepared(&handoff, prepared.clone()).is_ok());
-        assert!(
-            validate_prepared(
-                &HandoffOptions {
-                    expected_width: 3840,
-                    ..handoff.clone()
-                },
-                prepared
-            )
-            .is_err()
-        );
-        assert!(validate_prepared(&handoff, DesktopResponse::Active).is_err());
-        assert!(
-            validate_prepared(&handoff, DesktopResponse::unavailable("missing extension")).is_err()
-        );
-    }
-
-    #[test]
-    fn handoff_return_requires_explicit_finish_acknowledgement() {
-        assert!(validate_finished(Ok(DesktopResponse::Finished)).is_ok());
-        assert!(validate_finished(Ok(DesktopResponse::Active)).is_err());
-        assert!(
-            validate_finished(Ok(DesktopResponse::unavailable("receiver still active"))).is_err()
-        );
-        assert!(validate_finished(Err(anyhow!("disconnected"))).is_err());
-    }
-
-    #[tokio::test]
     async fn cancellation_ignores_false_updates_and_accepts_sender_loss() {
         let (sender, mut receiver) = watch::channel(false);
         sender.send(false).unwrap();
@@ -1367,30 +1109,6 @@ mod tests {
                 height: 1,
             }
         );
-    }
-
-    #[test]
-    fn maps_main_return_to_hid_return() {
-        assert_eq!(mac_keycode_to_hid(36), Some(HidUsage::keyboard(0x28)));
-    }
-
-    #[test]
-    fn maps_iso_jis_context_menu_and_high_function_keys() {
-        for (code, usage) in [
-            (10, 0x64),
-            (64, 0x6c),
-            (79, 0x6d),
-            (80, 0x6e),
-            (90, 0x6f),
-            (93, 0x89),
-            (94, 0x87),
-            (95, 0x85),
-            (102, 0x91),
-            (104, 0x90),
-            (110, 0x65),
-        ] {
-            assert_eq!(mac_keycode_to_hid(code), Some(HidUsage::keyboard(usage)));
-        }
     }
 
     #[test]

@@ -422,6 +422,25 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A two-session unit test with a fake sender covers the desktop handoff.
 - **Size:** about 10 files, 1600 to 2200 LOC.
 - **Risks:** macOS 27 posting quirks; pointer feel; Caps Lock; a firewall prompt; duplicate connections.
+- **Status (2026-09-28):** built on branch `mac-receiver`; the live sitting has not run.
+  - Done:
+    - The injector: `inject.c` and `media.m` post, and `inject.rs` turns receiver effects into Mac events, with the pointer curve and clamp, click state, drags, flags, the ISO swap, receiver-made repeat, Caps Lock through IOKit, media keys, line and pixel scroll, and release on every exit path the app sees.
+    - Receiving over the session the Mac dials and over connections peers open. The Mac listens on `transport.listen` and keeps one session per computer with the shared dial rule.
+    - One ownership guard: input goes one way at a time, and the Mac starts no crossing while controlled.
+    - The desktop handoff server, so a Linux edge crossing enters and returns at the mapped point. The Mac's own crossings use the shared handoff functions.
+    - Keyboard modes, with Mac shortcuts trading Ctrl and Cmd outside terminals, and reverse scrolling per computer.
+    - The shared layout on the Mac, the mDNS advertisement, the AWDL lease while controlled, and waking the display on Prepare and on taking control.
+    - The Mac settings rows: "Can control this computer", "Keys from NAME" and "Reverse scrolling".
+    - This also covers the Mac items left under Phases 3 and 4: merging layouts, the shared handoff functions, and reverse scroll.
+  - The sitting still has to prove (TESTPLAN.md, "Two-way input sitting, Mac side"): pointer feel, click and drag behavior, typing with repeat at the system rate, Caps Lock, media keys, scroll distance per detent, the Mac's own devices while controlled, release within 1 s after killing zflowd, every exit path, wake, AWDL, duplicate connections, the firewall and Local Network behavior on the listener, and that Mac-to-Linux crossings still work.
+  - Known limits:
+    - Held input stays down after SIGKILL of the Mac app, until the local key is pressed.
+    - The pointer curve constants are untuned. `ZFLOW_MAC_POINTER` is a sitting-only knob.
+    - The Mac reads every sender's scroll as 120 units per detent, so a Mac trackpad sender scrolls a Mac receiver slowly.
+    - A connection that arrives during a crossing waits until the crossing ends.
+    - With `experimental_touchpad` on both computers, a Linux sender may send contacts the Mac cannot post, and they are dropped.
+    - Secure fields, full-screen apps and games are untested.
+    - Clipboard sharing and pause at edges are on the Mac too (Phase 4 items). The Mac reads the clipboard only when macOS allows it without asking; otherwise Checks says to allow zflow under Paste from Other Apps. Whether macOS 27 still shows an alert at crossings is for the sitting.
 
 ### Phase 3: Linux sends by edge, plus the shared layout
 

@@ -4,6 +4,8 @@ import vm from 'node:vm';
 
 const timers = new Map();
 const calls = [];
+// While true, the desktop agent is not running yet, as right after login.
+let agentDown = false;
 let snapshot = {api: 2, status: {state: 'controlled', peer: 'Mac', title: 'Controlled by Mac'}, sharing: true, health: []};
 const context = {
     GLib: {
@@ -25,6 +27,7 @@ const context = {
                 }
                 queueMicrotask(() => callback({call_finish() {
                     if (cancel.is_cancelled()) throw new Error('cancelled');
+                    if (agentDown) throw new Error('The name io.zflow.Desktop was not provided');
                     return {deep_unpack: () => [JSON.stringify(request.command === 'snapshot' ? snapshot : {ok: true})]};
                 }}, {}));
             },
@@ -41,9 +44,12 @@ const context = {
     PopupMenu: {
         PopupMenuItem: class {label = {};}, PopupSeparatorMenuItem: class {},
         PopupSwitchMenuItem: class {
+            constructor(_text, active) {this.state = active; this.handlers = [];}
             setSensitive(value) {this.sensitive = value;}
-            setToggleState(value) {this.state = value;}
-            connect(_signal, callback) {this.toggle = callback;}
+            // GNOME 50 emits toggled when code sets the state, as for a click.
+            setToggleState(value) {if (value !== this.state) this.click();}
+            click() {this.state = !this.state; for (const handler of this.handlers) handler(this, this.state);}
+            connect(_signal, callback) {this.handlers.push(callback);}
         },
     },
     Main: {panel: {addToStatusArea() {}}, notifyError() {throw new Error('Unexpected panel error');}},
@@ -57,8 +63,31 @@ const panel = new context.TestIndicator();
 await new Promise(setImmediate);
 assert.equal(calls[0].flags, 1, 'panel reads must not override disabled login startup');
 assert.equal(panel._status.label.text, 'Controlled by Mac');
-await panel._run({command: 'set_sharing', enabled: false});
+assert.equal(panel._sharing.state, true);
+// After a reboot the panel can start before the agent, then meet one from
+// another API level, and then a working one. Showing any of that is not a
+// request, so sharing stays as it was.
+const sharingRequests = () => calls.filter(call => call.request.command === 'set_sharing')
+    .map(call => call.request.enabled);
+agentDown = true;
+await panel._client.refresh();
+assert.equal(panel._status.label.text, 'zflow is not running');
+assert.equal(panel._sharing.state, false);
+agentDown = false;
+snapshot.sharing = null;
+await panel._client.refresh();
+snapshot.api = 3;
+await panel._client.refresh();
+assert.equal(panel._status.label.text, 'Update zflow');
+snapshot.api = 2;
+snapshot.sharing = true;
+await panel._client.refresh();
+assert.equal(panel._sharing.state, true);
+assert.deepEqual(sharingRequests(), [], 'showing status never changes sharing');
+// A person's click does.
+panel._sharing.click();
 await new Promise(setImmediate);
+assert.deepEqual(sharingRequests(), [false]);
 assert.equal(panel._status.label.text, 'Paused');
 assert.equal(panel._sharing.state, false);
 assert.equal(panel._icon.icon_name, 'media-playback-pause-symbolic');

@@ -163,6 +163,14 @@ impl HeldLease {
     }
 }
 
+/// A held lease from a fake helper that creates `restored` once it gives
+/// AWDL back.
+#[cfg(test)]
+pub(super) async fn fake_held_lease(restored: &std::path::Path) -> HeldLease {
+    let (_helper, lease) = tests::lease(tests::PEER, Some(restored)).await;
+    lease.hold()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,7 +179,7 @@ mod tests {
 
     // This fake peer exercises the lease protocol without privileges or
     // network interfaces.
-    const PEER: &str = r#"
+    pub(super) const PEER: &str = r#"
 printf 'READY\n'
 IFS= read -r -n 1 command || exit 1
 [ "$command" = A ] || exit 2
@@ -210,7 +218,10 @@ exit 4
         (child, input, output)
     }
 
-    async fn lease(script: &str, argument: Option<&std::path::Path>) -> (Child, AwDlLease) {
+    pub(super) async fn lease(
+        script: &str,
+        argument: Option<&std::path::Path>,
+    ) -> (Child, AwDlLease) {
         let (child, input, output) = peer(script, argument);
         let lease = AwDlLease::start(input, output, RESPONSE_TIMEOUT)
             .await

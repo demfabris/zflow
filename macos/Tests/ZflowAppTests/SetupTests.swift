@@ -111,7 +111,8 @@ extension JSONDecoder {
 private let minimalSnapshot = """
   {"status":{"state":"ready","peer":null,"title":"Ready"},"sharing":true,"health":[],
   "layout":{"monitors":[]},"peers":[{"name":"ubuntu","state":"connected","detail":"Connected",
-  "allow_control":true,"keyboard":"standard"}],"pairing":{"state":"idle"},"nearby":[],
+  "allow_control":true,"keyboard":"standard","reverse_scroll":false}],"pairing":{"state":"idle"},
+  "nearby":[],
   "shortcuts":[],"autostart":null,"config_path":"",
   "platform":{"accessibility":true,"local_network":"allowed","block_awdl":false}}
   """

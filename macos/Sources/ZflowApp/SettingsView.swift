@@ -98,18 +98,21 @@ struct SettingsView: View {
           )
           .font(.callout).foregroundStyle(.secondary)
         }
-        // Control switch and keyboard picker wait until this Mac takes input (Phase 2).
         ForEach(snapshot.peers) { peer in
-          LabeledContent {
-            Button("Forget \(peer.name)…", systemImage: "trash") { forgetting = peer.name }
-              .labelStyle(.iconOnly).buttonStyle(.borderless)
-              .help("Forget \(peer.name)")
+          DisclosureGroup {
+            PeerRows(model: model, peer: peer)
           } label: {
-            Label {
-              Text(peer.name)
-              Text(peer.detail).textSelection(.enabled)
-            } icon: {
-              Image(systemName: "display")
+            LabeledContent {
+              Button("Forget \(peer.name)…", systemImage: "trash") { forgetting = peer.name }
+                .labelStyle(.iconOnly).buttonStyle(.borderless)
+                .help("Forget \(peer.name)")
+            } label: {
+              Label {
+                Text(peer.name)
+                Text(peer.detail).textSelection(.enabled)
+              } icon: {
+                Image(systemName: "display")
+              }
             }
           }
         }
@@ -123,12 +126,36 @@ struct SettingsView: View {
           .disabled(snapshot.sharing == nil)
         }
       }
+      if let pause = snapshot.pauseAtEdges {
+        Section {
+          Toggle(
+            isOn: Binding(
+              get: { pause },
+              set: { model.send(CoreRequest(command: "set_switching", pauseAtEdges: $0)) })
+          ) {
+            Text("Pause at edges")
+            Text("Rest the pointer against an edge for a moment before it crosses.")
+          }
+        }
+      }
       if !snapshot.shortcuts.isEmpty {
         Section("Shortcuts") {
           ForEach(snapshot.shortcuts, id: \.title) { shortcut in
             LabeledContent(shortcut.title) {
               Text(shortcut.keys).monospaced().textSelection(.enabled)
             }
+          }
+        }
+      }
+      if let share = snapshot.shareClipboard {
+        Section {
+          Toggle(
+            isOn: Binding(
+              get: { share },
+              set: { model.send(CoreRequest(command: "set_clipboard", share: $0)) })
+          ) {
+            Text("Share clipboard")
+            Text("Sends text or an image up to 3 MB when the pointer moves to another computer.")
           }
         }
       }
@@ -167,6 +194,50 @@ struct SettingsView: View {
   }
 }
 
+/// What one paired computer may do on this Mac, as the GNOME window has it.
+private struct PeerRows: View {
+  var model: AppModel
+  var peer: Peer
+
+  var body: some View {
+    Toggle(
+      isOn: binding(peer.allowControl) {
+        CoreRequest(command: "set_peer", name: peer.name, allowControl: $0)
+      }
+    ) {
+      Text("Can control this computer")
+      Text("Its keyboard and pointer can move onto this Mac.")
+    }
+    Picker(
+      selection: binding(peer.keyboard) {
+        CoreRequest(command: "set_peer", name: peer.name, keyboard: $0)
+      }
+    ) {
+      Text("Standard keys").tag("standard")
+      Text("PC key positions").tag("pc_positions")
+      Text("Mac shortcuts").tag("mac")
+    } label: {
+      Text("Keys from \(peer.name)")
+      Text("How its keys act on this Mac.")
+    }
+    Toggle(
+      isOn: binding(peer.reverseScroll) {
+        CoreRequest(command: "set_peer", name: peer.name, reverseScroll: $0)
+      }
+    ) {
+      Text("Reverse scrolling")
+      Text("Turn its scrolling around on this Mac.")
+    }
+  }
+
+  /// Shows the engine's value, and sends each change to it.
+  private func binding<Value>(
+    _ value: Value, _ request: @escaping (Value) -> CoreRequest
+  ) -> Binding<Value> {
+    Binding(get: { value }, set: { model.send(request($0)) })
+  }
+}
+
 /// Accessibility, Local Network, Reduce Wi-Fi lag with its helper, and Move
 /// to Applications when zflow runs from somewhere it cannot stay.
 private struct MacRows: View {
@@ -177,8 +248,8 @@ private struct MacRows: View {
     CheckRow(
       title: "Accessibility",
       detail: platform.accessibility
-        ? "Keyboard and pointer access allowed."
-        : "Allow zflow to share keyboard and pointer input.",
+        ? "zflow can share this Mac's keyboard and pointer, and paired computers can control it."
+        : "Allow zflow to share keyboard and pointer input, and to let paired computers control this Mac.",
       level: platform.accessibility ? "ok" : "error"
     ) {
       if !platform.accessibility { Button("Allow…") { model.openAccessibility() } }

@@ -216,6 +216,8 @@ pub enum LinuxRuntimeError {
     StartupChannelClosed,
     #[error("Linux input runtime thread panicked")]
     ThreadPanicked,
+    #[error("Linux input runtime thread did not stop in time")]
+    StopTimedOut,
     #[error("could not replace the virtual input devices during reload: {0}")]
     ReloadVirtualInput(#[source] InjectionError),
 }
@@ -281,6 +283,13 @@ impl LinuxRuntimeControl {
         lock_status(&self.status).clone()
     }
 
+    /// Tells the input thread to let go of every device and end. A flag
+    /// rather than a queued command, so a full queue cannot delay it.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.waker.wake();
+    }
+
     fn wake(&self) -> Result<(), RuntimeCommandError> {
         self.waker.wake().map_err(|_| RuntimeCommandError::Wake)
     }
@@ -310,7 +319,45 @@ pub struct LinuxRuntime {
     control: LinuxRuntimeControl,
     pub events: mpsc::Receiver<RuntimeEvent>,
     pub captured: mpsc::Receiver<CapturedDeviceFrame>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<InputThread>,
+}
+
+/// The input thread, and a channel that closes once it ends, even by panic.
+struct InputThread {
+    handle: JoinHandle<()>,
+    exited: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl InputThread {
+    fn spawn(body: impl FnOnce() + Send + 'static) -> io::Result<Self> {
+        let (exited_tx, exited) = tokio::sync::oneshot::channel::<()>();
+        let handle = thread::Builder::new()
+            .name("zflow-linux-input".into())
+            .spawn(move || {
+                let _exited = exited_tx;
+                body();
+            })?;
+        Ok(Self { handle, exited })
+    }
+
+    fn join(self) -> Result<(), LinuxRuntimeError> {
+        self.handle
+            .join()
+            .map_err(|_| LinuxRuntimeError::ThreadPanicked)
+    }
+
+    /// Waits up to `timeout` for the thread to end. One that overruns is left
+    /// running, since joining it could block for good, and the process exit
+    /// closes its descriptors.
+    async fn join_within(mut self, timeout: Duration) -> Result<(), LinuxRuntimeError> {
+        if tokio::time::timeout(timeout, &mut self.exited)
+            .await
+            .is_err()
+        {
+            return Err(LinuxRuntimeError::StopTimedOut);
+        }
+        self.join()
+    }
 }
 
 impl LinuxRuntime {
@@ -328,28 +375,26 @@ impl LinuxRuntime {
 
         let thread_status = status.clone();
         let thread_stop = stop.clone();
-        let thread = thread::Builder::new()
-            .name("zflow-linux-input".into())
-            .spawn(move || {
-                match RuntimeLoop::new(
-                    poll,
-                    config,
-                    command_rx,
-                    thread_stop,
-                    event_tx,
-                    capture_tx,
-                    thread_status,
-                ) {
-                    Ok(mut runtime) => {
-                        let _ = startup_tx.send(Ok(()));
-                        runtime.run();
-                    }
-                    Err(error) => {
-                        let _ = startup_tx.send(Err(error));
-                    }
+        let thread = InputThread::spawn(move || {
+            match RuntimeLoop::new(
+                poll,
+                config,
+                command_rx,
+                thread_stop,
+                event_tx,
+                capture_tx,
+                thread_status,
+            ) {
+                Ok(mut runtime) => {
+                    let _ = startup_tx.send(Ok(()));
+                    runtime.run();
                 }
-            })
-            .map_err(LinuxRuntimeError::Spawn)?;
+                Err(error) => {
+                    let _ = startup_tx.send(Err(error));
+                }
+            }
+        })
+        .map_err(LinuxRuntimeError::Spawn)?;
 
         match startup_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -382,15 +427,22 @@ impl LinuxRuntime {
         self.stop_and_join()
     }
 
+    /// Stops the input thread and waits up to `timeout` for it to let go of
+    /// every device, so a wedged thread cannot hold up the daemon's exit.
+    pub async fn stop(mut self, timeout: Duration) -> Result<(), LinuxRuntimeError> {
+        self.control.request_stop();
+        match self.thread.take() {
+            Some(thread) => thread.join_within(timeout).await,
+            None => Ok(()),
+        }
+    }
+
     fn stop_and_join(&mut self) -> Result<(), LinuxRuntimeError> {
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
-        // A flag rather than a queued command, so a full queue cannot delay
-        // teardown or leave a detached descriptor-owning thread.
-        self.control.stop.store(true, Ordering::Release);
-        let _ = self.control.waker.wake();
-        thread.join().map_err(|_| LinuxRuntimeError::ThreadPanicked)
+        self.control.request_stop();
+        thread.join()
     }
 }
 
@@ -1464,6 +1516,24 @@ mod tests {
             control.send_critical(release(), Duration::ZERO).await,
             Err(RuntimeCommandError::Full)
         );
+    }
+
+    #[tokio::test]
+    async fn a_stuck_input_thread_cannot_hold_up_stopping() {
+        let (release, stuck_until) = std::sync::mpsc::channel::<()>();
+        let stuck = InputThread::spawn(move || {
+            let _ = stuck_until.recv();
+        })
+        .unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            stuck.join_within(Duration::from_millis(50)).await,
+            Err(LinuxRuntimeError::StopTimedOut)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(release);
+        let finished = InputThread::spawn(|| {}).unwrap();
+        finished.join_within(Duration::from_secs(5)).await.unwrap();
     }
 
     #[tokio::test]

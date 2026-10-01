@@ -3,9 +3,10 @@
 zflow shares keyboard, pointer, and trackpad input over authenticated QUIC.
 Linux runs a system service with a GNOME panel indicator and native
 GTK4/libadwaita settings. macOS runs a native SwiftUI menu-bar app with a small
-settings window. The Mac currently sends input to Linux; receiving
-input on macOS remains future work. This is a working prototype. Live two-host
-qualification in [TESTPLAN.md](TESTPLAN.md) still gates the alpha label.
+settings window. Input goes both ways: the Mac sends to Linux, and a paired
+Linux computer can control the Mac. This is a working prototype. Live two-host
+qualification in [TESTPLAN.md](TESTPLAN.md) still gates the alpha label, and
+the two-way sitting there has not run yet.
 
 ## Install
 
@@ -117,11 +118,32 @@ and moves on, and **Back** returns to an earlier one:
    helper described below.
 
 To pair another computer later, use **Pair Computer…** in **Settings…**. Move
-through a touching edge with keys and mouse buttons released. Cross back from
-Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and pauses sharing.
+through a touching edge with keys and mouse buttons released. With **Pause at
+edges** on in Settings, the pointer has to rest against the edge for 250 ms
+before it crosses, and moving away first cancels. Cross back from Ubuntu to
+return. **Ctrl+Cmd+Backspace** returns input and pauses sharing.
 Resume from the menu-bar menu when you are ready. Later problems, such as
 Accessibility or Local Network access being turned off, show on the health
 badge in Settings.
+
+Ubuntu can control the Mac over the same pairing. On Ubuntu, press
+Ctrl+Super+F12, or push the pointer through the edge that touches the Mac's
+tile; Ctrl+Super+Backspace brings input back. The Mac needs Accessibility for
+this too. In the Mac's **Settings…**, each paired computer opens to three
+rows:
+
+- **Can control this computer**, on for a new pairing. Turning it off ends
+  control at once.
+- **Keys from NAME**: how that computer's keys act on the Mac. See Keyboard
+  modes below.
+- **Reverse scrolling**: turns that computer's scrolling around on the Mac.
+
+While Ubuntu controls the Mac, the Mac's own keyboard and trackpad still work,
+and the Mac starts no crossing of its own. The Mac listens on UDP port 43119
+for computers that connect first. If macOS asks whether zflow may accept
+incoming connections, choose **Allow**; if it can't listen, a health row says
+so, the Mac tries again every 2 seconds, and Ubuntu still controls the Mac
+over the connection the Mac opens.
 
 Closing Settings leaves sharing running. **Pause Sharing** returns input to
 the Mac; **Quit zflow** stops the engine and finishes cleanup. While sharing is
@@ -132,20 +154,23 @@ GNOME must be unlocked. Other Linux desktops do not yet supply this return path.
 
 ## Keyboard modes
 
-The Linux receiver keeps a keyboard mode for each paired computer. A change
+Each receiver keeps a keyboard mode for each paired computer. A change
 applies from that computer's next crossing.
 
 - **Standard keys** (`standard`, the default): keys arrive as sent. A Mac's
   Cmd is Super and Option is Alt.
 - **PC key positions** (`pc-positions`): Option and Cmd trade places, so each
   key does what the PC key in that spot does.
-- **Mac shortcuts** (`mac`): Cmd acts as Ctrl, plus common macOS shortcuts
-  such as Cmd+Tab, Option+arrows and Cmd+arrows. With the GNOME integration
-  running, Cmd+C and Cmd+V in a terminal copy and paste with Ctrl+Shift+C and
-  Ctrl+Shift+V. Without it, Cmd+C in a terminal is Ctrl+C.
+- **Mac shortcuts** (`mac`): shortcuts act as the receiver's own. On Linux,
+  Cmd acts as Ctrl, plus common macOS shortcuts such as Cmd+Tab,
+  Option+arrows and Cmd+arrows. With the GNOME integration running, Cmd+C and
+  Cmd+V in a terminal copy and paste with Ctrl+Shift+C and Ctrl+Shift+V.
+  Without it, Cmd+C in a terminal is Ctrl+C. On a Mac, Ctrl and Cmd trade
+  places, so a PC's Ctrl+C copies, except in Terminal, iTerm2, Ghostty,
+  kitty, Alacritty, WezTerm, Warp and Hyper, where Ctrl stays Ctrl.
 
 Choose the mode from the dropdown beside each computer in the GNOME settings
-window, or from the CLI:
+window, from **Keys from NAME** in the Mac settings, or from the Linux CLI:
 
 ```sh
 sudo zflow peer keyboard desk mac
@@ -189,7 +214,10 @@ desktop agent running. Pairing closes when its dialog closes.
 With **Share Clipboard** on at both ends, the clipboard goes with the
 pointer: the computer the pointer leaves sends its text, or one PNG image,
 to the computer it enters. Files never go, and a clip over 3 MB stays put
-with a notice. The switch is stored in `[clipboard].share`.
+with a notice. The switch is stored in `[clipboard].share`. The Mac
+settings window has the same **Share clipboard** switch; a clip too large to
+share shows as a warning under **Checks** until the next one goes. A copy a
+password manager marks as concealed or transient stays on the Mac.
 
 Linux stores the sharing switch in `[daemon].sharing`; pausing closes active
 input sessions and blocks sending and receiving, including pre-login input,
@@ -206,11 +234,13 @@ including vertical offsets. Nearby edges snap together; overlapping tiles are
 rejected. Only the touching portion of an edge permits crossing. Physical
 monitor placement inside a computer remains the operating system's job.
 
-The app reads each paired computer's desktop size over its authenticated
-connection and saves positions beside the configuration in
-`zflow.toml.layout.toml`. The receiver's geometry is checked again at each
-crossing. Moving, resizing, or removing a tile stops the old arrangement before
-the updated layout arms.
+Paired computers share one layout: a tile moved on one computer moves on the
+other, and each computer writes its own tile's size. Until the Mac first
+connects, it arranges tiles from each paired computer's desktop size. It keeps
+the shared layout in `zflow.toml.shared-layout.toml` and its own view of it in
+`zflow.toml.layout.toml`, beside the configuration. The receiver's geometry is
+checked again at each crossing. Moving, resizing, or removing a tile stops the
+old arrangement before the updated layout arms.
 
 ## Discover nearby computers
 
@@ -218,11 +248,12 @@ Pairing lists receivers advertised on the local network. Discovery does not
 verify identity; only the setup code shown on the receiver does. Manual
 addresses remain available. The Linux daemon advertises itself and also
 browses: when it dials a paired computer, it tries nearby addresses too, with
-that computer's pinned key, so a changed address does not break the link.
-Pairing also saves every address the other computer has, VPN ones such as
-Tailscale's included, so paired computers still reach each other away from
-the network they paired on. A nearby computer running another zflow version
-stays in the list and says to update it. macOS
+that computer's pinned key, so a changed address does not break the link. The
+Mac advertises its input port the same way while it listens for paired
+computers. Pairing also saves every address the other computer has, VPN ones
+such as Tailscale's included, so paired computers still reach each other away
+from the network they paired on. A nearby computer running another zflow
+version stays in the list and says to update it. macOS
 asks for Local Network access the first time the Mac browses, so the Mac waits
 for the setup's Local Network step or **Pair Computer…** in Settings. Once a
 computer is paired, it browses from launch. Browsing then continues while the
@@ -399,7 +430,8 @@ accepts no shell commands or arbitrary interface names. Installation and health
 checks do not change radio state.
 
 The helper remembers AWDL's initial up/down state, suppresses it during remote
-capture, and restores it on return, failed activation, or disconnect. A pipe and
+capture and while a paired computer controls the Mac, and restores it on
+return, failed activation, or disconnect. A pipe and
 a two-second renewable lease cover sender crashes and stalls. Missing heartbeat
 acknowledgements end remote capture. The daemon grants one lease at a time.
 

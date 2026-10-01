@@ -45,6 +45,131 @@ Checks:
   resized", and the Mac's tile for Linux follows.
 - **Chord:** Ctrl+Super+F12 still sends to the Mac without preparing its desktop.
 
+## Two-way input sitting, Mac side (ROADMAP Phase 2)
+
+The same sitting as the Ubuntu side, from the Mac16,5 on macOS 27. Ubuntu
+drives with Ctrl+Super+F12 and escapes with Ctrl+Super+Backspace. Allow about
+75 minutes, and mark each check pass or fail against both logs.
+
+Setup on the Mac:
+
+1. `./scripts/build-macos-app.sh --debug`. It signs with the first Apple
+   Development identity, so the Accessibility grant and any firewall answer
+   survive rebuilds. Grant the app Accessibility.
+2. Launch it with logs, keeping zflow.app as its own Accessibility process:
+   `osascript -e 'quit app id "io.zflow.zflow"'`, then
+   `mkdir -p target/logs; log=target/logs/zflow-mac-$(date -u +%Y%m%dT%H%M%SZ).log`, then
+   `open -n --stderr "$PWD/$log" --stdout "$PWD/$log" --env RUST_LOG=warn,zflow=debug target/debug/zflow.app`.
+   Running the binary from a shell makes the terminal the responsible process.
+3. On Ubuntu, `just debug-daemon`.
+
+Checks:
+
+1. **Preflight.** `lsof -nP -iUDP:43119` on the Mac shows the listener.
+   `/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate`; note any
+   prompt. `avahi-browse -rt _zflow._udp` on Ubuntu shows the Mac on port 43119.
+   Check that Local Network access still lets connections in (TN3179).
+2. **Chord.** The Mac shows "Controlled by ubuntu". Judge the feel with a slow,
+   precise move and a fast flick across 3008 pt. If needed, retune with
+   `ZFLOW_MAC_POINTER=adaptive:SPEED` or `flat:SPEED` in the `open --env` line.
+3. **Clicks.** Single click. Double-click selects a word and triple-click a
+   paragraph in TextEdit. Right-click opens a menu. Middle-click on a link in
+   Safari opens a new tab. The side buttons go back and forward in Safari. A
+   click on a background window focuses it.
+4. **Drag.** Move a Finder file into a folder, select text by dragging, and drag
+   a window.
+5. **Modifier clicks.** Cmd+click to multi-select in Finder, Shift+click for a
+   range, Option+drag to copy.
+6. **Typing.** A pangram, and the key left of 1. The ISO branch through "Change
+   Keyboard Type" if an external keyboard offers it; otherwise the unit tests
+   cover it. Hold k for 3 s remotely and locally: the counts agree within 10%.
+   Hold an arrow key too.
+7. **Caps Lock.** The Magic Keyboard LED follows, and letters come out upper
+   case. Toggle it back.
+8. **Keyboard modes.** Set **Keys from ubuntu** to each mode. Standard keys:
+   Super+C copies. PC key positions: Alt+C copies. Mac shortcuts: Ctrl+C copies
+   in TextEdit and interrupts `sleep 100` in Terminal.
+9. **Scroll.** A notched wheel scrolls in line mode. On a hi-res wheel, if one
+   is available, compare how far one detent scrolls against the notched wheel,
+   and judge whether one line per detent feels slow: CG counts a posted line as
+   about 10 px, and Barrier and Deskflow post 3 lines per detent. Record the
+   horizontal direction and the natural-scrolling setting. **Reverse
+   scrolling** turns both axes around.
+10. **Media and function keys.** Volume up, down and mute; play/pause in Music;
+    brightness (record what happens). PrintScreen arrives as F13 in
+    Karabiner-EventViewer or the probe window; ScrollLock and Pause arrive as
+    nothing.
+11. **Local devices while controlled.** The Mac's trackpad and keyboard work
+    with no stall.
+12. **Exclusion.** While the chord controls the Mac, remote and local motion
+    into the Mac's edge toward Ubuntu starts nothing, and the log shows "edge
+    crossings skipped while controlled" once. When Ubuntu came in by an edge
+    push instead, the Mac's own trackpad pushed into that edge hands control
+    back to Ubuntu ("cursor reached the desktop handoff edge"). Pushing on
+    then crosses to Ubuntu ("pointer pushed against a held edge", then
+    "configured edge reached"); stopping at the edge stays on the Mac.
+    After the escape chord, a Mac-to-Ubuntu edge crossing works. With the Mac
+    crossed to Ubuntu, the Ubuntu chord is refused.
+13. **Release safety.** Hold Shift+A remotely, then
+    `sudo systemctl kill -s KILL zflowd`. Repeat stops and Shift is up within
+    1 s (compare log timestamps). Repeat mid-drag with a button held.
+14. **Exit paths.** Quit the Mac app while a key is held remotely: nothing
+    stays stuck. Turn off **Can control this computer** while controlled:
+    control ends at once. Lock the Mac while controlled with Shift held
+    remotely: Shift comes up and control ends within 250 ms ("this Mac locked;
+    ending control"), and the chord is refused while locked.
+15. **Wake.** With the password delay above 0, run `pmset displaysleepnow`.
+    The chord plus a move wakes the display. Sleep it again: an Ubuntu edge
+    push enters the Mac and wakes it, with no "desktop handoff expired" line.
+16. **AWDL.** With **Reduce Wi-Fi lag** on, `ifconfig awdl0` shows it down
+    while controlled and back up afterwards.
+17. **Duplicates.** Turn Mac sharing off, then press Ctrl+Super+F12 on Ubuntu
+    at the moment you turn it back on: zflowd only dials the Mac from the chord
+    or an edge push, so restarting it makes no second dial. After 10 s there is
+    one session on each side (`zflow status`; zero or one "superseded" line),
+    and the chord still works. The link tests cover both dial orders.
+18. **One way only.** Turn off Ubuntu's **Can control this computer** for the
+    Mac. The Mac shows a "Paired computers" warning that ubuntu takes no input
+    from this Mac, not "Needs attention", and the chord still controls the Mac.
+    Turn it back on: within 5 s the warning goes and a Mac-to-Ubuntu crossing
+    works.
+19. **Mac to Linux regression.** A full Mac-to-Linux crossing: type, then
+    return. Horizontal scroll now goes the same way as vertical in both
+    directions; check it Mac to Linux and Linux to Mac.
+20. **Shared layout.** The Mac log shows "layout adopted" or "layout updated on
+    this Mac" once Ubuntu connects. A tile moved on either computer shows up
+    on the other within 2 s, and an Ubuntu edge push enters the Mac at the
+    matching point and returns at the matching point.
+21. **Clipboard.** Turn on **Share clipboard** on both computers. Copy text in
+    TextEdit, cross to Ubuntu and paste it in gedit; copy other text there,
+    return and paste it in TextEdit. Do the same with a PNG both ways: a
+    screenshot region copied with Cmd+Ctrl+Shift+4 on the Mac pastes into GIMP,
+    and an image copied on Ubuntu pastes into Preview (File > New from
+    Clipboard). Copy a 5 MiB image on the Mac and cross: nothing goes, and
+    Settings shows "Clipboard not shared: 5.0 MB is over the 3 MB limit" under
+    Checks until the next clip goes. No bounce: after pasting Ubuntu's text on
+    the Mac, cross to Ubuntu and back without copying; the Mac log shows no
+    "clipboard sent" line, and Ubuntu's clipboard is unchanged. Copy a password
+    in 1Password and cross: Ubuntu's clipboard is unchanged, and
+    the Mac log shows no "clipboard sent" line. Note whether
+    macOS 27 shows its paste privacy alert when the Mac reads the clipboard at
+    a crossing, and what the alert says. Turn the switch off on the Mac: a clip
+    from Ubuntu is dropped ("clipboard from peer dropped: sharing is off").
+22. **Pause at edges.** Turn on **Pause at edges** on the Mac. Touching the
+    edge toward Ubuntu and moving straight back stays on the Mac; resting
+    against it for a moment crosses at the point where the pointer rests. Leaving the edge
+    before then starts nothing, and nothing reconnects when the switch
+    changes (no "input link connected" line). Turn it off: the next push
+    crosses at once.
+23. **Pushes.** Flick Mac to Ubuntu and back several times, fast: a flick
+    into the Mac's edge crosses, and a cursor left resting against that edge
+    crosses with the next push. Push with Cmd held: the pointer stays, and
+    after letting go it has to leave the edge before a push crosses.
+
+Known before the sitting: the Mac reads every sender's scroll as 120 units per
+detent, so a Mac trackpad sending to a Mac receiver scrolls slowly. Only Mac to
+Mac is affected.
+
 ## Binary releases and Debian packaging, September 16
 
 Run `just test-install` (also included in `just check`). The tests use local

@@ -616,7 +616,18 @@ fn backend_supports(effect: &ReceiverEffect) -> bool {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The Mac posts only the keys and buttons it has codes for, and no touch.
+#[cfg(target_os = "macos")]
+fn backend_supports(effect: &ReceiverEffect) -> bool {
+    match effect {
+        ReceiverEffect::Key { key, .. } => crate::macos::supports_key(*key),
+        ReceiverEffect::Button { button, .. } => (1..=32).contains(&button.0),
+        ReceiverEffect::TouchReplaced { .. } => false,
+        _ => true,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn backend_supports(_: &ReceiverEffect) -> bool {
     true
 }
