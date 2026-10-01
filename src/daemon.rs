@@ -48,6 +48,7 @@ const SESSION_EVENT_CAPACITY: usize = 1_024;
 mod clipboard;
 mod crossing;
 mod desktop;
+mod links;
 mod peer_view;
 const ACCEPT_EVENT_CAPACITY: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -138,8 +139,10 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         server_config: RwLock::new(server_config),
         runtime: runtime.control(),
         sessions: Mutex::new(BTreeMap::new()),
+        session_changes: watch::Sender::new(()),
         dialed: Mutex::new(BTreeMap::new()),
-        nearby: Mutex::new(BTreeMap::new()),
+        nearby: watch::Sender::new(BTreeMap::new()),
+        links: Mutex::new(BTreeMap::new()),
         layout: Mutex::new(None),
         crossing: Mutex::new(()),
         metrics_history: Mutex::new(BTreeMap::new()),
@@ -157,6 +160,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         tracing::warn!(%error, "desktop metadata API unavailable");
     }
     shared.restore_layout().await;
+    shared.sync_links().await;
     let mut discovery = start_discovery(&config, shared.endpoint.local_addr()?);
     let daemon_uid = nix::unistd::geteuid().as_raw();
     let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
@@ -279,7 +283,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                     Err(error) => tracing::warn!(%error, "mDNS monitoring stopped"),
                 }
                 stop_discovery(&mut discovery).await;
-                shared.nearby.lock().await.clear();
+                shared.change_nearby(BTreeMap::clear);
             }
             event = next_discovery_event(discovery.as_ref()), if discovery.is_some() => {
                 match event {
@@ -288,26 +292,30 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                             continue;
                         };
                         let local = local_unicast_addresses().unwrap_or_default();
-                        let addresses = if candidate.is_compatible() {
-                            remote_addresses(candidate.socket_addresses(), &local)
-                        } else {
-                            Vec::new()
+                        // A computer on another version stays listed, so its
+                        // link can say so.
+                        let found = links::Nearby {
+                            addresses: remote_addresses(candidate.socket_addresses(), &local),
+                            compatible: candidate.is_compatible(),
                         };
-                        let mut nearby = shared.nearby.lock().await;
                         let instance = instance.to_string();
-                        if addresses.is_empty() {
-                            nearby.remove(&instance);
-                        } else if nearby.len() < MAX_NEARBY || nearby.contains_key(&instance) {
-                            nearby.insert(instance, addresses);
-                        }
+                        shared.change_nearby(|nearby| {
+                            if found.addresses.is_empty() {
+                                nearby.remove(&instance);
+                            } else if nearby.len() < MAX_NEARBY || nearby.contains_key(&instance) {
+                                nearby.insert(instance, found);
+                            }
+                        });
                     }
                     Ok(DiscoveryEvent::Removed(instance)) => {
-                        shared.nearby.lock().await.remove(&instance.to_string());
+                        shared.change_nearby(|nearby| {
+                            nearby.remove(&instance.to_string());
+                        });
                     }
                     Ok(DiscoveryEvent::Stopped) | Err(_) => {
                         tracing::warn!("mDNS browsing stopped");
                         stop_discovery(&mut discovery).await;
-                        shared.nearby.lock().await.clear();
+                        shared.change_nearby(BTreeMap::clear);
                     }
                 }
             }
@@ -323,6 +331,8 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Links stop dialing before the sessions close.
+    shared.links.lock().await.clear();
     shared
         .close_all(SessionCloseReason::BackendUnavailable)
         .await;
@@ -353,12 +363,16 @@ struct Shared {
     server_config: RwLock<Option<InputServerConfig>>,
     runtime: LinuxRuntimeControl,
     sessions: Mutex<BTreeMap<String, SessionHandle>>,
+    /// Bumped whenever `sessions` gains or loses one, which links watch.
+    session_changes: watch::Sender<()>,
     /// Sessions this computer dialed, by id, with when the dial finished.
     dialed: Mutex<BTreeMap<u64, Instant>>,
-    /// Addresses of compatible zflow computers on the network, by mDNS
-    /// instance. A dial also tries these, with the peer's pinned key, so a
-    /// peer whose address changed is still found.
-    nearby: Mutex<BTreeMap<String, Vec<SocketAddr>>>,
+    /// The zflow computers on the network, by mDNS instance. A dial on
+    /// demand also tries the compatible ones, with the peer's pinned key, so
+    /// a peer whose address changed is still found.
+    nearby: watch::Sender<BTreeMap<String, links::Nearby>>,
+    /// The live link to each peer this computer may send to.
+    links: Mutex<BTreeMap<String, links::Link>>,
     /// The newest layout this computer has seen from any peer.
     layout: Mutex<Option<crate::desktop::SharedLayout>>,
     /// Held while a crossing started from an edge runs.
@@ -723,16 +737,33 @@ impl Shared {
             return Ok(existing);
         }
         let mut addresses = record.addresses.clone();
-        addresses.extend(self.nearby.lock().await.values().flatten());
+        addresses.extend(
+            self.nearby
+                .borrow()
+                .values()
+                .filter(|nearby| nearby.compatible)
+                .flat_map(|nearby| nearby.addresses.iter().copied()),
+        );
         if addresses.is_empty() {
             bail!("peer {peer} has no configured input address and none was found nearby");
         }
+        self.connect(peer, record, &addresses).await
+    }
+
+    /// Dials `peer` at `addresses` and keeps the session, unless one the
+    /// peer dialed at the same moment wins.
+    async fn connect(
+        &self,
+        peer: &str,
+        record: &PeerConfig,
+        addresses: &[SocketAddr],
+    ) -> Result<SessionHandle> {
         let policy_generation = self.policy_generation.load(Ordering::Acquire);
         let connection = race_connect(
             &self.endpoint,
             &self.identity,
             record.spki_der()?,
-            &addresses,
+            addresses,
         )
         .await?;
         let generation = self.allocate_generation()?;
@@ -778,8 +809,19 @@ impl Shared {
             .await
             .insert(session.id(), Instant::now());
         drop(sessions);
+        self.session_changes.send_replace(());
         self.offer_layout(&session).await;
         Ok(session)
+    }
+
+    /// Changes the list of nearby computers, waking links only when it
+    /// really changed.
+    fn change_nearby(&self, change: impl FnOnce(&mut BTreeMap<String, links::Nearby>)) {
+        self.nearby.send_if_modified(|nearby| {
+            let before = nearby.clone();
+            change(nearby);
+            *nearby != before
+        });
     }
 
     /// Whether this computer's own dial to `peer` just finished and wins
@@ -847,6 +889,7 @@ impl Shared {
                     None => {
                         sessions.insert(peer, session.clone());
                         drop(sessions);
+                        self.session_changes.send_replace(());
                         self.offer_layout(&session).await;
                         return Ok(());
                     }
@@ -1250,15 +1293,23 @@ async fn race_connect(
                 .map_err(anyhow::Error::from)
         });
     }
-    let mut last_error = None;
+    let mut last_error: Option<anyhow::Error> = None;
     while let Some(result) = attempts.join_next().await {
-        match result {
+        let error = match result {
             Ok(Ok(connection)) => {
                 attempts.abort_all();
                 return Ok(connection);
             }
-            Ok(Err(error)) => last_error = Some(error),
-            Err(error) => last_error = Some(anyhow!(error)),
+            Ok(Err(error)) => error,
+            Err(error) => anyhow!(error),
+        };
+        // An answer a person can act on says more than an address that
+        // timed out.
+        if last_error
+            .as_ref()
+            .is_none_or(|last| crate::link::Fix::of(last).is_none())
+        {
+            last_error = Some(error);
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow!("peer has no connection candidates")))
@@ -1909,7 +1960,9 @@ impl Shared {
                         .get(&event.peer)
                         .filter(|session| session.id() == event.session_id)
                         .map(SessionHandle::metrics_snapshot);
-                    remove_session_if_current(&mut sessions, &event.peer, event.session_id);
+                    if remove_session_if_current(&mut sessions, &event.peer, event.session_id) {
+                        self.session_changes.send_replace(());
+                    }
                     final_metrics
                 };
                 self.dialed.lock().await.remove(&event.session_id);
@@ -2073,7 +2126,7 @@ impl Shared {
         }
     }
 
-    async fn apply_config_locked(&self, config: Config, persist: bool) -> Result<()> {
+    async fn apply_config_locked(self: &Arc<Self>, config: Config, persist: bool) -> Result<()> {
         config.validate()?;
         validate_peer_identities(&config)?;
         // SessionOptions performs the core duration/capability conversions
@@ -2151,6 +2204,9 @@ impl Shared {
                 session.close(SessionCloseReason::PermissionRevoked);
             }
         }
+        // A forgotten peer's link stops dialing, and a new one starts.
+        self.sync_links().await;
+
         // Pairing, forgetting or renaming a computer changes which tiles have
         // a computer behind them here.
         self.place_new_peers().await;
@@ -2206,6 +2262,7 @@ impl Shared {
 
     async fn close_all(&self, reason: SessionCloseReason) {
         let sessions = std::mem::take(&mut *self.sessions.lock().await);
+        self.session_changes.send_replace(());
         for session in sessions.into_values() {
             session.close(reason);
         }

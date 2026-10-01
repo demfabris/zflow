@@ -103,6 +103,11 @@ async fn desktop_command(
         shared.edge_hit(edge, position);
         return Ok(DesktopReply::Ack);
     }
+    if let Request::Retry {} = request {
+        authorize_peer(stream, daemon_uid, shared.active_uid())?;
+        shared.retry_links().await;
+        return Ok(DesktopReply::Ack);
+    }
     let _mutation = shared.config_mutation.lock().await;
     authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();
@@ -121,6 +126,7 @@ async fn desktop_command(
                 .as_ref()
                 .map(|active| active.peer.clone()),
             connected: shared.sessions.lock().await.keys().cloned().collect(),
+            links: shared.link_status().await,
             layout: shared.layout_status().await,
             ..DesktopStatus::from_config(&config)
         })),

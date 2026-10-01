@@ -79,6 +79,9 @@ pub enum Request {
         y: i32,
         tolerance: u32,
     },
+    /// Tries each paired computer that is not connected again now, instead
+    /// of after its link's wait.
+    Retry {},
 }
 
 /// What the service asks the desktop agent to do through GNOME Shell. Only
@@ -329,6 +332,23 @@ pub struct DesktopStatus {
     /// Whether the clipboard goes along with the pointer.
     #[serde(default)]
     pub share_clipboard: bool,
+    /// The links to paired computers that have no session yet. A computer
+    /// in neither this nor `connected` is not dialed: nothing listens where
+    /// it was paired. A service from before live links leaves it out.
+    #[serde(default)]
+    pub links: BTreeMap<String, LinkStatus>,
+}
+
+/// A link to a paired computer that has no session yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LinkStatus {
+    Connecting,
+    /// The last attempt failed. The link keeps retrying, and `reason` says
+    /// why in words for people.
+    Unreachable {
+        reason: String,
+    },
 }
 
 impl DesktopStatus {
@@ -345,6 +365,7 @@ impl DesktopStatus {
             escape_chord: config.input.escape_chord.clone(),
             layout: None,
             share_clipboard: config.clipboard.share,
+            links: BTreeMap::new(),
         }
     }
 }
@@ -414,6 +435,7 @@ mod tests {
             r#"{"command":"move_tile","id":"local","x":1,"y":2}"#,
             r#"{"command":"set_clipboard","share":"yes"}"#,
             r#"{"command":"set_clipboard","share":true,"peer":"desk"}"#,
+            r#"{"command":"retry","peer":"desk"}"#,
             // Only the service asks the agent for these, on its own stream.
             r#"{"command":"read_clipboard"}"#,
             r#"{"command":"write_clipboard","kind":"text","data":"aGk="}"#,
@@ -616,18 +638,23 @@ mod tests {
         config.transport.discovery = false;
         config.clipboard.share = true;
         let value = serde_json::to_value(DesktopStatus::from_config(&config)).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 11);
+        assert_eq!(value.as_object().unwrap().len(), 12);
         assert!(value.get("peers").is_some());
         assert_eq!(value["discovery"], false);
         assert_eq!(value["share_clipboard"], true);
         assert!(!value.to_string().contains("identity-location"));
-        // A service from before clipboard sharing leaves it out.
+        // A service from before clipboard sharing or live links leaves them out.
         let mut old = value;
         old.as_object_mut().unwrap().remove("share_clipboard");
-        assert!(
-            !serde_json::from_value::<DesktopStatus>(old)
-                .unwrap()
-                .share_clipboard
+        old.as_object_mut().unwrap().remove("links");
+        let old = serde_json::from_value::<DesktopStatus>(old).unwrap();
+        assert!(!old.share_clipboard && old.links.is_empty());
+        let down = LinkStatus::Unreachable {
+            reason: "Update zflow on desk".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&down).unwrap(),
+            r#"{"state":"unreachable","reason":"Update zflow on desk"}"#
         );
     }
 
