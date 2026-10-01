@@ -298,7 +298,7 @@ async fn run(
                 failures += 1;
                 tracing::warn!(peer = %name, error = %format_args!("{error:#}"), failures,
                     "input link could not connect");
-                state.send_replace(LinkState::Down(crate::link::reason(&name, &error)));
+                state.send_replace(LinkState::Down(crate::link::reason(&error)));
             }
         }
         if !wait_to_retry(&mut commands, &mut nearby, retry_delay(failures)).await {

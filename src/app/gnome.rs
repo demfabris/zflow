@@ -185,7 +185,7 @@ fn snapshot(
                 state.receiver.status(),
             ));
             if daemon.sharing {
-                health.extend(link_health(&peers));
+                health.extend(link_health(&peers, &daemon.links));
             }
             (
                 Some(daemon.sharing),
@@ -266,7 +266,7 @@ fn peers(daemon: &crate::peer_view::DesktopStatus) -> Vec<Peer> {
             } else {
                 match daemon.links.get(name) {
                     Some(LinkStatus::Connecting) => (PeerState::Connecting, None),
-                    Some(LinkStatus::Unreachable { reason }) => {
+                    Some(LinkStatus::Unreachable { reason, .. }) => {
                         (PeerState::Unreachable, Some(reason))
                     }
                     // Not dialed: nothing listens where it was paired, as with a Mac.
@@ -283,8 +283,14 @@ fn peers(daemon: &crate::peer_view::DesktopStatus) -> Vec<Peer> {
 }
 
 /// One row for the links to paired computers, with Retry while one cannot
-/// be reached. Each computer's own row says why.
-fn link_health(peers: &[Peer]) -> Option<Health> {
+/// be reached. Each computer's own row says why. A computer that is asleep
+/// or away only warns; one a person has to update or pair again needs
+/// attention.
+fn link_health(
+    peers: &[Peer],
+    links: &std::collections::BTreeMap<String, crate::peer_view::LinkStatus>,
+) -> Option<Health> {
+    use crate::peer_view::LinkStatus;
     if peers.is_empty() {
         return None;
     }
@@ -293,6 +299,15 @@ fn link_health(peers: &[Peer]) -> Option<Health> {
         .filter(|peer| peer.state == PeerState::Unreachable)
         .map(|peer| peer.name.as_str())
         .collect();
+    let needs_fix = down.iter().any(|name| {
+        matches!(
+            links.get(*name),
+            Some(LinkStatus::Unreachable {
+                needs_fix: true,
+                ..
+            })
+        )
+    });
     let title = "Paired computers";
     Some(if !down.is_empty() {
         Health {
@@ -302,7 +317,11 @@ fn link_health(peers: &[Peer]) -> Option<Health> {
             }),
             ..Health::new(
                 "computers",
-                Level::Error,
+                if needs_fix {
+                    Level::Error
+                } else {
+                    Level::Warning
+                },
                 title,
                 format!("Cannot connect to {}", down.join(", ")),
             )
@@ -634,7 +653,7 @@ mod tests {
                 },
             );
         }
-        let reinstalled = "laptop was reset or reinstalled. Pair it again.";
+        let reinstalled = "Reset or reinstalled. Pair it again.";
         let status = crate::peer_view::DesktopStatus {
             receiving_from: Some("mac".into()),
             connected: vec!["desk".into(), "mac".into()],
@@ -643,6 +662,7 @@ mod tests {
                     "laptop".into(),
                     LinkStatus::Unreachable {
                         reason: reinstalled.into(),
+                        needs_fix: true,
                     },
                 ),
                 ("new".into(), LinkStatus::Connecting),
@@ -674,12 +694,24 @@ mod tests {
                 row("old", PeerState::Paired, "Paired", false),
             ]
         );
-        let health = link_health(&peers(&status)).unwrap();
+        let health = link_health(&peers(&status), &status.links).unwrap();
         assert_eq!(
             (health.level, health.detail.as_str()),
             (Level::Error, "Cannot connect to laptop")
         );
         assert_eq!(health.action.unwrap().command, "retry");
+        // A computer that is only asleep or away warns and keeps retrying.
+        let mut asleep = status.links.clone();
+        asleep.insert(
+            "laptop".into(),
+            LinkStatus::Unreachable {
+                reason: "input connection to 192.0.2.7:43119 timed out".into(),
+                needs_fix: false,
+            },
+        );
+        let health = link_health(&peers(&status), &asleep).unwrap();
+        assert_eq!(health.level, Level::Warning);
+        assert!(health.action.is_some());
         assert_eq!(
             shortcuts(&status)[1].keys,
             "Ctrl+Super+Backspace",

@@ -764,6 +764,7 @@ impl Shared {
             &self.identity,
             record.spki_der()?,
             addresses,
+            &record.addresses,
         )
         .await?;
         let generation = self.allocate_generation()?;
@@ -1272,11 +1273,15 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
     Ok(())
 }
 
+/// Dials every address at once and keeps the first connection. `saved` are
+/// the peer's own addresses; the rest belong to whatever zflow computer is
+/// nearby, so a wrong key there is another computer, not a reset peer.
 async fn race_connect(
     endpoint: &Endpoint,
     identity: &Identity,
     peer_spki: Vec<u8>,
     addresses: &[SocketAddr],
+    saved: &[SocketAddr],
 ) -> Result<InputConnection> {
     let config = input_client_config(identity, &peer_spki)?;
     let mut addresses = addresses.to_vec();
@@ -1286,11 +1291,21 @@ async fn race_connect(
     for address in addresses {
         let endpoint = endpoint.clone();
         let config = config.clone();
+        let own = saved
+            .iter()
+            .any(|saved| saved.ip().to_canonical() == address.ip().to_canonical());
         attempts.spawn(async move {
-            tokio::time::timeout(CONNECT_TIMEOUT, connect_input(&endpoint, address, &config))
+            match tokio::time::timeout(CONNECT_TIMEOUT, connect_input(&endpoint, address, &config))
                 .await
-                .map_err(|_| anyhow!("input connection to {address} timed out"))?
-                .map_err(anyhow::Error::from)
+            {
+                Err(_) => Err(anyhow!("input connection to {address} timed out")),
+                Ok(Ok(connection)) => Ok(connection),
+                Ok(Err(error)) if own => Err(error.into()),
+                Ok(Err(error)) => Err(match crate::link::Fix::of_transport(&error) {
+                    Some(_) => anyhow!("another zflow computer answered at {address}"),
+                    None => error.into(),
+                }),
+            }
         });
     }
     let mut last_error: Option<anyhow::Error> = None;
@@ -2274,6 +2289,44 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_wrong_key_at_the_peers_own_address_means_it_was_reset() {
+        let directories = [(); 3].map(|_| tempfile::tempdir().unwrap());
+        let [this, peer, other] = directories
+            .each_ref()
+            .map(|dir| Identity::load_or_create(dir.path()).unwrap());
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        // Another zflow computer nearby, which knows this one but is not
+        // the peer being dialed.
+        let server = crate::transport::input_server_config(&other, this.spki()).unwrap();
+        let other_endpoint = Endpoint::server(server.quinn_config(), loopback).unwrap();
+        let other_address = other_endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = other_endpoint.accept().await {
+                let _ = crate::transport::accept_input(incoming, &server).await;
+            }
+        });
+        let endpoint = Endpoint::client(loopback).unwrap();
+        let dial = |saved: Vec<SocketAddr>| {
+            let (endpoint, this) = (&endpoint, &this);
+            let spki = peer.spki().to_vec();
+            async move { race_connect(endpoint, this, spki, &[other_address], &saved).await }
+        };
+
+        let nearby = dial(Vec::new()).await.err().unwrap();
+        assert_eq!(crate::link::Fix::of(&nearby), None);
+        assert!(
+            nearby
+                .to_string()
+                .contains("another zflow computer answered")
+        );
+        let saved = dial(vec![other_address]).await.err().unwrap();
+        assert_eq!(
+            crate::link::Fix::of(&saved),
+            Some(crate::link::Fix::PairAgain)
+        );
+    }
 
     #[test]
     fn pausing_blocks_both_directions_and_preserves_peer_permissions() {

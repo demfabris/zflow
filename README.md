@@ -183,8 +183,11 @@ of overwriting an external edit.
 The GNOME window exposes sharing, pairing, keyboard modes, forgetting
 computers, **Share Clipboard**, and **Start at Login**. Each paired computer
 shows as Connected, Connecting, or why it cannot be reached, such as
-**Update zflow on desk** or **desk was reset or reinstalled. Pair it again.**
-A **Retry** button tries again without waiting. Its panel menu shows
+**Different zflow version. Update both computers.** or **Reset or
+reinstalled. Pair it again.** Only those two make the status say
+**Needs attention**; a computer that is asleep or away is a warning, and
+zflow keeps trying. A **Retry** button tries again without waiting. Its
+panel menu shows
 the current sender or receiver and a sharing switch. The extension
 preferences show the same GTK settings. Closing either window leaves the
 desktop agent running. Pairing closes when its dialog closes.

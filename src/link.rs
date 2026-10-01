@@ -33,20 +33,25 @@ impl Fix {
     pub fn of(error: &anyhow::Error) -> Option<Self> {
         error
             .chain()
-            .find_map(|cause| match cause.downcast_ref::<TransportError>()? {
-                TransportError::InvalidAlpn => Some(Self::Update),
-                TransportError::PeerIdentityMismatch => Some(Self::PairAgain),
-                _ => None,
-            })
+            .find_map(|cause| Self::of_transport(cause.downcast_ref()?))
+    }
+
+    pub fn of_transport(error: &TransportError) -> Option<Self> {
+        match error {
+            TransportError::InvalidAlpn => Some(Self::Update),
+            TransportError::PeerIdentityMismatch => Some(Self::PairAgain),
+            _ => None,
+        }
     }
 }
 
-/// Why `peer` could not be reached, worded for people. Errors without a
-/// known fix keep their own text.
-pub fn reason(peer: &str, error: &anyhow::Error) -> String {
+/// Why a paired computer could not be reached, worded for people. It goes
+/// under or after the computer's name, so it leaves the name out. Errors
+/// without a known fix keep their own text.
+pub fn reason(error: &anyhow::Error) -> String {
     match Fix::of(error) {
-        Some(Fix::Update) => format!("Update zflow on {peer}"),
-        Some(Fix::PairAgain) => format!("{peer} was reset or reinstalled. Pair it again."),
+        Some(Fix::Update) => "Different zflow version. Update both computers.".into(),
+        Some(Fix::PairAgain) => "Reset or reinstalled. Pair it again.".into(),
         None => format!("{error:#}"),
     }
 }
@@ -70,18 +75,18 @@ mod tests {
                 .unwrap_err()
         };
         assert_eq!(
-            reason("desk", &failed(TransportError::InvalidAlpn)),
-            "Update zflow on desk"
+            reason(&failed(TransportError::InvalidAlpn)),
+            "Different zflow version. Update both computers."
         );
         assert_eq!(
-            reason("desk", &failed(TransportError::PeerIdentityMismatch)),
-            "desk was reset or reinstalled. Pair it again."
+            reason(&failed(TransportError::PeerIdentityMismatch)),
+            "Reset or reinstalled. Pair it again."
         );
         let timeout = anyhow::anyhow!("input connection to 192.0.2.7:43119 timed out");
         assert_eq!(Fix::of(&timeout), None);
-        assert_eq!(reason("desk", &timeout), timeout.to_string());
+        assert_eq!(reason(&timeout), timeout.to_string());
         assert_eq!(
-            reason("desk", &failed(TransportError::CriticalStreamClosed)),
+            reason(&failed(TransportError::CriticalStreamClosed)),
             "could not connect to 192.0.2.7:43119: critical control stream ended"
         );
     }

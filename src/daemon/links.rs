@@ -240,7 +240,8 @@ async fn run<S: Sessions>(mut task: Task<S>, status: watch::Sender<Option<LinkSt
                     Err(error) => {
                         failures += 1;
                         let down = Some(LinkStatus::Unreachable {
-                            reason: crate::link::reason(&task.peer, &error),
+                            reason: crate::link::reason(&error),
+                            needs_fix: crate::link::Fix::of(&error).is_some(),
                         });
                         // Repeats of the same failure stay out of the journal.
                         if *status.borrow() != down {
@@ -374,9 +375,10 @@ mod tests {
         }
     }
 
-    fn unreachable(reason: &str) -> Option<LinkStatus> {
+    fn unreachable(reason: &str, needs_fix: bool) -> Option<LinkStatus> {
         Some(LinkStatus::Unreachable {
             reason: reason.into(),
+            needs_fix,
         })
     }
 
@@ -433,7 +435,7 @@ mod tests {
         // The retry keeps showing why the last attempt failed.
         assert_eq!(
             *test.link.status.borrow(),
-            unreachable("Update zflow on desk")
+            unreachable("Different zflow version. Update both computers.", true)
         );
         answer.send(Err(anyhow!("timed out"))).unwrap();
 
@@ -442,7 +444,7 @@ mod tests {
         test.link.retry.send(()).unwrap();
         let (_, answer) = test.dials.recv().await.unwrap();
         assert_eq!(failed.elapsed(), Duration::ZERO);
-        assert_eq!(*test.link.status.borrow(), unreachable("timed out"));
+        assert_eq!(*test.link.status.borrow(), unreachable("timed out", false));
         answer.send(Ok(7)).unwrap();
         test.link.status.wait_for(Option::is_none).await.unwrap();
 

@@ -348,6 +348,10 @@ pub enum LinkStatus {
     /// why in words for people.
     Unreachable {
         reason: String,
+        /// A person has to act, as opposed to a computer that is off or
+        /// out of reach.
+        #[serde(default)]
+        needs_fix: bool,
     },
 }
 
@@ -650,11 +654,12 @@ mod tests {
         let old = serde_json::from_value::<DesktopStatus>(old).unwrap();
         assert!(!old.share_clipboard && old.links.is_empty());
         let down = LinkStatus::Unreachable {
-            reason: "Update zflow on desk".into(),
+            reason: "Reset or reinstalled. Pair it again.".into(),
+            needs_fix: true,
         };
         assert_eq!(
             serde_json::to_string(&down).unwrap(),
-            r#"{"state":"unreachable","reason":"Update zflow on desk"}"#
+            r#"{"state":"unreachable","reason":"Reset or reinstalled. Pair it again.","needs_fix":true}"#
         );
     }
 
