@@ -54,7 +54,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+/// A stop signal ends the process within this, even if something hangs.
+/// systemd kills the service after TimeoutStopSec=2s.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_millis(1_500);
+/// How long a stop waits for the input thread to let go of devices.
+const RUNTIME_STOP_TIMEOUT: Duration = Duration::from_millis(500);
+/// An input thread that takes longer than this to apply effects is wedged.
+const RUNTIME_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+/// Blocking tasks, such as a logind query, get this long after the daemon
+/// returns.
+const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_METRICS_HISTORY: usize = 128;
 const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAX_LOCAL_CLIENTS: usize = 64;
@@ -80,17 +90,20 @@ pub fn run(config_path: PathBuf) -> Result<()> {
         .init();
     // The unit caps threads with TasksMax=128, and input runs on its own
     // thread, so the control plane gets two workers rather than one per CPU.
-    tokio::runtime::Builder::new_multi_thread()
+    let executor = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
-        .build()?
-        .block_on(run_async(config_path))
+        .build()?;
+    let result = executor.block_on(run_async(config_path));
+    executor.shutdown_timeout(EXECUTOR_SHUTDOWN_TIMEOUT);
+    result
 }
 
 async fn run_async(config_path: PathBuf) -> Result<()> {
     // systemctl stop and the sleep hook send SIGTERM. Handle it from the start
     // so it always reaches the graceful shutdown below.
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let config = Config::load(&config_path)
         .with_context(|| format!("failed to load {}", config_path.display()))?;
     validate_peer_identities(&config)?;
@@ -101,6 +114,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     let process_epoch = random_epoch()?;
     let mut seat = watch_primary_seat();
     let mut runtime = LinuxRuntime::spawn(LinuxRuntimeConfig::from_config(&config))?;
+    let mut stopping = stop_on_signal(terminate, interrupt, runtime.control());
 
     let endpoint = Endpoint::client(config.transport.listen).with_context(|| {
         format!(
@@ -175,168 +189,224 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
         "headless input daemon started"
     );
 
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let Ok(permit) = local_slots.clone().try_acquire_owned() else {
-                    tracing::warn!("local control connection limit reached");
-                    continue;
-                };
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) = tokio::time::timeout(
-                        LOCAL_REQUEST_TIMEOUT,
-                        handle_client(stream, shared, daemon_uid),
-                    )
-                    .await
-                    .map_err(|_| anyhow!("local control request timed out"))
-                    .and_then(|result| result)
-                    {
-                        tracing::warn!(%error, "local control request failed");
-                    }
-                });
-            }
-            incoming = shared.endpoint.accept() => {
-                let Some(incoming) = incoming else {
-                    bail!("input QUIC endpoint stopped accepting connections");
-                };
-                let Ok(permit) = handshake_slots.clone().try_acquire_owned() else {
-                    incoming.refuse();
-                    tracing::warn!("input handshake limit reached");
-                    continue;
-                };
-                let config = shared.server_config.read().await.clone();
-                let accepted_tx = accepted_tx.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let result = match config {
-                        Some(config) => tokio::time::timeout(
-                            CONNECT_TIMEOUT,
-                            accept_input(incoming, &config),
+    let served = serve_until(&mut stopping, async {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let Ok(permit) = local_slots.clone().try_acquire_owned() else {
+                        tracing::warn!("local control connection limit reached");
+                        continue;
+                    };
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = tokio::time::timeout(
+                            LOCAL_REQUEST_TIMEOUT,
+                            handle_client(stream, shared, daemon_uid),
                         )
                         .await
-                        .map_err(|_| "input handshake timed out".to_owned())
-                        .and_then(|result| result.map_err(|error| error.to_string())),
-                        None => Err("input listener has no authorized peers".to_owned()),
-                    };
-                    let _ = accepted_tx.send(result).await;
-                });
-            }
-            accepted = accepted_rx.recv() => {
-                if let Some(accepted) = accepted {
-                    match accepted {
-                        Ok(connection) => {
-                            let Ok(permit) = session_setup_slots.clone().try_acquire_owned() else {
-                                connection.close();
-                                tracing::warn!("authenticated session setup limit reached");
-                                continue;
-                            };
-                            let shared = shared.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                if let Err(error) = tokio::time::timeout(
-                                    CONNECT_TIMEOUT,
-                                    shared.accept_connection(connection),
-                                )
-                                .await
-                                .map_err(|_| anyhow!("authenticated session negotiation timed out"))
-                                .and_then(|result| result)
-                                {
-                                    tracing::warn!(%error, "authenticated input connection was rejected");
-                                }
-                            });
+                        .map_err(|_| anyhow!("local control request timed out"))
+                        .and_then(|result| result)
+                        {
+                            tracing::warn!(%error, "local control request failed");
                         }
-                        Err(error) => tracing::warn!(%error, "input handshake failed"),
+                    });
+                }
+                incoming = shared.endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        bail!("input QUIC endpoint stopped accepting connections");
+                    };
+                    let Ok(permit) = handshake_slots.clone().try_acquire_owned() else {
+                        incoming.refuse();
+                        tracing::warn!("input handshake limit reached");
+                        continue;
+                    };
+                    let config = shared.server_config.read().await.clone();
+                    let accepted_tx = accepted_tx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let result = match config {
+                            Some(config) => tokio::time::timeout(
+                                CONNECT_TIMEOUT,
+                                accept_input(incoming, &config),
+                            )
+                            .await
+                            .map_err(|_| "input handshake timed out".to_owned())
+                            .and_then(|result| result.map_err(|error| error.to_string())),
+                            None => Err("input listener has no authorized peers".to_owned()),
+                        };
+                        let _ = accepted_tx.send(result).await;
+                    });
+                }
+                accepted = accepted_rx.recv() => {
+                    if let Some(accepted) = accepted {
+                        match accepted {
+                            Ok(connection) => {
+                                let Ok(permit) = session_setup_slots.clone().try_acquire_owned() else {
+                                    connection.close();
+                                    tracing::warn!("authenticated session setup limit reached");
+                                    continue;
+                                };
+                                let shared = shared.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    if let Err(error) = tokio::time::timeout(
+                                        CONNECT_TIMEOUT,
+                                        shared.accept_connection(connection),
+                                    )
+                                    .await
+                                    .map_err(|_| anyhow!("authenticated session negotiation timed out"))
+                                    .and_then(|result| result)
+                                    {
+                                        tracing::warn!(%error, "authenticated input connection was rejected");
+                                    }
+                                });
+                            }
+                            Err(error) => tracing::warn!(%error, "input handshake failed"),
+                        }
                     }
                 }
-            }
-            event = session_event_rx.recv() => {
-                let Some(event) = event else {
-                    bail!("session event router stopped");
-                };
-                shared.handle_session_event(event).await?;
-            }
-            event = runtime.events.recv() => {
-                let Some(event) = event else {
-                    bail!("Linux input runtime event channel closed");
-                };
-                handle_runtime_event(event, &shared).await?;
-            }
-            frame = runtime.captured.recv() => {
-                let Some(frame) = frame else {
-                    bail!("Linux input runtime capture channel closed");
-                };
-                // The input thread sends the switch to Remote before the frames
-                // it covers, so handle queued events first.
-                while let Ok(event) = runtime.events.try_recv() {
+                event = session_event_rx.recv() => {
+                    let Some(event) = event else {
+                        bail!("session event router stopped");
+                    };
+                    shared.handle_session_event(event).await?;
+                }
+                event = runtime.events.recv() => {
+                    let Some(event) = event else {
+                        bail!("Linux input runtime event channel closed");
+                    };
                     handle_runtime_event(event, &shared).await?;
                 }
-                shared.forward_capture(frame).await?;
-            }
-            error = next_discovery_error(discovery.as_ref()), if discovery.is_some() => {
-                match error {
-                    Ok(error) => tracing::warn!(%error, "mDNS daemon error"),
-                    Err(error) => tracing::warn!(%error, "mDNS monitoring stopped"),
+                frame = runtime.captured.recv() => {
+                    let Some(frame) = frame else {
+                        bail!("Linux input runtime capture channel closed");
+                    };
+                    // The input thread sends the switch to Remote before the frames
+                    // it covers, so handle queued events first.
+                    while let Ok(event) = runtime.events.try_recv() {
+                        handle_runtime_event(event, &shared).await?;
+                    }
+                    shared.forward_capture(frame).await?;
                 }
-                stop_discovery(&mut discovery).await;
-                shared.nearby.lock().await.clear();
-            }
-            event = next_discovery_event(discovery.as_ref()), if discovery.is_some() => {
-                match event {
-                    Ok(DiscoveryEvent::Candidate(candidate)) => {
-                        let Some(instance) = candidate.ephemeral_instance_id() else {
-                            continue;
-                        };
-                        let local = local_unicast_addresses().unwrap_or_default();
-                        let addresses = if candidate.is_compatible() {
-                            remote_addresses(candidate.socket_addresses(), &local)
-                        } else {
-                            Vec::new()
-                        };
-                        let mut nearby = shared.nearby.lock().await;
-                        let instance = instance.to_string();
-                        if addresses.is_empty() {
-                            nearby.remove(&instance);
-                        } else if nearby.len() < MAX_NEARBY || nearby.contains_key(&instance) {
-                            nearby.insert(instance, addresses);
+                error = next_discovery_error(discovery.as_ref()), if discovery.is_some() => {
+                    match error {
+                        Ok(error) => tracing::warn!(%error, "mDNS daemon error"),
+                        Err(error) => tracing::warn!(%error, "mDNS monitoring stopped"),
+                    }
+                    stop_discovery(&mut discovery).await;
+                    shared.nearby.lock().await.clear();
+                }
+                event = next_discovery_event(discovery.as_ref()), if discovery.is_some() => {
+                    match event {
+                        Ok(DiscoveryEvent::Candidate(candidate)) => {
+                            let Some(instance) = candidate.ephemeral_instance_id() else {
+                                continue;
+                            };
+                            let local = local_unicast_addresses().unwrap_or_default();
+                            let addresses = if candidate.is_compatible() {
+                                remote_addresses(candidate.socket_addresses(), &local)
+                            } else {
+                                Vec::new()
+                            };
+                            let mut nearby = shared.nearby.lock().await;
+                            let instance = instance.to_string();
+                            if addresses.is_empty() {
+                                nearby.remove(&instance);
+                            } else if nearby.len() < MAX_NEARBY || nearby.contains_key(&instance) {
+                                nearby.insert(instance, addresses);
+                            }
+                        }
+                        Ok(DiscoveryEvent::Removed(instance)) => {
+                            shared.nearby.lock().await.remove(&instance.to_string());
+                        }
+                        Ok(DiscoveryEvent::Stopped) | Err(_) => {
+                            tracing::warn!("mDNS browsing stopped");
+                            stop_discovery(&mut discovery).await;
+                            shared.nearby.lock().await.clear();
                         }
                     }
-                    Ok(DiscoveryEvent::Removed(instance)) => {
-                        shared.nearby.lock().await.remove(&instance.to_string());
-                    }
-                    Ok(DiscoveryEvent::Stopped) | Err(_) => {
-                        tracing::warn!("mDNS browsing stopped");
-                        stop_discovery(&mut discovery).await;
-                        shared.nearby.lock().await.clear();
-                    }
+                }
+                _ = discovery_retry.tick(), if discovery.is_none() => {
+                    let config = shared.config.read().await.clone();
+                    discovery = start_discovery(&config, shared.endpoint.local_addr()?);
                 }
             }
-            _ = discovery_retry.tick(), if discovery.is_none() => {
-                let config = shared.config.read().await.clone();
-                discovery = start_discovery(&config, shared.endpoint.local_addr()?);
-            }
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                break;
-            }
-            _ = terminate.recv() => break,
         }
-    }
+    })
+    .await;
 
     shared
         .close_all(SessionCloseReason::BackendUnavailable)
         .await;
-    // Nothing reads session events any more, so release injected input now
-    // rather than after the slower network teardown; a key held from the
-    // peer would autorepeat until then.
-    let runtime_result = runtime.shutdown();
+    // A stop signal already told the input thread to let go of injected
+    // input, before the slower network teardown; a key held from the peer
+    // would autorepeat until then. A failed loop tells it here.
+    let stopped = runtime.stop(RUNTIME_STOP_TIMEOUT).await;
     seat_watcher.abort();
     shared.endpoint.close(0_u32.into(), b"daemon shutdown");
     stop_discovery(&mut discovery).await;
-    runtime_result?;
-    Ok(())
+    served.and(stopped.map_err(anyhow::Error::from))
+}
+
+/// Waits for SIGTERM or Ctrl-C. Then it tells the input thread to stop at
+/// once, so injected keys go up even while the daemon loop is busy, and ends
+/// the process if the graceful shutdown overruns SHUTDOWN_DEADLINE. The
+/// returned receiver fires when the signal comes.
+fn stop_on_signal(
+    mut terminate: tokio::signal::unix::Signal,
+    mut interrupt: tokio::signal::unix::Signal,
+    runtime: LinuxRuntimeControl,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (stop, stopping) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        tracing::info!("stopping");
+        // The loop hears first, so the input thread's Stopped event that
+        // follows is not taken for a fault.
+        let _ = stop.send(());
+        runtime.request_stop();
+        exit_after(SHUTDOWN_DEADLINE, || {
+            tracing::error!("shutdown overran its deadline; exiting now");
+            // SAFETY: _exit only ends the process. The kernel closes every
+            // descriptor, which drops grabs and removes the virtual devices,
+            // and removing them releases whatever they held.
+            unsafe { libc::_exit(1) }
+        });
+    });
+    stopping
+}
+
+/// Runs `exit` once `deadline` passes, on a plain thread, so neither a stuck
+/// task nor a busy executor can hold it up.
+fn exit_after(deadline: Duration, exit: impl FnOnce() + Send + 'static) {
+    let spawned = std::thread::Builder::new()
+        .name("zflow-stop".into())
+        .spawn(move || {
+            std::thread::sleep(deadline);
+            exit();
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "shutdown has no deadline");
+    }
+}
+
+/// Runs the daemon loop until it fails or `stop` fires. The loop is dropped
+/// wherever it waits, so a stop never queues behind its work, and a stop
+/// wins over an error that comes at the same moment.
+async fn serve_until(
+    stop: impl Future,
+    serve: impl Future<Output = Result<std::convert::Infallible>>,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = stop => Ok(()),
+        result = serve => result.map(|never| match never {}),
+    }
 }
 
 struct Shared {
@@ -2076,19 +2146,23 @@ impl Shared {
                 session.record_receive_to_runtime_dispatch(received_at);
                 // Once accepted by the runtime queue, a local timeout cannot
                 // distinguish "not applied" from "will apply after timeout".
-                // Hold the policy barrier for the definitive ACK instead. The
-                // packaged service watchdog runs on this same runtime thread,
-                // so a wedged backend is terminated by the service manager.
-                match applied_rx.await {
-                    Ok(applied_at) => {
+                // Hold the policy barrier for the definitive ACK instead. An
+                // input thread that takes longer is wedged, so the daemon
+                // exits holding the barrier, as the service watchdog would
+                // make it, rather than block every other event behind it.
+                match tokio::time::timeout(RUNTIME_ACK_TIMEOUT, applied_rx).await {
+                    Ok(Ok(applied_at)) => {
                         session.record_receive_to_inject(received_at, applied_at);
                     }
-                    Err(_) if safety_release => {
+                    Ok(Err(_)) if safety_release => {
                         return Err(anyhow!(
                             "runtime did not acknowledge authoritative receiver cleanup"
                         ));
                     }
-                    Err(_) => rejected = true,
+                    Ok(Err(_)) => rejected = true,
+                    Err(_) => bail!(
+                        "Linux input runtime did not apply receiver effects within {RUNTIME_ACK_TIMEOUT:?}"
+                    ),
                 }
             }
         }
@@ -2310,6 +2384,87 @@ mod tests {
     }
 
     #[test]
+    fn the_chord_picks_a_connected_computer_and_cycles_through_them() {
+        use std::collections::BTreeSet;
+        fn names<T: FromIterator<String>>(names: &[&str]) -> T {
+            names.iter().map(|name| name.to_string()).collect()
+        }
+        let eligible: Vec<String> = names(&["mac", "ubuntu", "xps"]);
+        // The Mac is online and xps is off: the chord goes to the Mac.
+        let connected: BTreeSet<String> = names(&["mac"]);
+        assert_eq!(
+            chord_peer(&eligible, &connected, None).as_deref(),
+            Some("mac")
+        );
+        assert_eq!(
+            chord_peer(&eligible, &connected, Some("mac")).as_deref(),
+            Some("mac")
+        );
+        // With several online, each press moves to the next, in name order.
+        let connected: BTreeSet<String> = names(&["mac", "xps"]);
+        let mut last = None;
+        let picked: Vec<String> = (0..4)
+            .map(|_| {
+                let peer = chord_peer(&eligible, &connected, last.as_deref()).unwrap();
+                last = Some(peer.clone());
+                peer
+            })
+            .collect();
+        assert_eq!(picked, ["mac", "xps", "mac", "xps"]);
+        // A computer that went offline since the last press is skipped.
+        assert_eq!(
+            chord_peer(&eligible, &connected, Some("ubuntu")).as_deref(),
+            Some("xps")
+        );
+        // A connected computer that may not receive input is never picked.
+        assert_eq!(chord_peer(&[], &connected, None), None);
+        // Nobody online: a sole paired computer is still dialed, but the
+        // chord cannot guess between several.
+        let nobody = BTreeSet::new();
+        assert_eq!(
+            chord_peer(&names::<Vec<_>>(&["mac"]), &nobody, Some("mac")).as_deref(),
+            Some("mac")
+        );
+        assert_eq!(chord_peer(&eligible, &nobody, None), None);
+    }
+
+    #[tokio::test]
+    async fn a_stop_does_not_wait_for_a_stalled_runtime() {
+        // The loop waits on an input thread that never acknowledges.
+        let (_never, unanswered) = tokio::sync::oneshot::channel::<Instant>();
+        let (stop, stopping) = tokio::sync::oneshot::channel::<()>();
+        let stalled = async move {
+            let _ = unanswered.await;
+            bail!("the runtime answered")
+        };
+        stop.send(()).unwrap();
+        let served = tokio::time::timeout(Duration::from_secs(1), serve_until(stopping, stalled))
+            .await
+            .expect("a stop ends the loop at once");
+        assert!(served.is_ok());
+        // The input thread's Stopped event can fail the loop just as the
+        // signal lands. That is still a clean stop.
+        let failed = async { bail!("Linux input runtime stopped") };
+        assert!(serve_until(async {}, failed).await.is_ok());
+        let failed = async { bail!("Linux input runtime stopped") };
+        assert!(
+            serve_until(std::future::pending::<()>(), failed)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_missed_shutdown_deadline_still_exits() {
+        let (exit, exited) = std::sync::mpsc::channel();
+        exit_after(Duration::from_millis(50), move || exit.send(()).unwrap());
+        assert!(exited.try_recv().is_err(), "not before the deadline");
+        exited
+            .recv_timeout(Duration::from_secs(5))
+            .expect("once it passes");
+    }
+
+    #[test]
     fn discovery_advertises_touch_only_when_experiment_is_enabled() {
         let mut config = Config::default();
         let baseline = advertised_capabilities(&config);
@@ -2382,51 +2537,6 @@ mod tests {
         assert!(wins_dial(&config, &lower, "mac"));
         assert!(!wins_dial(&config, &higher, "mac"));
         assert!(!wins_dial(&config, &lower, "unknown"));
-    }
-
-    #[test]
-    fn the_chord_picks_a_connected_computer_and_cycles_through_them() {
-        use std::collections::BTreeSet;
-        fn names<T: FromIterator<String>>(names: &[&str]) -> T {
-            names.iter().map(|name| name.to_string()).collect()
-        }
-        let eligible: Vec<String> = names(&["mac", "ubuntu", "xps"]);
-        // The Mac is online and xps is off: the chord goes to the Mac.
-        let connected: BTreeSet<String> = names(&["mac"]);
-        assert_eq!(
-            chord_peer(&eligible, &connected, None).as_deref(),
-            Some("mac")
-        );
-        assert_eq!(
-            chord_peer(&eligible, &connected, Some("mac")).as_deref(),
-            Some("mac")
-        );
-        // With several online, each press moves to the next, in name order.
-        let connected: BTreeSet<String> = names(&["mac", "xps"]);
-        let mut last = None;
-        let picked: Vec<String> = (0..4)
-            .map(|_| {
-                let peer = chord_peer(&eligible, &connected, last.as_deref()).unwrap();
-                last = Some(peer.clone());
-                peer
-            })
-            .collect();
-        assert_eq!(picked, ["mac", "xps", "mac", "xps"]);
-        // A computer that went offline since the last press is skipped.
-        assert_eq!(
-            chord_peer(&eligible, &connected, Some("ubuntu")).as_deref(),
-            Some("xps")
-        );
-        // A connected computer that may not receive input is never picked.
-        assert_eq!(chord_peer(&[], &connected, None), None);
-        // Nobody online: a sole paired computer is still dialed, but the
-        // chord cannot guess between several.
-        let nobody = BTreeSet::new();
-        assert_eq!(
-            chord_peer(&names::<Vec<_>>(&["mac"]), &nobody, Some("mac")).as_deref(),
-            Some("mac")
-        );
-        assert_eq!(chord_peer(&eligible, &nobody, None), None);
     }
 
     #[test]
