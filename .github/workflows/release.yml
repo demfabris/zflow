@@ -51,31 +51,24 @@ jobs:
             exit 1
           fi
       - name: Install Rust build toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
-      - name: Check installer
-        run: python3 tests/install_test.py
-      - name: Linux checks and binaries
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      # CI already ran the code checks on the main commit this tag points at,
+      # so a release only builds, packages, signs and verifies.
+      - name: Linux binaries and package
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential debhelper
-          cargo fmt --all --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked --all-targets
-          node tests/gnome_desktop_test.mjs
-          node tests/gnome_panel_test.mjs
           cargo build --locked --release --bin zflow --bin zflowd
           ./scripts/build-deb.sh
           ./tests/deb_lifecycle.sh
-      - name: Native macOS app and bridge tests
+      - name: Native macOS app
         if: runner.os == 'macOS'
         # Build with an ad-hoc signature before the signing keychain exists, so
         # no build script in this job can sign with the Developer ID.
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           ./scripts/build-macos-app.sh --universal
-          ZFLOW_RUST_LIB_DIR="$PWD/target/universal-apple-darwin/release" swift test --package-path macos
-          python3 tests/macos_notarization_test.py
       - name: Import macOS signing certificate
         if: runner.os == 'macOS'
         env:
@@ -196,10 +189,15 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           tag="v$version"
-          # Never overwrite an existing release, including an incomplete draft.
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists; inspect it before retrying." >&2
-            exit 1
+          # Never overwrite a published release. A draft is what a run that
+          # failed before publishing left behind, so this run replaces it.
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$draft" != true ]]; then
+              echo "Release $tag is already published; inspect it before retrying." >&2
+              exit 1
+            fi
+            echo "Deleting the draft release $tag left by an earlier run."
+            gh release delete "$tag" --yes
           fi
           if [[ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]]; then
             git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag"

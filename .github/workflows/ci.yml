@@ -45,6 +45,20 @@ jobs:
           shellcheck -x install.sh scripts/*.sh packaging/linux/*.sh packaging/system-sleep/zflow \
             debian/zflow.postinst debian/zflow.postrm debian/zflow.preinst debian/zflow.prerm tests/deb_lifecycle.sh
 
+  # The release builds Linux on arm64 too, so its tests run there as well.
+  linux-arm:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust build toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Rust
+        run: cargo test --locked --all-targets
+
   macos:
     name: macOS
     runs-on: macos-26
@@ -92,3 +106,8 @@ jobs:
         run: |
           MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --locked --lib
           swift test --package-path macos
+      # install.sh also runs on Macs, with their own tar and checksum tools.
+      - name: Installer
+        run: python3 tests/install_test.py
+      - name: Notarization script
+        run: python3 tests/macos_notarization_test.py
