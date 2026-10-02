@@ -31,10 +31,14 @@ struct ZflowApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-  var model: AppModel?
+  var model: AppModel? {
+    didSet { if let model { notifier.attach(model) } }
+  }
+  let notifier = Notifier()
   /// zflow lives in the menu bar; the window brings the Dock icon along.
   func applicationWillFinishLaunching(_ notification: Notification) {
     NSApplication.shared.setActivationPolicy(.accessory)
+    notifier.listen()
   }
   /// Opening zflow again while it runs, as from Applications, shows the window.
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {

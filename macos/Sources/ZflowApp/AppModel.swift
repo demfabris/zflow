@@ -30,6 +30,9 @@ final class AppModel {
   var addingAddress = false
   /// Opens the pairing sheet once the Add by address sheet has closed.
   @ObservationIgnored var pairWhenClosed = false
+  /// Posts a computer that joined. The app sets it; each notice comes once.
+  @ObservationIgnored var joined: ((Notice) -> Void)?
+  @ObservationIgnored private var lastNotice: UInt64 = 0
   /// Asked once at launch, when zflow runs from somewhere it cannot stay.
   var askToMove = AppLocation.main.needsMove
   /// How macOS treats zflow reading what other apps copied.
@@ -108,9 +111,14 @@ final class AppModel {
     }
   }
 
-  /// Takes the engine's latest snapshot. The page and the pairing sheet follow it.
+  /// Takes the engine's latest snapshot. The page and the pairing sheet
+  /// follow it, and each new notice is posted.
   func apply(_ next: Snapshot) {
     if next != snapshot { snapshot = next }
+    for notice in next.notices where notice.id > lastNotice {
+      lastNotice = notice.id
+      joined?(notice)
+    }
     holdActivity(next.sharing == true)
     if case .computer(let name) = page, !next.peers.contains(where: { $0.name == name }) {
       page = .computers

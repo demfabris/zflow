@@ -83,6 +83,20 @@ private func temporary() -> URL {
   #expect(throws: DecodingError.self) { try decode([Peer.State].self, #"["asleep"]"#) }
 }
 
+@MainActor @Test func eachComputerThatJoinedIsPostedOnce() async throws {
+  let directory = temporary()
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let model = try model(directory)
+  var posted: [UInt64] = []
+  model.joined = { posted.append($0.id) }
+  model.apply(try snapshot(notices: [1]))
+  model.apply(try snapshot(notices: [1]))
+  model.apply(try snapshot(notices: [1, 2, 3]))
+  model.apply(try snapshot(notices: [2, 3]))
+  #expect(posted == [1, 2, 3])
+  await model.shutdown()
+}
+
 @Test func theOtherComputerCanFinishWhileTheWindowIsOpen() throws {
   let ubuntu = """
     {"id":"key:ab","name":"ubuntu","os":"linux","mark":"a1b2c3","version":"0.3.0",
