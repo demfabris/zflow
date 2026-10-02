@@ -3,7 +3,7 @@ use super::{
     handoff,
     layout_model::{self, Layout, LayoutDocument, Monitor},
     model::{ConfigDocument, Contents, Document},
-    nearby::{BrowserStatus, NearbyBrowser},
+    nearby::{BrowserStatus, NearbyBrowser, NearbyRecord},
     pairing::Pairing,
     sharing::Observer,
 };
@@ -17,8 +17,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
-    net::SocketAddr,
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -799,7 +799,7 @@ impl NativeApp {
             layout: Some(self.layout.draft.clone()),
             peers,
             pairing: self.pairing.snapshot(),
-            nearby: nearby.records.into_values().collect(),
+            nearby: unpaired(config, nearby.records.into_values()),
             pause_at_edges: Some(config.switching.pause_at_edges),
             shortcuts: vec![Shortcut {
                 title: "Return input to this computer".into(),
@@ -816,15 +816,21 @@ impl NativeApp {
         }
     }
 
-    /// Whether this Mac can send its input right now. The Allow button for
-    /// Accessibility is in the window's own Mac section, so this row has none.
+    /// Whether this Mac can send its input right now. The window shows a row
+    /// that is not fine as a banner, so this one carries the Allow button.
     fn sharing_health(&self, sharing: bool) -> Health {
         let row = |level, detail: &str| Health::new("sharing", level, "Sharing", detail);
         if !self.accessibility {
-            return row(
-                Level::Error,
-                "Allow Accessibility below so zflow can share the keyboard and pointer, and so paired computers can control this Mac.",
-            );
+            return Health {
+                action: Some(Action {
+                    label: "Allow…".into(),
+                    command: "allow_accessibility".into(),
+                }),
+                ..row(
+                    Level::Error,
+                    "Allow Accessibility so zflow can share the keyboard and pointer, and so paired computers can control this Mac.",
+                )
+            };
         }
         if let Some(error) = self.crossing_error.as_ref().filter(|_| sharing) {
             return Health {
@@ -863,6 +869,19 @@ fn peer_keys(config: &Config) -> BTreeMap<String, String> {
 /// kept one's.
 fn next_version(kept: Option<&SharedLayout>) -> Option<u64> {
     kept.map_or(0, |kept| kept.version).checked_add(1)
+}
+
+/// The nearby computers not paired yet. Discovery names nobody, so one that
+/// shares an address with a paired computer counts as that computer.
+fn unpaired(config: &Config, records: impl Iterator<Item = NearbyRecord>) -> Vec<NearbyRecord> {
+    let paired: BTreeSet<IpAddr> = config
+        .peers
+        .values()
+        .flat_map(|peer| peer.addresses.iter().map(SocketAddr::ip))
+        .collect();
+    records
+        .filter(|record| !record.addresses.iter().any(|a| paired.contains(&a.ip())))
+        .collect()
 }
 
 fn retry() -> Action {
@@ -1148,6 +1167,41 @@ mod tests {
         app.request(Request::SetSharing { enabled: false }).unwrap();
         assert_eq!(app.links.listen_port(), None);
         assert!(app.advertiser.is_none());
+    }
+
+    #[test]
+    fn missing_accessibility_comes_with_its_allow_button() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        std::fs::write(&path, "[transport]\ndiscovery = false\n").unwrap();
+        let mut app = NativeApp::open(path).unwrap();
+        app.accessibility = false;
+        let row = app.sharing_health(true);
+        assert_eq!(row.level, Level::Error);
+        assert_eq!(row.action.unwrap().command, "allow_accessibility");
+    }
+
+    #[test]
+    fn nearby_leaves_out_the_computers_already_paired() {
+        let record = |ip: &str| NearbyRecord {
+            instance: ip.into(),
+            addresses: vec![SocketAddr::new(ip.parse().unwrap(), 43119)],
+            compatible: true,
+            pair_address: None,
+        };
+        let mut config = Config::default();
+        config.peers.insert(
+            "desk".into(),
+            crate::config::PeerConfig {
+                spki_der_hex: "01".into(),
+                addresses: vec!["192.0.2.7:43119".parse().unwrap()],
+                permissions: Default::default(),
+                keyboard: Default::default(),
+                reverse_scroll: false,
+            },
+        );
+        let nearby = [record("192.0.2.7"), record("192.0.2.8")];
+        assert_eq!(unpaired(&config, nearby.into_iter()), [record("192.0.2.8")]);
     }
 
     #[test]
