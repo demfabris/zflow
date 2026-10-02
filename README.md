@@ -95,44 +95,47 @@ dimensions, and return barriers.
 On Ubuntu, open zflow. A fresh install opens **Pair Computer** by itself and
 shows a six-digit setup code; otherwise choose **Pair Computer…**.
 
-While no computer is paired, the Mac app opens a setup window at launch. Open
-it again from the menu-bar icon with **Set Up…**. Each step checks itself off
-and moves on, and **Back** returns to an earlier one:
+The Mac app lives in the menu bar. While no computer is paired, it opens its
+window at launch; otherwise choose **Open zflow** from the menu-bar icon, or
+open zflow again from Applications. When zflow runs from its disk image or
+another temporary place, it first asks you to drag it into Applications and
+open it from there. Until a computer is paired, **Computers** walks through the
+first one:
 
-1. **Move**, only when zflow runs from its disk image or another temporary
-   place: drag it into Applications and open it from there.
-2. **Accessibility**: choose **Allow…** and turn on zflow in the list.
-3. **Local Network**: zflow starts looking for computers here, so macOS asks
-   now. Choose **Allow**. If access stays off, the step says where to turn it on.
-4. **Pair**: Linux computers running zflow nearby are listed by address.
-   Choose **Pair…** and type the code Ubuntu shows, or use **Enter an
-   Address…**. Ubuntu then asks whether to allow your Mac; choose **Allow**.
-   Each side names the other after its host name. A network announcement or a
-   code alone never authorizes a computer. While none is found, the step shows
-   the install command with a copy button.
-5. **Try It**: move the pointer off the edge that leads to the Linux computer.
-   The receiver's tile is placed against the Mac's right edge, so that is the
-   right edge until you rearrange the tiles in Settings. The check turns green
-   once you control it. **Done** saves **Open zflow at login**, on by default,
-   and **Reduce Wi-Fi lag**, which is off by default and installs the AWDL
-   helper described below.
+1. **Let zflow move the pointer here**, shown until Accessibility is on:
+   choose **Allow…** and turn on zflow in the list.
+2. **Add your other computers**: zflow starts looking for computers here, so
+   macOS asks for Local Network access now. Choose **Allow**. If access stays
+   off, the page says where to turn it on. Linux computers running zflow
+   nearby are listed by address. Choose **Pair** and type the code Ubuntu
+   shows, or use **Enter an address instead…**. Ubuntu then asks whether to
+   allow your Mac; choose **Allow**. Each side names the other after its host
+   name. A network announcement or a code alone never authorizes a computer.
+   For a computer not listed, the page shows the install command with a copy
+   button.
 
-To pair another computer later, use **Pair Computer…** in **Settings…**. Move
-through a touching edge with keys and mouse buttons released. With **Pause at
-edges** on in Settings, the pointer has to rest against the edge for 250 ms
-before it crosses, and moving away first cancels. Cross back from Ubuntu to
-return. **Ctrl+Cmd+Backspace** returns input and pauses sharing.
-Resume from the menu-bar menu when you are ready. Later problems, such as
-Accessibility or Local Network access being turned off, show on the health
-badge in Settings.
+Once paired, **Computers** shows the arrangement. The receiver's tile is
+placed against the Mac's right edge, so move the pointer off that edge until
+you rearrange the tiles. **Start at login** and **Reduce Wi-Fi lag**, which
+installs the AWDL helper described below, are in **Settings** (⌘,).
+
+To pair another computer later, use **+** on **Computers**, or **Pair** beside
+it under **Nearby**. Move through a touching edge with keys and mouse buttons
+released. With **Pause at edges** on in Settings, the pointer has to rest
+against the edge for 250 ms before it crosses, and moving away first cancels.
+Cross back from Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and
+pauses sharing. Turn **Sharing** back on from the menu-bar icon when you are
+ready. Later problems, such as Accessibility or Local Network access being
+turned off, show as banners on **Computers**, and **Settings** lists each
+permission with an **Allow…** button.
 
 Ubuntu can control the Mac over the same pairing. On Ubuntu, press
 Ctrl+Super+F12, or push the pointer through the edge that touches the Mac's
 tile; Ctrl+Super+Backspace brings input back. The Mac needs Accessibility for
-this too. In the Mac's **Settings…**, each paired computer opens to three
-rows:
+this too. In the Mac's window, each paired computer has a page in the sidebar
+with three rows:
 
-- **Can control this computer**, on for a new pairing. Turning it off ends
+- **NAME can control this Mac**, on for a new pairing. Turning it off ends
   control at once.
 - **Keys from NAME**: how that computer's keys act on the Mac. See Keyboard
   modes below.
@@ -145,8 +148,9 @@ incoming connections, choose **Allow**; if it can't listen, a health row says
 so, the Mac tries again every 2 seconds, and Ubuntu still controls the Mac
 over the connection the Mac opens.
 
-Closing Settings leaves sharing running. **Pause Sharing** returns input to
-the Mac; **Quit zflow** stops the engine and finishes cleanup. While sharing is
+Closing the window leaves sharing running from the menu bar. Turning
+**Sharing** off returns input to the Mac; **Quit zflow** stops the engine and
+finishes cleanup. While sharing is
 on, the engine keeps one authenticated connection open to each paired receiver,
 reads its desktop, and reuses the connection for every crossing. A lost
 connection reconnects on its own; emergency pause stays paused.
@@ -170,7 +174,8 @@ applies from that computer's next crossing.
   kitty, Alacritty, WezTerm, Warp and Hyper, where Ctrl stays Ctrl.
 
 Choose the mode from the dropdown beside each computer in the GNOME settings
-window, from **Keys from NAME** in the Mac settings, or from the Linux CLI:
+window, from **Keys from NAME** on that computer's page in the Mac window, or
+from the Linux CLI:
 
 ```sh
 sudo zflow peer keyboard desk mac
@@ -184,10 +189,11 @@ it finds one of them while a computer uses another mode.
 
 ## Settings and configuration
 
-The native window exposes computer pairing and arrangement, **Block AWDL while
-sharing**, **Open at login**, and a health badge with permission and helper
-actions. Network, pointer, scrolling, raw touch, and playout settings live in
-TOML through **Open Configuration…**.
+The Mac window exposes computer pairing and arrangement, each computer's
+settings, **Reduce Wi-Fi lag**, **Start at login**, banners for problems with
+their fixes, and the permissions zflow needs. Network, pointer, scrolling, raw
+touch, and playout settings live in TOML, which **zflow › Open Configuration…**
+opens.
 
 The Mac configuration is `~/Library/Application Support/zflow/zflow.toml`.
 It is created on first launch. These are the Mac app defaults:
@@ -200,7 +206,7 @@ block_awdl = false
 
 Sharing arms only after a paired receiver, a valid touching layout, and
 permissions are ready. A missing AWDL helper does not hold it back; sharing
-then runs without blocking AWDL and the health badge says so. GUI writes preserve unrelated settings and
+then runs without blocking AWDL and the **Reduce Wi-Fi lag** row says so. GUI writes preserve unrelated settings and
 comments. External edits reload automatically; invalid edits display an error
 while the last valid configuration stays in use. Conflicting writes fail instead
 of overwriting an external edit.
@@ -220,9 +226,9 @@ desktop agent running. Pairing closes when its dialog closes.
 With **Share Clipboard** on at both ends, the clipboard goes with the
 pointer: the computer the pointer leaves sends its text, or one PNG image,
 to the computer it enters. Files never go, and a clip over 3 MB stays put
-with a notice. The switch is stored in `[clipboard].share`. The Mac
-settings window has the same **Share clipboard** switch; a clip too large to
-share shows as a warning under **Checks** until the next one goes. A copy a
+with a notice. The switch is stored in `[clipboard].share`. The Mac's
+**Settings** has the same **Share clipboard** switch; a clip too large to
+share shows as a banner on **Computers** until the next one goes. A copy a
 password manager marks as concealed or transient stays on the Mac.
 
 Linux stores the sharing switch in `[daemon].sharing`; pausing closes active
@@ -264,11 +270,11 @@ with that computer's pinned key, so a changed address does not break the link.
 Pairing saves every address the other computer has, VPN ones such as
 Tailscale's included, so paired computers still reach each other away from the
 network they paired on. A nearby computer running another zflow version stays
-in the list and says to update it. macOS
-asks for Local Network access the first time the Mac browses, so the Mac waits
-for the setup's Local Network step or **Pair Computer…** in Settings. Once a
-computer is paired, it browses from launch. Browsing then continues while the
-Mac app is running, even with Settings closed.
+in the list and says to update it; one that shares an address with a paired
+computer is left out. macOS asks for Local Network access the first time the
+Mac browses, so the Mac waits for the first-pairing page or **+** on
+**Computers**. Once a computer is paired, it browses from launch. Browsing then
+continues while the Mac app is running, even with its window closed.
 
 If the list stays empty, check zflow under **System Settings → Privacy & Security
 → Local Network**, or use a manual address. Terminal tools have different

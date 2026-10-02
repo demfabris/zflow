@@ -1,334 +1,128 @@
 import AppKit
 import SwiftUI
 
-/// The top sections match the GNOME settings window, in the order of
-/// src/app/api.rs Snapshot. The last section is for this Mac only.
+/// What applies to this Mac as a whole. Each paired computer has its own page.
 struct SettingsView: View {
-  @Bindable var model: AppModel
-  @State private var forgetting: String?
+  var model: AppModel
+  var snapshot: Snapshot
 
   var body: some View {
-    Group {
-      if let snapshot = model.snapshot {
-        form(snapshot)
-      } else {
-        VStack(spacing: 12) {
-          ContentUnavailableView(
-            "Settings could not load", systemImage: "exclamationmark.triangle",
-            description: Text(model.error ?? "Starting zflow…"))
-          Button("Try Again") { model.send(CoreRequest(command: "reload")) }
-        }
-        .frame(height: 320).padding(.bottom, 24)
-      }
-    }
-    .frame(width: 600)
-    .sheet(
-      isPresented: $model.showingPairing,
-      onDismiss: { model.send(CoreRequest(command: "pair_cancel")) },
-      content: { PairingView(model: model) }
-    )
-    .confirmationDialog(
-      "Forget \(forgetting ?? "computer")?",
-      isPresented: Binding(get: { forgetting != nil }, set: { if !$0 { forgetting = nil } }),
-      titleVisibility: .visible
-    ) {
-      Button("Forget Computer", role: .destructive) {
-        if let name = forgetting { model.send(CoreRequest(command: "forget", name: name)) }
-        forgetting = nil
-      }
-      Button("Cancel", role: .cancel) { forgetting = nil }
-    } message: {
-      Text(
-        "This stops input between the two computers and removes its trusted identity. Pair it again to reconnect."
-      )
-    }
-  }
-
-  private func form(_ snapshot: Snapshot) -> some View {
+    let platform = snapshot.platform
     Form {
-      Section {
-        HStack(spacing: 10) {
-          let badge = Self.badge(snapshot.status.state)
-          Image(systemName: badge.0).font(.title).foregroundStyle(badge.1)
-          Text(snapshot.status.title).font(.title2.weight(.semibold))
-        }
-        .accessibilityElement(children: .combine)
+      Section("General") {
         Toggle(
-          isOn: Binding(
-            get: { snapshot.sharing == true },
-            set: { model.send(CoreRequest(command: "set_sharing", enabled: $0)) })
-        ) {
-          Text("Input Sharing")
-          Text("Allow input to move between paired computers.")
-        }
-        .disabled(snapshot.sharing == nil)
-      }
-      if !snapshot.health.isEmpty {
-        Section("Checks") {
-          ForEach(snapshot.health) { row in
-            CheckRow(title: row.title, detail: row.detail, level: row.level) {
-              if let action = row.action {
-                Button(action.label) { model.fix(action) }
-              }
-            }
-          }
-        }
-      }
-      // Requests that failed; checks that fail are in the section above.
-      if let message = model.error ?? model.services.error {
-        Section {
-          CheckRow(title: "Needs attention", detail: message, level: "warning") {}
-        }
-      }
-      Section("Computers") {
-        if let layout = snapshot.layout {
-          ComputerLayout(
-            computers: layout.monitors,
-            move: { computer, x, y, tolerance in
-              model.send(
-                CoreRequest(
-                  command: "move_tile", id: computer.id, x: x, y: y, tolerance: tolerance))
-            }
-          )
-          .frame(height: 235)
-          Text(
-            snapshot.peers.isEmpty
-              ? "Pair another computer to share your keyboard and trackpad."
-              : "Drag to match your desk. Touching edges let your pointer cross."
-          )
-          .font(.callout).foregroundStyle(.secondary)
-        }
-        ForEach(snapshot.peers) { peer in
-          DisclosureGroup {
-            PeerRows(model: model, peer: peer)
-          } label: {
-            LabeledContent {
-              Button("Forget \(peer.name)…", systemImage: "trash") { forgetting = peer.name }
-                .labelStyle(.iconOnly).buttonStyle(.borderless)
-                .help("Forget \(peer.name)")
-            } label: {
-              Label {
-                Text(peer.name)
-                Text(peer.detail).textSelection(.enabled)
-              } icon: {
-                Image(systemName: "display")
-              }
-            }
-          }
-        }
-        HStack {
-          Spacer()
-          Button("Pair Computer…", systemImage: "plus") {
-            // Browsing waits for a reason to ask macOS for Local Network access.
-            model.send(CoreRequest(command: "discover"))
-            model.showingPairing = true
-          }
-          .disabled(snapshot.sharing == nil)
-        }
-      }
-      if let pause = snapshot.pauseAtEdges {
-        Section {
-          Toggle(
-            isOn: Binding(
-              get: { pause },
-              set: { model.send(CoreRequest(command: "set_switching", pauseAtEdges: $0)) })
-          ) {
-            Text("Pause at edges")
-            Text("Rest the pointer against an edge for a moment before it crosses.")
-          }
-        }
-      }
-      if !snapshot.shortcuts.isEmpty {
-        Section("Shortcuts") {
-          ForEach(snapshot.shortcuts, id: \.title) { shortcut in
-            LabeledContent(shortcut.title) {
-              Text(shortcut.keys).monospaced().textSelection(.enabled)
-            }
-          }
-        }
-      }
-      if let share = snapshot.shareClipboard {
-        Section {
+          "Start at login",
+          isOn: Binding(get: { model.services.loginEnabled }, set: { model.setLogin($0) })
+        )
+        // A login item would point at the disk image or a temporary copy.
+        .disabled(AppLocation.main.needsMove)
+        if let share = snapshot.shareClipboard {
           Toggle(
             isOn: Binding(
               get: { share },
               set: { model.send(CoreRequest(command: "set_clipboard", share: $0)) })
           ) {
             Text("Share clipboard")
-            Text("Sends text or an image up to 3 MB when the pointer moves to another computer.")
+            Text("Copy on one computer, paste on the next.")
+          }
+        }
+        if let pause = snapshot.pauseAtEdges {
+          Toggle(
+            isOn: Binding(
+              get: { pause },
+              set: { model.send(CoreRequest(command: "set_switching", pauseAtEdges: $0)) })
+          ) {
+            Text("Pause at edges")
+            Text("Rest against an edge for a moment before switching.")
           }
         }
       }
-      Section {
-        Toggle(
-          "Start at Login",
-          isOn: Binding(
-            get: { model.services.loginEnabled },
-            set: { enabled in Task { await model.services.setLogin(enabled) } })
-        )
-        // A login item would point at the disk image or a temporary copy.
-        .disabled(AppLocation.main.needsMove)
-        LabeledContent("Advanced configuration") {
-          Button("Open Configuration…") { model.openConfig() }
+      // Only a signed build can install the helper this needs.
+      if model.services.hasSigningTeam {
+        Section("Wi-Fi") {
+          WiFiRow(model: model, enabled: platform.blockAwdl)
         }
-      } footer: {
-        Text("Changes save automatically.").font(.caption).foregroundStyle(.tertiary)
       }
-      Section("This Mac") {
-        MacRows(model: model, platform: snapshot.platform)
+      Section {
+        PermissionRow(title: "Accessibility", allowed: platform.accessibility) {
+          model.openAccessibility()
+        }
+        PermissionRow(
+          title: "Local Network", allowed: platform.localNetwork == .allowed,
+          detail: platform.localNetwork == .blocked
+            ? "Needed to find your computers and reach them."
+            : "macOS asks when zflow first looks for computers."
+        ) {
+          model.allowLocalNetwork()
+        }
+        PermissionRow(
+          title: "Paste from Other Apps", allowed: model.pasteAccess == .alwaysAllow,
+          detail: "Needed to share what you copy on this Mac."
+        ) {
+          model.allowPaste()
+        }
+      } header: {
+        Text("Permissions")
+      } footer: {
+        Text("Take back control from any computer with ⌃⌘⌫.")
       }
     }
     .formStyle(.grouped)
-    .frame(height: 640)
-  }
-
-  static func badge(_ state: String) -> (String, Color) {
-    switch state {
-    case "ready": ("checkmark.circle.fill", .green)
-    case "controlling", "controlled": ("arrow.left.arrow.right.circle.fill", .accentColor)
-    case "paused": ("pause.circle.fill", .secondary)
-    case "checking": ("clock.fill", .secondary)
-    case "setup": ("plus.circle.fill", .secondary)
-    default: ("exclamationmark.circle.fill", .orange)
-    }
+    .navigationTitle("Settings")
   }
 }
 
-/// What one paired computer may do on this Mac, as the GNOME window has it.
-private struct PeerRows: View {
+/// Reduce Wi-Fi lag, with what its helper still needs while it is on.
+private struct WiFiRow: View {
   var model: AppModel
-  var peer: Peer
+  var enabled: Bool
 
   var body: some View {
-    Toggle(
-      isOn: binding(peer.allowControl) {
-        CoreRequest(command: "set_peer", name: peer.name, allowControl: $0)
+    let services = model.services
+    let waiting = enabled && !services.helperReady
+    LabeledContent {
+      HStack {
+        if waiting, let action = services.helperAction {
+          Button(action) { model.fixHelper() }.disabled(services.helperBusy)
+        }
+        Toggle(
+          "Reduce Wi-Fi lag", isOn: Binding(get: { enabled }, set: { model.setAwdl($0) })
+        )
+        .labelsHidden()
+        .toggleStyle(.switch)
       }
-    ) {
-      Text("Can control this computer")
-      Text("Its keyboard and pointer can move onto this Mac.")
-    }
-    Picker(
-      selection: binding(peer.keyboard) {
-        CoreRequest(command: "set_peer", name: peer.name, keyboard: $0)
-      }
-    ) {
-      Text("Standard keys").tag("standard")
-      Text("PC key positions").tag("pc_positions")
-      Text("Mac shortcuts").tag("mac")
     } label: {
-      Text("Keys from \(peer.name)")
-      Text("How its keys act on this Mac, from the next time it takes control.")
-    }
-    Toggle(
-      isOn: binding(peer.reverseScroll) {
-        CoreRequest(command: "set_peer", name: peer.name, reverseScroll: $0)
-      }
-    ) {
-      Text("Reverse scrolling")
-      Text("Turn its scrolling around on this Mac.")
-    }
-  }
-
-  /// Shows the engine's value, and sends each change to it.
-  private func binding<Value>(
-    _ value: Value, _ request: @escaping (Value) -> CoreRequest
-  ) -> Binding<Value> {
-    Binding(get: { value }, set: { model.send(request($0)) })
-  }
-}
-
-/// Accessibility, Local Network, Reduce Wi-Fi lag with its helper, and Move
-/// to Applications when zflow runs from somewhere it cannot stay.
-private struct MacRows: View {
-  var model: AppModel
-  var platform: MacPlatform
-
-  var body: some View {
-    CheckRow(
-      title: "Accessibility",
-      detail: platform.accessibility
-        ? "zflow can share this Mac's keyboard and pointer, and paired computers can control it."
-        : "Allow zflow to share keyboard and pointer input, and to let paired computers control this Mac.",
-      level: platform.accessibility ? "ok" : "error"
-    ) {
-      if !platform.accessibility { Button("Allow…") { model.openAccessibility() } }
-    }
-    let (network, networkLevel) = localNetwork
-    CheckRow(title: "Local Network", detail: network, level: networkLevel) {
-      if platform.localNetwork != "allowed" {
-        Button("Settings…") { model.openLocalNetwork() }
-      }
-    }
-    Toggle(
-      isOn: Binding(
-        get: { platform.blockAwdl },
-        set: { model.send(CoreRequest(command: "set_awdl", enabled: $0)) })
-    ) {
       Text("Reduce Wi-Fi lag")
-      Text("Pauses AirDrop and Continuity while you control another computer.")
-    }
-    if platform.blockAwdl {
-      CheckRow(
-        title: model.services.helperTitle, detail: model.services.helperDetail,
-        level: model.services.helperReady ? "ok" : "warning"
-      ) {
-        if !model.services.helperReady {
-          Button(model.services.helperAction) { model.fixHelper() }
-            .disabled(model.services.helperBusy || !model.services.hasSigningTeam)
-        }
-      }
-    }
-    if AppLocation.main.needsMove {
-      CheckRow(
-        title: "Move to Applications",
-        detail:
-          "zflow is running from a disk image or a temporary folder. Drag it into Applications, then open it from there.",
-        level: "warning"
-      ) {
-        Button("Show Applications") {
-          NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications"))
-        }
-      }
-    }
-  }
-
-  private var localNetwork: (String, String) {
-    switch platform.localNetwork {
-    case "allowed": ("zflow can reach computers on this network.", "ok")
-    case "blocked": ("Turn on zflow in Privacy & Security → Local Network.", "error")
-    default: ("Allow zflow if nearby computers do not appear.", "unknown")
+      Text(
+        waiting
+          ? services.helperNote
+          : "Pauses AirDrop’s radio while input is shared with another computer.")
     }
   }
 }
 
-/// One checked item: its state, what it means, and a fix when there is one.
-struct CheckRow<Action: View>: View {
+/// A permission macOS keeps, and the button that asks for it.
+private struct PermissionRow: View {
   var title: String
-  var detail: String
-  /// ok, warning or error; anything else has not been checked yet.
-  var level: String
-  @ViewBuilder var action: () -> Action
+  var allowed: Bool
+  /// Said only while it is not allowed.
+  var detail: String?
+  var allow: () -> Void
 
   var body: some View {
-    HStack(alignment: .top, spacing: 10) {
-      Image(systemName: mark.0).foregroundStyle(mark.1)
-      VStack(alignment: .leading, spacing: 2) {
-        Text(title)
-        Text(detail).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-          .fixedSize(horizontal: false, vertical: true)
+    LabeledContent {
+      if allowed {
+        Label {
+          Text("Allowed").foregroundStyle(.secondary)
+        } icon: {
+          Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        }
+      } else {
+        Button("Allow…", action: allow)
       }
-      Spacer(minLength: 4)
-      action()
-    }
-  }
-
-  private var mark: (String, Color) {
-    switch level {
-    case "ok": ("checkmark.circle.fill", .green)
-    case "warning": ("exclamationmark.triangle.fill", .orange)
-    case "error": ("exclamationmark.circle.fill", .red)
-    default: ("circle.dashed", .secondary)
+    } label: {
+      Text(title)
+      if !allowed, let detail { Text(detail) }
     }
   }
 }

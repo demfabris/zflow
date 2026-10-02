@@ -13,7 +13,7 @@ import Testing
   try original.write(to: file, atomically: true, encoding: .utf8)
   let core = CoreBridge(path: file.path)
   let initial = try await core.request(CoreRequest(command: "snapshot"))
-  #expect(initial.status.state == "paused")
+  #expect(initial.status.state == .paused)
   let changed = try await core.request(CoreRequest(command: "set_awdl", enabled: true))
   #expect(changed.platform.blockAwdl)
   #expect(
@@ -22,8 +22,8 @@ import Testing
   try "[broken".write(to: file, atomically: true, encoding: .utf8)
   let invalid = try await core.request(CoreRequest(command: "reload"))
   #expect(invalid.platform.blockAwdl)
-  #expect(invalid.health.contains { $0.id == "config" && $0.level == "error" })
-  #expect(invalid.status.state == "paused")
+  #expect(invalid.health.contains { $0.id == "config" && $0.level == .error })
+  #expect(invalid.status.state == .paused)
   await core.shutdown()
 }
 
@@ -43,7 +43,7 @@ import Testing
   } catch {}
   let paused = try await core.request(CoreRequest(command: "snapshot"))
   #expect(paused.sharing == false)
-  #expect(paused.status.state == "paused")
+  #expect(paused.status.state == .paused)
   await core.shutdown()
 }
 
@@ -77,7 +77,7 @@ import Testing
   try await Task.sleep(for: .milliseconds(2200))
   let snapshot = try await core.request(CoreRequest(command: "snapshot"))
   #expect(snapshot.platform.blockAwdl)
-  #expect(snapshot.status.state == "paused")
+  #expect(snapshot.status.state == .paused)
   await core.shutdown()
 }
 
@@ -89,13 +89,11 @@ import Testing
   try "[transport]\ndiscovery = false\n".write(to: file, atomically: true, encoding: .utf8)
   let core = CoreBridge(path: file.path)
   let snapshot = try await core.request(CoreRequest(command: "snapshot"))
-  #expect(snapshot.status.state == "setup")
+  #expect(snapshot.status.state == .setup)
   #expect(snapshot.status.title == "Pair a computer")
   #expect(snapshot.health.first?.id == "sharing")
   #expect(snapshot.layout != nil)
   #expect(snapshot.peers.isEmpty)
-  #expect(snapshot.shortcuts.map(\.keys) == ["⌃⌘⌫"])
-  #expect(snapshot.autostart == nil)
   #expect(snapshot.configPath == file.path)
   // The old names are gone; the shared ones reach the engine.
   for old in ["move", "pair_start"] {
@@ -114,19 +112,20 @@ import Testing
   try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
   defer { try? FileManager.default.removeItem(at: directory) }
   let file = directory.appendingPathComponent("zflow.toml")
-  try "[transport]\ndiscovery = false\n[macos]\nsharing = false\n[peers.desk]\nspki_der_hex = \"01\"\n"
+  try
+    "[transport]\ndiscovery = false\n[macos]\nsharing = false\n[peers.desk]\nspki_der_hex = \"01\"\n"
     .write(to: file, atomically: true, encoding: .utf8)
   let core = CoreBridge(path: file.path)
   let initial = try #require(try await core.request(CoreRequest(command: "snapshot")).peers.first)
-  #expect(!initial.allowControl && initial.keyboard == "standard" && !initial.reverseScroll)
+  #expect(!initial.allowControl && initial.keyboard == .standard && !initial.reverseScroll)
   // Two-word fields go out in snake case, one at a time.
   _ = try await core.request(CoreRequest(command: "set_peer", name: "desk", allowControl: true))
   _ = try await core.request(
-    CoreRequest(command: "set_peer", name: "desk", keyboard: "pc_positions"))
+    CoreRequest(command: "set_peer", name: "desk", keyboard: .pcPositions))
   let changed = try await core.request(
     CoreRequest(command: "set_peer", name: "desk", reverseScroll: true))
   let desk = try #require(changed.peers.first)
-  #expect(desk.allowControl && desk.keyboard == "pc_positions" && desk.reverseScroll)
+  #expect(desk.allowControl && desk.keyboard == .pcPositions && desk.reverseScroll)
   let saved = try String(contentsOf: file, encoding: .utf8)
   #expect(saved.contains("keyboard = \"pc_positions\"") && saved.contains("reverse_scroll = true"))
   await core.shutdown()
@@ -150,5 +149,22 @@ import Testing
   #expect(paused.pauseAtEdges == true)
   #expect(
     try String(contentsOf: file, encoding: .utf8).contains("[switching]\npause_at_edges = true"))
+  await core.shutdown()
+}
+
+@Test func nothingIsSentToTheNetworkBeforeTheWindowAsks() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let file = directory.appendingPathComponent("zflow.toml")
+  // Discovery stays on; only the missing computer and the window hold it back.
+  try "[macos]\nsharing = false\n".write(to: file, atomically: true, encoding: .utf8)
+  let core = CoreBridge(path: file.path)
+  _ = try await core.request(CoreRequest(command: "check_accessibility"))
+  // Let the worker's first maintenance tick run.
+  try await Task.sleep(for: .milliseconds(200))
+  let snapshot = try await core.request(CoreRequest(command: "snapshot"))
+  #expect(snapshot.platform.localNetwork == .unknown)
+  #expect(snapshot.nearby.isEmpty)
   await core.shutdown()
 }
