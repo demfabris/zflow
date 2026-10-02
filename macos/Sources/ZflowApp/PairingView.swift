@@ -68,7 +68,8 @@ struct PairingView: View {
                 if let address { choose(address) }
               } label: {
                 Label(
-                  address.map { "Computer · \(Self.host($0))" } ?? "Nearby computer",
+                  address.map { "\(candidate.name ?? "Computer") · \(Self.host($0))" }
+                    ?? "Nearby computer",
                   systemImage: "display")
               }.disabled(!candidate.compatible || address == nil)
             }

@@ -27,8 +27,8 @@ struct MenuBarView: View {
       }
       .padding(.horizontal, 8).padding(.vertical, 6)
       let peers = snapshot?.peers ?? []
-      let nearby = snapshot?.nearby ?? []
-      if !peers.isEmpty || !nearby.isEmpty {
+      let found = snapshot?.unplaced.filter(\.placeable) ?? []
+      if !peers.isEmpty || !found.isEmpty {
         Divider().padding(.vertical, 4)
         Text("Computers").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
           .padding(.horizontal, 8).padding(.bottom, 2)
@@ -42,13 +42,13 @@ struct MenuBarView: View {
             }
           }
         }
-        ForEach(nearby) { computer in
-          MenuRow(title: computer.host, symbol: "desktopcomputer") {
-            model.pair(computer.pairAddress)
+        // Found nearby: placing one happens on the arrangement.
+        ForEach(found) { computer in
+          MenuRow(title: computer.name, symbol: computer.symbol) {
+            model.show(.computers)
           } trailing: {
-            Text("Pair…")
+            Text("Place…")
           }
-          .disabled(!computer.compatible || computer.pairAddress == nil)
         }
       }
       Divider().padding(.vertical, 4)

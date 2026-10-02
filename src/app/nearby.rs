@@ -23,6 +23,9 @@ pub(super) enum BrowserStatus {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) struct NearbyRecord {
     pub instance: String,
+    /// The name its record gives, which versions before arrange to pair
+    /// leave out. Anyone can claim any name, so it only labels the row.
+    pub name: Option<String>,
     pub addresses: Vec<SocketAddr>,
     pub compatible: bool,
     /// Where its pairing listener waits. Computers advertise their input
@@ -35,6 +38,7 @@ impl NearbyRecord {
         let addresses = candidate.socket_addresses().to_vec();
         Some(Self {
             instance: candidate.ephemeral_instance_id()?.to_string(),
+            name: candidate.name().map(str::to_owned),
             pair_address: addresses
                 .first()
                 .map(|address| SocketAddr::new(address.ip(), crate::pairing::DEFAULT_PAIRING_PORT)),
@@ -214,6 +218,7 @@ mod tests {
     fn record(index: usize) -> NearbyRecord {
         NearbyRecord {
             instance: format!("zf-{index:032x}"),
+            name: None,
             addresses: vec![
                 format!("192.0.2.{}:43119", index % 250 + 1)
                     .parse()
@@ -312,13 +317,18 @@ mod tests {
                 &format!("{instance}.local."),
                 "192.0.2.1",
                 43119,
-                &[("v", version.as_str()), ("cap", "keyboard,pointer")][..],
+                &[
+                    ("v", version.as_str()),
+                    ("cap", "keyboard,pointer"),
+                    ("name", "desk"),
+                ][..],
             )
             .unwrap()
             .as_resolved_service();
             let candidate = crate::discovery::parse_resolved_service(&service).unwrap();
             let record = NearbyRecord::from_candidate(candidate).unwrap();
             assert_eq!(record.compatible, compatible);
+            assert_eq!(record.name.as_deref(), Some("desk"));
             assert_eq!(
                 record.pair_address,
                 Some("192.0.2.1:43120".parse().unwrap())

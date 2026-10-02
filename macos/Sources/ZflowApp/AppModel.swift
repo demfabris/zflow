@@ -26,6 +26,13 @@ final class AppModel {
   var failure: String?
   var page = Page.computers
   var pairing: PairingTarget?
+  /// Shows the Add by address sheet.
+  var addingAddress = false
+  /// Opens the pairing sheet once the Add by address sheet has closed.
+  @ObservationIgnored var pairWhenClosed = false
+  /// Posts a computer that joined. The app sets it; each notice comes once.
+  @ObservationIgnored var joined: ((Notice) -> Void)?
+  @ObservationIgnored private var lastNotice: UInt64 = 0
   /// Asked once at launch, when zflow runs from somewhere it cannot stay.
   var askToMove = AppLocation.main.needsMove
   /// How macOS treats zflow reading what other apps copied.
@@ -85,22 +92,33 @@ final class AppModel {
     Task { await perform(request) }
   }
   func perform(_ request: CoreRequest, quiet: Bool = false) async {
-    guard !busy else { return }
+    guard let message = await attempt(request) else { return }
+    if snapshot == nil {
+      error = message
+    } else if !quiet {
+      report(message)
+    }
+  }
+  /// Sends `request` and returns why it failed, for a caller that shows it.
+  func attempt(_ request: CoreRequest) async -> String? {
+    guard !busy else { return nil }
     do {
       apply(try await core.request(request))
       error = nil
+      return nil
     } catch {
-      if snapshot == nil {
-        self.error = error.localizedDescription
-      } else if !quiet {
-        report(error.localizedDescription)
-      }
+      return error.localizedDescription
     }
   }
 
-  /// Takes the engine's latest snapshot. The page and the pairing sheet follow it.
+  /// Takes the engine's latest snapshot. The page and the pairing sheet
+  /// follow it, and each new notice is posted.
   func apply(_ next: Snapshot) {
     if next != snapshot { snapshot = next }
+    for notice in next.notices where notice.id > lastNotice {
+      lastNotice = notice.id
+      joined?(notice)
+    }
     holdActivity(next.sharing == true)
     if case .computer(let name) = page, !next.peers.contains(where: { $0.name == name }) {
       page = .computers
@@ -146,6 +164,15 @@ final class AppModel {
     openWindow(id: "main")
     NSApplication.shared.activate()
   }
+
+  /// The name other computers know this Mac by, as its hellos give it.
+  nonisolated static let hostName: String = {
+    var buffer = [CChar](repeating: 0, count: 256)
+    guard gethostname(&buffer, buffer.count) == 0 else { return "this Mac" }
+    var name = buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+    if name.lowercased().hasSuffix(".local") { name.removeLast(".local".count) }
+    return name.isEmpty ? "this Mac" : name
+  }()
 
   /// Opens the pairing sheet, straight at the code when `address` is known.
   func pair(_ address: String? = nil) {
