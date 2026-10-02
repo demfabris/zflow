@@ -63,6 +63,19 @@ enum Command {
     Devices,
     /// List paired peers and their permissions.
     Peers,
+    /// List computers found on the network that are not trusted here.
+    Nearby {
+        /// Say hello to this IP address first, port optional, for a
+        /// computer mDNS cannot see, such as one on Tailscale.
+        #[arg(long, value_name = "ADDRESS")]
+        add: Option<String>,
+    },
+    /// Trust a computer `zflow nearby` lists, by name or mark, as dragging
+    /// it into the arrangement does.
+    Trust {
+        /// Its name, or its mark when two share a name.
+        computer: String,
+    },
     /// Pair with another logged-in zflow CLI using an authenticated code.
     Pair {
         #[command(subcommand)]
@@ -231,6 +244,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Doctor => doctor(path),
         Command::Devices => devices(path),
         Command::Peers => peers(path),
+        Command::Nearby { add } => nearby(path, add),
+        Command::Trust { computer } => trust(path, computer),
         Command::Pair { command } => match command {
             PairCommand::Connect {
                 peer,
@@ -1161,6 +1176,13 @@ fn daemon_request(socket: &std::path::Path, request: Request) -> Result<Response
         .block_on(async {
             let mut stream = tokio::net::UnixStream::connect(socket)
                 .await
+                .map_err(|error| match error.kind() {
+                    // Only root and the service may reach it.
+                    std::io::ErrorKind::PermissionDenied => {
+                        anyhow::anyhow!("{error}; run it with sudo")
+                    }
+                    _ => error.into(),
+                })
                 .with_context(|| format!("could not connect to {}", socket.display()))?;
             write_message(&mut stream, &request).await?;
             Ok(read_message(&mut stream).await?)
@@ -1419,6 +1441,78 @@ fn peers(path: PathBuf) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn nearby(path: PathBuf, add: Option<String>) -> Result<()> {
+    let config = Config::load(&path)?;
+    let add = add
+        .as_deref()
+        .map(crate::peer_view::parse_address)
+        .transpose()?;
+    let request = Request::Nearby { add };
+    let (computers, window) = match daemon_request(&config.daemon.control_socket, request)? {
+        Response::Nearby {
+            computers,
+            pairing_window,
+        } => (computers, pairing_window),
+        Response::Error { message } => bail!("daemon rejected nearby request: {message}"),
+        response => bail!("unexpected daemon response: {response:?}"),
+    };
+    if let Some(address) = add {
+        println!("said hello to {address}; it is listed once it answers");
+    }
+    for computer in &computers {
+        println!("{}", nearby_line(computer));
+    }
+    if computers.is_empty() {
+        println!("no other zflow computers found");
+    }
+    if let (crate::pairing_window::State::Open, Some(seconds)) = (window.state, window.seconds_left)
+    {
+        println!(
+            "pairing window: open for {} more minutes",
+            seconds.div_ceil(60)
+        );
+    }
+    Ok(())
+}
+
+/// One found computer: name, mark, system, version and what can be done.
+fn nearby_line(computer: &crate::neighbors::Unplaced) -> String {
+    use crate::neighbors::UnplacedState;
+    let state = match computer.state {
+        UnplacedState::Identifying => "not answered yet",
+        UnplacedState::Ready => "ready",
+        UnplacedState::DifferentVersion => "different zflow version",
+        UnplacedState::DuplicateName => "ready; shares its name, so trust it by mark",
+    };
+    let os = match computer.os {
+        Some(crate::wire::Os::Linux) => "Linux",
+        Some(crate::wire::Os::Macos) => "macOS",
+        None => "-",
+    };
+    let mut line = format!(
+        "{}  mark {}  {os}  {}  {state}",
+        computer.name,
+        computer.mark.as_deref().unwrap_or("-"),
+        computer.version.as_deref().unwrap_or("-"),
+    );
+    if computer.trusts_you {
+        line.push_str("  (has added this computer)");
+    }
+    line
+}
+
+fn trust(path: PathBuf, computer: String) -> Result<()> {
+    let config = Config::load(&path)?;
+    match daemon_request(&config.daemon.control_socket, Request::Trust { computer })? {
+        Response::Trusted { name } => {
+            println!("trusted {name}; arrange it in zflow settings");
+            Ok(())
+        }
+        Response::Error { message } => bail!("daemon rejected trust request: {message}"),
+        response => bail!("unexpected daemon response: {response:?}"),
+    }
 }
 
 fn pair_connect(

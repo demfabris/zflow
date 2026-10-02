@@ -39,16 +39,6 @@ pub fn run(install: bool) -> Result<()> {
                         state.receiver.status()
                     };
                     if status!=previous { tracing::info!(%status,"desktop agent"); previous=status; }
-                    match crate::peer_view::status().await {
-                        Ok(snapshot) => {
-                            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-                            if snapshot.discovery { state.nearby.start(); } else { state.nearby.stop(); }
-                        },
-                        Err(error) => {
-                            state.lock().unwrap_or_else(|e| e.into_inner()).nearby.stop();
-                            tracing::debug!(%error,"desktop service unavailable");
-                        },
-                    }
                 }
             }
         }

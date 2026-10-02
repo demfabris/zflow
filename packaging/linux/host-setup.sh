@@ -9,6 +9,9 @@ readonly SERVICE_GROUP="zflow"
 readonly CONFIG_DIR="/etc/zflow"
 readonly CONFIG_FILE="$CONFIG_DIR/zflow.toml"
 readonly STATE_DIR="/var/lib/zflow"
+# A fresh install may take one computer by itself, once someone is at the
+# desktop (src/pairing_window.rs). Upgrades never get this file.
+readonly PAIRING_WINDOW_FILE="$STATE_DIR/pairing-window"
 readonly CAPTURE_RULE_FILE="/etc/udev/rules.d/71-zflow-capture.rules"
 # Removing the Debian package parks the device selection here.
 readonly SAVED_CAPTURE_RULE_FILE="/etc/udev/71-zflow-capture.rules.disabled"
@@ -63,7 +66,7 @@ done
 
 ensure_service_account
 
-for path in "$CONFIG_DIR" "$CONFIG_FILE" "$STATE_DIR" "$CAPTURE_RULE_FILE" "$SAVED_CAPTURE_RULE_FILE"; do
+for path in "$CONFIG_DIR" "$CONFIG_FILE" "$STATE_DIR" "$PAIRING_WINDOW_FILE" "$CAPTURE_RULE_FILE" "$SAVED_CAPTURE_RULE_FILE"; do
     [[ ! -L "$path" ]] || die "refusing symlink: $path"
 done
 
@@ -71,6 +74,7 @@ done
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$CONFIG_DIR" "$STATE_DIR"
 if [[ ! -e "$CONFIG_FILE" ]]; then
     install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 "$DEFAULT_CONFIG" "$CONFIG_FILE"
+    install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 <(printf 'eligible\n') "$PAIRING_WINDOW_FILE"
 fi
 [[ -f "$CONFIG_FILE" ]] || die "configuration is not a regular file: $CONFIG_FILE"
 chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"

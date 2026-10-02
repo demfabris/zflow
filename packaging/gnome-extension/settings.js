@@ -15,11 +15,54 @@ const KEY_STEP = 100;
 const KEY_TOLERANCE = 150;
 const DRAG_TOLERANCE = 14;
 const ARROWS = {[Gdk.KEY_Left]: [-1, 0], [Gdk.KEY_Right]: [1, 0], [Gdk.KEY_Up]: [0, -1], [Gdk.KEY_Down]: [0, 1]};
+const BOARD_HEIGHT = 200;
+// The shelf of computers found on the network, under the board.
+const FOUND_SIZE = [132, 64];
+const SHELF_TOP = 48;
+const SHELF_GAP = 8;
+// The size the service gives a placed computer's tile (PEER_TILE_SIZE in
+// src/daemon.rs) until that computer sends its own.
+const NEW_TILE = [1920, 1080];
+const PLACEABLE = new Set(['ready', 'duplicate_name']);
+const OS_NAMES = {linux: 'Linux', macos: 'macOS'};
+// A key's mark is six hex digits; each of the first four picks one of these
+// by its low three bits, as the Mac app does, so a key looks the same on
+// every computer.
+const MARK_COLORS = ['#E5484D', '#F76B15', '#FFC53D', '#30A46C', '#12A594', '#0090FF', '#8E4EC6', '#D6409F'];
+const CSS = `
+.zf-shelf { border: 1.5px dashed alpha(currentColor, 0.25); border-radius: 12px; padding: 8px 12px; }
+.zf-mark { min-width: 7px; min-height: 7px; border-radius: 2px; }
+${MARK_COLORS.map((color, index) => `.zf-mark-${index} { background: ${color}; }`).join('\n')}
+`;
 
 function button(label, action, css = []) {
     const widget = new Gtk.Button({label, valign: Gtk.Align.CENTER, css_classes: css});
     widget.connect('clicked', action);
     return widget;
+}
+
+let styled = false;
+function addStyle() {
+    if (styled) return;
+    styled = true;
+    const provider = new Gtk.CssProvider();
+    provider.load_from_string(CSS);
+    Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
+
+// The palette indexes of a mark's four squares, from its six hex digits.
+export function markColors(seed) {
+    if (!/^[0-9a-f]{6}$/i.test(seed ?? '')) return [];
+    return [...seed.slice(0, 4)].map(digit => Number.parseInt(digit, 16) & 7);
+}
+
+// Draws a mark into `box` as four small squares, or nothing without one.
+function showMark(box, seed) {
+    if (box._seed === seed) return;
+    box._seed = seed;
+    for (let child = box.get_first_child(); child; child = box.get_first_child()) box.remove(child);
+    for (const color of markColors(seed)) box.append(new Gtk.Box({css_classes: ['zf-mark', `zf-mark-${color}`], valign: Gtk.Align.CENTER}));
+    box.visible = !!box.get_first_child();
 }
 
 export class Settings {
@@ -58,35 +101,63 @@ export class Settings {
         this._errorGroup.add(this._error);
         this.page.add(this._errorGroup);
 
+        addStyle();
         this._computers = new Adw.PreferencesGroup({title: 'Computers', description: NO_LAYOUT});
-        this._pairButton = button('Pair Computer…', () => this._openPairing(), ['suggested-action']);
-        this._computers.header_suffix = this._pairButton;
+        this._addButton = button('Add by Address…', () => this._openAddAddress(), ['flat']);
+        this._pairButton = button('Pair with Code…', () => this._openPairing(), ['flat']);
+        const actions = new Gtk.Box({spacing: 6});
+        actions.append(this._addButton);
+        actions.append(this._pairButton);
+        this._computers.header_suffix = actions;
+        // A fresh install's pairing window, and the computer it took.
+        this._windowRow = new Adw.ActionRow({title: '', subtitle_lines: 0, use_markup: false, visible: false});
+        this._windowMark = new Gtk.Box({spacing: 2});
+        this._windowRow.add_prefix(this._windowMark);
+        this._computers.add(this._windowRow);
+        this._dismissed = 0;
+        this._joinedRow = new Adw.ActionRow({title: '', subtitle: 'It can share this computer’s keyboard and mouse. Not yours?', subtitle_lines: 0, use_markup: false, visible: false});
+        this._joinedRow.add_suffix(button('Forget', () => this._forgetJoined(), ['destructive-action']));
+        const dismiss = new Gtk.Button({icon_name: 'window-close-symbolic', tooltip_text: 'Dismiss', valign: Gtk.Align.CENTER, css_classes: ['flat']});
+        dismiss.connect('clicked', () => this._dismissJoined());
+        this._joinedRow.add_suffix(dismiss);
+        this._computers.add(this._joinedRow);
         // The layout comes first, above the computers' rows. Each tile is a
-        // button, so it takes keyboard focus and has a name.
+        // button, so it takes keyboard focus and has a name. Computers found
+        // on the network wait on a shelf under it until one is dragged in.
         this._tiles = new Map();
+        this._found = new Map();
         this._layoutKey = '';
+        this._foundKey = '';
         this._pressed = null;
-        this._boardSize = [440, 200];
+        this._boardSize = [440, BOARD_HEIGHT];
+        this._shelfHeight = 0;
         this._board = new Gtk.Fixed();
+        this._shelf = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 2, css_classes: ['zf-shelf'], visible: false});
+        this._shelf.append(new Gtk.Label({label: 'Found on your network', xalign: 0, css_classes: ['heading']}));
+        this._shelf.append(new Gtk.Label({label: 'Drag one next to a screen to add it.', xalign: 0, css_classes: ['caption', 'dim-label']}));
+        this._board.put(this._shelf, 0, 0);
         // One drag for the whole box. On a tile, it would measure from the
         // tile that moves under it. It sees a press before the tile's button
         // does, as a scrolled window's drag does, and takes it only once the
         // pointer moves.
         const drag = new Gtk.GestureDrag({propagation_phase: Gtk.PropagationPhase.CAPTURE});
         drag.connect('drag-begin', (_drag, x, y) => {
+            const under = tile => x >= tile.x && y >= tile.y && x < tile.x + tile.size[0] && y < tile.y + tile.size[1];
             // Later tiles draw on top.
-            this._pressed = [...this._tiles.values()].findLast(tile => x >= tile.x && y >= tile.y && x < tile.x + tile.size[0] && y < tile.y + tile.size[1]);
+            this._pressed = [...this._tiles.values()].findLast(under)
+                ?? [...this._found.values()].find(tile => under(tile) && PLACEABLE.has(tile.found.state));
         });
         drag.connect('drag-update', (_drag, dx, dy) => this._dragTile(drag, dx, dy));
         drag.connect('drag-end', (_drag, dx, dy) => this._dropTile(dx, dy));
         this._board.add_controller(drag);
         // A Gtk.Fixed does not report its width, so the empty area under it does.
-        const area = new Gtk.DrawingArea({content_height: this._boardSize[1], hexpand: true});
-        area.connect('resize', (_area, width, height) => {
-            this._boardSize = [width, height];
+        this._area = new Gtk.DrawingArea({content_height: BOARD_HEIGHT, hexpand: true});
+        this._area.connect('resize', (_area, width) => {
+            this._boardSize = [width, BOARD_HEIGHT];
             this._placeTiles();
+            this._placeShelf();
         });
-        const canvas = new Gtk.Overlay({child: area, overflow: Gtk.Overflow.HIDDEN});
+        const canvas = new Gtk.Overlay({child: this._area, overflow: Gtk.Overflow.HIDDEN});
         canvas.add_overlay(this._board);
         this._layout = new Adw.PreferencesRow({title: 'Layout', child: canvas, activatable: false, focusable: false, visible: false});
         this._computers.add(this._layout);
@@ -137,7 +208,7 @@ export class Settings {
     async _run(request) {
         if (this._busy) return false;
         this._busy = true;
-        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = this._pause.sensitive = this._clipboard.sensitive = false;
+        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = this._addButton.sensitive = this._pause.sensitive = this._clipboard.sensitive = false;
         for (const row of [...this._keyboards.values(), ...this._controls.values(), ...this._scrolls.values()]) row.sensitive = false;
         this._showError(null);
         let success = false;
@@ -171,21 +242,58 @@ export class Settings {
         this._login.active = (known && snapshot.autostart) ?? false;
         this._login.sensitive = known && snapshot.autostart !== null && !this._busy;
         this._pairButton.sensitive = online && !this._busy && !this._pairing;
+        this._addButton.sensitive = online && !this._busy;
         this._updating = false;
         this._error.subtitle = this._actionError || (known ? '' : snapshot?.error ?? 'Update zflow so this window and the service match.');
         this._errorGroup.visible = !!this._error.subtitle;
         this._help.description = `Changes save automatically. Advanced settings are in ${known ? snapshot.config_path : '/etc/zflow/zflow.toml'}.`;
         this._updateHealth(known ? snapshot.health : []);
-        this._updateLayout(known ? snapshot.layout : null);
-        this._updatePeers(known ? snapshot.peers : []);
+        const peers = known ? snapshot.peers : [];
+        // An agent from before the shelf leaves these out.
+        this._updateLayout(known ? snapshot.layout : null, known ? snapshot.own_mark ?? null : null, peers);
+        this._updateFound(known ? snapshot.unplaced ?? [] : []);
+        this._updateWindow(known ? snapshot.pairing_window ?? null : null);
+        this._updateJoined(known ? snapshot.notices ?? [] : [], peers);
+        this._updatePeers(peers);
         this._updateShortcuts(known ? snapshot.shortcuts : []);
-        // A fresh install opens pairing with its code on screen, so the other
-        // computer can pair without anyone clicking through settings here.
-        if (online && !this._checkedFirstRun) {
-            this._checkedFirstRun = true;
-            if (!snapshot.peers.length) this._openPairing();
-        }
         this._updatePairing(known ? snapshot : {});
+    }
+
+    _updateWindow(window) {
+        const open = window?.state === 'open';
+        this._windowRow.visible = open;
+        if (!open) return;
+        const holding = window.holding;
+        if (holding) {
+            this._windowRow.title = `Adding ${holding.name}`;
+            this._windowRow.subtitle = `In ${Math.ceil(holding.ms_left / 1000)} s, unless another computer shows up.`;
+        } else {
+            const minutes = Math.max(1, Math.ceil((window.seconds_left ?? 0) / 60));
+            this._windowRow.title = 'This computer is new';
+            this._windowRow.subtitle = `For the next ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}, a new computer that shows up alone joins by itself. Or drag one into place below.`;
+        }
+        showMark(this._windowMark, holding?.mark ?? null);
+    }
+
+    // The newest computer that joined, while it is still here, until dismissed.
+    _updateJoined(notices, peers) {
+        const names = new Set(peers.map(({name}) => name));
+        const joined = notices.findLast(notice => notice.kind === 'joined' && notice.id > this._dismissed && names.has(notice.name));
+        this._joined = joined ?? null;
+        this._joinedRow.visible = !!joined;
+        if (joined) this._joinedRow.title = `${joined.name} joined`;
+    }
+
+    _dismissJoined() {
+        if (this._joined) this._dismissed = this._joined.id;
+        this._joinedRow.visible = false;
+    }
+
+    async _forgetJoined() {
+        const joined = this._joined;
+        if (!joined) return;
+        this._dismissJoined();
+        await this._run({command: 'forget', name: joined.name});
     }
 
     _updateHealth(rows) {
@@ -203,13 +311,16 @@ export class Settings {
         this._health.visible = rows.length > 0;
     }
 
-    _updateLayout(layout) {
+    _updateLayout(layout, ownMark, peers) {
         const monitors = layout?.monitors ?? [];
         this._layout.visible = monitors.length > 0;
         this._computers.description = monitors.length ? LAYOUT_HINT : NO_LAYOUT;
+        // Each tile shows its computer's key mark.
+        const marks = new Map(peers.map(({name, mark}) => [name, mark]));
+        const mark = monitor => monitor.peer ? marks.get(monitor.peer) ?? null : ownMark;
         // Keep tiles, and the focused one, while unchanged snapshots arrive. A
         // move keeps its tile too, so arrow keys can move it again.
-        const key = JSON.stringify(monitors);
+        const key = JSON.stringify(monitors.map(monitor => [monitor, mark(monitor)]));
         if (key === this._layoutKey) return;
         this._layoutKey = key;
         const ids = new Set(monitors.map(({id}) => id));
@@ -222,6 +333,7 @@ export class Settings {
             const tile = this._tiles.get(monitor.id) ?? this._newTile(monitor);
             tile.monitor = monitor;
             tile.label.label = tile.button.tooltip_text = monitor.label;
+            showMark(tile.mark, mark(monitor));
             tile.button.update_property([Gtk.AccessibleProperty.DESCRIPTION], [`Position ${monitor.x}, ${monitor.y}. Drag it or use the arrow keys to move it.`]);
         }
         this._placeTiles();
@@ -230,10 +342,14 @@ export class Settings {
     _newTile(monitor) {
         const {id} = monitor;
         const label = new Gtk.Label({ellipsize: Pango.EllipsizeMode.END, max_width_chars: 12});
+        const mark = new Gtk.Box({spacing: 2, halign: Gtk.Align.CENTER});
+        const content = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 4, valign: Gtk.Align.CENTER});
+        content.append(label);
+        content.append(mark);
         // This computer's tile is the highlighted one.
-        const button = new Gtk.Button({child: label, css_classes: monitor.peer ? [] : ['suggested-action']});
+        const button = new Gtk.Button({child: content, css_classes: monitor.peer ? [] : ['suggested-action']});
         // Where the tile shows on the board, in pixels.
-        const tile = {button, label, monitor, x: 0, y: 0, size: [0, 0], dragging: false};
+        const tile = {button, label, mark, monitor, x: 0, y: 0, size: [0, 0], dragging: false};
         const keys = new Gtk.EventControllerKey();
         keys.connect('key-pressed', (_keys, keyval) => {
             const step = ARROWS[keyval];
@@ -261,6 +377,9 @@ export class Settings {
         const scale = this._scale = Math.min(Math.max(width - 90, 1) / (right - left), Math.max(height - 70, 1) / (bottom - top), 0.12);
         const offsetX = (width - (right - left) * scale) / 2;
         const offsetY = (height - (bottom - top) * scale) / 2;
+        // Where layout unit (left, top) is on the board, for computers
+        // dropped from the shelf.
+        this._origin = {left, top, offsetX, offsetY};
         for (const tile of tiles) {
             const m = tile.monitor;
             const size = tile.size = [Math.max(64, Math.round(m.width * scale)), Math.max(40, Math.round(m.height * scale))];
@@ -291,16 +410,129 @@ export class Settings {
         if (!tile?.dragging) return;
         tile.dragging = false;
         const [x, y] = this._dragged(tile, dx, dy);
+        if (tile.found) {
+            this._dropFound(tile, x + tile.size[0] / 2, y + tile.size[1] / 2);
+            return;
+        }
         const {id, x: left, y: top} = tile.monitor;
         const scale = this._scale;
         this._moveTile(id, left + Math.round((x - tile.x) / scale), top + Math.round((y - tile.y) / scale), Math.round(DRAG_TOLERANCE / scale));
     }
 
-    // Where a dragged tile shows: it follows the pointer but stays in the box.
+    // Where a dragged tile shows: it follows the pointer but stays in the
+    // box. A board tile stays on the board; a found one may cross onto it.
     _dragged(tile, dx, dy) {
         const [width, height] = this._boardSize;
+        const bottom = tile.found ? height + this._shelfHeight : height;
         const clamp = (value, max) => Math.min(Math.max(value, 0), Math.max(max, 0));
-        return [clamp(tile.x + dx, width - tile.size[0]), clamp(tile.y + dy, height - tile.size[1])];
+        return [clamp(tile.x + dx, width - tile.size[0]), clamp(tile.y + dy, bottom - tile.size[1])];
+    }
+
+    // A found computer let go with its middle at (x, y) on the board joins
+    // the layout there, with a new tile's size. Let go on the shelf, it
+    // goes back.
+    async _dropFound(tile, x, y) {
+        if (y >= this._boardSize[1] || !this._origin) {
+            this._placeShelf();
+            return;
+        }
+        const {left, top, offsetX, offsetY} = this._origin;
+        const scale = this._scale;
+        const middle = [left + (x - offsetX) / scale, top + (y - offsetY) / scale];
+        await this._place(tile, Math.round(middle[0] - NEW_TILE[0] / 2), Math.round(middle[1] - NEW_TILE[1] / 2), Math.round(DRAG_TOLERANCE / scale));
+    }
+
+    // Keyboard people put a found computer beside this one.
+    _placeBeside(tile) {
+        const local = [...this._tiles.values()].find(({monitor}) => !monitor.peer)?.monitor;
+        if (!local || !PLACEABLE.has(tile.found.state)) return;
+        this._place(tile, local.x + local.width, local.y, KEY_TOLERANCE);
+    }
+
+    async _place(tile, x, y, tolerance) {
+        const placed = await this._run({command: 'place', id: tile.found.id, x, y, tolerance});
+        // A refused one goes back to the shelf; a placed one leaves it with
+        // the next snapshot.
+        if (!this._disposed) this._placeShelf();
+        return placed;
+    }
+
+    _updateFound(found) {
+        const key = JSON.stringify(found);
+        if (key === this._foundKey) return;
+        this._foundKey = key;
+        const ids = new Set(found.map(({id}) => id));
+        for (const [id, tile] of this._found) {
+            if (ids.has(id)) continue;
+            if (this._pressed === tile) this._pressed = null;
+            this._board.remove(tile.button);
+            this._found.delete(id);
+        }
+        for (const computer of found) {
+            const tile = this._found.get(computer.id) ?? this._newFound(computer);
+            tile.found = computer;
+            const placeable = PLACEABLE.has(computer.state);
+            tile.name.label = tile.button.tooltip_text = computer.name;
+            tile.detail.label = {
+                identifying: 'Looking it up…',
+                different_version: 'Different zflow version',
+                duplicate_name: 'Same name as another',
+            }[computer.state] ?? [OS_NAMES[computer.os], computer.trusts_you ? 'Added you' : null].filter(Boolean).join(' · ');
+            showMark(tile.mark, computer.mark ?? null);
+            tile.button.sensitive = placeable;
+            tile.button.update_property([Gtk.AccessibleProperty.DESCRIPTION], [placeable
+                ? 'Found on your network. Drag it next to a screen, or press Enter to put it beside this computer, to add it.'
+                : `Found on your network. ${tile.detail.label}.`]);
+        }
+        this._placeShelf();
+    }
+
+    _newFound(computer) {
+        const name = new Gtk.Label({ellipsize: Pango.EllipsizeMode.END, max_width_chars: 14, xalign: 0, css_classes: ['heading']});
+        const detail = new Gtk.Label({ellipsize: Pango.EllipsizeMode.END, max_width_chars: 16, xalign: 0, css_classes: ['caption', 'dim-label']});
+        const mark = new Gtk.Box({spacing: 2, hexpand: true, halign: Gtk.Align.END});
+        const top = new Gtk.Box();
+        top.append(new Gtk.Image({icon_name: 'computer-symbolic'}));
+        top.append(mark);
+        const content = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 2});
+        content.append(top);
+        content.append(name);
+        content.append(detail);
+        const button = new Gtk.Button({child: content});
+        const tile = {button, name, detail, mark, found: computer, x: 0, y: 0, size: FOUND_SIZE, dragging: false};
+        // Only a drag or a key places it, never a stray click.
+        const keys = new Gtk.EventControllerKey();
+        keys.connect('key-pressed', (_keys, keyval) => {
+            if (![Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space].includes(keyval)) return false;
+            this._placeBeside(tile);
+            return true;
+        });
+        button.add_controller(keys);
+        this._board.put(button, 0, 0);
+        this._found.set(computer.id, tile);
+        return tile;
+    }
+
+    // Lays the found computers out in rows under the board.
+    _placeShelf() {
+        const [width, height] = this._boardSize;
+        const tiles = [...this._found.values()];
+        const perRow = Math.max(1, Math.floor((width - 2 * SHELF_GAP - 16) / (FOUND_SIZE[0] + SHELF_GAP)));
+        const rows = Math.ceil(tiles.length / perRow);
+        const shelfHeight = tiles.length ? SHELF_TOP + rows * (FOUND_SIZE[1] + SHELF_GAP) + SHELF_GAP : 0;
+        if (shelfHeight !== this._shelfHeight) {
+            this._shelfHeight = shelfHeight;
+            this._area.content_height = BOARD_HEIGHT + shelfHeight;
+        }
+        this._shelf.visible = tiles.length > 0;
+        this._shelf.set_size_request(Math.max(width - 2 * SHELF_GAP, 1), Math.max(shelfHeight - SHELF_GAP, 1));
+        this._board.move(this._shelf, SHELF_GAP, height);
+        tiles.forEach((tile, index) => {
+            tile.x = 2 * SHELF_GAP + (index % perRow) * (FOUND_SIZE[0] + SHELF_GAP);
+            tile.y = height + SHELF_TOP + Math.floor(index / perRow) * (FOUND_SIZE[1] + SHELF_GAP);
+            tile.button.set_size_request(...FOUND_SIZE);
+            if (!tile.dragging) this._board.move(tile.button, tile.x, tile.y);
+        });
     }
 
     // Tiles stay sensitive during a request, so the focused one keeps focus;
@@ -345,14 +577,15 @@ export class Settings {
                 });
                 row.add_row(scroll);
                 this._scrolls.set(name, scroll);
+                // Forgetting puts it back on the shelf, so it takes no asking.
                 const forget = new Gtk.Button({icon_name: 'user-trash-symbolic', tooltip_text: `Forget ${name}`, valign: Gtk.Align.CENTER, css_classes: ['flat']});
-                forget.connect('clicked', () => this._forget(name));
+                forget.connect('clicked', () => this._run({command: 'forget', name}));
                 row.add_suffix(forget);
                 this._computers.add(row);
                 this._peerRows.push(row);
             }
             if (!this._peerRows.length) {
-                const row = new Adw.ActionRow({title: 'No paired computers', subtitle: 'Pair another computer to get started.'});
+                const row = new Adw.ActionRow({title: 'No computers added yet', subtitle: 'Computers running zflow on this network show up under the arrangement. Drag one next to this computer.', subtitle_lines: 0});
                 this._computers.add(row);
                 this._peerRows.push(row);
             }
@@ -384,15 +617,21 @@ export class Settings {
         this._shortcuts.visible = shortcuts.length > 0;
     }
 
-    _forget(name) {
-        const dialog = new Adw.AlertDialog({heading: `Forget ${name}?`, body: 'This stops input between the two computers and removes its trusted identity. Pair it again to reconnect.'});
+    // For a computer mDNS cannot see, such as one on Tailscale. What answers
+    // shows up on the shelf.
+    _openAddAddress() {
+        const dialog = new Adw.AlertDialog({heading: 'Add a Computer by Address', body: 'For a computer zflow can’t find on this network, like one on Tailscale. It shows up in Found on your network; drag it into place to add it.'});
+        const entry = new Gtk.Entry({placeholder_text: 'IP address, like 100.64.0.7', activates_default: true, input_purpose: Gtk.InputPurpose.URL});
+        dialog.extra_child = entry;
         dialog.add_response('cancel', 'Cancel');
-        dialog.add_response('forget', 'Forget Computer');
-        dialog.set_response_appearance('forget', Adw.ResponseAppearance.DESTRUCTIVE);
-        dialog.default_response = dialog.close_response = 'cancel';
+        dialog.add_response('look_up', 'Look Up');
+        dialog.set_response_appearance('look_up', Adw.ResponseAppearance.SUGGESTED);
+        dialog.default_response = 'look_up';
+        dialog.close_response = 'cancel';
         dialog.connect('response', (_dialog, response) => {
-            if (response === 'forget') this._run({command: 'forget', name});
+            if (response === 'look_up') this._run({command: 'add_address', address: entry.text.trim()});
         });
+        this._addDialog = {dialog, entry};
         dialog.present(this.window);
     }
 
@@ -429,14 +668,12 @@ export class Settings {
         other.add(entered);
         other.add(connect);
         page.add(other);
-        const nearby = new Adw.PreferencesGroup({title: 'Nearby computers'});
-        page.add(nearby);
         const result = new Adw.PreferencesGroup();
         // Peer names and remote error text end up here, so never parse them as markup.
         const stage = new Adw.ActionRow({title: '', visible: false, subtitle_lines: 0, use_markup: false});
         result.add(stage);
         page.add(result);
-        this._pairing = {dialog, ask, question, allow, shown, other, code, renew, remote, entered, connect, stage, nearby, rows: [], nearbyKey: '', asked: false};
+        this._pairing = {dialog, ask, question, allow, shown, other, code, renew, remote, entered, connect, stage, asked: false};
         dialog.connect('closed', () => {
             this._pairing = null;
             if (this._pairOwned) {
@@ -506,31 +743,6 @@ export class Settings {
         ui.stage.title = pairing.state === 'approving' ? 'Waiting for the other computer…' : connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
         ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange the computers in zflow on the other computer.'
             : pairing.state === 'approving' ? 'Choose Allow on the other computer.' : connecting ? '' : issue || '';
-        const discovery = snapshot.health?.find(row => row.id === 'discovery')?.detail;
-        const key = JSON.stringify([snapshot.nearby, discovery]);
-        if (key !== ui.nearbyKey) {
-            ui.nearbyKey = key;
-            for (const row of ui.rows) ui.nearby.remove(row);
-            ui.rows = [];
-            for (const record of snapshot.nearby ?? []) {
-                const address = record.addresses[0];
-                const separator = address.lastIndexOf(':');
-                const row = new Adw.ActionRow({title: address.slice(0, separator), subtitle: record.compatible ? 'Available on your network' : 'Update zflow on this computer', use_markup: false});
-                const use = button('Use', () => {
-                    ui.remote.text = record.pair_address;
-                    ui.entered.grab_focus();
-                });
-                use.sensitive = record.compatible && !!record.pair_address;
-                row.add_suffix(use);
-                ui.nearby.add(row);
-                ui.rows.push(row);
-            }
-            if (!ui.rows.length) {
-                const row = new Adw.ActionRow({title: 'No other computers found', subtitle: discovery || 'You can enter an address instead.', subtitle_lines: 0});
-                ui.nearby.add(row);
-                ui.rows.push(row);
-            }
-        }
     }
 
     destroy() {

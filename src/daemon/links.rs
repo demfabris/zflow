@@ -2,25 +2,18 @@
 //! first crossing does not wait for a handshake. A session the other
 //! computer dialed counts, and while one is up nothing is dialed.
 //!
-//! A link dials only where mDNS shows a zflow computer listening at the
-//! peer's saved address. A Mac advertises only while it listens, so one that
-//! does not is never dialed and its own link to this computer is the session.
-//! When both computers dial at once, both keep the same session. Crossings
-//! and the chord still dial on demand when no session is up.
+//! A link dials only where a hello proved the peer's key: an mDNS record or
+//! an added address that answered with it, whatever address it has now. A
+//! computer that does not listen is never dialed, and its own link to this
+//! computer is the session. When both computers dial at once, both keep the
+//! same session. Crossings and the chord still dial on demand when no
+//! session is up.
 
 use super::*;
 use crate::{
     link::{STABLE_SESSION, retry_delay},
     peer_view::LinkStatus,
 };
-
-/// A zflow computer's mDNS record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Nearby {
-    pub addresses: Vec<SocketAddr>,
-    /// Whether it speaks this computer's protocol version.
-    pub compatible: bool,
-}
 
 /// What a link uses from the daemon, so tests can stand in for it.
 pub(super) trait Sessions: Send + Sync + 'static {
@@ -57,11 +50,14 @@ pub(super) struct Link {
 impl Shared {
     /// Keeps one link per peer this computer may send to, and stops the
     /// others. A peer whose record changed starts over, so a computer paired
-    /// again is dialed at once. Pausing sharing stops every link.
+    /// again is dialed at once; one that only learned an address carries on.
+    /// Pausing sharing stops every link.
     pub(super) async fn sync_links(self: &Arc<Self>) {
         let wanted = linked_peers(&*self.config.read().await);
         let mut links = self.links.lock().await;
-        links.retain(|name, link| wanted.get(name) == Some(&link.record));
+        links.retain(|name, link| {
+            wanted.get(name).map(without_addresses) == Some(without_addresses(&link.record))
+        });
         for (name, record) in wanted {
             if let std::collections::btree_map::Entry::Vacant(slot) = links.entry(name) {
                 let link = start(
@@ -69,7 +65,7 @@ impl Shared {
                     slot.key().clone(),
                     record,
                     self.session_changes.subscribe(),
-                    self.nearby.subscribe(),
+                    self.neighbors.subscribe(),
                 );
                 slot.insert(link);
             }
@@ -106,42 +102,23 @@ fn linked_peers(config: &Config) -> BTreeMap<String, PeerConfig> {
         .collect()
 }
 
-/// Where a link dials `record`: every address of each zflow computer that
-/// mDNS shows at one of its saved addresses. Empty when nothing listens
-/// there, as with a Mac that is not listening.
-fn link_addresses(record: &PeerConfig, nearby: &BTreeMap<String, Nearby>) -> Vec<SocketAddr> {
-    let saved = |address: &SocketAddr| {
-        record
-            .addresses
-            .iter()
-            .any(|saved| saved.ip().to_canonical() == address.ip().to_canonical())
-    };
-    let mut addresses: Vec<_> = nearby
-        .values()
-        .filter(|nearby| nearby.addresses.iter().any(saved))
-        .flat_map(|nearby| nearby.addresses.iter().copied())
-        .collect();
-    addresses.sort_unstable();
-    addresses.dedup();
-    addresses
-}
-
 fn start<S: Sessions>(
     sessions: Arc<S>,
     peer: String,
     record: PeerConfig,
     changes: watch::Receiver<()>,
-    nearby: watch::Receiver<BTreeMap<String, Nearby>>,
+    neighbors: watch::Receiver<Neighbors>,
 ) -> Link {
     let (retry, retries) = mpsc::unbounded_channel();
     let (status_sender, status) = watch::channel(None);
     let task = Task {
         sessions,
         peer,
+        key: record.fingerprint_hex().unwrap_or_default(),
         record: record.clone(),
         retries,
         changes,
-        nearby,
+        neighbors,
     };
     tokio::spawn(run(task, status_sender));
     Link {
@@ -162,17 +139,22 @@ enum View {
 struct Task<S> {
     sessions: Arc<S>,
     peer: String,
+    /// The fingerprint of the peer's key, which finds it among the neighbors.
+    key: String,
     record: PeerConfig,
     retries: mpsc::UnboundedReceiver<()>,
     changes: watch::Receiver<()>,
-    nearby: watch::Receiver<BTreeMap<String, Nearby>>,
+    neighbors: watch::Receiver<Neighbors>,
 }
 
 impl<S: Sessions> Task<S> {
+    /// Without a session, the link dials wherever a hello proved the key.
+    /// That is nowhere while the peer is off, out of mDNS reach, or a Mac
+    /// that is not listening.
     async fn view(&self) -> View {
         match self.sessions.current(&self.peer).await {
             Some(id) => View::Session(id),
-            None => View::Dial(link_addresses(&self.record, &self.nearby.borrow())),
+            None => View::Dial(self.neighbors.borrow().addresses_for_key(&self.key)),
         }
     }
 
@@ -201,7 +183,7 @@ impl<S: Sessions> Task<S> {
                 changed = self.changes.changed() => if changed.is_err() {
                     return false;
                 },
-                changed = self.nearby.changed() => if changed.is_err() {
+                changed = self.neighbors.changed() => if changed.is_err() {
                     return false;
                 },
             }
@@ -216,9 +198,8 @@ async fn run<S: Sessions>(mut task: Task<S>, status: watch::Sender<Option<LinkSt
         let view = task.view().await;
         let session = match &view {
             View::Session(id) => *id,
-            // Nothing listens where the peer was paired: it is off, out of
-            // mDNS reach, or a Mac that is not listening. A crossing can
-            // still dial it.
+            // No hello found its key: it is off, out of mDNS reach, or a
+            // Mac that is not listening. A crossing can still dial it.
             View::Dial(addresses) if addresses.is_empty() => {
                 status.send_replace(None);
                 if !task.wait(&view, None).await {
@@ -288,10 +269,12 @@ mod tests {
     use tokio::{sync::oneshot, time::Instant as Clock};
 
     const SAVED: &str = "192.0.2.7:43119";
+    const DESK: &[u8] = &[1, 2, 3];
+    const OTHER: &[u8] = &[9, 9, 9];
 
     fn record() -> PeerConfig {
         PeerConfig::from_spki(
-            &[1, 2, 3],
+            DESK,
             vec![SAVED.parse().unwrap()],
             PeerPermissions {
                 connect: true,
@@ -303,17 +286,17 @@ mod tests {
         .unwrap()
     }
 
-    fn nearby(entries: &[(&str, &[&str])]) -> BTreeMap<String, Nearby> {
-        entries
-            .iter()
-            .map(|(instance, addresses)| {
-                let nearby = Nearby {
-                    addresses: addresses.iter().map(|a| a.parse().unwrap()).collect(),
-                    compatible: true,
-                };
-                (instance.to_string(), nearby)
-            })
-            .collect()
+    /// The computers around: each mDNS record, with the key its hello proved.
+    fn around(records: &[(&str, &[u8], &str)]) -> Neighbors {
+        let mut neighbors = Neighbors::new(&[0]);
+        let hello = crate::hello::make_hello("desk", 43119, Vec::new(), false);
+        for &(instance, spki, address) in records {
+            let address: SocketAddr = address.parse().unwrap();
+            neighbors.instance_seen(instance, vec![address], true, None);
+            let now = tokio::time::Instant::now();
+            neighbors.hello(spki, address, &hello, Some(instance), now);
+        }
+        neighbors
     }
 
     type Dial = (Vec<SocketAddr>, oneshot::Sender<Result<u64>>);
@@ -350,29 +333,29 @@ mod tests {
     struct Harness {
         fake: Arc<Fake>,
         link: Link,
-        nearby: watch::Sender<BTreeMap<String, Nearby>>,
+        neighbors: watch::Sender<Neighbors>,
         dials: mpsc::UnboundedReceiver<Dial>,
     }
 
-    fn harness(around: BTreeMap<String, Nearby>, session: Option<u64>) -> Harness {
+    fn harness(neighbors: Neighbors, session: Option<u64>) -> Harness {
         let (dial_sender, dials) = mpsc::unbounded_channel();
         let fake = Arc::new(Fake {
             session: std::sync::Mutex::new(session),
             changes: watch::Sender::new(()),
             dials: dial_sender,
         });
-        let nearby = watch::Sender::new(around);
+        let neighbors = watch::Sender::new(neighbors);
         let link = start(
             fake.clone(),
             "desk".into(),
             record(),
             fake.changes.subscribe(),
-            nearby.subscribe(),
+            neighbors.subscribe(),
         );
         Harness {
             fake,
             link,
-            nearby,
+            neighbors,
             dials,
         }
     }
@@ -382,26 +365,6 @@ mod tests {
             reason: reason.into(),
             needs_fix,
         })
-    }
-
-    #[test]
-    fn a_link_dials_only_the_computer_advertised_where_the_peer_was_paired() {
-        let around = nearby(&[
-            ("moved", &["192.0.2.9:43119"]),
-            ("desk", &["[2001:db8::7]:43119", "192.0.2.7:43119"]),
-        ]);
-        assert_eq!(
-            link_addresses(&record(), &around),
-            ["192.0.2.7:43119", "[2001:db8::7]:43119"].map(|a| a.parse().unwrap())
-        );
-        // A Mac that is not listening does not advertise, so its saved
-        // address matches nothing.
-        let mac = nearby(&[("other", &["192.0.2.9:43119"])]);
-        assert!(link_addresses(&record(), &mac).is_empty());
-        // Pairing over a dual-stack socket can save a mapped address.
-        let mut mapped = record();
-        mapped.addresses = vec!["[::ffff:192.0.2.7]:43119".parse().unwrap()];
-        assert_eq!(link_addresses(&mapped, &around).len(), 2);
     }
 
     #[test]
@@ -424,7 +387,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_link_backs_off_retries_on_request_and_redials_a_lost_session_at_once() {
-        let mut test = harness(nearby(&[("desk", &[SAVED])]), None);
+        let mut test = harness(around(&[("zf-desk", DESK, SAVED)]), None);
         let (addresses, answer) = test.dials.recv().await.unwrap();
         assert_eq!(addresses, [SAVED.parse().unwrap()]);
         assert_eq!(*test.link.status.borrow(), Some(LinkStatus::Connecting));
@@ -468,15 +431,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_link_waits_for_a_computer_that_does_not_listen_and_uses_its_session() {
-        // Only another computer advertises, as with a Mac that is not
-        // listening.
-        let mut test = harness(nearby(&[("other", &["192.0.2.9:43119"])]), None);
+    async fn a_link_dials_its_key_wherever_it_is_and_nowhere_else() {
+        // Another computer took the peer's saved address, and the peer, a
+        // Mac that is not listening, advertises nothing.
+        let mut test = harness(around(&[("zf-other", OTHER, SAVED)]), None);
         test.link.retry.send(()).unwrap();
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert!(
             test.dials.try_recv().is_err(),
-            "a computer that is not listening is never dialed"
+            "neither a computer that is not listening nor its namesake address is dialed"
         );
         assert_eq!(*test.link.status.borrow(), None);
 
@@ -485,16 +448,52 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert!(test.dials.try_recv().is_err());
 
-        // Without a session, a computer that starts listening there is dialed.
+        // Without a session, the peer is dialed where its hello says it is
+        // now, an address it was never saved at.
         test.fake.set_session(None);
-        test.nearby.send_replace(nearby(&[("desk", &[SAVED])]));
-        let (_, answer) = test.dials.recv().await.unwrap();
+        let moved = "192.0.2.70:43119";
+        test.neighbors.send_replace(around(&[
+            ("zf-other", OTHER, SAVED),
+            ("zf-desk", DESK, moved),
+        ]));
+        let (addresses, answer) = test.dials.recv().await.unwrap();
+        assert_eq!(addresses, [moved.parse().unwrap()]);
         answer.send(Ok(4)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn learning_an_address_restarts_neither_the_link_nor_sessions() {
+        let (shared, _kept) = test_daemon();
+        let directory = tempfile::tempdir().unwrap();
+        let desk = Identity::load_or_create(directory.path()).unwrap();
+        // Saved where nothing listens, so the link dials nothing real.
+        let saved: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        {
+            let _mutation = shared.config_mutation.lock().await;
+            let mut config = shared.config.read().await.clone();
+            crate::hello::trust_peer(&mut config, desk.spki(), "desk", &[saved]).unwrap();
+            shared.apply_config_locked(config, true).await.unwrap();
+        }
+        let link = shared.links.lock().await["desk"].retry.clone();
+        let generation = shared.policy_generation.load(Ordering::Acquire);
+
+        let moved: SocketAddr = "127.0.0.2:9".parse().unwrap();
+        shared.learn_address("desk", moved).await;
+        let config = shared.config.read().await.clone();
+        assert_eq!(config.peers["desk"].addresses, [moved, saved]);
+        assert_eq!(Config::load(&shared.config_path).unwrap(), config);
+        assert_eq!(shared.policy_generation.load(Ordering::Acquire), generation);
+        // The next change of something else syncs the links again.
+        let mut paused = config;
+        paused.switching.pause_at_edges = true;
+        let _mutation = shared.config_mutation.lock().await;
+        shared.apply_config_locked(paused, true).await.unwrap();
+        assert!(shared.links.lock().await["desk"].retry.same_channel(&link));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_stopped_link_stops_dialing() {
-        let mut test = harness(nearby(&[("desk", &[SAVED])]), None);
+        let mut test = harness(around(&[("zf-desk", DESK, SAVED)]), None);
         let (_, answer) = test.dials.recv().await.unwrap();
         answer.send(Err(anyhow!("timed out"))).unwrap();
         let down =

@@ -33,18 +33,21 @@ use crate::{
     },
     identity::{Identity, encode_hex},
     linux::{InjectionGate, OwnershipPhase, SeatState, watch_primary_seat},
+    neighbors::Neighbors,
+    pairing_window::PairingWindow,
     runtime::{
         LinuxRuntime, LinuxRuntimeConfig, LinuxRuntimeControl, RuntimeCloseReason, RuntimeCommand,
         RuntimeEvent,
     },
     session::{SessionEvent, SessionEventKind, SessionHandle, SessionOptions, start_session},
     transport::{
-        InputConnection, InputServerConfig, accept_input, connect_input, input_client_config,
-        input_server_config_for_peers,
+        Accepted, HelloClientConfig, InputConnection, InputServerConfig, TransportError, accept,
+        connect_input, hello_client_config, input_client_config, input_server_config_for_peers,
     },
 };
 
 const SESSION_EVENT_CAPACITY: usize = 1_024;
+mod arrange;
 mod clipboard;
 mod crossing;
 mod desktop;
@@ -69,8 +72,6 @@ const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_METRICS_HISTORY: usize = 128;
 const MAX_PENDING_HANDSHAKES: usize = 64;
 const MAX_LOCAL_CLIENTS: usize = 64;
-/// Nearby zflow computers kept as extra dial candidates, like the Mac app's list.
-const MAX_NEARBY: usize = 64;
 /// The shared layout this computer keeps, in its state directory.
 const LAYOUT_FILE: &str = "layout.json";
 /// A paired computer's tile has this size until that computer writes its own.
@@ -112,7 +113,6 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     fs::create_dir_all(&config.daemon.state_dir)?;
     fs::set_permissions(&config.daemon.state_dir, fs::Permissions::from_mode(0o700))?;
     let identity = Arc::new(Identity::load_or_create(&config.daemon.state_dir)?);
-    let process_epoch = random_epoch()?;
     let mut seat = watch_primary_seat();
     let mut runtime = LinuxRuntime::spawn(LinuxRuntimeConfig::from_config(&config))?;
     let mut stopping = stop_on_signal(terminate, interrupt, runtime.control());
@@ -123,8 +123,6 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
             config.transport.listen
         )
     })?;
-    let server_config = build_server_config(&identity, &config)?;
-    endpoint.set_server_config(server_config.as_ref().map(InputServerConfig::quinn_config));
 
     let socket_path = config.daemon.control_socket.clone();
     prepare_socket_path(&socket_path)?;
@@ -137,39 +135,15 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     let (accepted_tx, mut accepted_rx) = mpsc::channel(ACCEPT_EVENT_CAPACITY);
     // Give the first logind answer a moment so early requests see a real seat.
     let _ = tokio::time::timeout(SEAT_UNKNOWN_GRACE, seat.changed()).await;
-    let initial_seat = SeatGrace::new(seat.borrow().clone(), Instant::now()).gate();
-    let shared = Arc::new(Shared {
-        config: RwLock::new(config.clone()),
-        config_mutation: Mutex::new(()),
-        policy: Mutex::new(()),
-        policy_generation: AtomicU64::new(1),
+    let shared = Arc::new(Shared::new(
+        config.clone(),
         config_path,
-        identity_fingerprint: identity.fingerprint_hex(),
         identity,
-        process_epoch,
-        next_generation: AtomicU64::new(1),
-        next_activation: AtomicU64::new(1),
         endpoint,
-        server_config: RwLock::new(server_config),
-        runtime: runtime.control(),
-        sessions: Mutex::new(BTreeMap::new()),
-        session_changes: watch::Sender::new(()),
-        dialed: Mutex::new(BTreeMap::new()),
-        nearby: watch::Sender::new(BTreeMap::new()),
-        links: Mutex::new(BTreeMap::new()),
-        layout: Mutex::new(None),
-        crossing: Mutex::new(()),
-        metrics_history: Mutex::new(BTreeMap::new()),
-        arming_started: Mutex::new(None),
-        active_outbound: Mutex::new(None),
-        inbound_owner: Mutex::new(None),
-        chord_peer: Mutex::new(None),
-        clipboard_echo: Mutex::new(BTreeMap::new()),
-        desktop: desktop::Hub::default(),
+        runtime.control(),
         seat,
-        seat_gate: RwLock::new(initial_seat),
         session_events,
-    });
+    )?);
     desktop::start_local_sync(shared.clone());
     if let Err(error) = peer_view::start(shared.clone()) {
         tracing::warn!(%error, "desktop metadata API unavailable");
@@ -182,6 +156,9 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     let session_setup_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
     let local_slots = Arc::new(Semaphore::new(MAX_LOCAL_CLIENTS));
     let seat_watcher = tokio::spawn(watch_seat(shared.clone()));
+    let looking_around = arrange::start(shared.clone());
+    // The mDNS records fed to the neighbors, so they go when browsing stops.
+    let mut records = std::collections::BTreeSet::new();
     let mut discovery_retry = tokio::time::interval(DISCOVERY_RETRY_INTERVAL);
     discovery_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -230,23 +207,29 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                     let accepted_tx = accepted_tx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let result = match config {
-                            Some(config) => tokio::time::timeout(
-                                CONNECT_TIMEOUT,
-                                accept_input(incoming, &config),
-                            )
+                        let result = tokio::time::timeout(CONNECT_TIMEOUT, accept(incoming, &config))
                             .await
                             .map_err(|_| "input handshake timed out".to_owned())
-                            .and_then(|result| result.map_err(|error| error.to_string())),
-                            None => Err("input listener has no authorized peers".to_owned()),
-                        };
+                            .and_then(|result| result.map_err(|error| error.to_string()));
                         let _ = accepted_tx.send(result).await;
                     });
                 }
                 accepted = accepted_rx.recv() => {
                     if let Some(accepted) = accepted {
                         match accepted {
-                            Ok(connection) => {
+                            Ok(Accepted::Hello(hello)) => {
+                                let shared = shared.clone();
+                                tokio::spawn(async move { shared.answer_hello(hello).await });
+                            }
+                            // It trusts this computer, which does not trust it.
+                            Ok(Accepted::NotTrusted { peer_spki, remote_address }) => {
+                                tracing::debug!(%remote_address, "input refused from a computer not added here");
+                                shared.neighbors.send_if_modified(|neighbors| {
+                                    neighbors.refused_input(&peer_spki);
+                                    false
+                                });
+                            }
+                            Ok(Accepted::Input(connection)) => {
                                 let Ok(permit) = session_setup_slots.clone().try_acquire_owned() else {
                                     connection.close();
                                     tracing::warn!("authenticated session setup limit reached");
@@ -300,7 +283,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                         Err(error) => tracing::warn!(%error, "mDNS monitoring stopped"),
                     }
                     stop_discovery(&mut discovery).await;
-                    shared.change_nearby(BTreeMap::clear);
+                    shared.forget_records(&mut records);
                 }
                 event = next_discovery_event(discovery.as_ref()), if discovery.is_some() => {
                     match event {
@@ -309,30 +292,32 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                                 continue;
                             };
                             let local = local_unicast_addresses().unwrap_or_default();
-                            // A computer on another version stays listed, so its
-                            // link can say so.
-                            let found = links::Nearby {
-                                addresses: remote_addresses(candidate.socket_addresses(), &local),
-                                compatible: candidate.is_compatible(),
-                            };
+                            let addresses = remote_addresses(candidate.socket_addresses(), &local);
                             let instance = instance.to_string();
-                            shared.change_nearby(|nearby| {
-                                if found.addresses.is_empty() {
-                                    nearby.remove(&instance);
-                                } else if nearby.len() < MAX_NEARBY || nearby.contains_key(&instance) {
-                                    nearby.insert(instance, found);
-                                }
+                            let now = tokio::time::Instant::now();
+                            // A computer on another version stays listed, so
+                            // its tile can say so.
+                            if addresses.is_empty() {
+                                shared.neighbors.send_modify(|neighbors| neighbors.instance_gone(&instance, now));
+                                records.remove(&instance);
+                                continue;
+                            }
+                            let name = candidate.name().map(str::to_owned);
+                            shared.neighbors.send_modify(|neighbors| {
+                                neighbors.instance_seen(&instance, addresses, candidate.is_compatible(), name);
                             });
+                            records.insert(instance);
                         }
                         Ok(DiscoveryEvent::Removed(instance)) => {
-                            shared.change_nearby(|nearby| {
-                                nearby.remove(&instance.to_string());
-                            });
+                            let instance = instance.to_string();
+                            let now = tokio::time::Instant::now();
+                            shared.neighbors.send_modify(|neighbors| neighbors.instance_gone(&instance, now));
+                            records.remove(&instance);
                         }
                         Ok(DiscoveryEvent::Stopped) | Err(_) => {
                             tracing::warn!("mDNS browsing stopped");
                             stop_discovery(&mut discovery).await;
-                            shared.change_nearby(BTreeMap::clear);
+                            shared.forget_records(&mut records);
                         }
                     }
                 }
@@ -355,6 +340,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     // would autorepeat until then. A failed loop tells it here.
     let stopped = runtime.stop(RUNTIME_STOP_TIMEOUT).await;
     seat_watcher.abort();
+    looking_around.abort();
     shared.endpoint.close(0_u32.into(), b"daemon shutdown");
     stop_discovery(&mut discovery).await;
     served.and(stopped.map_err(anyhow::Error::from))
@@ -432,17 +418,23 @@ struct Shared {
     next_generation: AtomicU64,
     next_activation: AtomicU64,
     endpoint: Endpoint,
-    server_config: RwLock<Option<InputServerConfig>>,
+    server_config: RwLock<InputServerConfig>,
+    hello_config: HelloClientConfig,
+    /// Limits the hellos this computer has out at once.
+    hello_slots: Arc<Semaphore>,
     runtime: LinuxRuntimeControl,
     sessions: Mutex<BTreeMap<String, SessionHandle>>,
     /// Bumped whenever `sessions` gains or loses one, which links watch.
     session_changes: watch::Sender<()>,
     /// Sessions this computer dialed, by id, with when the dial finished.
     dialed: Mutex<BTreeMap<u64, Instant>>,
-    /// The zflow computers on the network, by mDNS instance. A dial on
-    /// demand also tries the compatible ones, with the peer's pinned key, so
-    /// a peer whose address changed is still found.
-    nearby: watch::Sender<BTreeMap<String, links::Nearby>>,
+    /// The zflow computers around this one, from mDNS and hellos. Links
+    /// find a peer here by its key, wherever it is now.
+    neighbors: watch::Sender<Neighbors>,
+    /// A fresh install's one-shot window for taking a computer by itself.
+    window: std::sync::Mutex<PairingWindow>,
+    /// Computers that joined lately, newest last.
+    notices: std::sync::Mutex<Vec<crate::hello::Notice>>,
     /// The live link to each peer this computer may send to.
     links: Mutex<BTreeMap<String, links::Link>>,
     /// The newest layout this computer has seen from any peer.
@@ -472,6 +464,57 @@ struct ActiveOutbound {
 }
 
 impl Shared {
+    fn new(
+        config: Config,
+        config_path: PathBuf,
+        identity: Arc<Identity>,
+        endpoint: Endpoint,
+        runtime: LinuxRuntimeControl,
+        seat: watch::Receiver<SeatState>,
+        session_events: mpsc::Sender<SessionEvent>,
+    ) -> Result<Self> {
+        // Always listening: hellos are answered before anything is trusted.
+        let server_config = build_server_config(&identity, &config)?;
+        endpoint.set_server_config(Some(server_config.quinn_config()));
+        let initial_seat = SeatGrace::new(seat.borrow().clone(), Instant::now()).gate();
+        Ok(Self {
+            config_mutation: Mutex::new(()),
+            policy: Mutex::new(()),
+            policy_generation: AtomicU64::new(1),
+            config_path,
+            identity_fingerprint: identity.fingerprint_hex(),
+            process_epoch: random_epoch()?,
+            next_generation: AtomicU64::new(1),
+            next_activation: AtomicU64::new(1),
+            endpoint,
+            server_config: RwLock::new(server_config),
+            hello_config: hello_client_config(&identity)?,
+            hello_slots: Arc::new(Semaphore::new(arrange::HELLO_SLOTS)),
+            runtime,
+            sessions: Mutex::new(BTreeMap::new()),
+            session_changes: watch::Sender::new(()),
+            dialed: Mutex::new(BTreeMap::new()),
+            neighbors: watch::Sender::new(Neighbors::new(identity.spki())),
+            window: std::sync::Mutex::new(PairingWindow::load(&config.daemon.state_dir)),
+            notices: std::sync::Mutex::new(Vec::new()),
+            links: Mutex::new(BTreeMap::new()),
+            layout: Mutex::new(None),
+            crossing: Mutex::new(()),
+            metrics_history: Mutex::new(BTreeMap::new()),
+            arming_started: Mutex::new(None),
+            active_outbound: Mutex::new(None),
+            inbound_owner: Mutex::new(None),
+            chord_peer: Mutex::new(None),
+            clipboard_echo: Mutex::new(BTreeMap::new()),
+            desktop: desktop::Hub::default(),
+            seat,
+            seat_gate: RwLock::new(initial_seat),
+            session_events,
+            identity,
+            config: RwLock::new(config),
+        })
+    }
+
     async fn status(&self) -> DaemonStatus {
         let runtime = self.runtime.status();
         let active = self.active_outbound.lock().await.clone();
@@ -832,14 +875,12 @@ impl Shared {
         if let Some(existing) = self.sessions.lock().await.get(peer).cloned() {
             return Ok(existing);
         }
-        let mut addresses = record.addresses.clone();
-        addresses.extend(
-            self.nearby
-                .borrow()
-                .values()
-                .filter(|nearby| nearby.compatible)
-                .flat_map(|nearby| nearby.addresses.iter().copied()),
-        );
+        // Where a hello proved its key now, then where it was saved.
+        let mut addresses = self
+            .neighbors
+            .borrow()
+            .addresses_for_key(&record.fingerprint_hex()?);
+        addresses.extend(&record.addresses);
         if addresses.is_empty() {
             bail!("peer {peer} has no configured input address and none was found nearby");
         }
@@ -863,6 +904,7 @@ impl Shared {
             &record.addresses,
         )
         .await?;
+        let remote = connection.remote_address();
         let generation = self.allocate_generation()?;
         let options = {
             let config = self.config.read().await;
@@ -880,7 +922,7 @@ impl Shared {
         let config = self.config.read().await;
         let current = config.peers.get(peer).cloned();
         if self.policy_generation.load(Ordering::Acquire) != policy_generation
-            || current.as_ref() != Some(record)
+            || current.as_ref().map(without_addresses) != Some(without_addresses(record))
             || current
                 .as_ref()
                 .is_none_or(|current| require_outbound_permission(&config, peer, current).is_err())
@@ -906,19 +948,51 @@ impl Shared {
             .await
             .insert(session.id(), Instant::now());
         drop(sessions);
+        drop(config);
         self.session_changes.send_replace(());
         self.offer_layout(&session).await;
+        self.learn_address(peer, remote).await;
         Ok(session)
     }
 
-    /// Changes the list of nearby computers, waking links only when it
-    /// really changed.
-    fn change_nearby(&self, change: impl FnOnce(&mut BTreeMap<String, links::Nearby>)) {
-        self.nearby.send_if_modified(|nearby| {
-            let before = nearby.clone();
-            change(nearby);
-            *nearby != before
-        });
+    /// Saves where a peer's authenticated session came from, so it is
+    /// dialed there next. Only addresses change, so links and sessions
+    /// carry on. Skipped while another change is being saved.
+    async fn learn_address(&self, peer: &str, address: SocketAddr) {
+        let Ok(_mutation) = self.config_mutation.try_lock() else {
+            return;
+        };
+        let old = self.config.read().await.clone();
+        let mut config = old.clone();
+        let Some(record) = config.peers.get_mut(peer) else {
+            return;
+        };
+        if !record.learn_addresses([address]) {
+            return;
+        }
+        match self.save_config(&old, &config) {
+            Ok(()) => *self.config.write().await = config,
+            Err(error) => tracing::debug!(%error, %peer, "address not saved"),
+        }
+    }
+
+    /// Where a peer that dialed in from `remote` takes input: that IP on
+    /// the port its hello named, else on a port it was saved with. A Mac
+    /// dials from a passing port, so the source port says nothing.
+    async fn input_address(&self, peer: &str, spki: &[u8], remote: SocketAddr) -> SocketAddr {
+        let key = crate::neighbors::fingerprint(spki);
+        let heard = self
+            .neighbors
+            .borrow()
+            .neighbor(&key)
+            .and_then(|neighbor| neighbor.addresses.first().map(SocketAddr::port));
+        let config = self.config.read().await;
+        let saved = config
+            .peers
+            .get(peer)
+            .and_then(|record| record.addresses.first().map(SocketAddr::port));
+        let port = heard.or(saved).unwrap_or(config.transport.listen.port());
+        SocketAddr::new(remote.ip().to_canonical(), port)
     }
 
     /// Whether this computer's own dial to `peer` just finished and wins
@@ -937,8 +1011,20 @@ impl Shared {
         let policy_generation = self.policy_generation.load(Ordering::Acquire);
         let peer = {
             let config = self.config.read().await;
-            peer_name_for_spki(&config, connection.peer_spki())?
+            peer_name_for_spki(&config, connection.peer_spki())
         };
+        // The listener keeps trusted keys while sharing is paused, so they
+        // are not told they were never added.
+        let peer = match peer {
+            Ok(peer) => peer,
+            Err(error) => {
+                connection.close();
+                return Err(error);
+            }
+        };
+        let remote = self
+            .input_address(&peer, &peer_spki, connection.remote_address())
+            .await;
         if self.keeps_own_dial(&peer).await {
             connection.close();
             bail!("{peer} dialed while this computer did; keeping this computer's connection");
@@ -984,10 +1070,11 @@ impl Shared {
                 let mut sessions = self.sessions.lock().await;
                 match sessions.get(&peer) {
                     None => {
-                        sessions.insert(peer, session.clone());
+                        sessions.insert(peer.clone(), session.clone());
                         drop(sessions);
                         self.session_changes.send_replace(());
                         self.offer_layout(&session).await;
+                        self.learn_address(&peer, remote).await;
                         return Ok(());
                     }
                     Some(_) if own_dial => {
@@ -1256,6 +1343,23 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
             shared.activate(&peer).await?;
             Ok(Response::Ack)
         }
+        Request::Nearby { add } => {
+            if let Some(address) = add {
+                shared.add_address(address)?;
+            }
+            let config = shared.config.read().await;
+            Ok(Response::Nearby {
+                computers: shared.unplaced(&config),
+                pairing_window: shared.window().view(tokio::time::Instant::now()),
+            })
+        }
+        Request::Trust { computer } => {
+            let _mutation = shared.config_mutation.lock().await;
+            let config = shared.config.read().await.clone();
+            let id = shared.find_unplaced(&config, &computer)?;
+            let name = shared.trust(config, &id, None).await?;
+            Ok(Response::Trusted { name })
+        }
     }
 }
 
@@ -1386,8 +1490,7 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
 }
 
 /// Dials every address at once and keeps the first connection. `saved` are
-/// the peer's own addresses; the rest belong to whatever zflow computer is
-/// nearby, so a wrong key there is another computer, not a reset peer.
+/// the peer's own addresses; see [`dial_error`] for what a failure means.
 async fn race_connect(
     endpoint: &Endpoint,
     identity: &Identity,
@@ -1411,12 +1514,7 @@ async fn race_connect(
                 .await
             {
                 Err(_) => Err(anyhow!("input connection to {address} timed out")),
-                Ok(Ok(connection)) => Ok(connection),
-                Ok(Err(error)) if own => Err(error.into()),
-                Ok(Err(error)) => Err(match crate::link::Fix::of_transport(&error) {
-                    Some(_) => anyhow!("another zflow computer answered at {address}"),
-                    None => error.into(),
-                }),
+                Ok(result) => result.map_err(|error| dial_error(error, own, address)),
             }
         });
     }
@@ -1440,6 +1538,20 @@ async fn race_connect(
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow!("peer has no connection candidates")))
+}
+
+/// What a failed dial at `address` means. A wrong key there is the peer
+/// reset only at one of its own addresses; elsewhere it is whatever other
+/// zflow computer took that address. Only the pinned key can say it has
+/// not added this computer, so that answer counts wherever it came from.
+fn dial_error(error: TransportError, own: bool, address: SocketAddr) -> anyhow::Error {
+    if own || matches!(error, TransportError::NotTrusted) {
+        return error.into();
+    }
+    match crate::link::Fix::of_transport(&error) {
+        Some(_) => anyhow!("another zflow computer answered at {address}"),
+        None => error.into(),
+    }
 }
 
 /// Keeps the inbound gate in step with the seat watch and ends the inbound
@@ -1847,20 +1959,26 @@ fn validate_peer_identities(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn build_server_config(identity: &Identity, config: &Config) -> Result<Option<InputServerConfig>> {
-    if !config.daemon.sharing {
-        return Ok(None);
-    }
+/// The input port's listener: hellos from anyone, input from the keys
+/// trusted here. While sharing is paused, input from them is refused once
+/// it arrives rather than by the allowlist, which would tell them they
+/// were never added.
+fn build_server_config(identity: &Identity, config: &Config) -> Result<InputServerConfig> {
     let peers = config
         .peers
         .values()
         .filter(|peer| peer.permissions.connect)
         .map(PeerConfig::spki_der)
         .collect::<Result<Vec<_>, _>>()?;
-    if peers.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(input_server_config_for_peers(identity, &peers)?))
+    Ok(input_server_config_for_peers(identity, &peers)?)
+}
+
+/// A record as far as trust goes: the addresses it learns do not change
+/// whom it trusts, so they restart nothing.
+fn without_addresses(record: &PeerConfig) -> PeerConfig {
+    PeerConfig {
+        addresses: Vec::new(),
+        ..record.clone()
     }
 }
 
@@ -2329,7 +2447,7 @@ impl Shared {
         }
         let _policy = self.policy.lock().await;
         self.endpoint
-            .set_server_config(replacement.as_ref().map(InputServerConfig::quinn_config));
+            .set_server_config(Some(replacement.quinn_config()));
         *self.server_config.write().await = replacement;
         *self.config.write().await = config.clone();
         self.policy_generation.fetch_add(1, Ordering::AcqRel);
@@ -2428,6 +2546,38 @@ impl Shared {
     }
 }
 
+/// A daemon without an input thread, desktop or mDNS, with its files in a
+/// temporary directory, and what it needs kept alive.
+#[cfg(test)]
+fn test_daemon() -> (Arc<Shared>, Box<dyn std::any::Any>) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.daemon.state_dir = directory.path().join("state");
+    config.daemon.control_socket = directory.path().join("control.sock");
+    fs::create_dir_all(&config.daemon.state_dir).unwrap();
+    let config_path = directory.path().join("zflow.toml");
+    config.save(&config_path).unwrap();
+    let identity = Arc::new(Identity::load_or_create(&config.daemon.state_dir).unwrap());
+    let endpoint = Endpoint::client(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))).unwrap();
+    let (runtime, commands, poll) = LinuxRuntimeControl::queue(16);
+    let (seat_sender, seat) = watch::channel(SeatState::Unknown {
+        reason: "test".into(),
+    });
+    let (session_events, events) = mpsc::channel(SESSION_EVENT_CAPACITY);
+    let shared = Shared::new(
+        config,
+        config_path,
+        identity,
+        endpoint,
+        runtime,
+        seat,
+        session_events,
+    )
+    .unwrap();
+    let kept = (directory, commands, poll, seat_sender, events);
+    (Arc::new(shared), Box::new(kept))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2471,6 +2621,24 @@ mod tests {
     }
 
     #[test]
+    fn only_the_peer_itself_can_say_it_has_not_added_this_computer() {
+        use crate::link::Fix;
+        let address = "192.0.2.7:43119".parse().unwrap();
+        let fix = |error, own| Fix::of(&dial_error(error, own, address));
+        // Found by its key somewhere it was never saved, the pinned key
+        // answered; nobody else could.
+        assert_eq!(
+            fix(TransportError::NotTrusted, false),
+            Some(Fix::WaitingForThem)
+        );
+        assert_eq!(fix(TransportError::PeerIdentityMismatch, false), None);
+        assert_eq!(
+            fix(TransportError::PeerIdentityMismatch, true),
+            Some(Fix::PairAgain)
+        );
+    }
+
+    #[test]
     fn pausing_blocks_both_directions_and_preserves_peer_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let identity = Identity::load_or_create(dir.path()).unwrap();
@@ -2494,7 +2662,6 @@ mod tests {
             InjectionGate::Normal { uid: 1000 }
         ));
         assert!(require_outbound_permission(&config, "mac", &record).is_ok());
-        assert!(build_server_config(&identity, &config).unwrap().is_some());
         config.daemon.sharing = false;
         assert!(!receiver_authorized(
             &config,
@@ -2509,7 +2676,8 @@ mod tests {
         assert!(require_outbound_permission(&config, "mac", &record).is_err());
         assert!(eligible_outbound_peers(&config).is_empty());
         assert!(peer_name_for_spki(&config, identity.spki()).is_err());
-        assert!(build_server_config(&identity, &config).unwrap().is_none());
+        // The port still answers hellos.
+        assert!(build_server_config(&identity, &config).is_ok());
         assert_eq!(config.peers["mac"], record);
         config.daemon.sharing = true;
         assert_eq!(eligible_outbound_peers(&config), vec!["mac"]);

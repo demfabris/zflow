@@ -4,10 +4,26 @@ import Gdk from 'gi://Gdk?version=4.0';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk?version=4.0';
-import {Settings} from '../packaging/gnome-extension/settings.js';
+import {Settings, markColors} from '../packaging/gnome-extension/settings.js';
 import {statusText} from '../packaging/gnome-extension/client.js';
 
 function assert(value, message) { if (!value) throw new Error(message); }
+// The first widget under `widget`, inside rows' own parts too, that matches.
+function descendant(widget, matches) {
+    for (let child = widget.get_first_child(); child; child = child.get_next_sibling()) {
+        if (matches(child)) return child;
+        const found = descendant(child, matches);
+        if (found) return found;
+    }
+    return null;
+}
+// The palette indexes a drawn mark shows.
+function drawnMark(box) {
+    const colors = [];
+    for (let child = box.get_first_child(); child; child = child.get_next_sibling())
+        colors.push(Number(child.get_css_classes().find(name => /^zf-mark-\d$/.test(name)).slice('zf-mark-'.length)));
+    return colors.join();
+}
 function controller(widget, type) {
     const list = widget.observe_controllers();
     for (let i = 0; i < list.get_n_items(); i++) {
@@ -35,7 +51,10 @@ function waitFor(predicate) {
 }
 
 // src/app/api.rs Snapshot, as the agent sends it.
-const peer = (name, fields = {}) => ({name, state: 'paired', detail: 'Paired', allow_control: true, keyboard: 'standard', reverse_scroll: false, ...fields});
+const peer = (name, fields = {}) => ({name, state: 'paired', detail: 'Paired', allow_control: true, keyboard: 'standard', reverse_scroll: false, mark: '3d4f00', ...fields});
+// src/neighbors.rs Unplaced: a computer found on the network.
+const found = (id, name, state, fields = {}) => ({id, name, os: null, mark: null, version: null, state, trusts_you: false, via: 'mdns', ...fields});
+const closedWindow = {state: 'never', seconds_left: null, holding: null, reason: null};
 const ready = {state: 'ready', peer: null, title: 'Ready'};
 // src/app/layout_model.rs Layout: this computer's view, where its own tile has no peer.
 const layout = {monitors: [
@@ -45,9 +64,10 @@ const layout = {monitors: [
 const snapshot = {
     api: 2, status: ready, sharing: true,
     health: [{id: 'service', level: 'ok', title: 'Background service', detail: 'Running', action: null}],
-    layout, peers: [peer('MacBook')], pairing: {state: 'idle'}, nearby: [], pause_at_edges: false,
+    pairing_window: closedWindow, layout, own_mark: 'a1b2c3', unplaced: [],
+    peers: [peer('MacBook')], pairing: {state: 'idle'}, nearby: [], pause_at_edges: false,
     shortcuts: [{title: 'Return input to this computer', keys: 'Ctrl+Super+Backspace'}],
-    share_clipboard: false, autostart: true, config_path: '/etc/zflow/zflow.toml', platform: null,
+    share_clipboard: false, autostart: true, config_path: '/etc/zflow/zflow.toml', notices: [], platform: null,
 };
 const find = name => snapshot.peers.find(peer => peer.name === name);
 let failSharing = false;
@@ -59,6 +79,9 @@ let scrollCalls = 0;
 let clipboardCalls = 0;
 let logsOpened = 0;
 const moves = [];
+const places = [];
+const added = [];
+const forgotten = [];
 const xml = '<node><interface name="io.zflow.Desktop"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>';
 const object = Gio.DBusExportedObject.wrapJSObject(xml, {
     Call(json) {
@@ -79,7 +102,22 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
             snapshot.share_clipboard = request.share;
             break;
         case 'open_logs': logsOpened++; break;
-        case 'forget': snapshot.peers = snapshot.peers.filter(peer => peer.name !== request.name); break;
+        case 'forget':
+            forgotten.push(request.name);
+            snapshot.peers = snapshot.peers.filter(peer => peer.name !== request.name);
+            break;
+        case 'place': {
+            places.push(request);
+            const computer = snapshot.unplaced.find(({id}) => id === request.id);
+            snapshot.unplaced = snapshot.unplaced.filter(other => other !== computer);
+            snapshot.peers.push(peer(computer.name, {mark: computer.mark}));
+            layout.monitors.push({id: `peer:${computer.name}`, label: computer.name, peer: computer.name, x: request.x, y: request.y, width: 1920, height: 1080});
+            break;
+        }
+        case 'add_address':
+            assert(Object.keys(request).join() === 'command,address', 'adding sends only the address');
+            added.push(request.address);
+            break;
         case 'set_peer': {
             const peer = find(request.name);
             const fields = ['keyboard', 'allow_control', 'reverse_scroll'].filter(field => field in request);
@@ -151,6 +189,10 @@ app.connect('activate', () => {
         const local = settings._tiles.get('local').button;
         assert(settings._tiles.get('peer:MacBook').label.label === 'MacBook' && mac.tooltip_text === 'MacBook', 'tiles are labelled');
         assert(local.has_css_class('suggested-action') && !mac.has_css_class('suggested-action'), 'this computer is marked');
+        // Every tile shows its key's mark: four colors, one per hex digit, as on the Mac.
+        assert(markColors('a1b2c3').join() === '2,1,3,2' && markColors('zz').length === 0, 'marks read the seed');
+        assert(drawnMark(settings._tiles.get('local').mark) === markColors('a1b2c3').join(), 'this computer shows its own mark');
+        assert(drawnMark(settings._tiles.get('peer:MacBook').mark) === markColors('3d4f00').join(), 'a peer shows its mark');
         await settings.client.refresh();
         assert(settings._tiles.get('peer:MacBook').button === mac, 'an unchanged snapshot keeps the tiles');
         // An arrow key moves the focused tile 100 units and snaps within 150, as on the Mac.
@@ -247,6 +289,94 @@ app.connect('activate', () => {
         assert(settings._peerRows[0].expanded, 'a rebuilt row stays open');
         assert(settings._peerRows[0].subtitle === 'Controlled from here', 'the row shows the state the agent sends');
         Object.assign(find('MacBook'), {state: 'connected', detail: 'Connected'});
+
+        // Computers found on the network wait on a shelf under the board.
+        assert(!settings._shelf.visible && settings._found.size === 0, 'no shelf while nothing is found');
+        snapshot.unplaced = [
+            found('key:aa', 'fedora', 'ready', {os: 'linux', mark: '1abc9e', trusts_you: true}),
+            found('key:bb', 'laptop', 'duplicate_name', {os: 'macos', mark: 'ffffff'}),
+            found('instance:zf-old', 'old', 'different_version'),
+        ];
+        await settings.client.refresh();
+        await waitFor(() => settings._found.size === 3 && settings._shelf.visible);
+        const fedora = settings._found.get('key:aa');
+        assert(fedora.name.label === 'fedora' && fedora.detail.label === 'Linux · Added you', `a found tile says what it is: ${fedora.detail.label}`);
+        assert(drawnMark(fedora.mark) === markColors('1abc9e').join(), 'a found tile shows its mark');
+        assert(settings._found.get('key:bb').detail.label === 'Same name as another' && settings._found.get('key:bb').button.sensitive, 'a namesake can still be placed');
+        const old = settings._found.get('instance:zf-old');
+        assert(!old.button.sensitive && old.detail.label === 'Different zflow version', 'another version cannot be placed');
+        assert(fedora.y >= 200 && settings._area.content_height > 200, 'the shelf sits under the board');
+        // Dragging one from another version does nothing.
+        drag.emit('drag-begin', old.x + 5, old.y + 5);
+        drag.emit('drag-update', 0, -120);
+        drag.emit('drag-end', 0, -120);
+        // Let go on the shelf, a found computer goes back to it.
+        drag.emit('drag-begin', fedora.x + 5, fedora.y + 5);
+        drag.emit('drag-update', 20, 4);
+        drag.emit('drag-end', 20, 4);
+        await waitFor(() => !settings._busy);
+        assert(places.length === 0, `only a drop on the board places: ${JSON.stringify(places)}`);
+        // Dropped on the board, it is placed where its middle landed.
+        const middle = [100, 100];
+        const [dx, dy] = [middle[0] - (fedora.x + 66), middle[1] - (fedora.y + 32)];
+        drag.emit('drag-begin', fedora.x + 5, fedora.y + 5);
+        drag.emit('drag-update', dx, dy);
+        const {left: originX, top: originY, offsetX, offsetY} = settings._origin;
+        const unit = settings._scale;
+        drag.emit('drag-end', dx, dy);
+        await waitFor(() => places.length === 1 && !settings._busy);
+        const landed = [originX + (middle[0] - offsetX) / unit - 960, originY + (middle[1] - offsetY) / unit - 540].map(Math.round);
+        const placed = {command: 'place', id: 'key:aa', x: landed[0], y: landed[1], tolerance: Math.round(14 / unit)};
+        assert(JSON.stringify(places[0]) === JSON.stringify(placed), `a drop sends one place: ${JSON.stringify(places)}`);
+        await waitFor(() => !settings._found.has('key:aa') && settings._tiles.has('peer:fedora'));
+        assert(drawnMark(settings._tiles.get('peer:fedora').mark) === markColors('1abc9e').join(), 'a placed computer keeps its mark');
+        // With the keyboard, Enter puts one beside this computer.
+        const laptop = settings._found.get('key:bb');
+        assert(controller(laptop.button, Gtk.EventControllerKey).emit('key-pressed', Gdk.KEY_Return, 0, 0), 'a found tile takes Enter');
+        await waitFor(() => places.length === 2 && !settings._busy);
+        assert(JSON.stringify(places[1]) === JSON.stringify({command: 'place', id: 'key:bb', x: 2560, y: 0, tolerance: 150}), `Enter places it beside this computer: ${JSON.stringify(places[1])}`);
+        await waitFor(() => settings._found.size === 1);
+
+        // A computer that joined by itself can be forgotten from here.
+        snapshot.notices = [{id: 1, kind: 'joined', name: 'fedora'}];
+        await settings.client.refresh();
+        await waitFor(() => settings._joinedRow.visible);
+        assert(settings._joinedRow.title === 'fedora joined', 'the notice names the computer');
+        descendant(settings._joinedRow, widget => widget instanceof Gtk.Button && widget.label === 'Forget').emit('clicked');
+        await waitFor(() => forgotten.includes('fedora') && !settings._busy);
+        assert(!settings._joinedRow.visible && !find('fedora'), 'forgetting takes it out of the arrangement');
+        snapshot.notices.push({id: 2, kind: 'joined', name: 'laptop'});
+        await settings.client.refresh();
+        await waitFor(() => settings._joinedRow.visible && settings._joinedRow.title === 'laptop joined');
+        settings._dismissJoined();
+        await settings.client.refresh();
+        assert(!settings._joinedRow.visible, 'a dismissed notice stays away');
+        // Forgetting asks nothing: the computer goes back on the shelf.
+        descendant(settings._computers, widget => widget instanceof Gtk.Button && widget.tooltip_text === 'Forget laptop').emit('clicked');
+        await waitFor(() => forgotten.includes('laptop') && !settings._busy);
+        assert(!find('laptop'), 'forget needs no confirmation');
+
+        // A fresh install's window shows how long it takes a computer by itself.
+        snapshot.pairing_window = {state: 'open', seconds_left: 530, holding: null, reason: null};
+        await settings.client.refresh();
+        await waitFor(() => settings._windowRow.visible);
+        assert(settings._windowRow.title === 'This computer is new' && settings._windowRow.subtitle.includes('9 minutes'), `the window counts down: ${settings._windowRow.subtitle}`);
+        snapshot.pairing_window = {state: 'open', seconds_left: 520, holding: {name: 'fedora', mark: '1abc9e', ms_left: 2400}, reason: null};
+        await settings.client.refresh();
+        await waitFor(() => settings._windowRow.title === 'Adding fedora');
+        assert(settings._windowRow.subtitle.startsWith('In 3 s') && drawnMark(settings._windowMark) === markColors('1abc9e').join(), 'the computer about to join is named and marked');
+        snapshot.pairing_window = {state: 'closed', seconds_left: null, holding: null, reason: 'accepted'};
+        await settings.client.refresh();
+        await waitFor(() => !settings._windowRow.visible);
+
+        // An address mDNS cannot reach gets a hello, and what answers shows up on the shelf.
+        settings._openAddAddress();
+        settings._addDialog.entry.text = ' 100.64.0.7 ';
+        settings._addDialog.dialog.emit('response', 'look_up');
+        await waitFor(() => added.length === 1 && !settings._busy);
+        assert(added[0] === '100.64.0.7', 'the typed address is sent');
+        settings._addDialog.dialog.force_close();
+
         settings._sharing.active = false;
         await waitFor(() => !snapshot.sharing && !settings._busy);
         assert(settings._status.title === 'Paused', 'pause reaches daemon and refreshes status');
@@ -276,6 +406,11 @@ app.connect('activate', () => {
         const fresh = new Settings(freshWindow);
         freshWindow.content = fresh.page;
         freshWindow.present();
+        await waitFor(() => fresh._sharing.sensitive);
+        // A fresh install waits for computers on the shelf; code pairing
+        // opens only when asked for.
+        assert(!fresh._pairing && fresh._peerRows[0].title === 'No computers added yet', 'a fresh install does not open code pairing by itself');
+        fresh._openPairing();
         await waitFor(() => fresh._pairing !== null && snapshot.pairing.state === 'listening' && fresh._pairing.code.label === '482 913');
         // A computer proves the code; nothing is saved until the person here allows it.
         snapshot.pairing = {state: 'confirm', name: 'Stranger', address: '192.0.2.66'};
@@ -318,7 +453,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, checks, shortcuts, focus, layout moves, keyboard mode, control permission, reverse scrolling, pause at edges, share clipboard, logs, open rows, pause, rollback, login, pairing, first-run pairing, allow and decline, forget, offline and cleanup passed');
+        print('GTK settings: status, checks, shortcuts, focus, layout moves, marks, the shelf, placing, joined notices, the pairing window, add by address, keyboard mode, control permission, reverse scrolling, pause at edges, share clipboard, logs, open rows, pause, rollback, login, pairing, first run, allow and decline, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

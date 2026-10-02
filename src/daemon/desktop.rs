@@ -501,10 +501,17 @@ pub(super) async fn serve(
     });
     let mut latest = shared.seat.clone();
     let mut seat = SeatGrace::new(latest.borrow_and_update().clone(), Instant::now());
+    let mut window_asked = false;
     let result = async {
         write_message(&mut stream, &DesktopResponse::Finished).await?;
         loop {
             authorize_peer(&stream, daemon_uid, seat.state.active_authenticated_uid())?;
+            // Someone is at this unlocked desktop, so a fresh install's
+            // pairing window may open. An ssh install alone never opens it.
+            if !window_asked && matches!(seat.state, SeatState::Unlocked(_)) {
+                window_asked = true;
+                shared.open_pairing_window().await;
+            }
             let lease_deadline = shared.desktop.lease_deadline().await;
             tokio::select! {
                 job = jobs.recv() => {
