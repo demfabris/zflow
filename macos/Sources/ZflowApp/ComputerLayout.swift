@@ -397,6 +397,8 @@ struct KeyMark: View {
         RoundedRectangle(cornerRadius: 2).fill(Self.palette[index]).frame(width: 7, height: 7)
       }
     }
+    // The text form a notification or `zflow nearby` gives.
+    .help("Mark \(mark)")
     .accessibilityHidden(true)
   }
 }

@@ -15,7 +15,7 @@ private func snapshot(
     "keyboard":"standard","reverse_scroll":false,"mark":"0123ab"}
     """
   }
-  let posts = notices.map { #"{"id":\#($0),"kind":"joined","name":"desk"}"# }
+  let posts = notices.map { #"{"id":\#($0),"kind":"joined","name":"desk","mark":"a1b2c3"}"# }
   let monitors = peers.map { name, _ in
     """
     {"id":"peer:\(name)","label":"\(name)","peer":"\(name)","x":1512,"y":0,"width":1920,"height":1080}

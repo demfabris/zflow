@@ -29,7 +29,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
   private func post(_ notice: Notice) {
     let content = UNMutableNotificationContent()
     content.title = "\(notice.name) joined"
-    content.body = "It can share this Mac’s keyboard and mouse. Not yours?"
+    content.body = "Its mark is \(notice.mark). It can share this Mac’s keyboard and mouse. Not yours?"
     content.categoryIdentifier = Self.category
     content.userInfo = ["name": notice.name]
     let request = UNNotificationRequest(

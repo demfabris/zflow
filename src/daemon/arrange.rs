@@ -72,7 +72,7 @@ impl Shared {
             let config = self.config.read().await.clone();
             match self.trust(config, &stranger.key, None).await {
                 Ok(name) => {
-                    tracing::info!(peer = %name, "computer joined while the pairing window was open")
+                    tracing::info!(peer = %name, mark = %stranger.mark, "computer joined while the pairing window was open")
                 }
                 Err(error) => {
                     tracing::warn!(error = %format_args!("{error:#}"), "pairing window could not add a computer")
@@ -198,9 +198,9 @@ impl Shared {
         self.neighbors.borrow().unplaced(config)
     }
 
-    /// The `key:` id of the found computer with this name or mark, for the
-    /// command line. A name two computers share needs the mark.
-    pub(super) fn find_unplaced(&self, config: &Config, computer: &str) -> Result<String> {
+    /// The found computer with this name or mark, for the command line. A
+    /// name two computers share needs the mark.
+    pub(super) fn find_unplaced(&self, config: &Config, computer: &str) -> Result<Unplaced> {
         let tiles = self.unplaced(config);
         let matches: Vec<&Unplaced> = tiles
             .iter()
@@ -215,7 +215,7 @@ impl Shared {
         match matches[..] {
             [] => bail!("No computer called {computer} was found; run zflow nearby"),
             [tile] => match tile.state {
-                UnplacedState::Ready | UnplacedState::DuplicateName => Ok(tile.id.clone()),
+                UnplacedState::Ready | UnplacedState::DuplicateName => Ok(tile.clone()),
                 UnplacedState::Identifying => bail!("{computer} has not answered yet; try again"),
                 UnplacedState::DifferentVersion => {
                     bail!("{computer} runs another zflow version. Update both computers")
@@ -286,7 +286,7 @@ impl Shared {
         {
             tracing::debug!(%error, peer = %name, "placed beside this computer instead");
         }
-        self.post_joined(&name);
+        self.post_joined(&name, &neighbor.mark);
         Ok(name)
     }
 
@@ -309,9 +309,10 @@ impl Shared {
         })
     }
 
-    /// Tells the person here that `name` joined: a notification now, and a
-    /// notice the settings window shows with a way to forget it.
-    fn post_joined(self: &Arc<Self>, name: &str) {
+    /// Tells the person here that `name` joined, with its key's `mark`: a
+    /// notification now, and a notice the settings window shows with a way
+    /// to forget it.
+    fn post_joined(self: &Arc<Self>, name: &str, mark: &str) {
         {
             let mut notices = self.notices.lock().unwrap_or_else(PoisonError::into_inner);
             let id = notices.last().map_or(1, |last| last.id + 1);
@@ -319,17 +320,24 @@ impl Shared {
                 id,
                 kind: NoticeKind::Joined,
                 name: name.to_owned(),
+                mark: mark.to_owned(),
             });
             if notices.len() > MAX_NOTICES {
                 notices.remove(0);
             }
         }
-        let message = format!(
-            "{name} joined. It can share this computer's keyboard and mouse. Not yours? Forget it in zflow settings."
-        );
+        let message = joined_message(name, mark);
         let shared = self.clone();
         tokio::spawn(async move { shared.desktop.notify(message).await });
     }
+}
+
+/// The notification for a computer that joined. Its mark is what tells it
+/// from another computer with its name.
+fn joined_message(name: &str, mark: &str) -> String {
+    format!(
+        "{name} joined, with mark {mark}. It can share this computer's keyboard and mouse. Not yours? Forget it in zflow settings."
+    )
 }
 
 #[cfg(test)]
@@ -390,7 +398,11 @@ mod tests {
         let layout = shared.layout.lock().await.clone().unwrap();
         assert_eq!(tile_at(&layout, &id), Some((-1920, 0)));
         assert!(shared.unplaced(&config).is_empty());
-        assert_eq!(shared.notices()[0].name, "desk");
+        let notice = &shared.notices()[0];
+        let mark = crate::neighbors::mark(desk.spki());
+        assert_eq!((notice.name.as_str(), &notice.mark), ("desk", &mark));
+        let message = joined_message("desk", &mark);
+        assert!(message.starts_with(&format!("desk joined, with mark {mark}.")));
 
         // Once only, and only computers that said hello.
         assert!(place(&shared, &id, None).await.is_err());
@@ -494,6 +506,6 @@ mod tests {
         assert!(error.to_string().contains("mark"), "{error}");
         assert!(shared.find_unplaced(&config, "laptop").is_err());
         let mark = crate::neighbors::mark(one.spki()).to_uppercase();
-        assert_eq!(shared.find_unplaced(&config, &mark).unwrap(), first);
+        assert_eq!(shared.find_unplaced(&config, &mark).unwrap().id, first);
     }
 }

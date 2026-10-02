@@ -319,14 +319,15 @@ app.connect('activate', () => {
         await waitFor(() => settings._found.size === 1);
 
         // A computer that joined by itself can be forgotten from here.
-        snapshot.notices = [{id: 1, kind: 'joined', name: 'fedora'}];
+        snapshot.notices = [{id: 1, kind: 'joined', name: 'fedora', mark: '1abc9e'}];
         await settings.client.refresh();
         await waitFor(() => settings._joinedRow.visible);
         assert(settings._joinedRow.title === 'fedora joined', 'the notice names the computer');
+        assert(drawnMark(settings._joinedMark) === markColors('1abc9e').join() && settings._joinedMark.tooltip_text === 'Mark 1abc9e', 'the notice shows its mark');
         descendant(settings._joinedRow, widget => widget instanceof Gtk.Button && widget.label === 'Forget').emit('clicked');
         await waitFor(() => forgotten.includes('fedora') && !settings._busy);
         assert(!settings._joinedRow.visible && !find('fedora'), 'forgetting takes it out of the arrangement');
-        snapshot.notices.push({id: 2, kind: 'joined', name: 'laptop'});
+        snapshot.notices.push({id: 2, kind: 'joined', name: 'laptop', mark: 'ffffff'});
         await settings.client.refresh();
         await waitFor(() => settings._joinedRow.visible && settings._joinedRow.title === 'laptop joined');
         settings._dismissJoined();

@@ -709,17 +709,19 @@ impl NativeApp {
         let addresses = self.neighbors.addresses_for_key(key);
         let config = &mut self.document.draft;
         let name = hello::trust_peer(config, &neighbor.spki, &neighbor.name, &addresses)?;
+        let mark = neighbor.mark.clone();
         self.save_config()?;
-        self.joined(&name);
+        self.joined(&name, &mark);
         Ok(name)
     }
 
-    fn joined(&mut self, name: &str) {
+    fn joined(&mut self, name: &str, mark: &str) {
         let id = self.notices.last().map_or(1, |notice| notice.id + 1);
         self.notices.push(Notice {
             id,
             kind: NoticeKind::Joined,
             name: name.to_owned(),
+            mark: mark.to_owned(),
         });
         if self.notices.len() > MAX_NOTICES {
             self.notices.remove(0);
@@ -767,7 +769,7 @@ impl NativeApp {
         if let Some(name) = namesake.and_then(|monitor| monitor.peer.clone()) {
             let old = config.peers.get(&name).context("Unknown computer")?;
             let old = old.fingerprint_hex()?;
-            let spki = neighbor.spki.clone();
+            let (spki, mark) = (neighbor.spki.clone(), neighbor.mark.clone());
             let addresses = self.neighbors.addresses_for_key(key);
             hello::replace_key(&mut self.document.draft, &name, &spki, &addresses)?;
             self.save_config()?;
@@ -780,8 +782,8 @@ impl NativeApp {
                 self.keep_layout(next);
                 self.show_shared()?;
             }
-            tracing::info!(%name, "placed onto its old tile with a new key");
-            self.joined(&name);
+            tracing::info!(%name, %mark, "placed onto its old tile with a new key");
+            self.joined(&name, &mark);
         } else {
             ensure!(
                 config.peers.len() + 1 < MAX_SHARED_TILES,
@@ -1776,6 +1778,7 @@ mod tests {
         assert_eq!(value["peers"][0]["mark"], mark(desk.spki()));
         assert_eq!(value["notices"][0]["kind"], "joined");
         assert_eq!(value["notices"][0]["name"], "desk");
+        assert_eq!(value["notices"][0]["mark"], mark(desk.spki()));
         assert_eq!(value["notices"][0]["id"], 1);
 
         // Forgotten, it is back on the shelf at once.

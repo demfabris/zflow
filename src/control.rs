@@ -56,9 +56,10 @@ pub enum Response {
         computers: Vec<Unplaced>,
         pairing_window: PairingWindow,
     },
-    /// The name the computer was saved under.
+    /// The name the computer was saved under, and its key mark.
     Trusted {
         name: String,
+        mark: String,
     },
     Error {
         message: String,

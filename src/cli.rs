@@ -1444,8 +1444,8 @@ fn nearby_line(computer: &crate::neighbors::Unplaced) -> String {
 fn trust(path: PathBuf, computer: String) -> Result<()> {
     let config = Config::load(&path)?;
     match daemon_request(&config.daemon.control_socket, Request::Trust { computer })? {
-        Response::Trusted { name } => {
-            println!("trusted {name}; arrange it in zflow settings");
+        Response::Trusted { name, mark } => {
+            println!("trusted {name}, mark {mark}; arrange it in zflow settings");
             Ok(())
         }
         Response::Error { message } => bail!("daemon rejected trust request: {message}"),

@@ -113,6 +113,10 @@ Checks:
 21. **No tile passes for this one.** Name the VM `This-Mac` (`sudo
     hostnamectl set-hostname This-Mac`) and restart its zflowd. On the Mac,
     and on Ubuntu, its shelf tile says "Computer" with its mark.
+22. **The mark comes with the name.** In check 1, each "NAME joined"
+    notification gives the other computer's mark as six hex digits, and
+    hovering the squares on that computer's own tile shows the same digits.
+    `sudo zflow trust NAME` prints "trusted NAME, mark MARK".
 
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 

@@ -63,6 +63,8 @@ function showMark(box, seed) {
     for (let child = box.get_first_child(); child; child = box.get_first_child()) box.remove(child);
     for (const color of markColors(seed)) box.append(new Gtk.Box({css_classes: ['zf-mark', `zf-mark-${color}`], valign: Gtk.Align.CENTER}));
     box.visible = !!box.get_first_child();
+    // The text form a notification or `zflow nearby` gives.
+    box.tooltip_text = box.visible ? `Mark ${seed}` : null;
 }
 
 export class Settings {
@@ -112,6 +114,8 @@ export class Settings {
         this._computers.add(this._windowRow);
         this._dismissed = 0;
         this._joinedRow = new Adw.ActionRow({title: '', subtitle: 'It can share this computer’s keyboard and mouse. Not yours?', subtitle_lines: 0, use_markup: false, visible: false});
+        this._joinedMark = new Gtk.Box({spacing: 2});
+        this._joinedRow.add_prefix(this._joinedMark);
         this._joinedRow.add_suffix(button('Forget', () => this._forgetJoined(), ['destructive-action']));
         const dismiss = new Gtk.Button({icon_name: 'window-close-symbolic', tooltip_text: 'Dismiss', valign: Gtk.Align.CENTER, css_classes: ['flat']});
         dismiss.connect('clicked', () => this._dismissJoined());
@@ -276,6 +280,7 @@ export class Settings {
         this._joined = joined ?? null;
         this._joinedRow.visible = !!joined;
         if (joined) this._joinedRow.title = `${joined.name} joined`;
+        showMark(this._joinedMark, joined?.mark ?? null);
     }
 
     _dismissJoined() {

@@ -1351,9 +1351,10 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
         Request::Trust { computer } => {
             let _mutation = shared.config_mutation.lock().await;
             let config = shared.config.read().await.clone();
-            let id = shared.find_unplaced(&config, &computer)?;
-            let name = shared.trust(config, &id, None).await?;
-            Ok(Response::Trusted { name })
+            let found = shared.find_unplaced(&config, &computer)?;
+            let name = shared.trust(config, &found.id, None).await?;
+            let mark = found.mark.unwrap_or_default();
+            Ok(Response::Trusted { name, mark })
         }
     }
 }

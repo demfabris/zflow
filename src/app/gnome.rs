@@ -737,6 +737,7 @@ mod tests {
             id: 1,
             kind: crate::hello::NoticeKind::Joined,
             name: "desk".into(),
+            mark: "a1b2c3".into(),
         };
         let up = snapshot(
             Ok(crate::peer_view::DesktopStatus {

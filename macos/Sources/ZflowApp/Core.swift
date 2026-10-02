@@ -60,6 +60,8 @@ struct Notice: Decodable, Identifiable, Equatable, Sendable {
   var id: UInt64
   var kind: Kind
   var name: String
+  /// That computer's key mark, so a person can tell it from a namesake.
+  var mark: String
 
   enum Kind: String, Decodable, Sendable { case joined }
 }

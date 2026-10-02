@@ -30,6 +30,8 @@ pub struct Notice {
     pub kind: NoticeKind,
     /// The computer it is about.
     pub name: String,
+    /// That computer's key mark, so a person can tell it from a namesake.
+    pub mark: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
