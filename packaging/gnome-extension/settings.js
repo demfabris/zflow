@@ -333,7 +333,7 @@ export class Settings {
                 });
                 row.add_row(control);
                 this._controls.set(name, control);
-                const keyboard = new Adw.ComboRow({title: 'Keys from this computer', subtitle: 'How its keys act here', model: Gtk.StringList.new(['Standard keys', 'PC key positions', 'Mac shortcuts'])});
+                const keyboard = new Adw.ComboRow({title: 'Keys from this computer', subtitle: 'How its keys act here, from the next time it takes control', model: Gtk.StringList.new(['Standard keys', 'PC key positions', 'Mac shortcuts'])});
                 keyboard.connect('notify::selected', () => {
                     if (!this._updating) this._run({command: 'set_peer', name, keyboard: KEYBOARD_MODES[keyboard.selected]});
                 });
