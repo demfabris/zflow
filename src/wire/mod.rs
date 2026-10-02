@@ -27,7 +27,6 @@ pub const MAX_NEGOTIATION_PAYLOAD_BYTES: usize = 4 * 1_024;
 pub const MAX_RELIABLE_PAYLOAD_BYTES: usize = 32 * 1_024;
 pub const MAX_MOTION_PAYLOAD_BYTES: usize = 8 * 1_024;
 pub const MAX_PROBE_PAYLOAD_BYTES: usize = 128;
-pub const MAX_PAIRING_PAYLOAD_BYTES: usize = 2 * 1_024;
 pub const MAX_HELLO_PAYLOAD_BYTES: usize = 1_024;
 /// A computer's name fits one DNS label, so the mDNS record can carry it.
 pub const MAX_NAME_BYTES: usize = 63;
@@ -43,7 +42,7 @@ pub enum Family {
     ReliableControl = 3,
     Motion = 4,
     Probe = 5,
-    Pairing = 6,
+    // 6 was the code pairing offer, before 0.3.0.
     Desktop = 7,
     Hello = 8,
 }
@@ -55,7 +54,6 @@ impl Family {
             Self::ReliableControl => MAX_RELIABLE_PAYLOAD_BYTES,
             Self::Motion => MAX_MOTION_PAYLOAD_BYTES,
             Self::Probe => MAX_PROBE_PAYLOAD_BYTES,
-            Self::Pairing => MAX_PAIRING_PAYLOAD_BYTES,
             Self::Desktop => crate::desktop::MAX_MESSAGE_BYTES,
             Self::Hello => MAX_HELLO_PAYLOAD_BYTES,
         }
@@ -72,7 +70,6 @@ impl TryFrom<u8> for Family {
             3 => Ok(Self::ReliableControl),
             4 => Ok(Self::Motion),
             5 => Ok(Self::Probe),
-            6 => Ok(Self::Pairing),
             7 => Ok(Self::Desktop),
             8 => Ok(Self::Hello),
             other => Err(WireError::UnknownFamily(other)),
@@ -87,7 +84,6 @@ pub enum WireMessage {
     ReliableControl(ReliableControlMessage),
     Motion(MotionFrame),
     Probe(ProbeMessage),
-    Pairing(PairingOffer),
     Desktop(DesktopMessage),
     Hello(Hello),
 }
@@ -100,19 +96,10 @@ impl WireMessage {
             Self::ReliableControl(_) => Family::ReliableControl,
             Self::Motion(_) => Family::Motion,
             Self::Probe(_) => Family::Probe,
-            Self::Pairing(_) => Family::Pairing,
             Self::Desktop(_) => Family::Desktop,
             Self::Hello(_) => Family::Hello,
         }
     }
-}
-
-/// Metadata exchanged only after the pairing-only TLS handshake.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairingOffer {
-    pub device_label: Option<String>,
-    pub input_port: u16,
-    pub input_candidates: Vec<String>,
 }
 
 /// What a computer says about itself before either side trusts the other.
@@ -164,7 +151,6 @@ fn frame(message: &WireMessage) -> Result<Vec<u8>, WireError> {
         WireMessage::ReliableControl(message) => codec::encode(message, header)?,
         WireMessage::Motion(frame) => codec::encode(frame, header)?,
         WireMessage::Probe(probe) => codec::encode(probe, header)?,
-        WireMessage::Pairing(offer) => codec::encode(offer, header)?,
         WireMessage::Hello(hello) => codec::encode(hello, header)?,
         WireMessage::Desktop(message) => {
             let mut bytes = header;
@@ -200,7 +186,6 @@ fn decode_inner(bytes: &[u8], expected: Option<Family>) -> Result<WireMessage, W
         Family::ReliableControl => WireMessage::ReliableControl(codec::decode(payload)?),
         Family::Motion => WireMessage::Motion(codec::decode(payload)?),
         Family::Probe => WireMessage::Probe(codec::decode(payload)?),
-        Family::Pairing => WireMessage::Pairing(codec::decode(payload)?),
         Family::Hello => WireMessage::Hello(codec::decode(payload)?),
         Family::Desktop => WireMessage::Desktop(
             serde_json::from_slice(payload)
@@ -325,14 +310,6 @@ mod tests {
         }
     }
 
-    fn pairing() -> PairingOffer {
-        PairingOffer {
-            device_label: Some("workstation".into()),
-            input_port: 43119,
-            input_candidates: vec!["192.0.2.1:43119".into()],
-        }
-    }
-
     fn hello() -> Hello {
         Hello {
             name: "workstation".into(),
@@ -378,7 +355,6 @@ mod tests {
                     echoed_at: MonotonicTimeMicros(111),
                 },
             }),
-            WireMessage::Pairing(pairing()),
             WireMessage::Hello(hello()),
         ]
     }
@@ -509,22 +485,6 @@ mod tests {
             ),
             (WireMessage::Motion(motion(Some(crowd()))), "touch contacts"),
             (
-                WireMessage::Pairing(PairingOffer {
-                    device_label: Some("x".repeat(bounds::MAX_STRING_BYTES + 1)),
-                    ..pairing()
-                }),
-                "device label bytes",
-            ),
-            (
-                WireMessage::Pairing(PairingOffer {
-                    input_candidates: (0..=bounds::MAX_DISCOVERY_CANDIDATES)
-                        .map(|port| format!("192.0.2.1:{}", port + 1))
-                        .collect(),
-                    ..pairing()
-                }),
-                "input candidates",
-            ),
-            (
                 WireMessage::Hello(Hello {
                     name: "x".repeat(MAX_NAME_BYTES + 1),
                     ..hello()
@@ -572,8 +532,10 @@ mod tests {
         });
         let bytes = encode(&largest).unwrap();
         assert!(bytes.len() - HEADER_BYTES <= MAX_HELLO_PAYLOAD_BYTES);
-        // A hello is never mistaken for the pairing offer it replaces.
-        assert!(decode_family(&bytes, Family::Pairing).is_err());
+        // Family 6 carried the code pairing offer and is no longer read.
+        let mut retired = bytes.clone();
+        retired[2] = 6;
+        assert_eq!(decode(&retired), Err(WireError::UnknownFamily(6)));
 
         let portless = WireMessage::Hello(Hello {
             input_port: 0,

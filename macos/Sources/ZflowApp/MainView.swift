@@ -20,20 +20,7 @@ struct MainView: View {
         }
     }
     .frame(minWidth: 700, minHeight: 480)
-    .sheet(
-      item: $model.pairing,
-      onDismiss: { model.send(CoreRequest(command: "pair_cancel")) },
-      content: { PairingView(model: model, initialAddress: $0.address) }
-    )
-    .sheet(
-      isPresented: $model.addingAddress,
-      onDismiss: {
-        guard model.pairWhenClosed else { return }
-        model.pairWhenClosed = false
-        model.pair()
-      },
-      content: { AddAddressView(model: model) }
-    )
+    .sheet(isPresented: $model.addingAddress) { AddAddressView(model: model) }
     .alert("Move zflow to Applications", isPresented: $model.askToMove) {
       Button("Show Applications") {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications"))

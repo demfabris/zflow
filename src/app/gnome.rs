@@ -2,7 +2,6 @@
 use super::{
     api::{self, Action, Health, Level, Peer, PeerState, Request, Shortcut, Status},
     desktop::DesktopReceiver,
-    pairing::Pairing,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -22,7 +21,6 @@ const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";
 #[derive(Default)]
 pub(super) struct State {
     pub receiver: DesktopReceiver,
-    pub pairing: Pairing,
 }
 
 pub(super) struct Service(pub Arc<Mutex<State>>);
@@ -92,27 +90,6 @@ impl Service {
             Request::SetClipboard { share } => {
                 crate::peer_view::request(&DaemonRequest::SetClipboard { share }).await?;
             }
-            Request::Pair { address, code } => {
-                let remote = address
-                    .as_deref()
-                    .map(crate::pairing::parse_pairing_address)
-                    .transpose()?;
-                let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-                ensure!(!state.pairing.active(), "Pairing is already open");
-                state.pairing.start(PathBuf::new(), remote, code)?;
-            }
-            Request::PairRespond { allow } => self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pairing
-                .respond(allow)?,
-            Request::PairCancel => self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pairing
-                .cancel(),
             Request::OpenSettings => {
                 let mut child = tokio::process::Command::new(std::env::current_exe()?)
                     .arg("settings")
@@ -243,9 +220,6 @@ fn snapshot(
             .map(|daemon| daemon.unplaced.clone())
             .unwrap_or_default(),
         peers,
-        pairing: state.pairing.snapshot(),
-        // The service finds computers now; they are on the shelf.
-        nearby: Vec::new(),
         pause_at_edges: daemon.as_ref().map(|daemon| daemon.pause_at_edges),
         shortcuts,
         share_clipboard: daemon.as_ref().map(|daemon| daemon.share_clipboard),
@@ -642,12 +616,12 @@ mod tests {
         let result: zbus::Result<String> = proxy.call("Call", &(r#"{"command":"set_sharing","enabled":true,"permissions":{"inject_prelogin":true}}"#,)).await;
         assert!(result.is_err());
         let reply: String = proxy
-            .call("Call", &(r#"{"command":"pair_cancel"}"#,))
+            .call("Call", &(r#"{"command":"snapshot"}"#,))
             .await
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&reply).unwrap()["ok"],
-            true
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap()["api"],
+            API
         );
         drop(connection);
     }
@@ -781,7 +755,6 @@ mod tests {
         assert_eq!(up.share_clipboard, Some(true));
         assert_eq!(up.own_mark.as_deref(), Some("a1b2c3"));
         assert_eq!((up.unplaced, up.notices), (vec![fedora], vec![joined]));
-        assert!(up.nearby.is_empty());
         // While sharing, a computer that cannot be reached is a problem.
         assert!(
             up.health

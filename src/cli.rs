@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{BufRead, IsTerminal, Write},
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -22,7 +22,7 @@ use clap::{
 use serde::Serialize;
 
 use crate::{
-    config::{Config, PeerConfig, PeerPermissions, PlayoutMode},
+    config::{Config, PlayoutMode},
     control::{DaemonStatus, Request, Response, read_message, write_message},
     core::KeyboardMode,
     identity::Identity,
@@ -75,11 +75,6 @@ enum Command {
     Trust {
         /// Its name, or its mark when two share a name.
         computer: String,
-    },
-    /// Pair with another logged-in zflow CLI using an authenticated code.
-    Pair {
-        #[command(subcommand)]
-        command: PairCommand,
     },
     /// Change one paired peer.
     Peer {
@@ -148,43 +143,6 @@ enum PeerCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
-enum PairCommand {
-    /// Connect to a peer's temporary pairing listener.
-    Connect {
-        /// Local name to assign to the peer.
-        peer: String,
-        /// Peer pairing address, normally port 43120.
-        address: SocketAddr,
-        /// Extra local input address to send to the peer.
-        #[arg(long = "advertise")]
-        advertised: Vec<SocketAddr>,
-        /// Setup code shown by the peer; prompts on a terminal when omitted.
-        #[arg(long)]
-        code: Option<String>,
-        /// Stop waiting after this many seconds.
-        #[arg(long, default_value_t = 120)]
-        timeout_seconds: u64,
-    },
-    /// Show a setup code and accept the peer that enters it.
-    Listen {
-        /// Local name to assign to the peer.
-        peer: String,
-        /// Pairing listener address.
-        #[arg(long, default_value = "[::]:43120")]
-        listen: SocketAddr,
-        /// Extra local input address to send to the peer.
-        #[arg(long = "advertise")]
-        advertised: Vec<SocketAddr>,
-        /// Allow the computer that enters the code without asking.
-        #[arg(long)]
-        yes: bool,
-        /// Stop waiting after this many seconds.
-        #[arg(long, default_value_t = 600)]
-        timeout_seconds: u64,
-    },
-}
-
 fn on_off() -> impl TypedValueParser<Value = bool> {
     PossibleValuesParser::new(["on", "off"]).map(|value| value == "on")
 }
@@ -246,22 +204,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Peers => peers(path),
         Command::Nearby { add } => nearby(path, add),
         Command::Trust { computer } => trust(path, computer),
-        Command::Pair { command } => match command {
-            PairCommand::Connect {
-                peer,
-                address,
-                advertised,
-                code,
-                timeout_seconds,
-            } => pair_connect(path, peer, address, advertised, code, timeout_seconds),
-            PairCommand::Listen {
-                peer,
-                listen,
-                advertised,
-                yes,
-                timeout_seconds,
-            } => pair_listen(path, peer, listen, advertised, yes, timeout_seconds),
-        },
         Command::Peer { command } => match command {
             PeerCommand::Revoke { peer } => revoke_peer(path, peer),
             PeerCommand::AllowPrelogin { peer, value } => allow_prelogin(path, peer, value),
@@ -1515,166 +1457,6 @@ fn trust(path: PathBuf, computer: String) -> Result<()> {
     }
 }
 
-fn pair_connect(
-    path: PathBuf,
-    peer: String,
-    address: SocketAddr,
-    advertised: Vec<SocketAddr>,
-    code: Option<String>,
-    timeout_seconds: u64,
-) -> Result<()> {
-    let config = Config::load(&path)?;
-    let identity = load_or_create_identity(&config.daemon.state_dir)?;
-    let port = config.transport.listen.port();
-    let offer = crate::pairing::make_offer(
-        crate::pairing::local_device_label(),
-        port,
-        advertised
-            .into_iter()
-            .chain(crate::pairing::this_host_candidates(port))
-            .collect(),
-    )?;
-    let code = match code {
-        Some(code) => code,
-        None => {
-            if !std::io::stdin().is_terminal() {
-                bail!("standard input is not interactive; pass --code from the peer display");
-            }
-            print!("enter the setup code shown on the peer: ");
-            std::io::stdout().flush()?;
-            let mut line = String::new();
-            std::io::stdin().lock().read_line(&mut line)?;
-            line
-        }
-    };
-    let code = crate::pairing::SetupCode::parse(&code)?;
-    println!("connecting to pairing listener at {address}");
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()?;
-    let session = runtime.block_on(async {
-        let mut session = tokio::time::timeout(
-            Duration::from_secs(timeout_seconds),
-            crate::pairing::connect(&identity, address, &offer, &code),
-        )
-        .await
-        .context("pairing timed out")??;
-        println!("waiting for the other computer to allow this one");
-        // The listener has saved this computer once it approves.
-        session.approved().await?;
-        anyhow::Ok(session)
-    })?;
-    let stored = store_paired_peer(&path, peer, session.observation());
-    runtime.block_on(session.finish(stored.is_ok()));
-    stored
-}
-
-fn pair_listen(
-    path: PathBuf,
-    peer: String,
-    listen: SocketAddr,
-    advertised: Vec<SocketAddr>,
-    yes: bool,
-    timeout_seconds: u64,
-) -> Result<()> {
-    let config = Config::load(&path)?;
-    let identity = load_or_create_identity(&config.daemon.state_dir)?;
-    let port = config.transport.listen.port();
-    let offer = crate::pairing::make_offer(
-        crate::pairing::local_device_label(),
-        port,
-        advertised
-            .into_iter()
-            .chain(crate::pairing::this_host_candidates(port))
-            .collect(),
-    )?;
-    let code = crate::pairing::SetupCode::generate()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()?;
-    let session = runtime.block_on(async {
-        let listener =
-            crate::pairing::PairingListener::bind(&identity, listen, offer, code.clone())?;
-        println!("pairing listener: {}", listener.local_addr()?);
-        println!("setup code: {code}");
-        println!("enter this code on the other computer");
-        tokio::time::timeout(Duration::from_secs(timeout_seconds), listener.accept())
-            .await
-            .context("pairing timed out")?
-    })?;
-    // Knowing the code is not enough; the person here allows the computer.
-    let question = format!(
-        "allow {} at {} to pair as {peer}? [y/N] ",
-        session.display_name(),
-        session.peer_ip()
-    );
-    if !yes && !confirm(&question)? {
-        runtime.block_on(session.finish(false));
-        bail!("pairing declined; no trust record was written");
-    }
-    let stored = store_paired_peer(&path, peer, session.observation());
-    // The peer saves this computer only after hearing that we kept it.
-    runtime.block_on(session.finish(stored.is_ok()));
-    stored
-}
-
-fn confirm(question: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() {
-        bail!(
-            "standard input is not interactive; pass --yes to allow the computer that enters the code"
-        );
-    }
-    print!("{question}");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
-}
-
-fn store_paired_peer(
-    path: &Path,
-    peer: String,
-    observation: &crate::pairing::PairingObservation,
-) -> Result<()> {
-    if let Some(label) = &observation.peer_label {
-        println!("peer label: {label}");
-    }
-    let record = PeerConfig::from_spki(
-        &observation.peer_spki,
-        observation.peer_candidates.clone(),
-        PeerPermissions {
-            connect: true,
-            send_normal: true,
-            receive_normal: true,
-            inject_prelogin: false,
-        },
-    )?;
-    let fingerprint = record.fingerprint_hex()?;
-    let config = Config::load(path)?;
-    if config.daemon.control_socket.exists() {
-        match daemon_request(
-            &config.daemon.control_socket,
-            Request::AddPeer {
-                peer: peer.clone(),
-                record,
-            },
-        )? {
-            Response::Ack => {}
-            Response::Error { message } => bail!("daemon rejected paired peer: {message}"),
-            response => bail!("unexpected daemon response: {response:?}"),
-        }
-    } else {
-        let mut config = config;
-        config.peers.insert(peer.clone(), record);
-        config.save(path)?;
-    }
-    println!("paired {peer} ({fingerprint})");
-    println!("pre-login permission remains off");
-    Ok(())
-}
-
 fn revoke_peer(path: PathBuf, peer: String) -> Result<()> {
     let mut config = Config::load(&path)?;
     if config.daemon.control_socket.exists() {
@@ -1781,6 +1563,7 @@ fn playout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{PeerConfig, PeerPermissions};
 
     #[test]
     fn command_line_definition_is_consistent() {
@@ -1946,34 +1729,6 @@ N: Name=\"keyd virtual keyboard\"
 
             assert!(error.to_string().contains("no stable physical path"));
         }
-    }
-
-    #[test]
-    fn paired_peer_pins_key_and_keeps_prelogin_off() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("zflow.toml");
-        let mut config = Config::default();
-        config.daemon.state_dir = directory.path().join("state");
-        config.daemon.control_socket = directory.path().join("missing.sock");
-        config.save(&path).unwrap();
-        let address = "127.0.0.1:43119".parse().unwrap();
-        let observation = crate::pairing::PairingObservation {
-            peer_spki: b"peer public key".to_vec(),
-            peer_label: Some("desk".into()),
-            peer_candidates: vec![address],
-            peer_ip: address.ip(),
-        };
-
-        store_paired_peer(&path, "desk".into(), &observation).unwrap();
-
-        let saved = Config::load(&path).unwrap();
-        let peer = &saved.peers["desk"];
-        assert_eq!(peer.spki_der().unwrap(), b"peer public key");
-        assert_eq!(peer.addresses, vec![address]);
-        assert!(peer.permissions.connect);
-        assert!(peer.permissions.send_normal);
-        assert!(peer.permissions.receive_normal);
-        assert!(!peer.permissions.inject_prelogin);
     }
 
     #[test]

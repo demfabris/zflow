@@ -53,20 +53,6 @@ pub enum TransportError {
     DatagramSizeAlreadyNegotiated { current: usize, requested: usize },
     #[error("datagram is {actual} bytes; negotiated maximum is {negotiated}")]
     DatagramTooLarge { actual: usize, negotiated: usize },
-    #[error("could not derive the pairing transcript binding")]
-    PairingExporter,
-    #[error("pairing metadata stream failed: {0}")]
-    PairingStream(String),
-    #[error("first pairing stream did not have the zflow pairing preface")]
-    InvalidPairingPreface,
-    #[error("pairing frame is {actual} bytes; maximum is {maximum}")]
-    PairingFrameTooLarge { actual: usize, maximum: usize },
-    #[error("message family is not allowed on the pairing-only stream")]
-    InvalidPairingFamily,
-    #[error("the setup code did not match")]
-    PairingCodeMismatch,
-    #[error("peer sent an invalid pairing key exchange")]
-    PairingKeyExchange,
     #[error("clipboard stream failed: {0}")]
     Clipboard(String),
     #[error("could not derive the hello transcript binding")]

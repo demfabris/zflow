@@ -10,7 +10,6 @@ pub use crate::discovery::MAX_DISCOVERY_CANDIDATES;
 pub const MAX_CONTACTS: usize = 32;
 pub const MAX_HELD_KEYS: usize = 32;
 pub const MAX_HELD_BUTTONS: usize = 16;
-pub const MAX_STRING_BYTES: usize = 255;
 
 /// Runs before encoding and after decoding, so neither side sends or accepts
 /// a message the other would refuse.
@@ -50,20 +49,6 @@ pub(super) fn validate(message: &WireMessage) -> Result<(), WireError> {
         }
         WireMessage::Motion(frame) => frame.touch_snapshot.as_ref().map_or(Ok(()), touch),
         WireMessage::Probe(_) => Ok(()),
-        WireMessage::Pairing(offer) => {
-            if let Some(label) = &offer.device_label {
-                limit("device label bytes", label.len(), MAX_STRING_BYTES)?;
-            }
-            let candidates = &offer.input_candidates;
-            limit(
-                "input candidates",
-                candidates.len(),
-                MAX_DISCOVERY_CANDIDATES,
-            )?;
-            candidates.iter().try_for_each(|candidate| {
-                limit("input candidate bytes", candidate.len(), MAX_STRING_BYTES)
-            })
-        }
         WireMessage::Hello(hello) => {
             limit("name bytes", hello.name.len(), MAX_NAME_BYTES)?;
             limit("version bytes", hello.version.len(), MAX_VERSION_BYTES)?;

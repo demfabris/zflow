@@ -96,7 +96,7 @@ import Testing
   #expect(snapshot.peers.isEmpty)
   #expect(snapshot.configPath == file.path)
   // The old names are gone; the shared ones reach the engine.
-  for old in ["move", "pair_start"] {
+  for old in ["move", "pair_start", "pair", "pair_cancel"] {
     await #expect(throws: AppError.self) { try await core.request(CoreRequest(command: old)) }
   }
   do {
@@ -179,6 +179,6 @@ import Testing
   try await Task.sleep(for: .milliseconds(200))
   let snapshot = try await core.request(CoreRequest(command: "snapshot"))
   #expect(snapshot.platform.localNetwork == .unknown)
-  #expect(snapshot.nearby.isEmpty)
+  #expect(snapshot.unplaced.isEmpty)
   await core.shutdown()
 }

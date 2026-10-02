@@ -11,27 +11,6 @@ struct Computer: Codable, Identifiable, Equatable, Sendable {
   var height: Int
 }
 struct Layout: Decodable, Equatable, Sendable { var monitors: [Computer] }
-struct Pairing: Decodable, Equatable, Sendable {
-  var state: State
-  var code: String?
-  var name: String?
-  var address: String?
-  var error: String?
-
-  enum State: String, Decodable, Sendable {
-    case idle, listening, confirm, connecting, approving, paired, failed
-  }
-}
-struct Nearby: Decodable, Identifiable, Equatable, Sendable {
-  var instance: String
-  /// The name its record gives; older versions give none.
-  var name: String?
-  var addresses: [String]
-  var compatible: Bool
-  /// Where its pairing listener waits; computers advertise their input port.
-  var pairAddress: String?
-  var id: String { instance }
-}
 /// src/neighbors.rs Unplaced: a computer found around this Mac that is not
 /// on the board yet, for the shelf.
 struct Unplaced: Decodable, Identifiable, Equatable, Sendable {
@@ -100,8 +79,6 @@ struct Snapshot: Decodable, Equatable, Sendable {
   /// Computers found but not on the board yet.
   var unplaced: [Unplaced]
   var peers: [Peer]
-  var pairing: Pairing
-  var nearby: [Nearby]
   /// Whether the pointer rests against an edge for a moment before it crosses.
   var pauseAtEdges: Bool?
   /// Whether the clipboard goes along with the pointer.
@@ -180,8 +157,6 @@ struct CoreRequest: Encodable, Sendable {
   var tolerance: Int?
   var address: String?
   var name: String?
-  var code: String?
-  var allow: Bool?
   var allowControl: Bool?
   var keyboard: KeyboardMode?
   var reverseScroll: Bool?

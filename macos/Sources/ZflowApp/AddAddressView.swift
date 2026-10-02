@@ -33,12 +33,6 @@ struct AddAddressView: View {
           .font(.callout).foregroundStyle(.secondary)
       }
       HStack {
-        // Code pairing stays until every computer can place the others.
-        Button("Pair with a code instead…") {
-          model.pairWhenClosed = true
-          dismiss()
-        }
-        .buttonStyle(.link)
         Spacer()
         Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
         Button("Look Up", action: lookUp)

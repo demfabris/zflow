@@ -5,7 +5,7 @@ import Testing
 
 /// A snapshot as the engine sends it, with `peers` as name to state.
 private func snapshot(
-  peers: [(String, String)] = [], pairing: String = "idle", blockAwdl: Bool = false,
+  peers: [(String, String)] = [], blockAwdl: Bool = false,
   health: String = "", window: String = #"{"state":"never"}"#, unplaced: String = "",
   notices: [UInt64] = []
 ) throws -> Snapshot {
@@ -26,7 +26,7 @@ private func snapshot(
     "pairing_window":\(window),
     "layout":{"monitors":[{"id":"local","label":"This Mac","x":0,"y":0,"width":1512,"height":982}
     \(monitors.map { "," + $0 }.joined())]},"own_mark":"fedcba","unplaced":[\(unplaced)],
-    "peers":[\(rows.joined(separator: ","))],"pairing":{"state":"\(pairing)"},"nearby":[],
+    "peers":[\(rows.joined(separator: ","))],
     "pause_at_edges":false,"shortcuts":[],"share_clipboard":false,"autostart":null,"config_path":"",
     "notices":[\(posts.joined(separator: ","))],
     "platform":{"accessibility":true,"local_network":"allowed","block_awdl":\(blockAwdl)}}
@@ -54,7 +54,7 @@ private func temporary() -> URL {
   func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
     try JSONDecoder().decode(type, from: Data(json.utf8))
   }
-  // src/app/api.rs, src/app/pairing.rs, src/core/keymap.rs and src/macos/local_network.rs.
+  // src/app/api.rs, src/core/keymap.rs and src/macos/local_network.rs.
   _ = try decode(
     [Status.State].self,
     #"["ready","controlling","controlled","paused","checking","setup","attention"]"#)
@@ -65,9 +65,6 @@ private func temporary() -> URL {
     )
       == [.paired, .connecting, .connected, .controllingThis, .controlledFromHere, .unreachable])
   _ = try decode([Health.Level].self, #"["ok","warning","error"]"#)
-  _ = try decode(
-    [Pairing.State].self,
-    #"["idle","listening","confirm","connecting","approving","paired","failed"]"#)
   #expect(
     try decode([KeyboardMode].self, #"["standard","pc_positions","mac"]"#) == KeyboardMode.allCases)
   _ = try decode([MacPlatform.LocalNetwork].self, #"["allowed","blocked","unknown"]"#)
@@ -174,18 +171,6 @@ private func temporary() -> URL {
   model.page = .settings
   model.apply(try snapshot())
   #expect(model.page == .settings)
-  await model.shutdown()
-}
-
-@MainActor @Test func finishedPairingClosesTheSheet() async throws {
-  let directory = temporary()
-  defer { try? FileManager.default.removeItem(at: directory) }
-  let model = try model(directory)
-  model.pairing = PairingTarget(address: "192.0.2.7")
-  model.apply(try snapshot(pairing: "approving"))
-  #expect(model.pairing != nil)
-  model.apply(try snapshot(peers: [("desk", "paired")], pairing: "paired"))
-  #expect(model.pairing == nil)
   await model.shutdown()
 }
 

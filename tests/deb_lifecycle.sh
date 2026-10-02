@@ -46,13 +46,14 @@ grep -qx 'ExecStart=/usr/bin/zflowd --config /etc/zflow/zflow.toml' /usr/lib/sys
 test "$(stat -c '%U:%G:%a' /etc/zflow/zflow.toml)" = zflow:zflow:600
 test "$(stat -c '%U:%G:%a' /var/lib/zflow)" = zflow:zflow:700
 test "$(getent group zflow | cut -d: -f4)" = ''
-# Both firewalls get the two UDP ports, and the installer says so.
+# Both firewalls get the one UDP port, and the installer says so.
 grep -qx 'allow zflow' /tmp/ufw.log
-grep -q 'ports=43119/udp|43120/udp' /etc/ufw/applications.d/zflow
-grep -q 'Opened UDP ports 43119 (input) and 43120 (pairing) in ufw' /tmp/install.log
+grep -qx 'ports=43119/udp' /etc/ufw/applications.d/zflow
+grep -q 'Opened UDP port 43119 in ufw' /tmp/install.log
 grep -qx -- '--permanent --add-service=zflow' /tmp/firewalld.log
 grep -qx -- '--add-service=zflow' /tmp/firewalld.log
-grep -q 'port protocol="udp" port="43120"' /etc/firewalld/services/zflow.xml
+grep -q 'port protocol="udp" port="43119"' /etc/firewalld/services/zflow.xml
+test "$(grep -c 43120 /etc/firewalld/services/zflow.xml)" = 0
 grep -q 'in firewalld (service zflow, zone public)' /tmp/install.log
 printf '\n# Preserve this edit\n' >> /etc/zflow/zflow.toml
 printf '# Preserve selected devices\n' > /etc/udev/rules.d/71-zflow-capture.rules

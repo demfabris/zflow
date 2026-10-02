@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::{layout_model::Layout, nearby::NearbyRecord, pairing::PairingSnapshot};
+use super::layout_model::Layout;
 use crate::{
     config::PeerConfig, core::KeyboardMode, hello::Notice, neighbors::Unplaced,
     pairing_window::View as PairingWindow,
@@ -30,8 +30,6 @@ pub(super) struct Snapshot<P> {
     /// Computers found but not on the board, for the shelf under it.
     pub unplaced: Vec<Unplaced>,
     pub peers: Vec<Peer>,
-    pub pairing: PairingSnapshot,
-    pub nearby: Vec<NearbyRecord>,
     /// None where crossings cannot pause yet.
     pub pause_at_edges: Option<bool>,
     pub shortcuts: Vec<Shortcut>,
@@ -244,17 +242,6 @@ pub(crate) enum Request {
     AddAddress {
         address: String,
     },
-    /// Without `address`, listens and shows a code. Otherwise connects to
-    /// that IP address, port optional, with the code shown there.
-    Pair {
-        address: Option<String>,
-        code: Option<String>,
-    },
-    /// Allows or declines the computer that proved this computer's code.
-    PairRespond {
-        allow: bool,
-    },
-    PairCancel,
     /// Checks the other computers again now.
     Retry,
     SetSwitching {
@@ -368,13 +355,6 @@ mod tests {
     fn requests_use_the_shared_names_and_nothing_else() {
         let parse = |json| serde_json::from_str::<Request>(json);
         assert!(matches!(
-            parse(r#"{"command":"pair","address":"192.0.2.7","code":"123456"}"#).unwrap(),
-            Request::Pair {
-                address: Some(_),
-                code: Some(_)
-            }
-        ));
-        assert!(matches!(
             parse(r#"{"command":"move_tile","id":"local","x":1,"y":2,"tolerance":8}"#).unwrap(),
             Request::MoveTile { .. }
         ));
@@ -392,7 +372,9 @@ mod tests {
         ));
         for old in [
             r#"{"command":"pair_start","address":null}"#,
-            r#"{"command":"pair","remote":null}"#,
+            r#"{"command":"pair","address":"192.0.2.7","code":"123456"}"#,
+            r#"{"command":"pair_respond","allow":true}"#,
+            r#"{"command":"pair_cancel"}"#,
             r#"{"command":"move","id":"local","x":1,"y":2,"tolerance":8}"#,
             r#"{"command":"set_keyboard","name":"desk","mode":"mac"}"#,
             r#"{"command":"set_peer","name":"desk","inject_prelogin":true}"#,
@@ -419,8 +401,6 @@ mod tests {
             own_mark: None,
             unplaced: Vec::new(),
             peers: Vec::new(),
-            pairing: PairingSnapshot::default(),
-            nearby: Vec::new(),
             pause_at_edges: None,
             shortcuts: Vec::new(),
             share_clipboard: None,
@@ -440,8 +420,6 @@ mod tests {
             "own_mark",
             "unplaced",
             "peers",
-            "pairing",
-            "nearby",
             "pause_at_edges",
             "shortcuts",
             "share_clipboard",

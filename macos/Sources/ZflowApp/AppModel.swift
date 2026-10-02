@@ -11,12 +11,6 @@ enum Page: Hashable {
   case computer(String)
 }
 
-/// The computer chosen for the pairing sheet; nil asks for an address.
-struct PairingTarget: Identifiable {
-  let id = UUID()
-  var address: String?
-}
-
 @MainActor @Observable
 final class AppModel {
   var snapshot: Snapshot?
@@ -25,11 +19,8 @@ final class AppModel {
   /// The last request that failed, shown for a few seconds.
   var failure: String?
   var page = Page.computers
-  var pairing: PairingTarget?
   /// Shows the Add by address sheet.
   var addingAddress = false
-  /// Opens the pairing sheet once the Add by address sheet has closed.
-  @ObservationIgnored var pairWhenClosed = false
   /// Posts a computer that joined. The app sets it; each notice comes once.
   @ObservationIgnored var joined: ((Notice) -> Void)?
   @ObservationIgnored private var lastNotice: UInt64 = 0
@@ -111,8 +102,8 @@ final class AppModel {
     }
   }
 
-  /// Takes the engine's latest snapshot. The page and the pairing sheet
-  /// follow it, and each new notice is posted.
+  /// Takes the engine's latest snapshot. The page follows it, and each new
+  /// notice is posted.
   func apply(_ next: Snapshot) {
     if next != snapshot { snapshot = next }
     for notice in next.notices where notice.id > lastNotice {
@@ -122,12 +113,6 @@ final class AppModel {
     holdActivity(next.sharing == true)
     if case .computer(let name) = page, !next.peers.contains(where: { $0.name == name }) {
       page = .computers
-    }
-    if next.pairing.state == .paired, pairing != nil {
-      // Closing the sheet clears the pairing. It saved the computer to the
-      // file, so read that now rather than at the next maintenance reload.
-      pairing = nil
-      send(CoreRequest(command: "reload"))
     }
   }
 
@@ -173,14 +158,6 @@ final class AppModel {
     if name.lowercased().hasSuffix(".local") { name.removeLast(".local".count) }
     return name.isEmpty ? "this Mac" : name
   }()
-
-  /// Opens the pairing sheet, straight at the code when `address` is known.
-  func pair(_ address: String? = nil) {
-    // Browsing waits for a reason to ask macOS for Local Network access.
-    send(CoreRequest(command: "discover"))
-    pairing = PairingTarget(address: address)
-    show()
-  }
 
   /// A health row's fix. The engine's rows carry theirs; the clipboard row
   /// gets one here while macOS keeps zflow from reading the pasteboard.

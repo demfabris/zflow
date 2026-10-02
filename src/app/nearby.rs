@@ -20,7 +20,7 @@ pub(super) enum BrowserStatus {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct NearbyRecord {
     pub instance: String,
     /// The name its record gives, which versions before arrange to pair
@@ -28,21 +28,14 @@ pub(super) struct NearbyRecord {
     pub name: Option<String>,
     pub addresses: Vec<SocketAddr>,
     pub compatible: bool,
-    /// Where its pairing listener waits. Computers advertise their input
-    /// port, and pairing listens on another.
-    pub pair_address: Option<SocketAddr>,
 }
 
 impl NearbyRecord {
     fn from_candidate(candidate: UntrustedCandidate) -> Option<Self> {
-        let addresses = candidate.socket_addresses().to_vec();
         Some(Self {
             instance: candidate.ephemeral_instance_id()?.to_string(),
             name: candidate.name().map(str::to_owned),
-            pair_address: addresses
-                .first()
-                .map(|address| SocketAddr::new(address.ip(), crate::pairing::DEFAULT_PAIRING_PORT)),
-            addresses,
+            addresses: candidate.socket_addresses().to_vec(),
             compatible: candidate.is_compatible(),
         })
     }
@@ -225,7 +218,6 @@ mod tests {
                     .unwrap(),
             ],
             compatible: true,
-            pair_address: None,
         }
     }
 
@@ -329,10 +321,6 @@ mod tests {
             let record = NearbyRecord::from_candidate(candidate).unwrap();
             assert_eq!(record.compatible, compatible);
             assert_eq!(record.name.as_deref(), Some("desk"));
-            assert_eq!(
-                record.pair_address,
-                Some("192.0.2.1:43120".parse().unwrap())
-            );
         }
     }
 }

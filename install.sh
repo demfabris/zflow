@@ -218,7 +218,7 @@ describe_linux() {
         printf '  - runtime packages from %s: %s\n' "$manager" "${packages[*]}"
     fi
     printf '  - a locked zflow system account that types remote input through /dev/uinput\n'
-    printf '  - an allow rule for UDP ports 43119 and 43120 when ufw or firewalld is on\n'
+    printf '  - an allow rule for UDP port 43119 when ufw or firewalld is on\n'
     if [[ "$desktop" == true ]]; then
         printf '  - for every GNOME user: the zflow launcher, and the desktop agent at login\n'
         printf '  - for you: the zflow GNOME extension (GNOME asks before it downloads it)\n'

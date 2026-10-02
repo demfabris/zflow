@@ -27,7 +27,6 @@ use crate::identity::Identity;
 use super::TransportError;
 
 pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/3";
-pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/4";
 /// Answered on the input port by computers that do not trust each other yet.
 pub const HELLO_ALPN_PROTOCOL: &[u8] = b"zflow-hello/4";
 const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -105,44 +104,6 @@ impl fmt::Debug for HelloClientConfig {
     }
 }
 
-/// A client configuration for a pairing-only RPK possession proof.
-///
-/// It deliberately carries no peer pin. Connections made with it are exposed
-/// only as [`super::PairingConnection`], which has no input channel surface.
-#[derive(Clone)]
-pub struct PairingClientConfig {
-    pub(super) quinn: quinn::ClientConfig,
-}
-
-impl fmt::Debug for PairingClientConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PairingClientConfig")
-            .finish_non_exhaustive()
-    }
-}
-
-/// A server configuration for a pairing-only RPK possession proof.
-#[derive(Clone)]
-pub struct PairingServerConfig {
-    pub(super) quinn: quinn::ServerConfig,
-}
-
-impl fmt::Debug for PairingServerConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PairingServerConfig")
-            .finish_non_exhaustive()
-    }
-}
-
-impl PairingServerConfig {
-    /// Clone the pairing-only endpoint configuration for [`quinn::Endpoint::server`].
-    pub fn quinn_config(&self) -> quinn::ServerConfig {
-        self.quinn.clone()
-    }
-}
-
 pub fn input_client_config(
     identity: &Identity,
     expected_peer_spki: &[u8],
@@ -205,24 +166,6 @@ pub fn hello_client_config(identity: &Identity) -> Result<HelloClientConfig, Tra
     let mut quinn = quinn::ClientConfig::new(Arc::new(crypto));
     quinn.transport_config(Arc::new(hello_client_transport_config()));
     Ok(HelloClientConfig { quinn })
-}
-
-pub fn pairing_client_config(identity: &Identity) -> Result<PairingClientConfig, TransportError> {
-    let tls = tls_client_config(identity, None, PAIRING_ALPN_PROTOCOL)?;
-    let crypto = QuicClientConfig::try_from(tls)
-        .map_err(|error| TransportError::Configuration(error.to_string()))?;
-    let mut quinn = quinn::ClientConfig::new(Arc::new(crypto));
-    quinn.transport_config(Arc::new(pairing_client_transport_config()));
-    Ok(PairingClientConfig { quinn })
-}
-
-pub fn pairing_server_config(identity: &Identity) -> Result<PairingServerConfig, TransportError> {
-    let tls = tls_server_config(identity, &[PAIRING_ALPN_PROTOCOL])?;
-    let crypto = QuicServerConfig::try_from(tls)
-        .map_err(|error| TransportError::Configuration(error.to_string()))?;
-    let mut quinn = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    quinn.transport_config(Arc::new(pairing_server_transport_config()));
-    Ok(PairingServerConfig { quinn })
 }
 
 fn required_pin(spki: &[u8]) -> Result<Arc<[u8]>, TransportError> {
@@ -373,31 +316,6 @@ fn hello_client_transport_config() -> quinn::TransportConfig {
     config
 }
 
-fn pairing_client_transport_config() -> quinn::TransportConfig {
-    let mut config = pairing_transport_config();
-    config.max_concurrent_bidi_streams(0_u8.into());
-    config
-}
-
-fn pairing_server_transport_config() -> quinn::TransportConfig {
-    let mut config = pairing_transport_config();
-    config.max_concurrent_bidi_streams(1_u8.into());
-    config
-}
-
-fn pairing_transport_config() -> quinn::TransportConfig {
-    let mut config = quinn::TransportConfig::default();
-    // The initiator opens the one pairing stream. Nothing else is allowed.
-    config
-        .max_concurrent_uni_streams(0_u8.into())
-        .datagram_receive_buffer_size(None)
-        .datagram_send_buffer_size(0)
-        // The connection stays open while the listener's user decides whether
-        // to allow the pairing, which can take longer than the idle timeout.
-        .keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    config
-}
-
 struct RpkServerVerifier {
     algorithms: WebPkiSupportedAlgorithms,
     expected: Option<Arc<[u8]>>,
@@ -421,7 +339,7 @@ impl fmt::Debug for RpkServerVerifier {
                 &if self.expected.is_some() {
                     "pinned"
                 } else {
-                    "pairing"
+                    "hello"
                 },
             )
             .finish()
@@ -564,23 +482,19 @@ fn verify_rpk_signature(
 mod tests {
     use super::*;
 
-    /// Each version's protocols. Computers on different protocols cannot
-    /// pair or connect, so a protocol change needs a new version, or the
+    /// Each version's input protocol. Computers on different protocols
+    /// cannot connect, so a protocol change needs a new version, or the
     /// installer hands out one that cannot talk to a build from main.
-    const VERSIONS: &[(&str, &[u8], &[u8])] = &[
-        ("0.1.0", b"zflow/1", b"zflow-pair/1"),
-        ("0.2.0", b"zflow/3", b"zflow-pair/4"),
-    ];
+    const VERSIONS: &[(&str, &[u8])] = &[("0.1.0", b"zflow/1"), ("0.2.0", b"zflow/3")];
 
     #[test]
     fn a_protocol_change_comes_with_a_new_version() {
         let version = env!("CARGO_PKG_VERSION");
-        let Some(&(_, input, pairing)) = VERSIONS.iter().find(|(known, ..)| *known == version)
-        else {
+        let Some(&(_, input)) = VERSIONS.iter().find(|(known, _)| *known == version) else {
             panic!("add version {version} and its protocols to VERSIONS");
         };
         assert!(
-            input == INPUT_ALPN_PROTOCOL && pairing == PAIRING_ALPN_PROTOCOL,
+            input == INPUT_ALPN_PROTOCOL,
             "version {version} already shipped other protocols; raise the version in Cargo.toml"
         );
     }

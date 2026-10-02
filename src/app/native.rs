@@ -3,8 +3,7 @@ use super::{
     handoff,
     layout_model::{self, Layout, LayoutDocument, Monitor},
     model::{ConfigDocument, Contents, Document},
-    nearby::{BrowserStatus, NearbyBrowser, NearbyRecord},
-    pairing::Pairing,
+    nearby::{BrowserStatus, NearbyBrowser},
     sharing::Observer,
 };
 use crate::{
@@ -113,7 +112,6 @@ pub(crate) struct NativeApp {
     window: PairingWindow,
     /// Computers that joined, newest last, for the window to post once.
     notices: Vec<Notice>,
-    pairing: Pairing,
     /// Receiver desktop sizes read over each peer's session.
     desktops: BTreeMap<String, (u32, u32)>,
     accessibility: bool,
@@ -167,7 +165,6 @@ impl NativeApp {
             identity,
             window: PairingWindow::load(&state_dir),
             notices: Vec::new(),
-            pairing: Pairing::default(),
             desktops: BTreeMap::new(),
             accessibility: crate::macos::accessibility_authorized(false),
             tap_refused: None,
@@ -247,19 +244,6 @@ impl NativeApp {
                 // Says hello on the next tick rather than in a second.
                 self.neighbors_at = Instant::now() - NEIGHBORS_TICK;
             }
-            Request::Pair { address, code } => {
-                let remote = address
-                    .as_deref()
-                    .map(crate::pairing::parse_pairing_address)
-                    .transpose()?;
-                if let Some(remote) = remote {
-                    ensure!(remote.port() != 0, "Enter the other computer's IP address");
-                }
-                self.pairing
-                    .start(self.document.path.clone(), remote, code)?;
-            }
-            Request::PairRespond { allow } => self.pairing.respond(allow)?,
-            Request::PairCancel => self.pairing.cancel(),
             Request::Forget { name } => {
                 self.document.draft.peers.remove(&name);
                 self.save_config()?;
@@ -536,7 +520,7 @@ impl NativeApp {
             return;
         }
         let config = self.document.saved();
-        if self.emergency_paused || !config.macos.sharing || self.pairing.active() {
+        if self.emergency_paused || !config.macos.sharing {
             return;
         }
         if config.peers.is_empty() || !self.accessibility {
@@ -1049,7 +1033,6 @@ impl NativeApp {
             self.observer.session_peer(),
             controller.as_deref(),
         );
-        let nearby = self.nearby.snapshot();
         let connected = peers.iter().any(|p| {
             matches!(
                 p.state,
@@ -1103,7 +1086,7 @@ impl NativeApp {
                 notice,
             ));
         }
-        if let BrowserStatus::Failed(error) = nearby.status {
+        if let BrowserStatus::Failed(error) = self.nearby.status() {
             health.push(Health::new(
                 "discovery",
                 Level::Warning,
@@ -1117,8 +1100,6 @@ impl NativeApp {
             health,
             layout: Some(self.layout.draft.clone()),
             peers,
-            pairing: self.pairing.snapshot(),
-            nearby: unpaired(config, nearby.records.into_values()),
             pause_at_edges: Some(config.switching.pause_at_edges),
             shortcuts: vec![Shortcut {
                 title: "Return input to this computer".into(),
@@ -1192,19 +1173,6 @@ fn peer_keys(config: &Config) -> BTreeMap<String, String> {
 /// kept one's.
 fn next_version(kept: Option<&SharedLayout>) -> Option<u64> {
     kept.map_or(0, |kept| kept.version).checked_add(1)
-}
-
-/// The nearby computers not paired yet. Discovery names nobody, so one that
-/// shares an address with a paired computer counts as that computer.
-fn unpaired(config: &Config, records: impl Iterator<Item = NearbyRecord>) -> Vec<NearbyRecord> {
-    let paired: BTreeSet<IpAddr> = config
-        .peers
-        .values()
-        .flat_map(|peer| peer.addresses.iter().map(SocketAddr::ip))
-        .collect();
-    records
-        .filter(|record| !record.addresses.iter().any(|a| paired.contains(&a.ip())))
-        .collect()
 }
 
 /// The configuration without the addresses saved for each computer, which
@@ -1395,8 +1363,6 @@ mod tests {
             "own_mark",
             "unplaced",
             "peers",
-            "pairing",
-            "nearby",
             "pause_at_edges",
             "shortcuts",
             "share_clipboard",
@@ -1535,30 +1501,6 @@ mod tests {
         let row = app.sharing_health(true);
         assert_eq!(row.level, Level::Error);
         assert_eq!(row.action.unwrap().command, "allow_accessibility");
-    }
-
-    #[test]
-    fn nearby_leaves_out_the_computers_already_paired() {
-        let record = |ip: &str| NearbyRecord {
-            instance: ip.into(),
-            name: None,
-            addresses: vec![SocketAddr::new(ip.parse().unwrap(), 43119)],
-            compatible: true,
-            pair_address: None,
-        };
-        let mut config = Config::default();
-        config.peers.insert(
-            "desk".into(),
-            crate::config::PeerConfig {
-                spki_der_hex: "01".into(),
-                addresses: vec!["192.0.2.7:43119".parse().unwrap()],
-                permissions: Default::default(),
-                keyboard: Default::default(),
-                reverse_scroll: false,
-            },
-        );
-        let nearby = [record("192.0.2.7"), record("192.0.2.8")];
-        assert_eq!(unpaired(&config, nearby.into_iter()), [record("192.0.2.8")]);
     }
 
     #[test]

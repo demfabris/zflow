@@ -5,11 +5,8 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    config::{PeerConfig, PeerPermissions},
-    core::KeyboardMode,
-    metrics::SessionMetricsSnapshot,
-    neighbors::Unplaced,
-    pairing_window::View as PairingWindow,
+    config::PeerPermissions, core::KeyboardMode, metrics::SessionMetricsSnapshot,
+    neighbors::Unplaced, pairing_window::View as PairingWindow,
 };
 
 pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
@@ -24,10 +21,6 @@ pub enum Request {
     },
     Local,
     ListPeers,
-    AddPeer {
-        peer: String,
-        record: PeerConfig,
-    },
     RevokePeer {
         peer: String,
     },

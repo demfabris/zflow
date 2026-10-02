@@ -65,7 +65,7 @@ const snapshot = {
     api: 2, status: ready, sharing: true,
     health: [{id: 'service', level: 'ok', title: 'Background service', detail: 'Running', action: null}],
     pairing_window: closedWindow, layout, own_mark: 'a1b2c3', unplaced: [],
-    peers: [peer('MacBook')], pairing: {state: 'idle'}, nearby: [], pause_at_edges: false,
+    peers: [peer('MacBook')], pause_at_edges: false,
     shortcuts: [{title: 'Return input to this computer', keys: 'Ctrl+Super+Backspace'}],
     share_clipboard: false, autostart: true, config_path: '/etc/zflow/zflow.toml', notices: [], platform: null,
 };
@@ -134,25 +134,6 @@ const object = Gio.DBusExportedObject.wrapJSObject(xml, {
             }
             break;
         }
-        case 'pair':
-            if (request.address === null) {
-                snapshot.pairing = {state: 'listening', code: '482 913'};
-            } else {
-                assert(request.address === '192.0.2.7' && request.code === '123456', 'connecting forwards the address and the typed code');
-                snapshot.pairing = {state: 'paired', name: 'Mac mini'};
-                snapshot.peers.push(peer('Mac mini'));
-            }
-            break;
-        case 'pair_respond':
-            assert(snapshot.pairing.state === 'confirm', 'answers only a waiting question');
-            if (request.allow) {
-                snapshot.pairing = {state: 'paired', name: snapshot.pairing.name};
-                snapshot.peers.push(peer(snapshot.pairing.name));
-            } else {
-                snapshot.pairing = {state: 'failed', error: 'Pairing declined'};
-            }
-            break;
-        case 'pair_cancel': snapshot.pairing = {state: 'idle'}; break;
         case 'move_tile': {
             moves.push(request);
             if (failMove) throw new Error('Computers cannot overlap');
@@ -388,51 +369,15 @@ app.connect('activate', () => {
         failSharing = false;
         settings._login.active = false;
         await waitFor(() => !snapshot.autostart && !settings._busy);
-        assert(!settings._pairing, 'a computer with peers does not open pairing by itself');
-        settings._openPairing();
-        await waitFor(() => settings._pairing.code.label === '482 913' && !settings._busy);
-        settings._pairing.remote.text = '192.0.2.7';
-        settings._pairing.entered.text = '123 456';
-        settings._pairing.connect.emit('clicked');
-        await waitFor(() => snapshot.pairing.state === 'paired' && !settings._busy);
-        assert(find('Mac mini'), 'pairing saves the other computer');
-        await waitFor(() => settings._pairing.stage.title === 'Paired with Mac mini');
-        settings._pairing.dialog.close();
-        await waitFor(() => settings._pairing === null && snapshot.pairing.state === 'idle');
         await settings._run({command: 'forget', name: 'MacBook'});
-        await settings._run({command: 'forget', name: 'Mac mini'});
         assert(!find('MacBook'), 'forget uses daemon API');
         const freshWindow = new Adw.ApplicationWindow({application: app, default_width: 520, default_height: 640});
         const fresh = new Settings(freshWindow);
         freshWindow.content = fresh.page;
         freshWindow.present();
         await waitFor(() => fresh._sharing.sensitive);
-        // A fresh install waits for computers on the shelf; code pairing
-        // opens only when asked for.
-        assert(!fresh._pairing && fresh._peerRows[0].title === 'No computers added yet', 'a fresh install does not open code pairing by itself');
-        fresh._openPairing();
-        await waitFor(() => fresh._pairing !== null && snapshot.pairing.state === 'listening' && fresh._pairing.code.label === '482 913');
-        // A computer proves the code; nothing is saved until the person here allows it.
-        snapshot.pairing = {state: 'confirm', name: 'Stranger', address: '192.0.2.66'};
-        await fresh.client.refresh();
-        await waitFor(() => fresh._pairing.ask.visible && !fresh._pairing.shown.visible);
-        assert(fresh._pairing.question.title === 'Allow Stranger to pair with this computer?', 'the question names the computer');
-        assert(fresh._pairing.question.subtitle.includes('192.0.2.66'), 'the question shows its address');
-        await fresh._respond(false);
-        await waitFor(() => snapshot.pairing.state === 'failed' && fresh._pairing.renew.visible && !fresh._busy);
-        assert(!find('Stranger'), 'declining saves nothing');
-        await fresh._listen();
-        await waitFor(() => snapshot.pairing.state === 'listening' && !fresh._busy);
-        snapshot.pairing = {state: 'confirm', name: 'MacBook', address: '192.0.2.9'};
-        await fresh.client.refresh();
-        await waitFor(() => fresh._pairing.ask.visible);
-        fresh._pairing.allow.emit('clicked');
-        await waitFor(() => snapshot.pairing.state === 'paired' && !fresh._busy);
-        assert(find('MacBook'), 'allowing saves the computer');
-        await waitFor(() => fresh._pairing.stage.title === 'Paired with MacBook');
-        snapshot.peers = [];
-        fresh._pairing.dialog.close();
-        await waitFor(() => snapshot.pairing.state === 'idle');
+        // A fresh install has nothing to show but the shelf and its window.
+        assert(fresh._peerRows[0].title === 'No computers added yet', 'a fresh install starts with no computers');
         fresh.destroy();
         freshWindow.close();
         Object.assign(snapshot, {
@@ -440,7 +385,7 @@ app.connect('activate', () => {
             health: [{id: 'service', level: 'error', title: 'Background service', detail: 'Start the zflow system service', action: null}],
         });
         await settings.client.refresh();
-        assert(!settings._sharing.sensitive && !settings._pairButton.sensitive && !settings._clipboard.sensitive, 'offline controls disabled');
+        assert(!settings._sharing.sensitive && !settings._addButton.sensitive && !settings._clipboard.sensitive, 'offline controls disabled');
         assert(!settings._layout.visible && settings._computers.description === 'Arrange computers in zflow on the other computer.', 'without a layout, the hint comes back');
         assert(statusText(snapshot) === 'Needs attention', 'offline status');
         assert(settings._healthRows[0].subtitle === 'Start the zflow system service', 'the check says what failed');
@@ -453,7 +398,7 @@ app.connect('activate', () => {
         const before = callCount;
         await settings.client.refresh();
         assert(callCount === before, 'closed window stops polling');
-        print('GTK settings: status, checks, shortcuts, focus, layout moves, marks, the shelf, placing, joined notices, the pairing window, add by address, keyboard mode, control permission, reverse scrolling, pause at edges, share clipboard, logs, open rows, pause, rollback, login, pairing, first run, allow and decline, forget, offline and cleanup passed');
+        print('GTK settings: status, checks, shortcuts, focus, layout moves, marks, the shelf, placing, joined notices, the pairing window, add by address, keyboard mode, control permission, reverse scrolling, pause at edges, share clipboard, logs, open rows, pause, rollback, login, first run, forget, offline and cleanup passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         settings.destroy();
         object.unexport();

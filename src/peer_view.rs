@@ -1,4 +1,4 @@
-//! Desktop peer metadata, setup-code pairing, and desktop session attachment.
+//! Desktop peer metadata, placing found computers, and desktop session attachment.
 
 use std::{
     collections::BTreeMap,
@@ -55,16 +55,6 @@ pub enum Request {
         terminal: bool,
     },
     Desktop {},
-    /// Listens and shows a fresh setup code, or connects to `remote` with the
-    /// code shown on it.
-    Pair {
-        remote: Option<std::net::SocketAddr>,
-        code: Option<String>,
-    },
-    /// Answers [`PairingEvent::Confirm`] on the same connection.
-    PairRespond {
-        allow: bool,
-    },
     SetSwitching {
         pause_at_edges: bool,
     },
@@ -268,29 +258,6 @@ impl AgentReply {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PairingEvent {
-    /// The setup code this computer shows while it waits.
-    Listening {
-        code: String,
-    },
-    /// A computer proved the code; the person here allows it or not.
-    Confirm {
-        name: String,
-        address: String,
-    },
-    /// Connected with the code; the other computer's user has to allow it.
-    Approving,
-    /// Both computers proved the code and this one saved the other as `name`.
-    Paired {
-        name: String,
-    },
-    Error {
-        message: String,
-    },
-}
-
 /// Applies a settings change to a paired computer. Any change also lets this
 /// computer send to it, which brings a record saved by one-way pairing up to
 /// two-way. Pre-login input stays a root-only setting.
@@ -474,8 +441,9 @@ mod tests {
             r#"{"command":"reload_config"}"#,
             r#"{"command":"status","path":"/etc/zflow"}"#,
             r#"{"command":"snapshot"}"#,
-            r#"{"command":"pair","remote":null,"identity":"attacker"}"#,
-            r#"{"command":"pair","remote":null,"code":null,"name":"desk","permissions":{"inject_prelogin":true}}"#,
+            // Code pairing is gone.
+            r#"{"command":"pair","remote":null,"code":null}"#,
+            r#"{"command":"pair_respond","allow":true}"#,
             r#"{"command":"set_keyboard","name":"desk","mode":"mac"}"#,
             r#"{"command":"set_peer","name":"desk","keyboard":"dvorak"}"#,
             r#"{"command":"set_peer","name":"desk","keyboard":"mac","permissions":{"inject_prelogin":true}}"#,

@@ -14,11 +14,10 @@ use zflow::{
     identity::Identity,
     transport::{
         Accepted, InputControlMessage, InputDatagram, TransportError, accept, accept_input,
-        accept_pairing, connect_hello, connect_input, connect_pairing, hello_client_config,
-        input_client_config, input_server_config, input_server_config_for_peers,
-        pairing_client_config, pairing_server_config,
+        connect_hello, connect_input, hello_client_config, input_client_config,
+        input_server_config, input_server_config_for_peers,
     },
-    wire::{Hello, Os, PairingOffer, WireMessage, encode},
+    wire::{Hello, Os, WireMessage, encode},
 };
 
 const LOOPBACK: SocketAddr =
@@ -475,48 +474,6 @@ async fn wrong_server_spki_pin_rejects_the_handshake() {
             .unwrap()
             .is_err()
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pairing_proves_rpk_possession_and_the_setup_code() {
-    let (_client_directory, client_identity) = identity();
-    let (_server_directory, server_identity) = identity();
-    let client_config = pairing_client_config(&client_identity).unwrap();
-    let server_config = pairing_server_config(&server_identity).unwrap();
-
-    let server_endpoint = quinn::Endpoint::server(server_config.quinn_config(), LOOPBACK).unwrap();
-    let server_address = server_endpoint.local_addr().unwrap();
-    let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
-    let accept_endpoint = server_endpoint.clone();
-    let accept = tokio::spawn(async move {
-        let incoming = accept_endpoint.accept().await.unwrap();
-        accept_pairing(incoming).await.unwrap()
-    });
-
-    let mut client = connect_pairing(&client_endpoint, server_address, &client_config)
-        .await
-        .unwrap();
-    let mut server = accept.await.unwrap();
-    assert_eq!(client.peer_spki(), server_identity.spki());
-    assert_eq!(server.peer_spki(), client_identity.spki());
-    let client_offer = PairingOffer {
-        device_label: Some("client".into()),
-        input_port: 43119,
-        input_candidates: vec!["127.0.0.1:43119".into()],
-    };
-    let server_offer = PairingOffer {
-        device_label: Some("server".into()),
-        input_port: 43120,
-        input_candidates: vec!["127.0.0.1:43120".into()],
-    };
-    let (seen_by_client, seen_by_server) = tokio::join!(
-        client.authenticate(client_identity.spki(), &client_offer, b"000417"),
-        server.authenticate(server_identity.spki(), &server_offer, b"000417")
-    );
-    assert_eq!(seen_by_client.unwrap(), server_offer);
-    assert_eq!(seen_by_server.unwrap(), client_offer);
-    client.close();
-    server.close();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

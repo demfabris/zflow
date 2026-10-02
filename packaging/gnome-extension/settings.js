@@ -104,11 +104,7 @@ export class Settings {
         addStyle();
         this._computers = new Adw.PreferencesGroup({title: 'Computers', description: NO_LAYOUT});
         this._addButton = button('Add by Address…', () => this._openAddAddress(), ['flat']);
-        this._pairButton = button('Pair with Code…', () => this._openPairing(), ['flat']);
-        const actions = new Gtk.Box({spacing: 6});
-        actions.append(this._addButton);
-        actions.append(this._pairButton);
-        this._computers.header_suffix = actions;
+        this._computers.header_suffix = this._addButton;
         // A fresh install's pairing window, and the computer it took.
         this._windowRow = new Adw.ActionRow({title: '', subtitle_lines: 0, use_markup: false, visible: false});
         this._windowMark = new Gtk.Box({spacing: 2});
@@ -208,7 +204,7 @@ export class Settings {
     async _run(request) {
         if (this._busy) return false;
         this._busy = true;
-        this._sharing.sensitive = this._login.sensitive = this._pairButton.sensitive = this._addButton.sensitive = this._pause.sensitive = this._clipboard.sensitive = false;
+        this._sharing.sensitive = this._login.sensitive = this._addButton.sensitive = this._pause.sensitive = this._clipboard.sensitive = false;
         for (const row of [...this._keyboards.values(), ...this._controls.values(), ...this._scrolls.values()]) row.sensitive = false;
         this._showError(null);
         let success = false;
@@ -241,7 +237,6 @@ export class Settings {
         this._clipboard.sensitive = online && share !== null && !this._busy;
         this._login.active = (known && snapshot.autostart) ?? false;
         this._login.sensitive = known && snapshot.autostart !== null && !this._busy;
-        this._pairButton.sensitive = online && !this._busy && !this._pairing;
         this._addButton.sensitive = online && !this._busy;
         this._updating = false;
         this._error.subtitle = this._actionError || (known ? '' : snapshot?.error ?? 'Update zflow so this window and the service match.');
@@ -256,7 +251,6 @@ export class Settings {
         this._updateJoined(known ? snapshot.notices ?? [] : [], peers);
         this._updatePeers(peers);
         this._updateShortcuts(known ? snapshot.shortcuts : []);
-        this._updatePairing(known ? snapshot : {});
     }
 
     _updateWindow(window) {
@@ -635,121 +629,8 @@ export class Settings {
         dialog.present(this.window);
     }
 
-    _openPairing() {
-        if (this._pairing) return;
-        const dialog = new Adw.Dialog({title: 'Pair Computer', content_width: 440, content_height: 560});
-        const toolbar = new Adw.ToolbarView();
-        toolbar.add_top_bar(new Adw.HeaderBar());
-        const page = new Adw.PreferencesPage();
-        toolbar.content = page;
-        dialog.child = toolbar;
-        // Knowing the code is not enough: the person here allows the computer.
-        const ask = new Adw.PreferencesGroup({visible: false});
-        const question = new Adw.ActionRow({title: '', subtitle_lines: 0, use_markup: false});
-        question.add_prefix(new Gtk.Image({icon_name: 'computer-symbolic'}));
-        ask.add(question);
-        const allow = button('Allow', () => this._respond(true), ['suggested-action']);
-        const answers = new Gtk.Box({spacing: 12, halign: Gtk.Align.END, margin_top: 12});
-        answers.append(button('Decline', () => this._respond(false)));
-        answers.append(allow);
-        ask.add(answers);
-        page.add(ask);
-        const shown = new Adw.PreferencesGroup({title: 'Setup code', description: 'On the other computer, start pairing in zflow and type this code.'});
-        const code = new Gtk.Label({label: '', selectable: true, css_classes: ['title-1', 'numeric'], margin_top: 18, margin_bottom: 18});
-        shown.add(code);
-        const renew = button('Show a New Code', () => this._listen());
-        shown.add(renew);
-        page.add(shown);
-        const other = new Adw.PreferencesGroup({title: 'Or type another computer’s code', description: 'Open Pair Computer on the other computer, then enter its address and the code it shows.'});
-        const remote = new Adw.EntryRow({title: 'IP address'});
-        const entered = new Adw.EntryRow({title: 'Its setup code', input_purpose: Gtk.InputPurpose.DIGITS});
-        const connect = button('Pair', () => this._connect(remote.text, entered.text), ['suggested-action']);
-        other.add(remote);
-        other.add(entered);
-        other.add(connect);
-        page.add(other);
-        const result = new Adw.PreferencesGroup();
-        // Peer names and remote error text end up here, so never parse them as markup.
-        const stage = new Adw.ActionRow({title: '', visible: false, subtitle_lines: 0, use_markup: false});
-        result.add(stage);
-        page.add(result);
-        this._pairing = {dialog, ask, question, allow, shown, other, code, renew, remote, entered, connect, stage, asked: false};
-        dialog.connect('closed', () => {
-            this._pairing = null;
-            if (this._pairOwned) {
-                this._pairOwned = false;
-                this.client.call({command: 'pair_cancel'}).catch(error => this._showError(error.message));
-            }
-            this.client.refresh();
-        });
-        dialog.present(this.window);
-        this._updatePairing(this.client.snapshot ?? {});
-        // Showing a code is the usual case: the Mac types it.
-        this._listen();
-    }
-
-    _listen() {
-        return this._startPair({command: 'pair', address: null});
-    }
-
-    _respond(allow) {
-        return this._run({command: 'pair_respond', allow});
-    }
-
-    _connect(remote, code) {
-        remote = remote.trim();
-        if (!remote) { this._showError('Enter the other computer’s IP address.'); return Promise.resolve(false); }
-        return this._startPair({command: 'pair', address: remote, code: code.replace(/[\s-]/g, '')});
-    }
-
-    async _startPair(request) {
-        // One pairing runs at a time, so a new request replaces the code on screen.
-        if (this._pairOwned) {
-            this._pairOwned = false;
-            await this.client.call({command: 'pair_cancel'}).catch(() => {});
-        }
-        this._pendingPair = this._run(request);
-        const started = await this._pendingPair;
-        this._pendingPair = null;
-        if (started && (!this._pairing || this._disposed)) {
-            await this.client.call({command: 'pair_cancel'}).catch(() => {});
-            return false;
-        }
-        this._pairOwned = started;
-        return started;
-    }
-
-    _updatePairing(snapshot) {
-        const ui = this._pairing;
-        if (!ui) return;
-        const pairing = snapshot.pairing ?? {state: 'idle'};
-        const listening = pairing.state === 'listening';
-        const confirming = pairing.state === 'confirm';
-        const connecting = pairing.state === 'connecting' || pairing.state === 'approving';
-        ui.ask.visible = confirming;
-        ui.shown.visible = ui.other.visible = !confirming;
-        if (confirming) {
-            ui.question.title = `Allow ${pairing.name ?? 'this computer'} to pair with this computer?`;
-            ui.question.subtitle = `It entered this computer’s code from ${pairing.address ?? 'your network'}. Once paired, each can control the other. Allow it only if it is the computer you are setting up.`;
-            if (!ui.asked) ui.allow.grab_focus();
-        }
-        ui.asked = confirming;
-        ui.code.label = listening ? (pairing.code ?? '…') : 'No code shown';
-        ui.code.sensitive = listening;
-        ui.renew.visible = !listening && !connecting && !confirming;
-        ui.connect.sensitive = !connecting && !this._busy;
-        const issue = pairing.error || this._actionError;
-        ui.stage.visible = connecting || pairing.state === 'paired' || !!issue;
-        ui.stage.title = pairing.state === 'approving' ? 'Waiting for the other computer…' : connecting ? 'Pairing…' : pairing.state === 'paired' ? `Paired with ${pairing.name ?? 'the other computer'}` : 'Pairing needs attention';
-        ui.stage.subtitle = pairing.state === 'paired' ? 'You can close this window. Arrange the computers in zflow on the other computer.'
-            : pairing.state === 'approving' ? 'Choose Allow on the other computer.' : connecting ? '' : issue || '';
-    }
-
     destroy() {
         this._disposed = true;
-        // Let the cancellation reach the service before cancelling pending UI reads.
-        if (this._pendingPair) this._pendingPair.then(started => started ? this.client.call({command: 'pair_cancel'}) : null).finally(() => this.client.destroy()).catch(() => {});
-        else if (this._pairOwned) this.client.call({command: 'pair_cancel'}).finally(() => this.client.destroy()).catch(() => {});
-        else this.client.destroy();
+        this.client.destroy();
     }
 }

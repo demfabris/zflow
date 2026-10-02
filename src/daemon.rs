@@ -1292,13 +1292,6 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
                 .map(|(name, peer)| (name.clone(), peer.permissions))
                 .collect(),
         }),
-        Request::AddPeer { peer, record } => {
-            let _mutation = shared.config_mutation.lock().await;
-            let mut config = shared.config.read().await.clone();
-            config.peers.insert(peer, record);
-            shared.apply_config_locked(config, true).await?;
-            Ok(Response::Ack)
-        }
         Request::RevokePeer { peer } => {
             let _mutation = shared.config_mutation.lock().await;
             let mut config = shared.config.read().await.clone();
