@@ -110,6 +110,9 @@ Checks:
     192.0.2.50/32 dev lo`) and restart zflowd. The Mac's `zflow.toml` never
     gains 192.0.2.50, while a DHCP change (check 10) still saves the new
     address once a session comes up there.
+21. **No tile passes for this one.** Name the VM `This-Mac` (`sudo
+    hostnamectl set-hostname This-Mac`) and restart its zflowd. On the Mac,
+    and on Ubuntu, its shelf tile says "Computer" with its mark.
 
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 

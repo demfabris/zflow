@@ -18,6 +18,9 @@ use crate::{
 
 /// The longest host name the OS label is cut to before it becomes a name.
 const MAX_LABEL_BYTES: usize = 255;
+/// What the Mac and GNOME windows call a computer's own tile. No other
+/// computer's name may read as one, or its tile could pass for this one.
+const OWN_TILE_LABELS: [&str; 2] = ["This Mac", "This computer"];
 
 /// Something to tell people once, as a system notification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,7 +179,8 @@ fn default_permissions() -> PeerPermissions {
 /// The name a computer is shown and saved under. It comes from the other
 /// computer, so only plain ASCII survives: invisible, bidirectional and
 /// lookalike characters could make two computers look the same in a list.
-/// It fits one DNS label, so the mDNS record can carry it too.
+/// A name that reads as an own tile's label becomes "Computer". It fits one
+/// DNS label, so the mDNS record can carry it too.
 pub fn peer_name(label: Option<&str>) -> String {
     let label = label.unwrap_or_default().trim();
     let label = label
@@ -193,11 +197,25 @@ pub fn peer_name(label: Option<&str>) -> String {
     let mut name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate(&mut name, MAX_NAME_BYTES);
     let name = name.trim_end();
-    if name.is_empty() {
+    if name.is_empty() || reads_as_own_tile(name) {
         "Computer".into()
     } else {
         name.into()
     }
+}
+
+/// Whether `name` is an own tile's label once case, spaces and punctuation
+/// are left out, as "this-mac" or "THIS_COMPUTER" would be.
+fn reads_as_own_tile(name: &str) -> bool {
+    let letters = |text: &str| -> String {
+        text.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|character| character.to_ascii_lowercase())
+            .collect()
+    };
+    OWN_TILE_LABELS
+        .iter()
+        .any(|label| letters(label) == letters(name))
 }
 
 /// This computer's name, as hellos and mDNS carry it.
@@ -280,6 +298,16 @@ mod tests {
         assert_eq!(peer_name(Some("\u{200b}")), "Computer");
         assert_eq!(peer_name(Some(".local")), "Computer");
         assert_eq!(peer_name(None), "Computer");
+        // No computer can name itself like the tile of the one showing it.
+        for own in [
+            "This Mac",
+            "this-mac.local",
+            "THIS_COMPUTER",
+            " This  computer. ",
+        ] {
+            assert_eq!(peer_name(Some(own)), "Computer", "{own}");
+        }
+        assert_eq!(peer_name(Some("This MacBook")), "This MacBook");
         assert_eq!(peer_name(Some(&"a".repeat(400))).len(), MAX_NAME_BYTES);
         // A cut that lands after a space does not leave it dangling.
         let spaced = format!("{} b", "a".repeat(MAX_NAME_BYTES - 1));
