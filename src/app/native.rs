@@ -1196,6 +1196,7 @@ mod tests {
     fn nearby_leaves_out_the_computers_already_paired() {
         let record = |ip: &str| NearbyRecord {
             instance: ip.into(),
+            name: None,
             addresses: vec![SocketAddr::new(ip.parse().unwrap(), 43119)],
             compatible: true,
             pair_address: None,
