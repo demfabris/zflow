@@ -1343,6 +1343,23 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
             shared.activate(&peer).await?;
             Ok(Response::Ack)
         }
+        Request::Nearby { add } => {
+            if let Some(address) = add {
+                shared.add_address(address)?;
+            }
+            let config = shared.config.read().await;
+            Ok(Response::Nearby {
+                computers: shared.unplaced(&config),
+                pairing_window: shared.window().view(tokio::time::Instant::now()),
+            })
+        }
+        Request::Trust { computer } => {
+            let _mutation = shared.config_mutation.lock().await;
+            let config = shared.config.read().await.clone();
+            let id = shared.find_unplaced(&config, &computer)?;
+            let name = shared.trust(config, &id, None).await?;
+            Ok(Response::Trusted { name })
+        }
     }
 }
 

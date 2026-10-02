@@ -8,7 +8,7 @@ use super::*;
 use crate::{
     discovery::UntrustedCandidate,
     hello::{Notice, NoticeKind, peer_name},
-    neighbors::{Unplaced, fingerprint},
+    neighbors::{Unplaced, UnplacedState, fingerprint},
     transport::{HelloConnection, connect_hello},
     wire::Hello,
 };
@@ -196,6 +196,33 @@ impl Shared {
         self.neighbors.borrow().unplaced(config)
     }
 
+    /// The `key:` id of the found computer with this name or mark, for the
+    /// command line. A name two computers share needs the mark.
+    pub(super) fn find_unplaced(&self, config: &Config, computer: &str) -> Result<String> {
+        let tiles = self.unplaced(config);
+        let matches: Vec<&Unplaced> = tiles
+            .iter()
+            .filter(|tile| {
+                tile.name == computer
+                    || tile
+                        .mark
+                        .as_deref()
+                        .is_some_and(|mark| mark.eq_ignore_ascii_case(computer))
+            })
+            .collect();
+        match matches[..] {
+            [] => bail!("No computer called {computer} was found; run zflow nearby"),
+            [tile] => match tile.state {
+                UnplacedState::Ready | UnplacedState::DuplicateName => Ok(tile.id.clone()),
+                UnplacedState::Identifying => bail!("{computer} has not answered yet; try again"),
+                UnplacedState::DifferentVersion => {
+                    bail!("{computer} runs another zflow version. Update both computers")
+                }
+            },
+            _ => bail!("Several computers are called {computer}; use the mark zflow nearby shows"),
+        }
+    }
+
     /// Trusts a found computer, as a person dropping its tile on the board
     /// or the pairing window does, and returns the name it is saved under.
     /// Dropped on the tile of a saved computer with its name, it is that
@@ -306,7 +333,6 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neighbors::UnplacedState;
 
     fn identity() -> (tempfile::TempDir, Identity) {
         let directory = tempfile::tempdir().unwrap();
@@ -423,5 +449,20 @@ mod tests {
         let layout = shared.layout.lock().await.clone().unwrap();
         assert_eq!(tile_at(&layout, &after), Some((x, y)));
         assert_eq!(tile_at(&layout, &before), None);
+    }
+
+    #[tokio::test]
+    async fn the_command_line_picks_a_computer_by_name_or_by_mark() {
+        let (shared, _kept) = test_daemon();
+        let (_one_directory, one) = identity();
+        let (_two_directory, two) = identity();
+        let first = found(&shared, one.spki(), "desk");
+        found(&shared, two.spki(), "desk");
+        let config = shared.config.read().await.clone();
+        let error = shared.find_unplaced(&config, "desk").unwrap_err();
+        assert!(error.to_string().contains("mark"), "{error}");
+        assert!(shared.find_unplaced(&config, "laptop").is_err());
+        let mark = crate::neighbors::mark(one.spki()).to_uppercase();
+        assert_eq!(shared.find_unplaced(&config, &mark).unwrap(), first);
     }
 }
