@@ -10,7 +10,7 @@ use crate::{
     config::Config,
     desktop::{MAX_SHARED_TILES, SharedLayout},
     discovery::UntrustedCandidate,
-    hello::{self, Notice, NoticeKind, hello_addresses, peer_name},
+    hello::{self, Notice, NoticeKind, peer_name},
     identity::Identity,
     macos::{self, Advertiser, Found, Greeting, Heard, LinkState, Links, LocalNetwork},
     neighbors::{Neighbors, UnplacedState, fingerprint, mark},
@@ -571,8 +571,8 @@ impl NativeApp {
         }
     }
 
-    /// Answers a knock, within its address's share, and keeps what a hello
-    /// or refusal told.
+    /// Answers a knock, within its address's share, keeps what a hello or
+    /// refusal told, and saves where a trusted computer's session came from.
     fn hear(&mut self, heard: Heard, now: tokio::time::Instant) {
         match heard {
             Heard::Knock(knock) => {
@@ -592,21 +592,41 @@ impl NativeApp {
             } => {
                 self.neighbors
                     .hello(&spki, remote, &hello, instance.as_deref(), now);
-                self.learn(&spki, &hello_addresses(remote, &hello));
             }
             Heard::Refused { spki } => self.neighbors.refused_input(&spki),
             Heard::TurnedAway => self.neighbors.turned_one_away(),
+            Heard::Connected {
+                key,
+                address,
+                dialed,
+            } => self.learn(&key, address, dialed),
         }
     }
 
-    /// Saves where a paired computer said it is. Links find it by key, so
-    /// nothing reconnects.
-    fn learn(&mut self, spki: &[u8], addresses: &[SocketAddr]) {
+    /// Saves where a paired computer's session came from, to dial it there
+    /// next, as the Linux service does. A hello's addresses are only its
+    /// word and are never saved. A computer that connected here dialed from
+    /// any port, so its address gets the input port its hello named, else
+    /// the one saved with it. Links find it by key, so nothing reconnects.
+    fn learn(&mut self, key: &str, address: SocketAddr, dialed: bool) {
+        let listen = self.document.saved().transport.listen.port();
         let mut peers = self.document.draft.peers.values_mut();
-        let Some(peer) = peers.find(|peer| peer.spki_der().is_ok_and(|key| key == spki)) else {
+        let Some(peer) = peers.find(|peer| peer.spki_der_hex == key) else {
             return;
         };
-        if peer.learn_addresses(addresses.iter().copied())
+        let address = if dialed {
+            address
+        } else {
+            let heard = peer
+                .fingerprint_hex()
+                .ok()
+                .and_then(|key| self.neighbors.neighbor(&key)?.addresses.first().copied());
+            let port = heard
+                .or(peer.addresses.first().copied())
+                .map_or(listen, |known| known.port());
+            SocketAddr::new(address.ip().to_canonical(), port)
+        };
+        if peer.learn_addresses([address])
             && let Err(error) = self.save_config()
         {
             tracing::warn!(error = %format!("{error:#}"), "a computer's new address was not saved");
@@ -1901,24 +1921,48 @@ mod tests {
     }
 
     #[test]
-    fn new_addresses_for_a_computer_change_nothing_else() {
+    fn only_a_sessions_address_is_saved_and_it_changes_nothing_else() {
         let directory = tempfile::tempdir().unwrap();
         let desk = Identity::load_or_create(&directory.path().join("desk")).unwrap();
         let mut app = mac_with(directory.path(), &[("desk", &desk)]);
         let path = directory.path().join("zflow.toml");
+        let saved = || Config::load(&path).unwrap().peers["desk"].addresses.clone();
         let armed_at = app.retry_at;
+        let now = tokio::time::Instant::now();
+        // Its hello names addresses, which are only its word.
+        let claimed = vec!["198.51.100.9:43200".parse().unwrap()];
+        let hello = hello::make_hello("desk", 43200, claimed, true);
+        let heard = Heard::Hello {
+            instance: None,
+            spki: desk.spki().to_vec(),
+            remote: "192.0.2.7:50000".parse().unwrap(),
+            hello: Box::new(hello),
+        };
+        app.hear(heard, now);
+        assert!(saved().is_empty());
+
+        // A session this Mac dialed saves the address that answered.
+        let key = app.document.saved().peers["desk"].spki_der_hex.clone();
+        let connected = |address: &str, dialed| Heard::Connected {
+            key: key.clone(),
+            address: address.parse().unwrap(),
+            dialed,
+        };
+        app.hear(connected("192.0.2.70:43119", true), now);
         let moved: SocketAddr = "192.0.2.70:43119".parse().unwrap();
-        app.learn(desk.spki(), &[moved]);
-        assert_eq!(
-            Config::load(&path).unwrap().peers["desk"].addresses,
-            [moved]
-        );
+        assert_eq!(saved(), [moved]);
+        // One it opened from a passing port gets the port its hello named.
+        app.hear(connected("[::ffff:192.0.2.7]:50000", false), now);
+        let inbound: SocketAddr = "192.0.2.7:43200".parse().unwrap();
+        assert_eq!(saved(), [inbound, moved]);
         // Another computer's key teaches nothing.
-        app.learn(&[1; 91], &["192.0.2.9:43119".parse().unwrap()]);
-        assert_eq!(
-            Config::load(&path).unwrap().peers["desk"].addresses,
-            [moved]
-        );
+        let other = Heard::Connected {
+            key: "01".into(),
+            address: "192.0.2.9:43119".parse().unwrap(),
+            dialed: true,
+        };
+        app.hear(other, now);
+        assert_eq!(saved(), [inbound, moved]);
         // Nor does an edit of the file that only moves it.
         let mut config = Config::load(&path).unwrap();
         config.peers.get_mut("desk").unwrap().addresses = vec!["192.0.2.71:43119".parse().unwrap()];

@@ -101,7 +101,8 @@ impl Greeting {
     }
 }
 
-/// What came of hellos, for the app to weigh. Nothing here is trusted.
+/// What came of hellos and connections, for the app to weigh. Only a
+/// session's address was proven by the key it trusts.
 pub enum Heard {
     /// A computer is saying hello. Answer it with [`Links::answer`], or
     /// drop it to hang up.
@@ -119,6 +120,15 @@ pub enum Heard {
     /// A connection was turned away because too many were being set up at
     /// once. It could have been a computer not seen otherwise.
     TurnedAway,
+    /// A trusted computer's input session came up: this Mac dialed it at
+    /// `address`, or it connected from there. Unlike a hello's word, TLS
+    /// proved the key at that address, so it is worth saving.
+    Connected {
+        /// The computer's `spki_der_hex`.
+        key: String,
+        address: SocketAddr,
+        dialed: bool,
+    },
 }
 
 /// Where each paired computer was found just now, by its key
@@ -129,6 +139,8 @@ pub type Found = BTreeMap<String, Vec<SocketAddr>>;
 struct Opened {
     handle: SessionHandle,
     events: mpsc::Receiver<SessionEvent>,
+    /// The address this Mac dialed, or the one the peer connected from.
+    address: SocketAddr,
 }
 
 impl Opened {
@@ -390,6 +402,7 @@ impl Links {
                 peer: peer.clone(),
                 config: settings.clone(),
                 window: self.dial_window,
+                heard: self.heard_sender.clone(),
             };
             let layouts = LayoutRoute {
                 peer: name.clone(),
@@ -763,6 +776,8 @@ struct Remote {
     /// How long after this Mac's dial a peer's connection counts as dialed
     /// at the same moment.
     window: Duration,
+    /// Where each session's address goes, for the app to save.
+    heard: mpsc::UnboundedSender<Heard>,
 }
 
 impl Remote {
@@ -833,6 +848,11 @@ async fn run(
         };
         match opened {
             Ok(mut session) => {
+                let _ = remote.heard.send(Heard::Connected {
+                    key: remote.peer.spki_der_hex.clone(),
+                    address: session.address,
+                    dialed: session.endpoint.is_some(),
+                });
                 let opened_at = Instant::now();
                 let mut inbound = receiving.inbound(name, &session.handle);
                 let served = session
@@ -1073,9 +1093,11 @@ async fn open_inbound(
     )
     .await?;
     tracing::info!(peer = %name, %address, session_id = handle.id(), "input link accepted");
-    if let Err(mpsc::error::SendError(command)) =
-        commands.send(Command::Inbound(Opened { handle, events }))
-    {
+    if let Err(mpsc::error::SendError(command)) = commands.send(Command::Inbound(Opened {
+        handle,
+        events,
+        address,
+    })) {
         refuse(command, "the link closed");
     }
     Ok(())
@@ -1086,6 +1108,9 @@ struct Session {
     endpoint: Option<Endpoint>,
     /// When this Mac's dial finished.
     dialed_at: Option<Instant>,
+    /// Where the peer is: the address this Mac dialed, or the one it
+    /// connected from.
+    address: SocketAddr,
     handle: SessionHandle,
     events: mpsc::Receiver<SessionEvent>,
     epoch: SessionEpoch,
@@ -1127,17 +1152,21 @@ impl Session {
             .await?;
             tracing::info!(peer = name, %address, session_id = handle.id(),
                 elapsed_ms = started.elapsed().as_millis() as u64, "input link connected");
-            Ok::<_, anyhow::Error>((handle, events))
+            Ok::<_, anyhow::Error>(Opened {
+                handle,
+                events,
+                address,
+            })
         }
         .await;
-        let (handle, events) = match opened {
+        let opened = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 endpoint.close(0_u32.into(), b"input link failed");
                 return Err(error);
             }
         };
-        let session = Self::new(Opened { handle, events }, Some(endpoint), peer, config)?;
+        let session = Self::new(opened, Some(endpoint), peer, config)?;
         Ok(Self {
             dialed_at: Some(Instant::now()),
             ..session
@@ -1157,7 +1186,11 @@ impl Session {
         peer: &PeerConfig,
         config: &Config,
     ) -> Result<Self> {
-        let Opened { handle, events } = opened;
+        let Opened {
+            handle,
+            events,
+            address,
+        } = opened;
         let mut epoch = [0_u8; 16];
         if let Err(error) = getrandom::fill(&mut epoch) {
             handle.close(SessionCloseReason::LocalRelease);
@@ -1173,6 +1206,7 @@ impl Session {
         Ok(Self {
             endpoint,
             dialed_at: None,
+            address,
             handle,
             events,
             epoch: SessionEpoch(epoch),
@@ -2621,7 +2655,8 @@ mod tests {
         assert!(!theirs.is_closed());
         drop(links);
 
-        // A computer this Mac has no address for connects on its own.
+        // A computer this Mac has no address for connects on its own, and
+        // the app hears where from.
         config.peers.get_mut("linux").unwrap().addresses.clear();
         let mut links = Links::with_backend(FakeBackend::default()).unwrap();
         links.sync(&config, true, false);
@@ -2630,11 +2665,21 @@ mod tests {
                 .states()
                 .any(|(_, state)| matches!(state, LinkState::Down(_)))
         });
-        let (theirs, mut seen, _endpoint) =
+        let (theirs, mut seen, endpoint) =
             server.block_on(dial_mac(linux.path(), &spki, listening(&links)));
         assert_eq!(next(&server, &mut seen), "snapshot");
         wait_until(&mut links, ready);
         assert!(!theirs.is_closed());
+        let Heard::Connected {
+            key,
+            address,
+            dialed,
+        } = heard(&mut links)
+        else {
+            panic!("expected the session's address");
+        };
+        assert_eq!(key, config.peers["linux"].spki_der_hex);
+        assert_eq!((address, dialed), (endpoint.local_addr().unwrap(), false));
         drop(links);
     }
 
@@ -2663,8 +2708,18 @@ mod tests {
                 .states()
                 .any(|(_, state)| matches!(state, LinkState::Down(_)))
         });
-        links.set_found(Found::from([(key, vec![receiver.address])]));
+        links.set_found(Found::from([(key.clone(), vec![receiver.address])]));
         wait_until(&mut links, ready);
+        // The app hears the address that answered, to save it.
+        let Heard::Connected {
+            key: connected,
+            address,
+            dialed,
+        } = heard(&mut links)
+        else {
+            panic!("expected the session's address");
+        };
+        assert_eq!((connected, address, dialed), (key, receiver.address, true));
 
         // Saving where it was found does not reconnect.
         let task = links.links["linux"].task.id();
@@ -2675,7 +2730,7 @@ mod tests {
         drop(links);
     }
 
-    /// Waits for the next hello or refusal.
+    /// Waits for the next thing heard.
     fn heard(links: &mut Links) -> Heard {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

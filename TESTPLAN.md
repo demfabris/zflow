@@ -105,6 +105,11 @@ Checks:
     Mac's record for Ubuntu in its `zflow.toml` has Ubuntu's LAN address and
     not its Tailscale one, since Ubuntu's hellos to a key it does not trust
     name no other addresses.
+20. **Only session addresses are saved on the Mac.** With the Mac and Ubuntu
+    trusting each other, give Ubuntu an extra address (`sudo ip addr add
+    192.0.2.50/32 dev lo`) and restart zflowd. The Mac's `zflow.toml` never
+    gains 192.0.2.50, while a DHCP change (check 10) still saves the new
+    address once a session comes up there.
 
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 
