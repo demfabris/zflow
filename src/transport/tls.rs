@@ -26,7 +26,7 @@ use crate::identity::Identity;
 
 use super::TransportError;
 
-pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/3";
+pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/4";
 /// Answered on the input port by computers that do not trust each other yet.
 pub const HELLO_ALPN_PROTOCOL: &[u8] = b"zflow-hello/4";
 const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -482,19 +482,27 @@ fn verify_rpk_signature(
 mod tests {
     use super::*;
 
-    /// Each version's input protocol. Computers on different protocols
-    /// cannot connect, so a protocol change needs a new version, or the
-    /// installer hands out one that cannot talk to a build from main.
-    const VERSIONS: &[(&str, &[u8])] = &[("0.1.0", b"zflow/1"), ("0.2.0", b"zflow/3")];
+    /// Each version's protocols: input, then the one computers use before
+    /// they trust each other, which was code pairing until 0.3.0. Computers
+    /// on different protocols cannot connect, so a protocol change needs a
+    /// new version, or the installer hands out one that cannot talk to a
+    /// build from main.
+    const VERSIONS: &[(&str, &[u8], &[u8])] = &[
+        ("0.1.0", b"zflow/1", b"zflow-pair/1"),
+        ("0.2.0", b"zflow/3", b"zflow-pair/4"),
+        ("0.3.0", b"zflow/4", b"zflow-hello/4"),
+    ];
 
     #[test]
     fn a_protocol_change_comes_with_a_new_version() {
         let version = env!("CARGO_PKG_VERSION");
-        let Some(&(_, input)) = VERSIONS.iter().find(|(known, _)| *known == version) else {
+        let Some(&(_, input, first_contact)) =
+            VERSIONS.iter().find(|(known, ..)| *known == version)
+        else {
             panic!("add version {version} and its protocols to VERSIONS");
         };
         assert!(
-            input == INPUT_ALPN_PROTOCOL,
+            input == INPUT_ALPN_PROTOCOL && first_contact == HELLO_ALPN_PROTOCOL,
             "version {version} already shipped other protocols; raise the version in Cargo.toml"
         );
     }
