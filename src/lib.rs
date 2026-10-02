@@ -13,6 +13,7 @@ pub mod desktop;
 pub mod discovery;
 #[cfg(target_os = "macos")]
 mod ffi;
+pub mod hello;
 pub mod identity;
 pub mod link;
 #[cfg(target_os = "linux")]

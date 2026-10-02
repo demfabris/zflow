@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 
+pub(crate) use crate::hello::local_device_label;
+pub use crate::hello::this_host_candidates;
 use crate::{
+    hello::peer_name,
     identity::Identity,
     transport::{
         PairingConnection, TransportError, accept_pairing, connect_pairing, pairing_client_config,
@@ -16,9 +19,6 @@ use crate::{
 };
 
 pub const DEFAULT_PAIRING_PORT: u16 = 43120;
-const MAX_LABEL_BYTES: usize = 255;
-/// Leaves room for a " 99" suffix when two computers share a host name.
-const MAX_BASE_NAME_BYTES: usize = MAX_LABEL_BYTES - 8;
 
 /// Bounds the automatic part of pairing, which never waits for a person.
 const PAIRING_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -195,30 +195,6 @@ pub fn make_offer(
     })
 }
 
-/// This computer's addresses on its input port. Sent while pairing, they let
-/// the other computer reach this one after either leaves the network they
-/// paired on, for example over Tailscale.
-pub fn this_host_candidates(input_port: u16) -> Vec<SocketAddr> {
-    let addresses = crate::discovery::local_unicast_addresses().unwrap_or_else(|error| {
-        tracing::debug!("could not list this computer's addresses: {error}");
-        Vec::new()
-    });
-    candidates_on_port(addresses, input_port)
-}
-
-fn candidates_on_port(addresses: Vec<IpAddr>, input_port: u16) -> Vec<SocketAddr> {
-    addresses
-        .into_iter()
-        // A link-local address only works on the link it came from, and the
-        // other computer refuses an IPv6 one without its interface scope.
-        .filter(|address| match address {
-            IpAddr::V4(address) => !address.is_link_local(),
-            IpAddr::V6(address) => !address.is_unicast_link_local(),
-        })
-        .map(|address| SocketAddr::new(address, input_port))
-        .collect()
-}
-
 pub struct PairingListener<'identity> {
     endpoint: quinn::Endpoint,
     identity: &'identity Identity,
@@ -378,31 +354,6 @@ pub fn add_paired_peer(
     Ok(name)
 }
 
-/// The name a new peer is saved under. The label comes from the other
-/// computer, so only plain ASCII survives: invisible, bidirectional and
-/// lookalike characters could make two computers look the same in a list.
-fn peer_name(label: Option<&str>) -> String {
-    let label = label.unwrap_or_default().trim();
-    let label = label
-        .len()
-        .checked_sub(".local".len())
-        .filter(|&end| label.is_char_boundary(end) && label[end..].eq_ignore_ascii_case(".local"))
-        .map_or(label, |end| &label[..end]);
-    let kept: String = label
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '-' | '_' | '\'')
-        })
-        .collect();
-    let mut name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
-    name.truncate(MAX_BASE_NAME_BYTES);
-    if name.is_empty() {
-        "Computer".into()
-    } else {
-        name
-    }
-}
-
 pub async fn connect(
     identity: &Identity,
     remote: SocketAddr,
@@ -507,29 +458,6 @@ async fn complete(
     })
 }
 
-/// The OS host name, cut to the label bound. GUI apps and services do not
-/// inherit the shell's `$HOSTNAME`, so this asks the OS.
-pub(crate) fn local_device_label() -> Option<String> {
-    let mut buffer = [0_u8; 256];
-    // SAFETY: the pointer and length describe `buffer`, which outlives the call.
-    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
-        return None;
-    }
-    let end = buffer
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(buffer.len());
-    let name = String::from_utf8_lossy(&buffer[..end]);
-    let mut end = name.len().min(MAX_LABEL_BYTES);
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    let label = name[..end].trim();
-    validate_label(Some(label))
-        .is_ok()
-        .then(|| label.to_owned())
-}
-
 fn validate_label(label: Option<&str>) -> Result<()> {
     if label.is_some_and(|label| label.is_empty() || label.chars().any(char::is_control)) {
         bail!("pairing device labels must be non-empty printable text");
@@ -593,29 +521,6 @@ mod tests {
 
     #[test]
     fn pairing_offers_every_address_the_other_computer_can_use() {
-        let addresses = [
-            "192.168.1.215",
-            "100.114.101.60",
-            "169.254.3.4",
-            "fe80::1",
-            "fd7a:115c:a1e0::1",
-        ]
-        .map(|address| address.parse().unwrap());
-        assert_eq!(
-            candidates_on_port(addresses.to_vec(), 43119),
-            [
-                "192.168.1.215:43119",
-                "100.114.101.60:43119",
-                "[fd7a:115c:a1e0::1]:43119",
-            ]
-            .map(|address| address.parse::<SocketAddr>().unwrap())
-        );
-
-        // The other computer rejects the whole offer over one bad candidate.
-        for candidate in this_host_candidates(43119) {
-            crate::discovery::UntrustedCandidate::explicit(candidate).unwrap();
-        }
-
         let advertised: SocketAddr = "203.0.113.7:43119".parse().unwrap();
         let many = std::iter::repeat_n(advertised, 2)
             .chain((1..=20).map(|host| SocketAddr::from(([192, 0, 2, host], 43119))))
@@ -686,22 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn peer_names_keep_only_plain_ascii() {
-        assert_eq!(
-            peer_name(Some("Fabricios-MacBook-Pro.local")),
-            "Fabricios-MacBook-Pro"
-        );
-        assert_eq!(peer_name(Some("  desk   pc  ")), "desk pc");
-        assert_eq!(peer_name(Some("Mac\u{202e}kooB")), "MackooB");
-        assert_eq!(peer_name(Some("<span>x</span>")), "spanxspan");
-        assert_eq!(peer_name(Some("Café")), "Caf");
-        assert_eq!(peer_name(Some("\u{200b}")), "Computer");
-        assert_eq!(peer_name(Some(".local")), "Computer");
-        assert_eq!(peer_name(None), "Computer");
-        assert!(peer_name(Some(&"a".repeat(400))).len() <= MAX_BASE_NAME_BYTES);
-    }
-
-    #[test]
     fn setup_codes_accept_what_people_type() {
         for typed in ["482913", "482 913", "482-913", " 482913 "] {
             assert_eq!(SetupCode::parse(typed).unwrap().as_bytes(), b"482913");
@@ -725,14 +614,6 @@ mod tests {
         assert_eq!(parse("[fd00::7]"), "[fd00::7]:43120");
         assert_eq!(parse("[fd00::7]:43120"), "[fd00::7]:43120");
         assert!(parse_pairing_address("ubuntu.local").is_err());
-    }
-
-    #[test]
-    fn device_label_comes_from_the_os_host_name() {
-        // cargo, like launchd and systemd, does not pass $HOSTNAME along.
-        let label = local_device_label().expect("this host has a name");
-        assert!(label.len() <= MAX_LABEL_BYTES);
-        validate_label(Some(&label)).unwrap();
     }
 
     #[test]

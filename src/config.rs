@@ -16,6 +16,9 @@ use crate::{core::KeyboardMode, identity::encode_hex};
 pub const CONFIG_VERSION: u32 = 1;
 pub const MAX_LEASE: Duration = Duration::from_secs(1);
 pub const MAX_CHECKPOINT: Duration = Duration::from_millis(250);
+/// Addresses kept per peer. A computer moves between a few networks; more
+/// would only be dialed in vain.
+pub const MAX_PEER_ADDRESSES: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -242,6 +245,27 @@ impl PeerConfig {
 
     pub fn fingerprint_hex(&self) -> Result<String, ConfigError> {
         Ok(encode_hex(&Sha256::digest(self.spki_der()?)))
+    }
+
+    /// Puts addresses heard from just now first and keeps the newest few,
+    /// one per IP: a newer port replaces an older one. Returns whether
+    /// anything changed, so a caller can skip saving.
+    pub fn learn_addresses(&mut self, newest: impl IntoIterator<Item = SocketAddr>) -> bool {
+        let mut learned: Vec<SocketAddr> = Vec::new();
+        for address in newest.into_iter().chain(self.addresses.iter().copied()) {
+            let address = match address.ip().to_canonical() {
+                IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), address.port()),
+                // Keeps an IPv6 address's interface scope.
+                IpAddr::V6(_) => address,
+            };
+            if !learned.iter().any(|known| known.ip() == address.ip()) {
+                learned.push(address);
+            }
+        }
+        learned.truncate(MAX_PEER_ADDRESSES);
+        let changed = learned != self.addresses;
+        self.addresses = learned;
+        changed
     }
 }
 
@@ -563,6 +587,31 @@ mod tests {
 
         assert_eq!(peer.spki_der().unwrap(), spki);
         assert_eq!(peer.fingerprint_hex().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn peer_addresses_keep_the_newest_few_one_per_ip() {
+        let parse = |addresses: &[&str]| -> Vec<SocketAddr> {
+            addresses.iter().map(|a| a.parse().unwrap()).collect()
+        };
+        let mut peer = PeerConfig::from_spki(
+            b"key",
+            parse(&["192.0.2.1:43119"]),
+            PeerPermissions::default(),
+        )
+        .unwrap();
+        assert!(!peer.learn_addresses(parse(&["192.0.2.1:43119"])));
+        // A mapped address is the same IP, and its newer port wins.
+        assert!(peer.learn_addresses(parse(&["[::ffff:192.0.2.1]:5000", "[2001:db8::1]:43119"])));
+        assert_eq!(
+            peer.addresses,
+            parse(&["192.0.2.1:5000", "[2001:db8::1]:43119"])
+        );
+        let many: Vec<_> = (2..=20)
+            .map(|host| SocketAddr::from(([198, 51, 100, host], 43119)))
+            .collect();
+        peer.learn_addresses(many.clone());
+        assert_eq!(peer.addresses, many[..MAX_PEER_ADDRESSES]);
     }
 
     #[test]
