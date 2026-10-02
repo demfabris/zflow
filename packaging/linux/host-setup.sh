@@ -60,7 +60,7 @@ ensure_service_account() {
 [[ $# -eq 3 ]] || die "usage: host-setup.sh DEFAULT_CONFIG CAPTURE_RULES_TEMPLATE VIRTUAL_RULES"
 readonly DEFAULT_CONFIG="$1" CAPTURE_TEMPLATE="$2" VIRTUAL_RULE_FILE="$3"
 [[ "$EUID" -eq 0 ]] || die "run as root"
-for command in awk cut getent grep groupadd install modprobe runuser udevadm useradd; do
+for command in awk cut getent grep groupadd install mktemp modprobe runuser udevadm useradd; do
     command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
@@ -73,8 +73,14 @@ done
 # Configuration and capture rules are created once and kept on upgrades.
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$CONFIG_DIR" "$STATE_DIR"
 if [[ ! -e "$CONFIG_FILE" ]]; then
+    # The marker goes first, so a run that fails between the two writes both
+    # again. uutils install (Ubuntu 26.04) can't copy a pipe over an existing
+    # file, and a purge leaves the old marker behind.
+    eligible="$(mktemp)"
+    printf 'eligible\n' >"$eligible"
+    install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 "$eligible" "$PAIRING_WINDOW_FILE"
+    rm -f -- "$eligible"
     install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 "$DEFAULT_CONFIG" "$CONFIG_FILE"
-    install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 <(printf 'eligible\n') "$PAIRING_WINDOW_FILE"
 fi
 [[ -f "$CONFIG_FILE" ]] || die "configuration is not a regular file: $CONFIG_FILE"
 chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"
