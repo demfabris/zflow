@@ -150,7 +150,9 @@ impl Service {
             | Request::HelperReady { .. }
             | Request::AllowAccessibility
             | Request::CheckAccessibility
-            | Request::Discover => bail!("Not available on this computer"),
+            | Request::Discover
+            | Request::Place { .. }
+            | Request::AddAddress { .. } => bail!("Not available on this computer"),
         }
         Ok(serde_json::json!({"ok": true}))
     }
@@ -232,6 +234,11 @@ fn snapshot(
         share_clipboard: daemon.as_ref().ok().map(|daemon| daemon.share_clipboard),
         autostart: Some(autostart_enabled()?),
         config_path: CONFIG_PATH.into(),
+        // Filled in once the service says hello and keeps a shelf.
+        pairing_window: Default::default(),
+        own_mark: None,
+        unplaced: Vec::new(),
+        notices: Vec::new(),
         platform: (),
     })
 }

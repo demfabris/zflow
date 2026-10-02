@@ -277,7 +277,9 @@ impl NativeApp {
             Request::SetAutostart { .. }
             | Request::OpenSettings
             | Request::OpenLogs
-            | Request::InstallExtension => bail!("Not available on this computer"),
+            | Request::InstallExtension
+            | Request::Place { .. }
+            | Request::AddAddress { .. } => bail!("Not available on this computer"),
         }
         Ok(serde_json::to_value(self.snapshot())?)
     }
@@ -808,6 +810,11 @@ impl NativeApp {
             share_clipboard: Some(config.clipboard.share),
             autostart: None,
             config_path: self.document.path.clone(),
+            // Filled in once the Mac says hello and keeps a shelf.
+            pairing_window: Default::default(),
+            own_mark: None,
+            unplaced: Vec::new(),
+            notices: Vec::new(),
             platform: MacPlatform {
                 accessibility: self.accessibility,
                 local_network: self.local_network,
@@ -1019,7 +1026,10 @@ mod tests {
             "status",
             "sharing",
             "health",
+            "pairing_window",
             "layout",
+            "own_mark",
+            "unplaced",
             "peers",
             "pairing",
             "nearby",
@@ -1028,6 +1038,7 @@ mod tests {
             "share_clipboard",
             "autostart",
             "config_path",
+            "notices",
             "platform",
         ];
         assert!(

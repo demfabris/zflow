@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::{layout_model::Layout, nearby::NearbyRecord, pairing::PairingSnapshot};
-use crate::{config::PeerConfig, core::KeyboardMode};
+use crate::{
+    config::PeerConfig, core::KeyboardMode, hello::Notice, neighbors::Unplaced,
+    pairing_window::View as PairingWindow,
+};
 
 #[derive(Serialize)]
 pub(super) struct Snapshot<P> {
@@ -18,8 +21,14 @@ pub(super) struct Snapshot<P> {
     /// None while the part that shares input cannot be reached.
     pub sharing: Option<bool>,
     pub health: Vec<Health>,
+    /// The one-shot window in which a fresh install accepts one computer.
+    pub pairing_window: PairingWindow,
     /// None while there is no layout to arrange.
     pub layout: Option<Layout>,
+    /// This computer's key mark, drawn on its own tile. None until known.
+    pub own_mark: Option<String>,
+    /// Computers found but not on the board, for the shelf under it.
+    pub unplaced: Vec<Unplaced>,
     pub peers: Vec<Peer>,
     pub pairing: PairingSnapshot,
     pub nearby: Vec<NearbyRecord>,
@@ -32,6 +41,9 @@ pub(super) struct Snapshot<P> {
     pub autostart: Option<bool>,
     /// The file with the advanced settings.
     pub config_path: PathBuf,
+    /// Things to tell people once, such as a computer that joined. Ids grow,
+    /// so a window posts each one it has not posted before.
+    pub notices: Vec<Notice>,
     pub platform: P,
 }
 
@@ -106,6 +118,8 @@ pub(super) struct Peer {
     pub keyboard: KeyboardMode,
     /// Whether its scrolling is turned around here.
     pub reverse_scroll: bool,
+    /// Its key's mark, as its tile on the shelf showed it.
+    pub mark: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -136,6 +150,10 @@ impl Peer {
             allow_control: record.permissions.send_normal,
             keyboard: record.keyboard,
             reverse_scroll: record.reverse_scroll,
+            mark: record
+                .spki_der()
+                .map(|spki| crate::neighbors::mark(&spki))
+                .unwrap_or_default(),
         }
     }
 }
@@ -212,6 +230,19 @@ pub(crate) enum Request {
         x: i32,
         y: i32,
         tolerance: u32,
+    },
+    /// Drops a computer from the shelf onto the board, which trusts it. `id`
+    /// is its shelf tile's `key:<fingerprint>`; the point is where it landed.
+    Place {
+        id: String,
+        x: i32,
+        y: i32,
+        tolerance: u32,
+    },
+    /// Says hello to an IP address, port optional, so a computer mDNS
+    /// cannot see shows up on the shelf.
+    AddAddress {
+        address: String,
     },
     /// Without `address`, listens and shows a code. Otherwise connects to
     /// that IP address, port optional, with the code shown there.
@@ -328,6 +359,7 @@ mod tests {
             serde_json::json!({
                 "name": "desk", "state": "controlled_from_here", "detail": "Controlled from here",
                 "allow_control": false, "keyboard": "mac", "reverse_scroll": false,
+                "mark": crate::neighbors::mark(&[1]),
             })
         );
     }
@@ -350,6 +382,14 @@ mod tests {
             parse(r#"{"command":"set_clipboard","share":true}"#).unwrap(),
             Request::SetClipboard { share: true }
         ));
+        assert!(matches!(
+            parse(r#"{"command":"place","id":"key:ab","x":1,"y":2,"tolerance":8}"#).unwrap(),
+            Request::Place { .. }
+        ));
+        assert!(matches!(
+            parse(r#"{"command":"add_address","address":"100.64.0.7"}"#).unwrap(),
+            Request::AddAddress { .. }
+        ));
         for old in [
             r#"{"command":"pair_start","address":null}"#,
             r#"{"command":"pair","remote":null}"#,
@@ -359,6 +399,10 @@ mod tests {
             r#"{"command":"set_sharing","enabled":true,"permissions":{"inject_prelogin":true}}"#,
             r#"{"command":"set_clipboard","share":"yes"}"#,
             r#"{"command":"set_clipboard","share":true,"files":true}"#,
+            r#"{"command":"place","id":"key:ab","x":1,"y":2,"tolerance":8,"name":"desk"}"#,
+            r#"{"command":"place","id":"key:ab","x":1,"y":2,"tolerance":8,"trust":true}"#,
+            r#"{"command":"place","id":"key:ab","x":1,"y":2}"#,
+            r#"{"command":"add_address","address":"100.64.0.7","port":43119}"#,
         ] {
             assert!(parse(old).is_err(), "{old}");
         }
@@ -370,7 +414,10 @@ mod tests {
             status: Status::new(Some(true), &[], &[], false),
             sharing: Some(true),
             health: Vec::new(),
+            pairing_window: PairingWindow::default(),
             layout: None,
+            own_mark: None,
+            unplaced: Vec::new(),
             peers: Vec::new(),
             pairing: PairingSnapshot::default(),
             nearby: Vec::new(),
@@ -379,6 +426,7 @@ mod tests {
             share_clipboard: None,
             autostart: None,
             config_path: "/etc/zflow/zflow.toml".into(),
+            notices: Vec::new(),
             platform: (),
         };
         let text = serde_json::to_string(&snapshot).unwrap();
@@ -387,7 +435,10 @@ mod tests {
             "status",
             "sharing",
             "health",
+            "pairing_window",
             "layout",
+            "own_mark",
+            "unplaced",
             "peers",
             "pairing",
             "nearby",
@@ -396,6 +447,7 @@ mod tests {
             "share_clipboard",
             "autostart",
             "config_path",
+            "notices",
             "platform",
         ];
         assert!(
@@ -405,5 +457,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value.as_object().unwrap().len(), order.len());
         assert_eq!(value["status"]["title"], "Pair a computer");
+        // Before a platform fills them, the new rows say nothing is going on.
+        assert_eq!(value["pairing_window"]["state"], "never");
+        assert_eq!(value["unplaced"], serde_json::json!([]));
+        assert_eq!(value["notices"], serde_json::json!([]));
     }
 }

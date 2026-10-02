@@ -8,6 +8,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{Config, PeerConfig, PeerPermissions},
@@ -17,6 +18,23 @@ use crate::{
 
 /// The longest host name the OS label is cut to before it becomes a name.
 const MAX_LABEL_BYTES: usize = 255;
+
+/// Something to tell people once, as a system notification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    /// Grows with each notice, so a window posts each one once.
+    pub id: u64,
+    pub kind: NoticeKind,
+    /// The computer it is about.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    /// It joined while the pairing window was open, or a person placed it.
+    Joined,
+}
 
 /// This computer's hello. `trusts_you` says whether the computer it goes to
 /// is already trusted here, which the other side only shows.
