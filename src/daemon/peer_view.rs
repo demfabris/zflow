@@ -108,11 +108,16 @@ async fn desktop_command(
         shared.retry_links().await;
         return Ok(DesktopReply::Ack);
     }
+    if let Request::AddAddress { address } = request {
+        authorize_peer(stream, daemon_uid, shared.active_uid())?;
+        shared.add_address(address)?;
+        return Ok(DesktopReply::Ack);
+    }
     let _mutation = shared.config_mutation.lock().await;
     let uid = authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();
     match request {
-        Request::Status {} => Ok(DesktopReply::Status(DesktopStatus {
+        Request::Status {} => Ok(DesktopReply::Status(Box::new(DesktopStatus {
             receiving_from: shared
                 .inbound_owner
                 .lock()
@@ -128,8 +133,12 @@ async fn desktop_command(
             connected: shared.sessions.lock().await.keys().cloned().collect(),
             links: shared.link_status().await,
             layout: shared.layout_status().await,
+            pairing_window: shared.window().view(tokio::time::Instant::now()),
+            own_mark: Some(crate::neighbors::mark(shared.identity.spki())),
+            unplaced: shared.unplaced(&config),
+            notices: shared.notices(),
             ..DesktopStatus::from_config(&config)
-        })),
+        }))),
         Request::SetSharing { enabled } => {
             let was = config.daemon.sharing;
             config.daemon.sharing = enabled;
@@ -183,6 +192,17 @@ async fn desktop_command(
             tolerance,
         } => {
             shared.move_tile(&id, x, y, tolerance).await?;
+            Ok(DesktopReply::Ack)
+        }
+        Request::Place {
+            id,
+            x,
+            y,
+            tolerance,
+        } => {
+            let spot = super::arrange::Spot { x, y, tolerance };
+            let name = shared.trust(config, &id, Some(spot)).await?;
+            tracing::info!(peer = %name, uid, "computer placed and trusted");
             Ok(DesktopReply::Ack)
         }
         _ => bail!("Unsupported desktop operation"),

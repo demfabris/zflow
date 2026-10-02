@@ -372,6 +372,32 @@ mod tests {
     }
 
     #[test]
+    fn a_peers_layout_adds_no_trust() {
+        // A peer placed a computer this one has only found on its shelf.
+        let [own, desk, found] = [1, 2, 3].map(|n| format!("{n:064x}"));
+        let tile = |key: &String, x| Tile {
+            key: key.clone(),
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let from_desk = SharedLayout {
+            version: 4,
+            editor: desk.clone(),
+            tiles: vec![tile(&own, 0), tile(&desk, 1920), tile(&found, -1920)],
+        };
+        let keys = BTreeMap::from([("desk".to_owned(), desk)]);
+        // Its tile is not shown here, so no crossing leads to it, and the
+        // next layout this computer writes leaves it out.
+        let here = Layout::from_shared(&from_desk, &own, "This computer", &keys);
+        let ids: Vec<&str> = here.monitors.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["local", "peer:desk"]);
+        let written = here.to_shared(5, &own, &keys);
+        assert!(written.tiles.iter().all(|tile| tile.key != found));
+    }
+
+    #[test]
     fn touching_edges_have_reciprocal_normalized_ranges() {
         let layout = Layout {
             monitors: vec![
