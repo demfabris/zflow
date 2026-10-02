@@ -8,16 +8,20 @@ import XPC
 @MainActor @Observable
 final class Services {
   var helperReady = false
-  var helperTitle = "Checking helper…"
-  var helperDetail = ""
-  var helperAction = "Install…"
+  /// What the Reduce Wi-Fi lag row says while the helper is not ready.
+  var helperNote = "Checking the Wi-Fi helper…"
+  /// The row's fix, when there is one.
+  var helperAction: String?
   var helperBusy = false
   var loginEnabled = SMAppService.mainApp.status == .enabled
   var error: String?
+  /// Only a build signed by a team can install the helper, and that can't
+  /// change while zflow runs.
+  let hasSigningTeam = Services.signingTeam()
   private var refreshing = false
   private let helper = SMAppService.daemon(plistName: "io.zflow.awdl.plist")
 
-  var hasSigningTeam: Bool {
+  private nonisolated static func signingTeam() -> Bool {
     var code: SecCode?
     var information: CFDictionary?
     var staticCode: SecStaticCode?
@@ -30,43 +34,35 @@ final class Services {
     return information[kSecCodeInfoTeamIdentifier as String] as? String != nil
   }
 
-  func refresh() async {
+  func refreshLogin() { loginEnabled = SMAppService.mainApp.status == .enabled }
+
+  func refreshHelper() async {
     guard !refreshing else { return }
     refreshing = true
     defer { refreshing = false }
-    loginEnabled = SMAppService.mainApp.status == .enabled
     guard hasSigningTeam else {
       helperReady = false
-      helperTitle = "Signed build required"
-      helperDetail =
-        "Installing the Wi-Fi helper requires an Apple-signed build. Sharing works without it."
-      helperAction = "Install…"
+      helperNote = "Needs a signed build of zflow. Sharing works without it."
+      helperAction = nil
       return
     }
     switch helper.status {
     case .notRegistered, .notFound:
       helperReady = false
-      helperTitle = "Helper not installed"
-      helperDetail = "macOS will ask you to authorize the background helper."
+      helperNote = "Needs a helper. macOS asks you to allow it."
       helperAction = "Install…"
     case .requiresApproval:
       helperReady = false
-      helperTitle = "Allow the background helper"
-      helperDetail = "Allow zflow in System Settings → General → Login Items & Extensions."
+      helperNote = "Allow zflow in System Settings › General › Login Items & Extensions."
       helperAction = "Allow…"
     case .enabled:
-      let result = await Self.checkHelper()
-      helperReady = result
-      helperTitle = result ? "Wi-Fi helper ready" : "Wi-Fi helper unavailable"
-      helperDetail =
-        result
-        ? "Only active while controlling another computer."
-        : "The helper is registered but did not respond."
-      helperAction = "Repair…"
+      helperReady = await Self.checkHelper()
+      helperNote = helperReady ? "" : "The helper is installed but did not answer."
+      helperAction = helperReady ? nil : "Repair…"
     @unknown default:
       helperReady = false
-      helperTitle = "Helper unavailable"
-      helperDetail = "macOS returned an unknown background service status."
+      helperNote = "macOS returned an unknown status for the helper."
+      helperAction = nil
     }
   }
 
@@ -76,7 +72,7 @@ final class Services {
     defer { helperBusy = false }
     error = nil
     guard hasSigningTeam else {
-      error = helperDetail
+      error = helperNote
       return
     }
     do {
@@ -84,7 +80,7 @@ final class Services {
       if status == .requiresApproval {
         SMAppService.openSystemSettingsLoginItems()
       } else if status == .enabled, await Self.checkHelper() {
-        // The panel refreshes every 10 s, so this button can outlive the approval
+        // The row refreshes every 10 s, so this button can outlive the approval
         // that started the helper. Unregistering disables the item, and macOS
         // refuses an immediate register, so a working helper is left alone.
       } else {
@@ -92,11 +88,11 @@ final class Services {
         try helper.register()
         if helper.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
       }
-      await refresh()
+      await refreshHelper()
     } catch {
       if helper.status == .requiresApproval {
         SMAppService.openSystemSettingsLoginItems()
-        await refresh()
+        await refreshHelper()
       } else {
         self.error = error.localizedDescription
       }

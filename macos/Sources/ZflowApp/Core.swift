@@ -10,25 +10,33 @@ struct Computer: Codable, Identifiable, Equatable, Sendable {
   var width: Int
   var height: Int
 }
-struct Layout: Decodable, Sendable { var monitors: [Computer] }
-struct Pairing: Decodable, Sendable {
-  var state: String
+struct Layout: Decodable, Equatable, Sendable { var monitors: [Computer] }
+struct Pairing: Decodable, Equatable, Sendable {
+  var state: State
   var code: String?
   var name: String?
   var address: String?
   var error: String?
+
+  enum State: String, Decodable, Sendable {
+    case idle, listening, confirm, connecting, approving, paired, failed
+  }
 }
-struct Nearby: Decodable, Identifiable, Sendable {
+struct Nearby: Decodable, Identifiable, Equatable, Sendable {
   var instance: String
   var addresses: [String]
   var compatible: Bool
   /// Where its pairing listener waits; computers advertise their input port.
   var pairAddress: String?
   var id: String { instance }
+  /// Discovery names nobody, so people know a computer by its address.
+  @MainActor var host: String {
+    (pairAddress ?? addresses.first).map { PairingView.host($0) } ?? "Unknown address"
+  }
 }
 /// src/app/api.rs Snapshot, which the GNOME settings window shows too. The
 /// shared rows come first, in window order, then the ones for this Mac.
-struct Snapshot: Decodable, Sendable {
+struct Snapshot: Decodable, Equatable, Sendable {
   var status: Status
   /// Nil while the part that shares input cannot be reached.
   var sharing: Bool?
@@ -39,56 +47,68 @@ struct Snapshot: Decodable, Sendable {
   var nearby: [Nearby]
   /// Whether the pointer rests against an edge for a moment before it crosses.
   var pauseAtEdges: Bool?
-  var shortcuts: [Shortcut]
   /// Whether the clipboard goes along with the pointer.
   var shareClipboard: Bool?
-  /// Nil here: the app keeps the login item itself.
-  var autostart: Bool?
   var configPath: String
   var platform: MacPlatform
 
-  var peerNames: [String] { peers.map(\.name) }
+  /// The rows the window shows as banners.
+  var problems: [Health] { health.filter { $0.level != .ok } }
 }
-struct Status: Decodable, Sendable {
-  /// ready, controlling, controlled, paused, checking, setup or attention.
-  var state: String
+struct Status: Decodable, Equatable, Sendable {
+  var state: State
   var peer: String?
   var title: String
+
+  enum State: String, Decodable, Sendable {
+    case ready, controlling, controlled, paused, checking, setup, attention
+  }
 }
-struct Peer: Decodable, Identifiable, Sendable {
+struct Peer: Decodable, Identifiable, Equatable, Sendable {
   var name: String
-  /// paired, connecting, connected, controlling_this, controlled_from_here or unreachable.
-  var state: String
+  var state: State
+  /// What its row says; an unreachable computer's error.
   var detail: String
   /// Whether it may control this Mac.
   var allowControl: Bool
-  /// standard, pc_positions or mac: how its keys act on this Mac.
-  var keyboard: String
+  /// How its keys act on this Mac.
+  var keyboard: KeyboardMode
   /// Whether its scrolling is turned around on this Mac.
   var reverseScroll: Bool
   var id: String { name }
+
+  enum State: String, Decodable, Sendable {
+    case paired, connecting, connected, unreachable
+    case controllingThis = "controlling_this"
+    case controlledFromHere = "controlled_from_here"
+  }
 }
-struct Health: Decodable, Identifiable, Sendable {
+/// src/core/keymap.rs KeyboardMode, in menu order.
+enum KeyboardMode: String, Codable, CaseIterable, Sendable {
+  case standard
+  case pcPositions = "pc_positions"
+  case mac
+}
+struct Health: Decodable, Identifiable, Equatable, Sendable {
   var id: String
-  /// ok, warning or error.
-  var level: String
+  var level: Level
   var title: String
   var detail: String
   var action: HealthAction?
+
+  enum Level: String, Decodable, Sendable { case ok, warning, error }
 }
-struct HealthAction: Decodable, Sendable {
+struct HealthAction: Decodable, Equatable, Sendable {
   var label: String
   var command: String
 }
-struct Shortcut: Decodable, Sendable {
-  var title: String
-  var keys: String
-}
-struct MacPlatform: Decodable, Sendable {
+struct MacPlatform: Decodable, Equatable, Sendable {
   var accessibility: Bool
-  /// "allowed", "blocked", or "unknown" until setup asks to find computers.
-  var localNetwork: String
+  var localNetwork: LocalNetwork
   var blockAwdl: Bool
+
+  /// Unknown until zflow first looks for computers, which is when macOS asks.
+  enum LocalNetwork: String, Decodable, Sendable { case allowed, blocked, unknown }
 }
 struct CoreRequest: Encodable, Sendable {
   var command: String
@@ -103,7 +123,7 @@ struct CoreRequest: Encodable, Sendable {
   var code: String?
   var allow: Bool?
   var allowControl: Bool?
-  var keyboard: String?
+  var keyboard: KeyboardMode?
   var reverseScroll: Bool?
   var pauseAtEdges: Bool?
   var share: Bool?

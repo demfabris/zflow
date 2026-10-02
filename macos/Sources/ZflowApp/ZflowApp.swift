@@ -7,39 +7,41 @@ struct ZflowApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
   var body: some Scene {
     MenuBarExtra {
-      Text("zflow · \(model.title)")
-      Divider()
-      Button(model.snapshot?.sharing == true ? "Pause Sharing" : "Resume Sharing") {
-        model.send(CoreRequest(command: "set_sharing", enabled: model.snapshot?.sharing != true))
-      }.disabled(model.snapshot == nil)
-      SetUpButton()
-      SettingsLink { Text("Settings…") }.keyboardShortcut(",")
-      Divider()
-      Button("Quit zflow") { model.quit() }.keyboardShortcut("q").disabled(model.busy)
+      MenuBarView(model: model)
     } label: {
-      MenuIcon(model: model).onAppear { delegate.model = model }
+      MenuIcon(model: model, delegate: delegate)
     }
-    .menuBarExtraStyle(.menu)
+    .menuBarExtraStyle(.window)
 
-    Settings {
-      SettingsView(model: model)
+    Window("zflow", id: "main") {
+      MainView(model: model)
     }
-    .defaultSize(width: 600, height: 560)
-    .windowResizability(.contentSize)
-
-    Window("Set Up zflow", id: "setup") {
-      OnboardingView(model: model)
-    }
-    .windowResizability(.contentSize)
-    .defaultPosition(.center)
+    .defaultSize(width: 960, height: 660)
     .restorationBehavior(.disabled)
     .defaultLaunchBehavior(.suppressed)
+    .commands {
+      // Settings is a page of the window, not a window of its own.
+      CommandGroup(replacing: .appSettings) {
+        Button("Settings…") { model.show(.settings) }.keyboardShortcut(",")
+        Button("Open Configuration…") { model.openConfig() }
+      }
+    }
   }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
   var model: AppModel?
+  /// zflow lives in the menu bar; the window brings the Dock icon along.
+  func applicationWillFinishLaunching(_ notification: Notification) {
+    NSApplication.shared.setActivationPolicy(.accessory)
+  }
+  /// Opening zflow again while it runs, as from Applications, shows the window.
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+    model?.show()
+    return false
+  }
+  func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard let model else { return .terminateNow }
     guard !model.busy else { return .terminateCancel }
@@ -51,35 +53,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 }
 
-private struct SetUpButton: View {
-  @Environment(\.openWindow) private var openWindow
-  var body: some View {
-    Button("Set Up…") {
-      openWindow(id: "setup")
-      NSApplication.shared.activate()
-    }
-  }
-}
-
+/// The menu bar icon, which is there from launch to quit, so it also opens
+/// the window when zflow starts and something needs the person.
 private struct MenuIcon: View {
   var model: AppModel
-  @Environment(\.openSettings) private var openSettings
+  var delegate: AppDelegate
   @Environment(\.openWindow) private var openWindow
   var body: some View {
     Image(systemName: model.healthy ? "computermouse" : "computermouse.fill")
       .accessibilityLabel("zflow, \(model.title)")
       .task {
+        delegate.model = model
+        model.openWindow = openWindow
         // The engine's first answer says whether any computer is paired.
         let deadline = ContinuousClock.now + .seconds(5)
         while model.snapshot == nil && model.error == nil && ContinuousClock.now < deadline {
           try? await Task.sleep(for: .milliseconds(50))
         }
-        if model.snapshot?.peers.isEmpty == true {
-          openWindow(id: "setup")
-          NSApplication.shared.activate()
-        } else if model.showSettingsAtLaunch || model.snapshot == nil {
-          NSApplication.shared.activate()
-          openSettings()
+        if model.showSettingsAtLaunch {
+          model.show(.settings)
+        } else if model.snapshot?.peers.isEmpty != false || model.askToMove {
+          model.show()
         }
       }
   }

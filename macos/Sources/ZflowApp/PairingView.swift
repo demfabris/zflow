@@ -13,17 +13,17 @@ struct PairingView: View {
   @State private var submitted: String?
   var pairing: Pairing? { model.snapshot?.pairing }
   var busy: Bool {
-    ["listening", "confirm", "connecting", "approving"].contains(pairing?.state ?? "")
+    pairing.map { [.listening, .confirm, .connecting, .approving].contains($0.state) } ?? false
   }
   var body: some View {
     VStack(alignment: .leading, spacing: 20) {
       Text("Pair a computer").font(.title2.bold())
-      if pairing?.state == "confirm" {
+      if pairing?.state == .confirm {
         Text("Allow \(pairing?.name ?? "this computer") to pair with this Mac?").font(.headline)
         Text(
           "It entered this Mac's code from \(pairing?.address ?? "your network"). Allow it only if it is the computer you are setting up."
         ).foregroundStyle(.secondary)
-      } else if pairing?.state == "listening" {
+      } else if pairing?.state == .listening {
         Text("Type this code on the other computer:")
         Text(pairing?.code ?? "…").font(.system(size: 34, weight: .medium, design: .monospaced))
           .textSelection(.enabled)
@@ -44,12 +44,12 @@ struct PairingView: View {
             if digits.count == 6 { submit(digits) }
           }
           .onSubmit(connect)
-        if pairing?.state == "connecting" {
+        if pairing?.state == .connecting {
           HStack {
             ProgressView().controlSize(.small)
             Text("Pairing…")
           }
-        } else if pairing?.state == "approving" {
+        } else if pairing?.state == .approving {
           HStack {
             ProgressView().controlSize(.small)
             Text("On \(Self.host(target)), choose Allow.")
@@ -84,7 +84,7 @@ struct PairingView: View {
           model.send(CoreRequest(command: "pair"))
         }.buttonStyle(.link)
       }
-      if let error = pairing?.error ?? model.error {
+      if let error = pairing?.error ?? model.failure {
         Text(error).foregroundStyle(.red).font(.callout).textSelection(.enabled)
       }
       HStack {
@@ -93,7 +93,7 @@ struct PairingView: View {
         }
         Spacer()
         Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
-        if pairing?.state == "confirm" {
+        if pairing?.state == .confirm {
           Button("Decline") { model.send(CoreRequest(command: "pair_respond", allow: false)) }
           Button("Allow") { model.send(CoreRequest(command: "pair_respond", allow: true)) }
             .keyboardShortcut(.defaultAction)
