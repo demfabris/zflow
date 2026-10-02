@@ -359,14 +359,9 @@ static void key_tests(void) {
 
 static void scroll_tests(void) {
   CGEventRef event = post_one((ZFlowMacPosted){
-      .kind = ZFLOW_POST_SCROLL, .wheel_x = -1, .wheel_y = 2});
-  assert(CGEventGetType(event) == kCGEventScrollWheel);
-  assert(field(event, kCGScrollWheelEventIsContinuous) == 0);
-  assert(field(event, kCGScrollWheelEventDeltaAxis1) == 2);
-  assert(field(event, kCGScrollWheelEventDeltaAxis2) == -1);
-  event = post_one((ZFlowMacPosted){
-      .kind = ZFLOW_POST_SCROLL, .wheel_x = 7, .wheel_y = -40, .pixel = 1,
+      .kind = ZFLOW_POST_SCROLL, .wheel_x = 7, .wheel_y = -40,
       .flags = kCGEventFlagMaskAlternate});
+  assert(CGEventGetType(event) == kCGEventScrollWheel);
   assert(field(event, kCGScrollWheelEventIsContinuous) == 1);
   assert(field(event, kCGScrollWheelEventPointDeltaAxis1) == -40);
   assert(field(event, kCGScrollWheelEventPointDeltaAxis2) == 7);

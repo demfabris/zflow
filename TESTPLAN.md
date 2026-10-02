@@ -77,8 +77,9 @@ Checks:
    prompt. `avahi-browse -rt _zflow._udp` on Ubuntu shows the Mac on port 43119.
    Check that Local Network access still lets connections in (TN3179).
 2. **Chord.** The Mac shows "Controlled by ubuntu". Judge the feel with a slow,
-   precise move and a fast flick across 3008 pt. If needed, retune with
-   `ZFLOW_MAC_POINTER=adaptive:SPEED` or `flat:SPEED` in the `open --env` line.
+   precise move and a fast flick across 3008 pt. Motion is one point per count
+   (`flat:0`). If needed, retune with `ZFLOW_MAC_POINTER=adaptive:SPEED` or
+   `flat:SPEED` in the `open --env` line.
 3. **Clicks.** Single click. Double-click selects a word and triple-click a
    paragraph in TextEdit. Right-click opens a menu. Middle-click on a link in
    Safari opens a new tab. The side buttons go back and forward in Safari. A
@@ -96,12 +97,13 @@ Checks:
 8. **Keyboard modes.** Set **Keys from ubuntu** to each mode. Standard keys:
    Super+C copies. PC key positions: Alt+C copies. Mac shortcuts: Ctrl+C copies
    in TextEdit and interrupts `sleep 100` in Terminal.
-9. **Scroll.** A notched wheel scrolls in line mode. On a hi-res wheel, if one
-   is available, compare how far one detent scrolls against the notched wheel,
-   and judge whether one line per detent feels slow: CG counts a posted line as
-   about 10 px, and Barrier and Deskflow post 3 lines per detent. Record the
-   horizontal direction and the natural-scrolling setting. **Reverse
-   scrolling** turns both axes around.
+9. **Scroll.** Every scroll posts as pixels, 30 per detent (Deskflow's 3 lines
+   of about 10 px). Judge the distance per detent in Safari and TextEdit, then
+   spin the wheel fast: it scrolls as far per detent as slowly, since nothing
+   accelerates the wheel yet.
+   On a hi-res wheel, if one is available, a detent scrolls as far as on the
+   notched wheel. Record the horizontal direction and the natural-scrolling
+   setting. **Reverse scrolling** turns both axes around.
 10. **Media and function keys.** Volume up, down and mute; play/pause in Music;
     brightness (record what happens). PrintScreen arrives as F13 in
     Karabiner-EventViewer or the probe window; ScrollLock and Pause arrive as
@@ -168,9 +170,10 @@ Checks:
     before then starts nothing, and nothing reconnects when the switch
     changes (no "input link connected" line). Turn it off: the next push
     crosses at once.
-23. **Pushes.** Flick Mac to Ubuntu and back several times, fast: a flick
-    into the Mac's edge crosses, and a cursor left resting against that edge
-    crosses with the next push. Push with Cmd held: the pointer stays, and
+23. **Pushes and corners.** Flick Mac to Ubuntu and back several times, fast:
+    a flick into the Mac's edge crosses, and a cursor left resting against
+    that edge crosses with the next push. A push within 8 points of a
+    desktop corner never does. Push with Cmd held: the pointer stays, and
     after letting go it has to leave the edge before a push crosses.
 
 Known before the sitting: the Mac reads every sender's scroll as 120 units per

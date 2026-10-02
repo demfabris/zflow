@@ -197,6 +197,7 @@ app.connect('activate', () => {
         failMove = false;
         const keyboard = settings._keyboards.get('MacBook');
         assert(keyboard.selected === 0, 'a peer without a keyboard mode shows standard keys');
+        assert(keyboard.subtitle.includes('next time it takes control'), 'the dropdown says when a change applies');
         keyboard.selected = 2;
         assert(!keyboard.sensitive, 'a request in flight locks the dropdown instead of dropping a choice');
         // Times out if the dropdown stays locked after the request.

@@ -28,7 +28,7 @@ Tags: **exists**, **partial**, **missing**. "Guess" marks anything not proven by
 | 4 | Monitor layout: shared or per machine? | **Shared.** Tiles keyed by key fingerprint, newest version wins. Needs `zflow/3`. |
 | 5 | Order? | **Phase 0, then Phase 1**, with a Mac injection spike alongside Phase 1. |
 | 6 | Clipboard? | **Text and images, synced when the pointer crosses, in Phase 4. Never files.** |
-| 7 | Mac pointer acceleration? | **A curve in Rust.** Spike I showed posted motion is not accelerated. A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
+| 7 | Mac pointer acceleration? | **None by default: one count moves one point.** Spike I showed posted motion is not accelerated. A libinput-style curve in Rust felt accelerated in the first sitting, so it is opt-in through `ZFLOW_MAC_POINTER`. A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
 | 8 | Protocol bumps? | **One batched `zflow/3` bump, no `zflow/2` fallback.** New desktop commands are strict JSON anyway. |
 
 ---
@@ -77,7 +77,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 | Lock the pointer to the current computer | Scroll Lock toggle | missing | missing | build (small) | A menu item on both. |
 | Switch delay | Off, or 250 ms | missing | missing | build (small) | One "pause at edges" toggle, off by default. |
 | Double tap | Off, or 250 ms | missing | missing | skip | The delay covers the same need. |
-| Dead corners | Per-corner checkboxes | missing | missing | build (tiny, no setting) | A fixed few-pixel dead zone at corners. It protects the GNOME hot corner. |
+| Dead corners | Per-corner checkboxes | exists: 8 points (`handoff.rs`) | exists: 8 px (`extension.js`) | have | A fixed dead zone at the desktop's corners, no setting. It protects the hot corners. |
 | No crossing while a button is held | yes | exists (`sharing.rs:261`, `capture_bridge.c:132-141`) | n/a yet | have | |
 | Require a modifier to cross | Mouse Without Borders | no | no | skip | Conflicts with the rule that modifiers must be up. |
 | Relative moves for games | option | Always relative on the wire (`src/session.rs:97`) | same | have | |
@@ -100,7 +100,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 |---|---|---|---|---|---|
 | Reverse scroll per peer | per axis | missing | missing | build (small) | Natural scrolling on the Mac against Linux settings is the usual mismatch. Apply it on the receiver. |
 | Scroll speed per peer | 0.1 to 10 | missing | missing | skip | Reversing is what people need. |
-| Pointer speed | open request | The Mac receiver needs a curve | libinput accelerates the virtual pointer (guess) | build (Mac, no UI at first) | |
+| Pointer speed | open request | The Mac receiver moves one point per count; a curve is opt-in | libinput accelerates the virtual pointer (guess) | build (Mac, no UI at first) | |
 | Hi-res wheel | yes | Pixel deltas | exists (`src/linux/mapping.rs:368-381`) | have | |
 | Trackpad gestures | no ([#2905](https://github.com/deskflow/deskflow/issues/2905)) | Raw contacts to Linux, experimental | receives them | have (Mac to Linux); skip (Linux to Mac) | No public macOS API. |
 | Linux laptop touchpad as the sender | yes, through EIS | n/a | Raw contacts only (`src/linux/touch.rs`) | skip for now | Section 3. |
@@ -277,14 +277,14 @@ The baseline is CGEventPost from the logged-in app, which is what Deskflow and l
 | Area | Design | Gotcha |
 |---|---|---|
 | Event source | HID system-state source, posted at the HID tap, suppression interval 0, local events permitted. | The Mac's own trackpad kept working with every source tried, including the default one, while events were posted every 8 ms. The deprecated system-wide suppression calls are not needed. |
-| Pointer | Current cursor plus the delta after a curve, clamped to the displays and snapped to the nearest one. Also set the delta fields. | Linux sends raw deltas (`src/session.rs:97`). CGEventPost places the cursor at the event location 1:1, with no acceleration; delta fields alone do not move it. macOS does not clamp an off-screen location. |
+| Pointer | Current cursor plus the delta, one point per count, clamped to the displays and snapped to the nearest one. Also set the delta fields. A libinput-style curve is opt-in. | Linux sends raw deltas (`src/session.rs:97`). CGEventPost places the cursor at the event location 1:1, with no acceleration; delta fields alone do not move it. macOS does not clamp an off-screen location. |
 | Drag and clicks | Drag event types while a button is down. Click state on every down and up; the event number is optional. | Without click state there is no double-click. A posted click does activate a background app on 27. |
 | Keys | Inverted table, ISO swap keyed on the receiving Mac's keyboard type, modifier flags (including the left/right device bits) on every event. | The HID-state source merges held modifiers anyway. The keyboard-type field on a posted event does not change characters, so the ISO swap must be in the table. Untested on an ISO Mac. |
 | Repeat | Made on the receiver at the System Settings delay and interval, with the autorepeat field set. | The wire drops repeats (`src/session.rs:595-599`), and macOS does not repeat a held posted key. Defaults read 225/30 ms, AppKit reports 250/33 ms; pick one. |
 | Caps Lock | `IOHIDSetModifierLockState` on an `IOHIDSystem` connection. | Keycode 57 only sets the event flag, so letters and the real lock disagree. |
 | Unmapped keys | PrintScreen becomes F13. Drop ScrollLock, Pause and F21 to F24. | F14 and F15 never reach apps. F16 to F19 are untested. |
 | Media keys | NX_SYSDEFINED subtype 8. | Volume and brightness both work; brightness stepped on the external display with the lid closed. |
-| Scroll | Line units for a wheel, pixel units for continuous scrolling. | No phase or momentum on the wire (`src/session.rs:103-104`). macOS accepts posted phases and momentum, so the wire could carry them later. |
+| Scroll | Pixel units only, 30 px per detent (Deskflow's 3 lines of 10 px), with the part under a pixel carried on each axis. | Playout hands over the wheel in batches of any size, so the distance must depend only on the total. No phase or momentum on the wire (`src/session.rs:103-104`). macOS accepts posted phases and momentum, so the wire could carry them later. |
 | Wake | `IOPMAssertionDeclareUserActivity` on Prepare. | Not tested yet (spike I skipped it). |
 
 **Handoff answers, in-process:**
@@ -404,7 +404,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - The `peer_view` rejection tests still pass.
 - **Size:** about 14 files, 900 to 1300 lines changed.
 - **Risk:** churn. No new features in this phase.
-- **Status (2026-09-28):** the Linux half is done on branch `one-settings-api`.
+- **Status (2026-10-02):** done on both sides, on main.
   - `src/app/api.rs` holds `Snapshot<P>` (the platform section is a type parameter), `Status`, `Peer`, `Health` and one `Request` enum. Status titles and peer row text come from Rust.
   - The GNOME agent, panel and settings window use it. Health rows and shortcut rows show on Linux. Nearby records carry `pair_address`, so the 43120 rewrite in `settings.js` is gone.
   - The GNOME API level went from 1 to 2, because the snapshot changed shape. Phase 3 needs no second raise if it ships in the same release.
@@ -422,9 +422,9 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A two-session unit test with a fake sender covers the desktop handoff.
 - **Size:** about 10 files, 1600 to 2200 LOC.
 - **Risks:** macOS 27 posting quirks; pointer feel; Caps Lock; a firewall prompt; duplicate connections.
-- **Status (2026-09-28):** built on branch `mac-receiver`; the live sitting has not run.
+- **Status (2026-10-02):** on main. A first sitting on 2026-09-29 led to the pointer and scroll defaults and to crossing from an edge the cursor already rests on. TESTPLAN.md has no recorded results for the rest yet.
   - Done:
-    - The injector: `inject.c` and `media.m` post, and `inject.rs` turns receiver effects into Mac events, with the pointer curve and clamp, click state, drags, flags, the ISO swap, receiver-made repeat, Caps Lock through IOKit, media keys, line and pixel scroll, and release on every exit path the app sees.
+    - The injector: `inject.c` and `media.m` post, and `inject.rs` turns receiver effects into Mac events, with the pointer clamp and an opt-in curve, click state, drags, flags, the ISO swap, receiver-made repeat, Caps Lock through IOKit, media keys, pixel scroll, and release on every exit path the app sees.
     - Receiving over the session the Mac dials and over connections peers open. The Mac listens on `transport.listen` and keeps one session per computer with the shared dial rule.
     - One ownership guard: input goes one way at a time, and the Mac starts no crossing while controlled.
     - The desktop handoff server, so a Linux edge crossing enters and returns at the mapped point. The Mac's own crossings use the shared handoff functions.
@@ -435,7 +435,8 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - The sitting still has to prove (TESTPLAN.md, "Two-way input sitting, Mac side"): pointer feel, click and drag behavior, typing with repeat at the system rate, Caps Lock, media keys, scroll distance per detent, the Mac's own devices while controlled, release within 1 s after killing zflowd, every exit path, wake, AWDL, duplicate connections, the firewall and Local Network behavior on the listener, and that Mac-to-Linux crossings still work.
   - Known limits:
     - Held input stays down after SIGKILL of the Mac app, until the local key is pressed.
-    - The pointer curve constants are untuned. `ZFLOW_MAC_POINTER` is a sitting-only knob.
+    - Motion is one point per count by default (`flat:0`, chosen in the first sitting), whatever the sender's mouse DPI. `ZFLOW_MAC_POINTER=adaptive:<speed>` opts into the untuned curve; it is a sitting-only knob.
+    - Scroll is 30 px per detent at any speed, with no wheel acceleration. The number is untuned.
     - The Mac reads every sender's scroll as 120 units per detent, so a Mac trackpad sender scrolls a Mac receiver slowly.
     - A connection that arrives during a crossing waits until the crossing ends.
     - With `experimental_touchpad` on both computers, a Linux sender may send contacts the Mac cannot post, and they are dropped.
@@ -456,7 +457,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A layout edit shows up on the other machine within 2 s.
 - **Size:** about 15 files, 1500 to 2000 LOC.
 - **Risks:** barrier hits from local motion; held keys at the edge; remappers; extension review; wider device access.
-- **Status (2026-09-28):** in progress on branch `linux-edge-sending`.
+- **Status (2026-10-02):** built, on main.
   - Done:
     - Capture-all: an empty `capture_devices` list captures every keyboard and pointer, and a device another program grabbed (EBUSY) is skipped.
     - The daemon half of change 9, and the rule for two computers dialing each other at once (`identity::wins_simultaneous_dial`).
@@ -467,9 +468,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
     - A computer paired after the layout exists gets a tile beside this one (`SharedLayout::with_tiles_for`), and so does one missing from a layout a peer sent.
     - Live links (`src/daemon/links.rs`): the daemon keeps a session to each peer it may send to, with the Mac's retry schedule (`src/link.rs`), so the first crossing reuses it. A session the peer dialed counts. It dials only where mDNS shows a zflow computer at the peer's saved address, so it dials a Mac only while the Mac listens. GNOME shows each peer as Connected, Connecting or Unreachable with a reason, plus a "Paired computers" health row with Retry. The GNOME API level stays 2: the snapshot keeps its shape, and `connecting`, `unreachable` and health actions were already part of it.
-  - Left:
-    - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
-    - The live checks in TESTPLAN.md, "Two-way input sitting".
+  - Left: the live checks in TESTPLAN.md, "Two-way input sitting".
   - Known limits:
     - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
     - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
@@ -486,9 +485,15 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A Mac "switch to next computer" chord.
   - Mac media keys.
   - Open logs.
-- **Status (2026-09-28):** started on Linux, on branch `linux-edge-sending`.
-  - Done: dead corners (outbound barriers stop 8 px short of the desktop's corners), pause at edges (`[switching] pause_at_edges`, `set_switching`, 250 ms rest against a barrier on Linux), and reverse scrolling per computer. `reverse_scroll` is on the peer record, in `set_peer` and in the snapshot; the Linux daemon turns that peer's scroll around, and the settings window has the switch. The Mac injector and Mac UI pick it up in Phase 2.
-  - Clipboard on Linux: done, merged into `linux-edge-sending`. The computer the pointer leaves sends its clipboard to the one it enters, as SPEC.md's Clipboard section says. `[clipboard] share` and the Share Clipboard switch (`set_clipboard`) turn it on for one computer. The GNOME extension reads and writes the clipboard through `St.Clipboard` in two D-Bus methods only the agent may call, and shows the over-limit notice. The agent carries clips to the service as base64 on its own stream, which alone allows messages that large. The Mac side (`NSPasteboard` and its switch) is pending.
+- **Status (2026-10-02):** about half done, on main.
+  - Done on both: dead corners (Linux's outbound barriers stop 8 px short of the desktop's corners, and the Mac's crossings 8 points short), pause at edges (`[switching] pause_at_edges`, `set_switching`, a 250 ms rest against the edge), and reverse scrolling per computer (`reverse_scroll` on the peer record, in `set_peer` and in the snapshot).
+  - Clipboard: done on both. The computer the pointer leaves sends its clipboard to the one it enters, as SPEC.md's Clipboard section says. `[clipboard] share` and the Share Clipboard switch (`set_clipboard`) turn it on for one computer. The GNOME extension reads and writes the clipboard through `St.Clipboard` in two D-Bus methods only the agent may call, and shows the over-limit notice. The agent carries clips to the service as base64 on its own stream, which alone allows messages that large. The Mac uses `NSPasteboard`.
+  - Left:
+    - Peer-to-peer hops.
+    - Locking the pointer to the current computer.
+    - The "switch to next computer" chord on the Mac. Linux's chord cycles through connected computers.
+    - Media keys from the Mac. Capture still swallows them while sending (`capture_bridge.c`).
+    - Open logs on the Mac, which still logs to stderr only. Linux has it.
 - **Acceptance:**
   - Text and PNG copy/paste work both ways.
   - A 5 MiB clip is refused with a notice, without disconnecting.

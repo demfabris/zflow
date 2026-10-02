@@ -218,7 +218,7 @@ private struct PeerRows: View {
       Text("Mac shortcuts").tag("mac")
     } label: {
       Text("Keys from \(peer.name)")
-      Text("How its keys act on this Mac.")
+      Text("How its keys act on this Mac, from the next time it takes control.")
     }
     Toggle(
       isOn: binding(peer.reverseScroll) {

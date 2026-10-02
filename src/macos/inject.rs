@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 
 use super::{
     CursorPosition, DesktopRect, keys,
-    pointer::{Acceleration, Profile, Scroll, ScrollSplit, clamp_to_displays},
+    pointer::{Acceleration, Profile, ScrollScale, clamp_to_displays},
 };
 use crate::core::{HidUsage, KeyRemap, KeyboardMode, PointerButton, ReceiverEffect};
 
@@ -71,20 +71,11 @@ pub(crate) enum Posted {
         flags: u64,
     },
     /// A modifier going down or up. `flags` already include the change.
-    Modifier {
-        code: u16,
-        down: bool,
-        flags: u64,
-    },
-    Scroll {
-        scroll: Scroll,
-        flags: u64,
-    },
+    Modifier { code: u16, down: bool, flags: u64 },
+    /// Pixels, with the wire's signs.
+    Scroll { x: i32, y: i32, flags: u64 },
     /// An `NX_KEYTYPE`, such as volume up.
-    Media {
-        key: u32,
-        down: bool,
-    },
+    Media { key: u32, down: bool },
 }
 
 impl Posted {
@@ -142,14 +133,11 @@ impl Posted {
                 native.down = u8::from(down);
                 native.flags = flags;
             }
-            Self::Scroll { scroll, flags } => {
+            Self::Scroll { x, y, flags } => {
                 native.kind = NativePostKind::Scroll as u32;
                 // Up is positive for both, but the wire counts right as
                 // positive, as Linux does, and CoreGraphics counts left.
-                (native.wheel_x, native.wheel_y, native.pixel) = match scroll {
-                    Scroll::Lines { x, y } => (x.saturating_neg(), y, 0),
-                    Scroll::Pixels { x, y } => (x.saturating_neg(), y, 1),
-                };
+                (native.wheel_x, native.wheel_y) = (x.saturating_neg(), y);
                 native.flags = flags;
             }
             Self::Media { .. } => {}
@@ -236,7 +224,7 @@ pub(crate) struct InjectorCore<B> {
     /// first. A real cursor at one of them is behind, not moved on the Mac.
     unseen: VecDeque<CursorPosition>,
     acceleration: Acceleration,
-    scroll: ScrollSplit,
+    scroll: ScrollScale,
     displays: Vec<DesktopRect>,
     display_generation: Option<u32>,
     locked: Option<(Instant, bool)>,
@@ -261,7 +249,7 @@ impl<B: Backend> InjectorCore<B> {
             position: None,
             unseen: VecDeque::new(),
             acceleration: Acceleration::new(profile),
-            scroll: ScrollSplit::default(),
+            scroll: ScrollScale::default(),
             displays: Vec::new(),
             display_generation: None,
             locked: None,
@@ -723,11 +711,11 @@ impl<B: Backend> InjectorCore<B> {
     }
 
     fn scroll(&mut self, x: i64, y: i64) -> Result<()> {
-        let Some(scroll) = self.scroll.split(x, y) else {
+        let Some((x, y)) = self.scroll.pixels(x, y) else {
             return Ok(());
         };
         let flags = self.flags();
-        self.backend.post(&Posted::Scroll { scroll, flags })
+        self.backend.post(&Posted::Scroll { x, y, flags })
     }
 
     /// Whether the screen is locked, asked at most every 100 ms.
@@ -1098,9 +1086,8 @@ struct NativePosted {
     dy: i64,
     wheel_x: i32,
     wheel_y: i32,
-    pixel: u8,
     drag: u8,
-    padding: [u8; 6],
+    padding: [u8; 7],
     click_state: i64,
     flags: u64,
 }
@@ -1301,14 +1288,7 @@ fn describe(event: &Posted) -> String {
             down,
             flags: bits,
         } => format!("modifier {code} {}{}", edge(down), flags(bits)),
-        Posted::Scroll {
-            scroll: Scroll::Lines { x, y },
-            flags: bits,
-        } => format!("scroll lines {x},{y}{}", flags(bits)),
-        Posted::Scroll {
-            scroll: Scroll::Pixels { x, y },
-            flags: bits,
-        } => format!("scroll pixels {x},{y}{}", flags(bits)),
+        Posted::Scroll { x, y, flags: bits } => format!("scroll {x},{y}{}", flags(bits)),
         Posted::Media { key, down } => format!("media {key} {}", edge(down)),
     }
 }
@@ -1540,7 +1520,7 @@ mod tests {
                 "key 0 down flags 0x20002",
                 "button 0 down at 960,540 click 1 flags 0x20002",
                 "move 961,540 by 1,0 drag 0 click 1 flags 0x20002",
-                "scroll lines 0,1 flags 0x20002",
+                "scroll 0,30 flags 0x20002",
             ]
         );
         assert_eq!(
@@ -1998,10 +1978,10 @@ mod tests {
     }
 
     #[test]
-    fn motion_is_accelerated() {
+    fn adaptive_motion_is_accelerated() {
         let start = Instant::now();
         let fake = FakeBackend::default();
-        let mut core = InjectorCore::new(fake.clone(), Profile::default());
+        let mut core = InjectorCore::new(fake.clone(), Profile::Adaptive { speed: 0.0 });
         core.apply(vec![opened()], None, start).unwrap();
         fake.take_log();
         for step in 0..3 {
@@ -2020,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn scroll_posts_lines_for_detents_and_pixels_otherwise() {
+    fn scroll_posts_pixels_on_each_axis() {
         let start = Instant::now();
         let (mut core, fake) = open(KeyboardMode::Standard, start);
         assert_eq!(
@@ -2030,16 +2010,23 @@ mod tests {
                 vec![
                     motion(0, 0, 0, -240),
                     motion(0, 0, 15, 0),
-                    motion(2, 0, 0, 120)
+                    motion(2, 0, 0, 120),
                 ],
                 start
             ),
             [
-                "scroll lines 0,-2",
-                "scroll pixels 1,0",
+                "scroll 0,-60",
+                "scroll 4,0",
                 "move 962,540 by 2,0",
-                "scroll pixels 0,10"
+                "scroll 0,30"
             ]
+        );
+        // A new activation forgets the 3.75 pixels, so half a pixel rounds
+        // up to one instead of 4.25 staying at 4.
+        apply(&mut core, &fake, vec![closed(), opened()], start);
+        assert_eq!(
+            apply(&mut core, &fake, vec![motion(0, 0, 2, 0)], start),
+            ["scroll 1,0"]
         );
     }
 
@@ -2232,24 +2219,17 @@ mod tests {
     }
 
     #[test]
-    fn scroll_keeps_its_axes_and_units_and_turns_right_into_cg_left() {
+    fn scroll_keeps_its_axes_and_turns_right_into_cg_left() {
         let native = Posted::Scroll {
-            scroll: Scroll::Lines { x: -1, y: 2 },
+            x: 7,
+            y: -9,
             flags: 0,
         }
         .native();
-        assert_eq!(
-            (native.kind, native.wheel_x, native.wheel_y, native.pixel),
-            (5, 1, 2, 0)
-        );
+        assert_eq!((native.kind, native.wheel_x, native.wheel_y), (5, -7, -9));
         let native = Posted::Scroll {
-            scroll: Scroll::Pixels { x: 7, y: -9 },
-            flags: 0,
-        }
-        .native();
-        assert_eq!((native.wheel_x, native.wheel_y, native.pixel), (-7, -9, 1));
-        let native = Posted::Scroll {
-            scroll: Scroll::Pixels { x: i32::MIN, y: 0 },
+            x: i32::MIN,
+            y: 0,
             flags: 0,
         }
         .native();

@@ -38,9 +38,8 @@ typedef struct {
   double x, y;
   int64_t dx, dy;
   int32_t wheel_x, wheel_y;
-  uint8_t pixel;
   uint8_t drag;
-  uint8_t padding[6];
+  uint8_t padding[7];
   int64_t click_state;
   uint64_t flags;
 } ZFlowMacPosted;
@@ -146,11 +145,11 @@ static CGEventRef create_event(const ZFlowMacPosted *posted) {
       }
       break;
     case ZFLOW_POST_SCROLL:
-      event = CGEventCreateScrollWheelEvent2(
-          g_source, posted->pixel ? kCGScrollEventUnitPixel : kCGScrollEventUnitLine,
-          2, posted->wheel_y, posted->wheel_x, 0);
+      // Always pixels, which macOS passes on as they are. Rust scales the wheel.
+      event = CGEventCreateScrollWheelEvent2(g_source, kCGScrollEventUnitPixel, 2,
+                                             posted->wheel_y, posted->wheel_x, 0);
       if (!event) return NULL;
-      CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, posted->pixel ? 1 : 0);
+      CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
       break;
     default:
       return NULL;

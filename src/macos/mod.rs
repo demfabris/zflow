@@ -202,6 +202,47 @@ pub fn forget_desktop_geometry() {
     *GEOMETRY.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
+/// The Mac's own pointer motion since the last [`take_local_motion`], in
+/// points. macOS reports the deltas even while the cursor is held against a
+/// screen edge and cannot move.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LocalMotion {
+    pub dx: f64,
+    pub dy: f64,
+    /// How long ago the last move came.
+    pub age: Duration,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct NativeMotion {
+    dx: f64,
+    dy: f64,
+    age_ns: u64,
+}
+
+/// Starts watching the Mac's own pointer motion, if it is not watched yet.
+/// Motion zflow posts for a peer is left out.
+pub fn watch_local_motion() -> Result<()> {
+    // SAFETY: the bridge creates its listen-only tap and thread once.
+    ensure!(
+        unsafe { zflow_mac_motion_watch() } == 0,
+        "macOS refused to show zflow the Mac's pointer motion"
+    );
+    Ok(())
+}
+
+/// The Mac's own pointer motion since the last call, if there was any.
+pub fn take_local_motion() -> Option<LocalMotion> {
+    let mut motion = NativeMotion::default();
+    // SAFETY: the output has the bridge's C layout.
+    (unsafe { zflow_mac_motion_take(&mut motion) } == 1).then(|| LocalMotion {
+        dx: motion.dx,
+        dy: motion.dy,
+        age: Duration::from_nanos(motion.age_ns),
+    })
+}
+
 pub fn input_is_neutral() -> bool {
     // SAFETY: this reads physical key, button and modifier state without capture.
     unsafe { zflow_mac_input_is_neutral() == 1 }
@@ -889,6 +930,8 @@ unsafe extern "C" {
     fn zflow_mac_desktop_rectangles(rectangles: *mut DesktopRect, capacity: u32) -> i32;
     fn zflow_mac_display_generation() -> u32;
     fn zflow_mac_input_is_neutral() -> i32;
+    fn zflow_mac_motion_watch() -> i32;
+    fn zflow_mac_motion_take(motion: *mut NativeMotion) -> i32;
     fn zflow_mac_secure_input_enabled() -> i32;
     fn zflow_mac_capture_start(
         raw_touch: i32,
