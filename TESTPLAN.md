@@ -226,9 +226,13 @@ Checks:
     into the Mac's edge toward Ubuntu starts nothing, and the log shows "edge
     crossings skipped while controlled" once. When Ubuntu came in by an edge
     push instead, the Mac's own trackpad pushed into that edge hands control
-    back to Ubuntu ("cursor reached the desktop handoff edge"). Pushing on
-    then crosses to Ubuntu ("pointer pushed against a held edge", then
-    "configured edge reached"); stopping at the edge stays on the Mac.
+    back to Ubuntu ("cursor reached the desktop handoff edge"). Motion that
+    carries straight on stays on the Mac. Holding still a moment, then
+    pushing on crosses to Ubuntu ("pointer pushed against a held edge", then
+    "configured edge reached"); stopping at the edge stays on the Mac. The
+    same with Ubuntu's mouse: Ubuntu takes control back at the Mac's edge
+    and the Mac does not cross back on its own, with no "crossing failed"
+    line.
     After the escape chord, a Mac-to-Ubuntu edge crossing works. With the Mac
     crossed to Ubuntu, the Ubuntu chord is refused.
 13. **Release safety.** Hold Shift+A remotely, then

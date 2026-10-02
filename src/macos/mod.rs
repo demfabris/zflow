@@ -351,6 +351,11 @@ async fn cross(
         elapsed_ms = preparing.elapsed().as_millis() as u64,
         "desktop preparation completed"
     );
+    if let Some(cancelled) = busy(session.peer(), &prepared) {
+        // It refused before reserving anything, so there is nothing to
+        // finish, and a Finish it refused too would fail the crossing.
+        return Err(cancelled);
+    }
     let (mut lease, mut result) = match lease {
         Ok(lease) => (lease, Ok(None)),
         Err(error) => (None, Err(error)),
@@ -399,6 +404,14 @@ async fn cross(
         keep_first_failure(&mut result, lease.release().await, "AWDL restoration");
     }
     result
+}
+
+/// A peer refuses a crossing while it sends its own input, as just after it
+/// took control of this Mac back. Nothing is wrong, so the crossing is
+/// cancelled rather than failed.
+fn busy(peer: &str, prepared: &Result<DesktopResponse>) -> Option<anyhow::Error> {
+    matches!(prepared, Ok(DesktopResponse::Unavailable { reason }) if reason == receive::SENDING)
+        .then(|| AdmissionCancelled(format!("{peer} is sending its own input")).into())
 }
 
 async fn acquire_lease(reduce_wifi_latency: bool) -> Result<Option<awdl::HeldLease>> {
@@ -1059,6 +1072,20 @@ mod tests {
         ] {
             assert!(matches!(failure_status(&error), SourceStatus::Failed(_)));
         }
+    }
+
+    #[test]
+    fn a_peer_sending_its_own_input_cancels_the_crossing() {
+        // As in the live test, where linux had just taken control back.
+        let refused = Ok(DesktopResponse::unavailable(receive::SENDING));
+        let cancelled = busy("linux", &refused).unwrap();
+        assert_eq!(
+            failure_status(&cancelled),
+            SourceStatus::Cancelled("linux is sending its own input".into())
+        );
+        let owned = Ok(DesktopResponse::unavailable(receive::OWNED));
+        assert!(busy("linux", &owned).is_none());
+        assert!(busy("linux", &Err(anyhow!("timed out"))).is_none());
     }
 
     #[test]

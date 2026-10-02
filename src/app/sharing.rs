@@ -40,6 +40,13 @@ struct Running {
 const PUSH_FRESH: Duration = Duration::from_millis(100);
 /// How long to wait before watching local motion again after macOS refused.
 const WATCH_RETRY: Duration = Duration::from_secs(5);
+/// After a peer lets go of this Mac, how long the pointer has to be still
+/// before a push on the edge it rests on counts. The peer let go because its
+/// pointer reached that edge, and motion from the hand-back still arrives.
+const HAND_BACK_QUIET: Duration = Duration::from_millis(200);
+/// How long after a peer takes control back this Mac does not cross to it.
+/// The peer is still finishing its own crossing and would refuse.
+const HAND_BACK_GUARD: Duration = Duration::from_millis(500);
 
 /// A push against an edge that crosses once it has lasted [`EDGE_PAUSE`].
 struct Resting {
@@ -59,15 +66,88 @@ struct Approach {
     /// it. Pushing there again does nothing until it leaves, as a GNOME
     /// barrier reports each push once.
     spent: Option<Edge>,
+    /// The peer that last controlled this Mac, and when it let go.
+    released_by: Option<(String, Instant)>,
+    /// Set while a peer's hand-back settles: when the pointer last moved
+    /// since. Until it has been still for [`HAND_BACK_QUIET`], or leaves the
+    /// edges, its motion is not a push.
+    settling: Option<Instant>,
 }
 
 impl Approach {
+    /// Starts over while `peer` controls this Mac, so that once it lets go
+    /// the hand-back settles first.
+    fn controlled_by(peer: String, now: Instant) -> Self {
+        Self {
+            released_by: Some((peer, now)),
+            settling: Some(now),
+            ..Self::default()
+        }
+    }
+
+    /// Forgets the way to an edge, but not a hand-back still settling.
+    fn restart(&mut self) {
+        *self = Self {
+            released_by: self.released_by.take(),
+            settling: self.settling,
+            ..Self::default()
+        };
+    }
+
     /// The crossing the pointer at `current` starts, if any: by moving onto
     /// an edge, or by `push`, the Mac's own motion since the last look,
     /// pushing on while the cursor is held against one. With `pause`, the
     /// pointer has to stay against the edge for [`EDGE_PAUSE`] first, and
     /// moving away from it cancels.
     fn reached(
+        &mut self,
+        layout: &Layout,
+        geometry: &Geometry,
+        current: Point,
+        push: Option<LocalMotion>,
+        now: Instant,
+        pause: bool,
+    ) -> Option<Handoff> {
+        let push = self.settled(geometry, current, push, now);
+        let handoff = self.reaching(layout, geometry, current, push, now, pause)?;
+        if let Some((peer, at)) = &self.released_by
+            && *peer == handoff.peer
+            && now.duration_since(*at) < HAND_BACK_GUARD
+        {
+            tracing::debug!(%peer, "that computer just took control back; input stays on the Mac");
+            // Pushing on once the guard is over still crosses.
+            self.spent = None;
+            return None;
+        }
+        Some(handoff)
+    }
+
+    /// `push`, unless it belongs to a peer's hand-back that has not settled.
+    fn settled(
+        &mut self,
+        geometry: &Geometry,
+        current: Point,
+        push: Option<LocalMotion>,
+        now: Instant,
+    ) -> Option<LocalMotion> {
+        let Some(moved) = self.settling else {
+            return push;
+        };
+        if !handoff::on_any_edge(geometry, current) {
+            self.settling = None;
+            return push;
+        }
+        if push.is_some() && now.duration_since(moved) < HAND_BACK_QUIET {
+            self.settling = Some(now);
+            return None;
+        }
+        if push.is_some() {
+            self.settling = None;
+        }
+        push
+    }
+
+    fn reaching(
         &mut self,
         layout: &Layout,
         geometry: &Geometry,
@@ -189,7 +269,7 @@ impl Observer {
             tracing::info!("edge sharing disarmed");
         }
         self.enabled = false;
-        self.approach = Approach::default();
+        self.approach.restart();
         if let Some(running) = &self.running {
             tracing::info!(parent: &running.span, "sharing stop requested");
             let _ = running.crossing.stop.send(true);
@@ -206,7 +286,7 @@ impl Observer {
             tracing::info!("edge sharing disarmed for a new layout");
         }
         self.enabled = false;
-        self.approach = Approach::default();
+        self.approach.restart();
     }
 
     pub fn enable(&mut self, config: &Config, layout: &Layout) -> Result<()> {
@@ -229,7 +309,7 @@ impl Observer {
             }
         }
         self.layout = Some(layout.clone());
-        self.approach = Approach::default();
+        self.approach.restart();
         self.enabled = true;
         self.pause_requested = false;
         tracing::info!("edge sharing enabled");
@@ -270,7 +350,7 @@ impl Observer {
         if let Some(peer) = controller {
             // Nothing crosses while a peer controls this Mac, and a cursor it
             // leaves resting on an edge does not cross once it lets go.
-            self.approach = Approach::default();
+            self.approach = Approach::controlled_by(peer.clone(), Instant::now());
             if self.enabled && self.running.is_none() {
                 if !self.controlled {
                     tracing::info!(%peer, "edge crossings skipped while controlled");
@@ -289,7 +369,7 @@ impl Observer {
         {
             tracing::warn!(error = %format!("{error:#}"), "edge observation failed; sharing disabled");
             self.enabled = false;
-            self.approach = Approach::default();
+            self.approach.restart();
             self.notice = format!("Sharing stopped: {error:#}");
         }
     }
@@ -584,7 +664,8 @@ mod tests {
         assert_eq!(observer.notice, "Controlled by linux");
 
         // Its own push brought the cursor to the edge and handed control
-        // back. Once the peer lets go, pushing on crosses.
+        // back. Once the peer lets go and the hand-back is over, pushing on
+        // crosses.
         assert_eq!(observer.approach.spent, None);
         let (layout, geometry) = edge();
         let held = Point { x: 1919, y: 100 };
@@ -593,10 +674,71 @@ mod tests {
             &geometry,
             held,
             push(3.0, 1),
-            Instant::now(),
+            Instant::now() + HAND_BACK_GUARD,
             false,
         );
         assert_eq!(handoff.unwrap().peer, "linux");
+    }
+
+    #[test]
+    fn motion_right_after_a_peer_lets_go_does_not_cross_back_to_it() {
+        // As in the live test: linux controlled this Mac, the pointer reached
+        // this edge, linux took control back, and 15 ms later motion pushing
+        // on the edge crossed straight back to linux.
+        let links = Links::with_backend(Default::default()).unwrap();
+        let mut observer = Observer::default();
+        observer.enabled = true;
+        observer.tick_with(Some("linux".into()), None, &links);
+        let let_go = Instant::now();
+        let at = |ms| let_go + Duration::from_millis(ms);
+        let (layout, geometry) = edge();
+        let held = Point { x: 1919, y: 100 };
+        let approach = &mut observer.approach;
+        let mut reach = |push, ms| {
+            let handoff = approach.reached(&layout, &geometry, held, push, at(ms), false);
+            handoff.map(|handoff| handoff.peer)
+        };
+        assert_eq!(reach(push(3.0, 1), 15), None, "motion from the hand-back");
+        assert_eq!(reach(push(3.0, 1), 120), None, "and more of it");
+        // Still for a moment, then a fresh push: the Mac's own. Linux is
+        // still finishing its crossing, so that waits out the guard.
+        assert_eq!(reach(None, 330), None);
+        assert_eq!(
+            reach(push(3.0, 1), 340),
+            None,
+            "linux just took control back"
+        );
+        assert_eq!(reach(push(3.0, 1), 520).as_deref(), Some("linux"));
+    }
+
+    #[test]
+    fn a_hand_back_is_over_once_the_pointer_leaves_the_edge() {
+        let (layout, geometry) = edge();
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut approach = Approach::controlled_by("linux".into(), start);
+        // A new layout or a rearm keeps the hand-back.
+        approach.restart();
+        let mut reach = |point, push, ms| {
+            let handoff = approach.reached(&layout, &geometry, point, push, at(ms), false);
+            handoff.map(|handoff| handoff.peer)
+        };
+        let desk = Point { x: 1919, y: 800 };
+        assert_eq!(
+            reach(desk, push(3.0, 1), 10),
+            None,
+            "motion from the hand-back"
+        );
+        assert_eq!(reach(Point { x: 1900, y: 800 }, push(-3.0, 1), 20), None);
+        // Desk did not just take control back, so its part of the edge
+        // crosses at once.
+        assert_eq!(reach(desk, None, 30).as_deref(), Some("desk"));
+        // Linux's part waits out the guard, however the pointer gets there.
+        let held = Point { x: 1919, y: 100 };
+        assert_eq!(reach(Point { x: 1900, y: 100 }, None, 40), None);
+        assert_eq!(reach(held, None, 50), None);
+        assert_eq!(reach(held, push(3.0, 1), 60), None);
+        assert_eq!(reach(held, push(3.0, 1), 510).as_deref(), Some("linux"));
     }
 
     fn push(dx: f64, age_ms: u64) -> Option<LocalMotion> {
