@@ -1,6 +1,9 @@
 use std::{
     ffi::{CStr, c_char},
+    future::Future,
     os::fd::{FromRawFd, OwnedFd},
+    pin::Pin,
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
@@ -15,6 +18,11 @@ use tokio::{
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const RENEW_INTERVAL: Duration = Duration::from_millis(500);
+/// How long the shared lease outlives its last user, so a crossing right
+/// after a peer let go of this Mac, or the other way round, keeps it.
+const LINGER: Duration = Duration::from_secs(1);
+/// Failures in a row before the app shows them.
+const TROUBLE_AFTER: u32 = 3;
 
 unsafe extern "C" {
     fn zflow_awdl_lease(
@@ -161,20 +169,159 @@ impl HeldLease {
         let _ = self.release.send(());
         self.task.await.context("AWDL lease task stopped")?
     }
+
+    /// The helper stopped answering heartbeats, and has given AWDL back.
+    fn lapsed(&self) -> bool {
+        self.task.is_finished()
+    }
 }
 
-/// A held lease from a fake helper that creates `restored` once it gives
-/// AWDL back.
-#[cfg(test)]
-pub(super) async fn fake_held_lease(restored: &std::path::Path) -> HeldLease {
-    let (_helper, lease) = tests::lease(tests::PEER, Some(restored)).await;
-    lease.hold()
+type Acquire =
+    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<HeldLease>> + Send>> + Send + Sync>;
+
+/// One AWDL lease for the whole app. The helper grants one at a time, and
+/// this Mac wants AWDL down while a peer controls it and while it sends,
+/// which overlap when control changes hands. Everyone shares the lease, and
+/// it goes back once nobody has wanted it for a moment. AWDL staying up only
+/// costs Wi-Fi lag, so nothing here fails a crossing.
+pub(super) struct Shared {
+    acquire: Acquire,
+    linger: Duration,
+    users: Mutex<usize>,
+    lease: tokio::sync::Mutex<Option<HeldLease>>,
+    /// Failures in a row, and the last one.
+    trouble: Mutex<(u32, String)>,
+}
+
+/// The app's shared lease, from the real helper.
+pub(super) fn shared() -> &'static Arc<Shared> {
+    static SHARED: LazyLock<Arc<Shared>> = LazyLock::new(|| {
+        let acquire: Acquire =
+            Box::new(|| Box::pin(async { Ok(AwDlLease::acquire().await?.hold()) }));
+        Shared::new(acquire, LINGER)
+    });
+    &SHARED
+}
+
+impl Shared {
+    fn new(acquire: Acquire, linger: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            acquire,
+            linger,
+            users: Mutex::new(0),
+            lease: tokio::sync::Mutex::new(None),
+            trouble: Mutex::default(),
+        })
+    }
+
+    fn users(&self) -> MutexGuard<'_, usize> {
+        self.users.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wants AWDL down until the guard drops. [`Self::down`] takes it down.
+    pub(super) fn want(self: &Arc<Self>) -> Wanted {
+        *self.users() += 1;
+        Wanted(self.clone())
+    }
+
+    /// Says why AWDL keeps staying up, once it has failed a few times in a
+    /// row.
+    pub(super) fn trouble(&self) -> Option<String> {
+        let trouble = self.trouble.lock().unwrap_or_else(PoisonError::into_inner);
+        (trouble.0 >= TROUBLE_AFTER).then(|| {
+            format!(
+                "AWDL could not be turned off {} times in a row ({}). Sharing works, with more Wi-Fi lag.",
+                trouble.0, trouble.1
+            )
+        })
+    }
+
+    fn failed(&self, peer: &str, error: anyhow::Error) {
+        let error = format!("{error:#}");
+        tracing::warn!(%peer, %error, "AWDL stays on");
+        let mut trouble = self.trouble.lock().unwrap_or_else(PoisonError::into_inner);
+        *trouble = (trouble.0 + 1, error);
+    }
+
+    /// Takes AWDL down for `peer`, on the lease already held if there is
+    /// one, while anyone wants it down. Gives up after `limit`, and logs
+    /// why AWDL stays up instead of failing.
+    pub(super) async fn down(&self, peer: &str, limit: Duration) {
+        let attempt = async {
+            let mut lease = self.lease.lock().await;
+            if *self.users() == 0 {
+                return Ok(false);
+            }
+            if let Some(mut lapsed) = lease.take_if(|held| held.lapsed()) {
+                let error = format!("{:#}", lapsed.failed().await);
+                tracing::warn!(%error, "AWDL lease lapsed");
+            }
+            if lease.is_some() {
+                tracing::debug!(%peer, "AWDL already off");
+                return Ok(false);
+            }
+            *lease = Some((self.acquire)().await?);
+            Ok(true)
+        };
+        match timeout(limit, attempt).await {
+            Ok(Ok(true)) => {
+                tracing::info!(%peer, "AWDL off");
+                self.trouble
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0 = 0;
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => self.failed(peer, error),
+            Err(_) => self.failed(
+                peer,
+                anyhow!("the AWDL helper did not grant a lease in time"),
+            ),
+        }
+    }
+
+    /// Gives AWDL back once nobody has wanted it for the linger time.
+    async fn restore(&self) {
+        tokio::time::sleep(self.linger).await;
+        let mut lease = self.lease.lock().await;
+        if *self.users() > 0 {
+            return;
+        }
+        if let Some(held) = lease.take() {
+            match held.release().await {
+                Ok(()) => tracing::info!("AWDL back on"),
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    tracing::warn!(%error, "AWDL restoration failed; the helper restores it when the lease lapses");
+                }
+            }
+        }
+    }
+}
+
+/// Wants AWDL down while it lives.
+pub(super) struct Wanted(Arc<Shared>);
+
+impl Drop for Wanted {
+    fn drop(&mut self) {
+        let last = {
+            let mut users = self.0.users();
+            *users -= 1;
+            *users == 0
+        };
+        // Outside a runtime nothing can give it back; the helper restores
+        // AWDL once the lease lapses.
+        if let (true, Ok(runtime)) = (last, tokio::runtime::Handle::try_current()) {
+            let shared = self.0.clone();
+            runtime.spawn(async move { shared.restore().await });
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Stdio;
+    use std::{path::PathBuf, process::Stdio};
     use tokio::process::{Child, Command};
 
     // This fake peer exercises the lease protocol without privileges or
@@ -321,5 +468,99 @@ exit 4
         let script = PEER.replace("printf 'RELEASED\\n'", "exit 1");
         let (_child, lease) = lease(&script, None).await;
         assert!(lease.release().await.is_err());
+    }
+
+    /// A helper like the real one: one lease at a time, until it has given
+    /// AWDL back. Each lease leaves a marker in `directory` once it has.
+    fn one_at_a_time(directory: &std::path::Path) -> (Acquire, Arc<Mutex<Vec<PathBuf>>>) {
+        let leases = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let (directory, given) = (directory.to_owned(), leases.clone());
+        let acquire: Acquire = Box::new(move || {
+            let (directory, given) = (directory.clone(), given.clone());
+            Box::pin(async move {
+                let marker = {
+                    let mut given = given.lock().unwrap();
+                    if given.iter().any(|marker| !marker.exists()) {
+                        bail!("AWDL helper: AWDL is already in use");
+                    }
+                    let marker = directory.join(given.len().to_string());
+                    given.push(marker.clone());
+                    marker
+                };
+                let (_helper, lease) = lease(PEER, Some(&marker)).await;
+                Ok(lease.hold())
+            })
+        });
+        (acquire, leases)
+    }
+
+    #[tokio::test]
+    async fn a_crossing_right_after_control_ends_shares_the_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let (acquire, leases) = one_at_a_time(directory.path());
+        let shared = Shared::new(acquire, Duration::from_millis(200));
+        let controlled = shared.want();
+        shared.down("xps", RESPONSE_TIMEOUT).await;
+        // As in the live test: xps lets go, and 15 ms later this Mac crosses
+        // back to it. A second lease would be refused.
+        drop(controlled);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let crossing = shared.want();
+        shared.down("xps", RESPONSE_TIMEOUT).await;
+        assert_eq!(shared.trouble.lock().unwrap().0, 0, "nothing failed");
+        let first = leases.lock().unwrap().clone();
+        assert_eq!(first.len(), 1, "one lease for both");
+        // Past the linger time, the crossing still holds AWDL down.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!first[0].exists(), "AWDL stayed down throughout");
+        drop(crossing);
+        restored(&first[0]).await;
+        // Once given back, the next one takes a new lease.
+        let again = shared.want();
+        shared.down("xps", RESPONSE_TIMEOUT).await;
+        let second = leases.lock().unwrap()[1].clone();
+        drop(again);
+        restored(&second).await;
+    }
+
+    #[tokio::test]
+    async fn a_lease_that_comes_after_its_user_left_goes_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let (slow, leases) = one_at_a_time(directory.path());
+        let acquire: Acquire = Box::new(move || {
+            let lease = slow();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                lease.await
+            })
+        });
+        let shared = Shared::new(acquire, Duration::from_millis(10));
+        let wanted = shared.want();
+        let taking = {
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.down("xps", RESPONSE_TIMEOUT).await })
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        drop(wanted);
+        taking.await.unwrap();
+        let marker = leases.lock().unwrap()[0].clone();
+        restored(&marker).await;
+    }
+
+    #[tokio::test]
+    async fn an_awdl_failure_is_logged_and_shown_once_it_keeps_happening() {
+        let acquire: Acquire =
+            Box::new(|| Box::pin(async { Err(anyhow!("AWDL helper: AWDL is already in use")) }));
+        let shared = Shared::new(acquire, Duration::from_millis(10));
+        let wanted = shared.want();
+        for _ in 1..TROUBLE_AFTER {
+            // Returns, so the crossing goes on without the tweak.
+            shared.down("xps", RESPONSE_TIMEOUT).await;
+            assert_eq!(shared.trouble(), None);
+        }
+        shared.down("xps", RESPONSE_TIMEOUT).await;
+        let trouble = shared.trouble().unwrap();
+        assert!(trouble.contains("already in use"), "{trouble}");
+        drop(wanted);
     }
 }

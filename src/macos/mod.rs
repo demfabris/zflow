@@ -255,6 +255,12 @@ pub fn secure_input_enabled() -> bool {
     unsafe { zflow_mac_secure_input_enabled() == 1 }
 }
 
+/// Why AWDL keeps staying up with Reduce Wi-Fi lag on, once it has failed
+/// a few times in a row.
+pub fn awdl_trouble() -> Option<String> {
+    awdl::shared().trouble()
+}
+
 /// What one crossing borrows from its link.
 struct Activation<'a> {
     session: &'a SessionHandle,
@@ -342,9 +348,19 @@ async fn cross(
     let token = handoff::token()?;
     let prepare = prepare_request(&mut handoff, entry_position, token)?;
     let preparing = Instant::now();
+    // AWDL goes down beside Prepare, before input starts. A peer that
+    // controlled this Mac a moment ago may still hold it down; then the
+    // crossing shares its lease.
+    let awdl = reduce_wifi_latency.then(|| awdl::shared().want());
     // Await Prepare even after Stop so Finish can use the same session.
-    let (lease, prepared) = tokio::join!(
-        acquire_lease(reduce_wifi_latency),
+    let ((), prepared) = tokio::join!(
+        async {
+            if awdl.is_some() {
+                awdl::shared()
+                    .down(session.peer(), AWDL_ACQUIRE_TIMEOUT)
+                    .await;
+            }
+        },
         activation.session.desktop_request(prepare)
     );
     tracing::info!(
@@ -356,37 +372,29 @@ async fn cross(
         // finish, and a Finish it refused too would fail the crossing.
         return Err(cancelled);
     }
-    let (mut lease, mut result) = match lease {
-        Ok(lease) => (lease, Ok(None)),
-        Err(error) => (None, Err(error)),
-    };
-    if result.is_ok() {
-        result = async {
-            // The link's snapshot already showed the receiver handles desktop
-            // requests, so a failure here is the session or the receiver.
-            handoff.check_prepared(
-                prepared.context("Could not prepare the other computer's desktop")?,
-            )?;
-            if stopped(stop) {
-                return Ok(None);
-            }
-            ensure!(
-                local_desktop == active_desktop_rectangles()?,
-                "the Mac desktop changed while preparing the crossing; refresh and save its layout"
-            );
-            remote(
-                &mut activation,
-                &handoff,
-                &local_desktop,
-                token,
-                &mut lease,
-                stop,
-                status,
-            )
-            .await
+    let mut result = async {
+        // The link's snapshot already showed the receiver handles desktop
+        // requests, so a failure here is the session or the receiver.
+        handoff
+            .check_prepared(prepared.context("Could not prepare the other computer's desktop")?)?;
+        if stopped(stop) {
+            return Ok(None);
         }
-        .await;
+        ensure!(
+            local_desktop == active_desktop_rectangles()?,
+            "the Mac desktop changed while preparing the crossing; refresh and save its layout"
+        );
+        remote(
+            &mut activation,
+            &handoff,
+            &local_desktop,
+            token,
+            stop,
+            status,
+        )
+        .await
     }
+    .await;
     let finishing = Instant::now();
     let finished = handoff::check_finished(
         activation
@@ -400,9 +408,8 @@ async fn cross(
         "desktop handoff cleanup completed"
     );
     keep_first_failure(&mut result, finished, "desktop handoff cleanup");
-    if let Some(lease) = lease {
-        keep_first_failure(&mut result, lease.release().await, "AWDL restoration");
-    }
+    // A moment after the last user lets go, the shared lease gives AWDL back.
+    drop(awdl);
     result
 }
 
@@ -412,17 +419,6 @@ async fn cross(
 fn busy(peer: &str, prepared: &Result<DesktopResponse>) -> Option<anyhow::Error> {
     matches!(prepared, Ok(DesktopResponse::Unavailable { reason }) if reason == receive::SENDING)
         .then(|| AdmissionCancelled(format!("{peer} is sending its own input")).into())
-}
-
-async fn acquire_lease(reduce_wifi_latency: bool) -> Result<Option<awdl::HeldLease>> {
-    if !reduce_wifi_latency {
-        return Ok(None);
-    }
-    // Dropping a late acquisition closes its pipes, so the helper restores AWDL.
-    let lease = tokio::time::timeout(AWDL_ACQUIRE_TIMEOUT, awdl::AwDlLease::acquire())
-        .await
-        .context("the AWDL helper did not grant a lease in time")??;
-    Ok(Some(lease.hold()))
 }
 
 /// Samples the cursor again, since it kept moving after the edge was detected.
@@ -462,7 +458,6 @@ async fn remote(
     handoff: &Handoff,
     local_desktop: &[DesktopRect],
     token: u64,
-    lease: &mut Option<awdl::HeldLease>,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<Option<u32>> {
@@ -475,7 +470,6 @@ async fn remote(
         local_desktop,
         token,
         &mut poll,
-        lease,
         stop,
         status,
     )
@@ -532,7 +526,6 @@ async fn capture<'a>(
     local_desktop: &[DesktopRect],
     token: u64,
     poll: &mut Option<DesktopPoll<'a>>,
-    lease: &mut Option<awdl::HeldLease>,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<Option<u32>> {
@@ -558,17 +551,7 @@ async fn capture<'a>(
     activation.clipboard.share(activation.session);
     // Polling renews the receiver's handoff and reports its return edge.
     *poll = Some(poll_desktop(activation.session, token));
-    let ended = forward(
-        &mut capture,
-        activation,
-        handoff,
-        token,
-        poll,
-        lease,
-        stop,
-        status,
-    )
-    .await;
+    let ended = forward(&mut capture, activation, handoff, token, poll, stop, status).await;
     tracing::info!(reason = ended.reason, captured_events = ended.events,
         active_ms = started.elapsed().as_millis() as u64,
         error = ?ended.error.as_ref().map(|error| format!("{error:#}")), "stopping native capture");
@@ -626,7 +609,6 @@ async fn forward<'a>(
     handoff: &Handoff,
     token: u64,
     poll: &mut Option<DesktopPoll<'a>>,
-    lease: &mut Option<awdl::HeldLease>,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Ended {
@@ -669,10 +651,6 @@ async fn forward<'a>(
                 }
                 Err(error) => return ended.failed("desktop request failed", error),
             },
-            error = lease_failed(lease) => {
-                *lease = None;
-                return ended.failed("AWDL renewal failed", error);
-            }
             _ = secure_input_check.tick() => {
                 if secure_input_enabled() {
                     let error = AdmissionCancelled(SECURE_INPUT_RETURNED.into()).into();
@@ -764,14 +742,6 @@ async fn stop_requested(stop: &mut watch::Receiver<bool>) {
         if *stop.borrow_and_update() || stop.changed().await.is_err() {
             return;
         }
-    }
-}
-
-/// Resolves only when a held AWDL lease fails to renew.
-async fn lease_failed(lease: &mut Option<awdl::HeldLease>) -> anyhow::Error {
-    match lease {
-        Some(lease) => lease.failed().await,
-        None => std::future::pending().await,
     }
 }
 

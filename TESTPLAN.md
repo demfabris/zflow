@@ -247,7 +247,13 @@ Checks:
     The chord plus a move wakes the display. Sleep it again: an Ubuntu edge
     push enters the Mac and wakes it, with no "desktop handoff expired" line.
 16. **AWDL.** With **Reduce Wi-Fi lag** on, `ifconfig awdl0` shows it down
-    while controlled and back up afterwards.
+    while controlled and back up about a second afterwards. Let Ubuntu take
+    control back at the Mac's edge, then cross from the Mac within a second:
+    the log shows "AWDL already off" for the crossing, never "AWDL is
+    already in use", and AWDL stays down throughout. When the helper gives
+    no lease, as while another zflow build holds it, each crossing still
+    works and logs "AWDL stays on"; after three in a row Settings shows the
+    **Reduce Wi-Fi lag** warning, and sharing stays on.
 17. **Duplicates.** Turn Mac sharing off, then press Ctrl+Super+F12 on Ubuntu
     at the moment you turn it back on, so the chord and zflowd's live link
     dial the Mac while the Mac dials Ubuntu. After 10 s there is one session
@@ -630,7 +636,8 @@ The daemon rejects a second session from the same peer before the old session
 closes. Since September 24 the Mac keeps one session per receiver while sharing
 is on, so a crossing no longer waits for a handshake and rearming no longer
 waits for a QUIC drain. With Reduce Wi-Fi latency enabled, AWDL acquisition
-overlaps Prepare and release follows Finish. The previous 17:32 Mac log shows about 15 ms for
+overlaps Prepare and release follows Finish by a second, unless a crossing or
+a peer's control takes the lease over first. The previous 17:32 Mac log shows about 15 ms for
 acquisition and 25 ms for release with the switch on; measure the updated build
 before claiming a reduction. The under-60-ms rearm target remains unverified.
 

@@ -211,6 +211,8 @@ pub(super) struct Observer {
     running: Option<Running>,
     approach: Approach,
     secure_input_notice: bool,
+    /// Why the last crossing failed, while the notice still says so.
+    failure: Option<String>,
     /// The notice says a peer controls this Mac.
     controlled: bool,
     /// When to try watching the Mac's own motion again.
@@ -230,6 +232,7 @@ impl Default for Observer {
             running: None,
             approach: Approach::default(),
             secure_input_notice: false,
+            failure: None,
             controlled: false,
             watch_at: Instant::now(),
             notice: "Sharing is off.".into(),
@@ -254,6 +257,11 @@ impl Observer {
     /// The notice says Secure Input keeps input on the Mac.
     pub fn waiting_for_secure_input(&self) -> bool {
         self.secure_input_notice && self.notice == SECURE_INPUT_ON
+    }
+
+    /// The notice still says why the last crossing failed.
+    pub fn crossing_failed(&self) -> bool {
+        self.failure.as_ref() == Some(&self.notice)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -462,12 +470,14 @@ impl Observer {
             spent: self.approach.spent.filter(|_| running.returned.is_none()),
             ..Approach::default()
         };
+        // Only Escape and the person's own switches pause sharing. A crossing
+        // that went wrong says why, and the next push tries again.
         if !running.finished {
             tracing::error!("crossing worker stopped without reporting");
-            self.enabled = false;
-            self.notice = "The sharing worker stopped unexpectedly. Sharing will retry.".into();
+            self.notice = "The sharing worker stopped unexpectedly. Input is on the Mac.".into();
+            self.failure = Some(self.notice.clone());
         } else if running.failed {
-            self.enabled = false;
+            self.failure = Some(self.notice.clone());
         } else if running.cancelled && self.enabled {
             tracing::info!("crossing cancelled; edge sharing remains armed");
         } else if running.returned.is_some() && self.enabled {
@@ -479,9 +489,8 @@ impl Observer {
         } else if self.enabled {
             // Only a stop or Escape ends a crossing without a return, and both
             // disarm first. Anything else is a failure, never a user pause.
-            self.enabled = false;
-            self.notice =
-                "Remote input ended without returning to the Mac. Sharing will retry.".into();
+            self.notice = "Remote input ended without returning to the Mac.".into();
+            self.failure = Some(self.notice.clone());
         } else {
             self.notice = "Sharing is off. Input is on the Mac.".into();
         }
@@ -641,12 +650,29 @@ mod tests {
     fn a_crossing_that_ends_without_returning_fails_instead_of_pausing() {
         // For example, macOS invalidated the tap and the bridge ended capture.
         let observer = finished(&[SourceStatus::Failed("tap invalidated".into())], false);
-        assert!(!observer.is_enabled() && !observer.pause_requested);
+        assert!(observer.is_enabled() && !observer.pause_requested);
+        assert!(observer.crossing_failed());
         let observer = finished(&[], true);
-        assert!(!observer.is_enabled() && !observer.pause_requested);
-        assert!(observer.notice.contains("without returning"));
+        assert!(observer.is_enabled() && !observer.pause_requested);
+        assert!(observer.notice.contains("without returning") && observer.crossing_failed());
         let observer = finished(&[], false);
-        assert!(!observer.is_enabled() && !observer.pause_requested);
+        assert!(observer.is_enabled() && !observer.pause_requested);
+        assert!(observer.crossing_failed());
+    }
+
+    #[test]
+    fn a_failed_crossing_keeps_sharing_armed() {
+        // As in the live test, where the AWDL helper refused a second lease,
+        // the crossing failed and sharing went off. Only Escape or a toggle
+        // pauses sharing.
+        let failure = SourceStatus::Failed("AWDL helper: AWDL is already in use".into());
+        let mut observer = finished(&[failure], true);
+        assert!(observer.is_enabled() && !observer.pause_requested);
+        assert!(observer.crossing_failed());
+        // The notice says so until something newer happens.
+        let links = Links::with_backend(Default::default()).unwrap();
+        observer.tick_with(Some("linux".into()), None, &links);
+        assert!(!observer.crossing_failed());
     }
 
     #[test]

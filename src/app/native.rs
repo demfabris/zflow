@@ -1089,6 +1089,15 @@ impl NativeApp {
                     error,
                 ));
             }
+            // Only Wi-Fi lag, so it never stops a crossing; this says why.
+            if let Some(trouble) = macos::awdl_trouble().filter(|_| config.macos.block_awdl) {
+                health.push(Health::new(
+                    "awdl",
+                    Level::Warning,
+                    "Reduce Wi-Fi lag",
+                    trouble,
+                ));
+            }
         }
         // A computer gets its tile once it connects, so until then there is
         // nothing to drag.
@@ -1181,7 +1190,9 @@ impl NativeApp {
         if sharing && !self.observer.is_active() {
             return row(Level::Ok, "Sharing starts once a paired computer is ready.");
         }
-        let level = if sharing && self.observer.waiting_for_secure_input() {
+        let level = if sharing
+            && (self.observer.waiting_for_secure_input() || self.observer.crossing_failed())
+        {
             Level::Warning
         } else {
             Level::Ok
