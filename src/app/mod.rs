@@ -13,7 +13,9 @@ pub mod layout_model;
 pub mod model;
 #[cfg(target_os = "macos")]
 mod native;
+// On Linux the service finds computers, and only the record type is used.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod nearby;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod pairing;

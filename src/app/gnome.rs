@@ -2,7 +2,6 @@
 use super::{
     api::{self, Action, Health, Level, Peer, PeerState, Request, Shortcut, Status},
     desktop::DesktopReceiver,
-    nearby::{BrowserStatus, NearbyBrowser},
     pairing::Pairing,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -23,7 +22,6 @@ const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";
 #[derive(Default)]
 pub(super) struct State {
     pub receiver: DesktopReceiver,
-    pub nearby: NearbyBrowser,
     pub pairing: Pairing,
 }
 
@@ -145,14 +143,31 @@ impl Service {
             Request::Retry => {
                 crate::peer_view::request(&DaemonRequest::Retry {}).await?;
             }
+            Request::Place {
+                id,
+                x,
+                y,
+                tolerance,
+            } => {
+                crate::peer_view::request(&DaemonRequest::Place {
+                    id,
+                    x,
+                    y,
+                    tolerance,
+                })
+                .await?;
+            }
+            Request::AddAddress { address } => {
+                let address = crate::peer_view::parse_address(&address)?;
+                crate::peer_view::request(&DaemonRequest::AddAddress { address }).await?;
+            }
+            // The service looks for computers whenever discovery is on.
             Request::Reload
             | Request::SetAwdl { .. }
             | Request::HelperReady { .. }
             | Request::AllowAccessibility
             | Request::CheckAccessibility
-            | Request::Discover
-            | Request::Place { .. }
-            | Request::AddAddress { .. } => bail!("Not available on this computer"),
+            | Request::Discover => bail!("Not available on this computer"),
         }
         Ok(serde_json::json!({"ok": true}))
     }
@@ -164,7 +179,6 @@ fn snapshot(
     daemon: Result<crate::peer_view::DesktopStatus>,
     state: &State,
 ) -> Result<api::Snapshot<()>> {
-    let nearby = state.nearby.snapshot();
     let mut health = Vec::new();
     let (sharing, peers, shortcuts, layout) = match &daemon {
         Ok(daemon) => {
@@ -206,14 +220,6 @@ fn snapshot(
             (None, Vec::new(), Vec::new(), None)
         }
     };
-    if let BrowserStatus::Failed(error) = nearby.status {
-        health.push(Health::new(
-            "discovery",
-            Level::Warning,
-            "Nearby computers",
-            error,
-        ));
-    }
     let connected = peers.iter().any(|peer| {
         matches!(
             peer.state,
@@ -221,24 +227,31 @@ fn snapshot(
         )
     });
     let checking = !connected && peers.iter().any(|peer| peer.state == PeerState::Connecting);
+    let daemon = daemon.ok();
     Ok(api::Snapshot {
         status: Status::new(sharing, &peers, &health, checking),
         sharing,
         health,
+        pairing_window: daemon
+            .as_ref()
+            .map(|daemon| daemon.pairing_window.clone())
+            .unwrap_or_default(),
         layout,
+        own_mark: daemon.as_ref().and_then(|daemon| daemon.own_mark.clone()),
+        unplaced: daemon
+            .as_ref()
+            .map(|daemon| daemon.unplaced.clone())
+            .unwrap_or_default(),
         peers,
         pairing: state.pairing.snapshot(),
-        nearby: nearby.records.into_values().collect(),
-        pause_at_edges: daemon.as_ref().ok().map(|daemon| daemon.pause_at_edges),
+        // The service finds computers now; they are on the shelf.
+        nearby: Vec::new(),
+        pause_at_edges: daemon.as_ref().map(|daemon| daemon.pause_at_edges),
         shortcuts,
-        share_clipboard: daemon.as_ref().ok().map(|daemon| daemon.share_clipboard),
+        share_clipboard: daemon.as_ref().map(|daemon| daemon.share_clipboard),
         autostart: Some(autostart_enabled()?),
         config_path: CONFIG_PATH.into(),
-        // Filled in once the service says hello and keeps a shelf.
-        pairing_window: Default::default(),
-        own_mark: None,
-        unplaced: Vec::new(),
-        notices: Vec::new(),
+        notices: daemon.map(|daemon| daemon.notices).unwrap_or_default(),
         platform: (),
     })
 }
@@ -736,10 +749,29 @@ mod tests {
                 height: 1440,
             }],
         };
+        // The shelf, the window and the notices come from the service.
+        let fedora = crate::neighbors::Unplaced {
+            id: "key:aa".into(),
+            name: "fedora".into(),
+            os: Some(crate::wire::Os::Linux),
+            mark: Some("1abc9e".into()),
+            version: Some("0.3.0".into()),
+            state: crate::neighbors::UnplacedState::Ready,
+            trusts_you: false,
+            via: crate::neighbors::Via::Mdns,
+        };
+        let joined = crate::hello::Notice {
+            id: 1,
+            kind: crate::hello::NoticeKind::Joined,
+            name: "desk".into(),
+        };
         let up = snapshot(
             Ok(crate::peer_view::DesktopStatus {
                 layout: Some(layout.clone()),
                 share_clipboard: true,
+                own_mark: Some("a1b2c3".into()),
+                unplaced: vec![fedora.clone()],
+                notices: vec![joined.clone()],
                 ..status
             }),
             &State::default(),
@@ -747,6 +779,9 @@ mod tests {
         .unwrap();
         assert_eq!(up.layout, Some(layout));
         assert_eq!(up.share_clipboard, Some(true));
+        assert_eq!(up.own_mark.as_deref(), Some("a1b2c3"));
+        assert_eq!((up.unplaced, up.notices), (vec![fedora], vec![joined]));
+        assert!(up.nearby.is_empty());
         // While sharing, a computer that cannot be reached is a problem.
         assert!(
             up.health
