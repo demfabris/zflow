@@ -379,12 +379,17 @@ extension Unplaced {
 struct KeyMark: View {
   var mark: String
 
-  nonisolated static let palette: [Color] = [
+  private nonisolated static let rgb: [UInt32] = [
     0xE5484D, 0xF76B15, 0xFFC53D, 0x30A46C, 0x12A594, 0x0090FF, 0x8E4EC6, 0xD6409F,
-  ].map { rgb in
-    Color(
-      red: Double(rgb >> 16 & 0xFF) / 255, green: Double(rgb >> 8 & 0xFF) / 255,
-      blue: Double(rgb & 0xFF) / 255)
+  ]
+  nonisolated static let palette: [Color] = rgb.map(color)
+
+  // Split out so the compiler doesn't give up inferring one long expression.
+  private nonisolated static func color(_ rgb: UInt32) -> Color {
+    let red = Double((rgb >> 16) & 0xFF) / 255
+    let green = Double((rgb >> 8) & 0xFF) / 255
+    let blue = Double(rgb & 0xFF) / 255
+    return Color(red: red, green: green, blue: blue)
   }
   /// The palette index of each square.
   nonisolated static func indices(_ mark: String) -> [Int] {
