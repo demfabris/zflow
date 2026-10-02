@@ -690,7 +690,7 @@ Each computer creates a long-term identity key and presents it as a raw public k
 
 **The pairing window.** A fresh install may take one computer without anyone dragging it, once. Setup writes `eligible` to `state_dir/pairing-window` only when it creates the configuration: `host-setup.sh` on Linux, the first launch on a new configuration on the Mac. An upgrade, or an install that keeps a configuration, has no window. The window opens when a person is at the computer: on Linux when the desktop agent attaches from the active, unlocked seat, so an install over ssh alone never opens it, and on the Mac once Local Network access lets it look for computers. A computer that already trusts another closes the window as it would open (`had_peers`). While open, for 10 minutes, the window weighs the computers not trusted here. A computer is the candidate when:
 
-- it is the only computer here whose key is not trusted, and a hello proved that key in the last 30 seconds;
+- it is the only computer here whose key is not trusted, and a hello proved that key in the last 30 seconds. While the window is open, every record that answered is asked again 15 seconds after, so a window that opens long after the last hello still finds its computer;
 - this computer found it: the key answered a hello this computer sent to an mDNS record or to an address a person added. A hello that only came in can come from anywhere the port is open, so it puts a computer on the shelf, and counts as a second stranger, but never makes it the candidate;
 - every compatible record around maps to a known key, so no computer that has not answered could be a second one;
 - its name is its own: one that shares its name with a trusted computer or another stranger is never taken by itself.
