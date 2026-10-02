@@ -4,8 +4,9 @@
 //!
 //! It is trust on first use, kept narrow: the window opens at most once per
 //! install, never on an upgrade or an unattended install, and closes for
-//! good on the first acceptance, after ten minutes, or as soon as two
-//! unknown computers are around at once. The state lives in
+//! good on the first acceptance, after ten minutes, as soon as two unknown
+//! computers are around at once, or when the one it took cannot be added.
+//! The state lives in
 //! `state_dir/pairing-window`: only setup writes `eligible`, and a window
 //! still open when the program stopped comes back closed.
 //!
@@ -41,6 +42,8 @@ pub enum Reason {
     Rival,
     /// The program stopped while it was open.
     Restarted,
+    /// The computer it settled on could not be added, so a person places it.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,15 +151,30 @@ impl PairingWindow {
         };
     }
 
-    /// A person placed a computer, which uses the window up.
+    /// A computer was placed, or the one [`Self::tick`] returned was saved
+    /// as trusted, which uses the window up.
     pub fn placed(&mut self) {
         if matches!(self.phase, Phase::Eligible | Phase::Open { .. }) {
             self.close(Reason::Accepted);
         }
     }
 
-    /// Weighs who is around and returns the stranger to trust now, at most
-    /// once. A candidate is the only stranger, every compatible record
+    /// The computer [`Self::tick`] returned could not be added. Trying it
+    /// again every second would not help, so the window closes.
+    pub fn not_added(&mut self) {
+        if matches!(self.phase, Phase::Open { .. }) {
+            self.close(Reason::Failed);
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        matches!(self.phase, Phase::Open { .. })
+    }
+
+    /// Weighs who is around and returns the stranger to trust now. The
+    /// window stays open until the caller says how that went, with
+    /// [`Self::placed`] or [`Self::not_added`]. A candidate is the only
+    /// stranger, every compatible record
     /// around has a known key, it answered a hello this computer sent, its
     /// name is its own, and it said hello lately. It joins once it stayed
     /// the candidate for [`HOLD_OFF`]; any change starts the wait again, and
@@ -194,9 +212,7 @@ impl PairingWindow {
         if now.duration_since(*since) < HOLD_OFF {
             return None;
         }
-        let stranger = stranger.clone();
-        self.close(Reason::Accepted);
-        Some(stranger)
+        Some(stranger.clone())
     }
 
     pub fn view(&self, now: Instant) -> View {
@@ -303,9 +319,27 @@ mod tests {
         assert_eq!(after(&mut window, almost, &desk).await, None);
         let joined = after(&mut window, Duration::from_millis(1), &desk).await;
         assert_eq!(joined, Some(stranger("k1", "desk")));
+        // It is used up only once the computer is saved.
+        assert_eq!(window.view(Instant::now()).state, State::Open);
+        window.placed();
         assert_eq!(window.view(Instant::now()).reason, Some(Reason::Accepted));
         // Once only.
         assert_eq!(after(&mut window, HOLD_OFF, &desk).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_computer_that_could_not_be_added_closes_the_window_as_failed() {
+        let (directory, mut window) = opened();
+        let desk = around(&[stranger("k1", "desk")], 0);
+        window.tick(&desk, Instant::now());
+        assert!(after(&mut window, HOLD_OFF, &desk).await.is_some());
+        window.not_added();
+        assert!(!window.is_open());
+        assert_eq!(after(&mut window, HOLD_OFF, &desk).await, None);
+        let reloaded = PairingWindow::load(directory.path());
+        assert_eq!(reloaded.view(Instant::now()).reason, Some(Reason::Failed));
+        let path = directory.path().join(FILE_NAME);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "closed failed\n");
     }
 
     #[tokio::test(start_paused = true)]

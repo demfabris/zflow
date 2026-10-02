@@ -690,6 +690,35 @@ async fn exchange(stream: &mut UnixStream, request: &AgentRequest) -> Result<Age
 }
 
 #[cfg(test)]
+impl Hub {
+    /// Stands in for a connected desktop agent on one 2560 by 1440
+    /// monitor, which answers every request at once.
+    pub(super) async fn answer_everything(&self) -> tokio::task::JoinHandle<()> {
+        let (sender, mut jobs) = mpsc::channel::<Job>(4);
+        *self.broker.lock().await = Some((0, sender));
+        tokio::spawn(async move {
+            while let Some(job) = jobs.recv().await {
+                let response = match job.request {
+                    AgentRequest::Handoff(DesktopRequest::Snapshot) => DesktopResponse::Snapshot {
+                        geometry: crate::desktop::Geometry {
+                            monitors: vec![crate::desktop::Rect {
+                                x: 0,
+                                y: 0,
+                                width: 2560,
+                                height: 1440,
+                            }],
+                        },
+                        position: crate::desktop::Point { x: 10, y: 10 },
+                    },
+                    _ => DesktopResponse::Finished,
+                };
+                let _ = job.reply.send(AgentReply::Desktop(response));
+            }
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::clipboard::{ClipKind, MAX_CLIP_BYTES};

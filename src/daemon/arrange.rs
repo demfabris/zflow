@@ -8,7 +8,7 @@ use super::*;
 use crate::{
     discovery::UntrustedCandidate,
     hello::{Notice, NoticeKind, peer_name},
-    neighbors::{Unplaced, UnplacedState, fingerprint},
+    neighbors::{Stranger, Unplaced, UnplacedState, fingerprint},
     transport::{HelloConnection, connect_hello},
     wire::Hello,
 };
@@ -68,15 +68,33 @@ impl Shared {
         };
         let joining = self.window().tick(&strangers, now);
         if let Some(stranger) = joining {
-            let _mutation = self.config_mutation.lock().await;
-            let config = self.config.read().await.clone();
-            match self.trust(config, &stranger.key, None).await {
-                Ok(name) => {
-                    tracing::info!(peer = %name, mark = %stranger.mark, "computer joined while the pairing window was open")
-                }
-                Err(error) => {
-                    tracing::warn!(error = %format_args!("{error:#}"), "pairing window could not add a computer")
-                }
+            self.join(&stranger).await;
+        }
+    }
+
+    /// Trusts the lone stranger the pairing window settled on. Saving it
+    /// closes the window as accepted; if it cannot be saved, the window
+    /// closes as failed and a person places it.
+    async fn join(self: &Arc<Self>, stranger: &Stranger) {
+        let _mutation = self.config_mutation.lock().await;
+        // A person placed a computer while this waited, which used it up.
+        if !self.window().is_open() {
+            return;
+        }
+        let config = self.config.read().await.clone();
+        let id = format!("key:{}", stranger.key);
+        match self.trust(config, &id, None).await {
+            Ok(name) => {
+                tracing::info!(peer = %name, mark = %stranger.mark, "computer joined while the pairing window was open");
+            }
+            Err(error) => {
+                self.window().not_added();
+                tracing::warn!(
+                    peer = %stranger.name,
+                    mark = %stranger.mark,
+                    error = %format_args!("{error:#}"),
+                    "pairing window could not add a computer and closed; place it by hand"
+                );
             }
         }
     }
@@ -463,6 +481,33 @@ mod tests {
         let layout = shared.layout.lock().await.clone().unwrap();
         assert_eq!(tile_at(&layout, &after), Some((x, y)));
         assert_eq!(tile_at(&layout, &before), None);
+    }
+
+    #[tokio::test]
+    async fn a_computer_the_window_cannot_save_closes_it_as_failed() {
+        use crate::pairing_window::{Reason, State};
+        let (shared, _kept) = test_daemon();
+        let state_dir = shared.config.read().await.daemon.state_dir.clone();
+        PairingWindow::mark_eligible(&state_dir).unwrap();
+        *shared.window() = PairingWindow::load(&state_dir);
+        shared.open_pairing_window().await;
+        let (_directory, desk) = identity();
+        found(&shared, desk.spki(), "desk");
+        let now = tokio::time::Instant::now();
+        let config = shared.config.read().await.clone();
+        let stranger = shared.neighbors.borrow().strangers(&config, now).present[0].clone();
+        // Someone edited the file meanwhile, so saving it refuses.
+        let mut edited = config.clone();
+        edited.clipboard.share = !edited.clipboard.share;
+        edited.save(&shared.config_path).unwrap();
+
+        shared.join(&stranger).await;
+        let window = shared.window().view(now);
+        assert_eq!(
+            (window.state, window.reason),
+            (State::Closed, Some(Reason::Failed))
+        );
+        assert!(shared.config.read().await.peers.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

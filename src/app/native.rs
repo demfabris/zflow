@@ -691,13 +691,15 @@ impl NativeApp {
         };
         match self.trust(&stranger.key) {
             Ok(name) => {
+                self.window.placed();
                 tracing::info!(%name, "joined while the pairing window was open");
                 self.restart();
                 self.place_new_peers();
             }
             Err(error) => {
+                self.window.not_added();
                 let error = format!("{error:#}");
-                tracing::warn!(%error, "could not add the computer that joined");
+                tracing::warn!(%error, name = %stranger.name, "could not add the computer that joined, so the pairing window closed");
             }
         }
     }

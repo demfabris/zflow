@@ -206,6 +206,11 @@ extension Snapshot {
         "Drag the one you want",
         "More than one new computer showed up, so this Mac waits for you to choose."
       )
+    case .closed where pairingWindow.reason == .failed:
+      return (
+        "Drag the new computer into place",
+        "This Mac could not add it by itself."
+      )
     default:
       return nil
     }
