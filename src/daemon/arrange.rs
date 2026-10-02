@@ -110,13 +110,15 @@ impl Shared {
         self.exchange(connection, address, Some(instance)).await;
     }
 
-    /// Answers a hello that came to the input port, from any key.
+    /// Answers a hello that came to the input port, from any key, unless
+    /// it came from this computer itself.
     pub(super) async fn answer_hello(&self, connection: HelloConnection) {
         let remote = connection.remote_address();
         let now = tokio::time::Instant::now();
+        let local = crate::discovery::this_host_addresses();
         let mut allowed = false;
         self.neighbors.send_if_modified(|neighbors| {
-            allowed = neighbors.allow_hello(remote.ip(), now);
+            allowed = neighbors.allow_hello(remote.ip(), &local, now);
             false
         });
         if !allowed {
@@ -449,6 +451,35 @@ mod tests {
         let layout = shared.layout.lock().await.clone().unwrap();
         assert_eq!(tile_at(&layout, &after), Some((x, y)));
         assert_eq!(tile_at(&layout, &before), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hello_from_this_computer_is_hung_up() {
+        let (shared, _kept) = test_daemon();
+        let (_server_directory, server_key) = identity();
+        let (_local_directory, local_key) = identity();
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let server =
+            input_server_config_for_peers(&server_key, std::iter::empty::<&[u8]>()).unwrap();
+        let listener = Endpoint::server(server.quinn_config(), loopback).unwrap();
+        let address = listener.local_addr().unwrap();
+        // A process on this computer, such as another user's, knocks.
+        let client = Endpoint::client(loopback).unwrap();
+        let config = hello_client_config(&local_key).unwrap();
+        let knocking = tokio::spawn(async move {
+            let connection = connect_hello(&client, address, &config).await?;
+            let hello = crate::hello::make_hello("desk", 9, Vec::new(), false);
+            connection.exchange(&hello).await
+        });
+        let incoming = listener.accept().await.unwrap();
+        let Accepted::Hello(knock) = accept(incoming, &server).await.unwrap() else {
+            panic!("expected a hello");
+        };
+        shared.answer_hello(knock).await;
+        let answer = tokio::time::timeout(CONNECT_TIMEOUT, knocking).await;
+        assert!(answer.unwrap().unwrap().is_err(), "nobody answered it");
+        assert!(shared.unplaced(&*shared.config.read().await).is_empty());
+        listener.close(0_u32.into(), b"test finished");
     }
 
     #[tokio::test]

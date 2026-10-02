@@ -151,9 +151,10 @@ impl PairingWindow {
 
     /// Weighs who is around and returns the stranger to trust now, at most
     /// once. A candidate is the only stranger, every compatible record
-    /// around has a known key, its name is its own, and it said hello
-    /// lately. It joins once it stayed the candidate for [`HOLD_OFF`]; any
-    /// change starts the wait again, and a second stranger closes the window.
+    /// around has a known key, it answered a hello this computer sent, its
+    /// name is its own, and it said hello lately. It joins once it stayed
+    /// the candidate for [`HOLD_OFF`]; any change starts the wait again, and
+    /// a second stranger closes the window, even one that only said hello.
     pub fn tick(&mut self, strangers: &Strangers, now: Instant) -> Option<Stranger> {
         let Phase::Open { until } = self.phase else {
             return None;
@@ -167,7 +168,12 @@ impl PairingWindow {
             return None;
         }
         let candidate = match &strangers.present[..] {
-            [only] if strangers.unidentified == 0 && only.fresh && !only.duplicate_name => {
+            [only]
+                if strangers.unidentified == 0
+                    && only.answered
+                    && only.fresh
+                    && !only.duplicate_name =>
+            {
                 Some(only)
             }
             _ => None,
@@ -242,6 +248,7 @@ mod tests {
             key: key.into(),
             name: name.into(),
             mark: "a1b2c3".into(),
+            answered: true,
             fresh: true,
             duplicate_name: false,
         }
@@ -354,6 +361,35 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_computer_that_only_said_hello_never_joins_but_is_a_rival() {
+        let (_directory, mut window) = opened();
+        // Its hello came in, maybe from off the network, and no record or
+        // added address led this computer to it.
+        let knocked = Stranger {
+            answered: false,
+            ..stranger("k1", "desk")
+        };
+        let alone = around(std::slice::from_ref(&knocked), 0);
+        window.tick(&alone, Instant::now());
+        assert_eq!(after(&mut window, HOLD_OFF * 3, &alone).await, None);
+        assert_eq!(window.view(Instant::now()).holding, None);
+        // Once a hello this computer sent proves the key, it can join.
+        let known = around(&[stranger("k1", "desk")], 0);
+        assert_eq!(after(&mut window, Duration::ZERO, &known).await, None);
+        assert!(after(&mut window, HOLD_OFF, &known).await.is_some());
+
+        // Beside the computer it would take, it still counts as a second.
+        let (_directory, mut window) = opened();
+        let evil = Stranger {
+            answered: false,
+            ..stranger("k2", "evil")
+        };
+        let both = around(&[stranger("k1", "desk"), evil], 0);
+        assert_eq!(after(&mut window, Duration::ZERO, &both).await, None);
+        assert_eq!(window.view(Instant::now()).reason, Some(Reason::Rival));
     }
 
     #[tokio::test(start_paused = true)]

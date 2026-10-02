@@ -572,7 +572,9 @@ impl NativeApp {
         for heard in self.links.take_heard() {
             match heard {
                 Heard::Knock(knock) => {
-                    let allowed = self.neighbors.allow_hello(knock.remote_address().ip(), now);
+                    let local = crate::discovery::this_host_addresses();
+                    let ip = knock.remote_address().ip();
+                    let allowed = self.neighbors.allow_hello(ip, &local, now);
                     match self.greeting().filter(|_| allowed) {
                         Some(greeting) => self.links.answer(knock, greeting),
                         None => knock.close(),
@@ -1681,6 +1683,18 @@ mod tests {
         format!("key:{}", key.unwrap())
     }
 
+    /// `identity` answers the hello this Mac sent to its mDNS record.
+    fn answers_hello(app: &mut NativeApp, identity: &Identity, name: &str) {
+        let (record, remote) = (format!("zf-{name}"), "192.0.2.7:43119".parse().unwrap());
+        let now = tokio::time::Instant::now();
+        app.neighbors
+            .instance_seen(&record, vec![remote], true, Some(name.into()));
+        app.neighbors.take_due_hellos(MAX_HELLOS, now);
+        let hello = hello::make_hello(name, 43119, Vec::new(), false);
+        app.neighbors
+            .hello(identity.spki(), remote, &hello, Some(&record), now);
+    }
+
     #[test]
     fn a_computer_dropped_from_the_shelf_is_trusted_where_it_landed() {
         let directory = tempfile::tempdir().unwrap();
@@ -1820,11 +1834,16 @@ mod tests {
         app.discover = true;
         app.local_network = LocalNetwork::Allowed;
         let desk = Identity::load_or_create(&directory.path().join("desk")).unwrap();
+        // A hello that only came in, maybe from off the network, is not
+        // enough to join.
         says_hello(&mut app, &desk, "desk");
         app.tick_window(start);
         let open = window(&app);
         assert_eq!(open.state, crate::pairing_window::State::Open);
-        assert_eq!(open.holding.unwrap().name, "desk");
+        assert_eq!(open.holding, None);
+        answers_hello(&mut app, &desk, "desk");
+        app.tick_window(start);
+        assert_eq!(window(&app).holding.unwrap().name, "desk");
         app.tick_window(start + crate::pairing_window::HOLD_OFF);
         assert!(Config::load(&path).unwrap().peers.contains_key("desk"));
         assert_eq!(app.notices.len(), 1);

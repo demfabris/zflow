@@ -83,6 +83,13 @@ Checks:
     `zflow::transport::connect_hello`. Ubuntu answers at most five per 30 s
     from that address and closes the rest, the shelf keeps one tile for that
     key, and crossings with the Mac do not stutter.
+16. **Only computers it found join.** On a fresh computer with nobody else
+    around, make a computer it cannot see over mDNS (another subnet, or over
+    Tailscale) say hello to it: `sudo zflow nearby --add FRESH_IP` there. It
+    shows on the fresh computer's shelf, but the window never holds for it
+    and nothing joins; dragging it in still works. As an ordinary user on the
+    fresh computer, a hello to `127.0.0.1:43119` or to its own LAN address
+    puts nothing on the shelf.
 
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 

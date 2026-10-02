@@ -49,6 +49,15 @@ pub fn local_unicast_addresses() -> Result<Vec<IpAddr>, DiscoveryError> {
     Ok(select_advertisable_addresses(addresses))
 }
 
+/// Every address on this host's interfaces, with none left out. A
+/// connection from one of them, or from loopback, comes from a process here
+/// rather than another computer. Empty if they cannot be listed.
+pub fn this_host_addresses() -> Vec<IpAddr> {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| interfaces.iter().map(if_addrs::Interface::ip).collect())
+        .unwrap_or_default()
+}
+
 fn select_advertisable_addresses(addresses: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
     addresses
         .into_iter()
@@ -660,6 +669,14 @@ mod tests {
 
     fn test_instance() -> EphemeralInstanceId {
         EphemeralInstanceId([0xab; 16])
+    }
+
+    #[test]
+    fn this_host_has_every_address_it_could_advertise() {
+        let all = this_host_addresses();
+        for address in local_unicast_addresses().unwrap() {
+            assert!(all.contains(&address), "{address}");
+        }
     }
 
     fn advertisement() -> Advertisement {

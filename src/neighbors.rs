@@ -108,6 +108,10 @@ pub struct Stranger {
     pub key: String,
     pub name: String,
     pub mark: String,
+    /// Its key answered a hello this computer sent to an mDNS record or to
+    /// an address a person added. A hello that only came in could be from
+    /// anywhere, so it never makes a computer the one to join.
+    pub answered: bool,
     /// Said hello within [`FRESH_HELLO`].
     pub fresh: bool,
     /// Shares its name with a trusted computer or another stranger.
@@ -245,9 +249,14 @@ impl Neighbors {
         due
     }
 
-    /// Whether to answer or start one more hello with `ip` now.
-    pub fn allow_hello(&mut self, ip: IpAddr, now: Instant) -> bool {
+    /// Whether to answer one more hello from `ip` now. One from loopback or
+    /// from this computer's own addresses, `local`, comes from a process
+    /// here rather than another computer, and is never answered.
+    pub fn allow_hello(&mut self, ip: IpAddr, local: &[IpAddr], now: Instant) -> bool {
         let ip = ip.to_canonical();
+        if ip.is_loopback() || local.contains(&ip) {
+            return false;
+        }
         self.hellos
             .retain(|_, (start, _)| now.duration_since(*start) < HELLO_WINDOW);
         if !self.hellos.contains_key(&ip) && self.hellos.len() >= MAX_TRACKED_IPS {
@@ -438,6 +447,11 @@ impl Neighbors {
             .iter()
             .filter(|(key, _)| !trusted.contains(*key))
             .collect();
+        let answered: BTreeSet<&String> = self
+            .instances
+            .values()
+            .filter_map(|instance| instance.key.as_ref())
+            .collect();
         untrusted
             .iter()
             .map(|(key, neighbor)| {
@@ -454,6 +468,7 @@ impl Neighbors {
                     key: (*key).clone(),
                     name: neighbor.name.clone(),
                     mark: neighbor.mark.clone(),
+                    answered: answered.contains(*key),
                     fresh: now
                         .is_some_and(|now| now.duration_since(neighbor.last_hello) < FRESH_HELLO),
                     duplicate_name,
@@ -625,18 +640,69 @@ mod tests {
 
         let ip: IpAddr = "192.0.2.7".parse().unwrap();
         for _ in 0..HELLOS_PER_IP {
-            assert!(around.allow_hello(ip, now));
+            assert!(around.allow_hello(ip, &[], now));
         }
-        assert!(!around.allow_hello(ip, now));
-        assert!(around.allow_hello("192.0.2.8".parse().unwrap(), now));
+        assert!(!around.allow_hello(ip, &[], now));
+        assert!(around.allow_hello("192.0.2.8".parse().unwrap(), &[], now));
         tokio::time::advance(HELLO_WINDOW).await;
-        assert!(around.allow_hello(ip, Instant::now()));
+        assert!(around.allow_hello(ip, &[], Instant::now()));
 
         for index in 0..=MAX_INSTANCES {
             let address = SocketAddr::from(([198, 51, 100, (index % 250) as u8], 43119));
             around.instance_seen(&format!("zf-{index}"), vec![address], true, None);
         }
         assert_eq!(around.instances.len(), MAX_INSTANCES);
+    }
+
+    #[test]
+    fn hellos_from_this_computer_are_never_answered() {
+        let mut around = Neighbors::new(&spki(0));
+        let now = Instant::now();
+        let own: IpAddr = "192.0.2.2".parse().unwrap();
+        for ip in [
+            "127.0.0.1",
+            "127.0.0.53",
+            "::1",
+            "::ffff:127.0.0.1",
+            "192.0.2.2",
+            "::ffff:192.0.2.2",
+        ] {
+            assert!(
+                !around.allow_hello(ip.parse().unwrap(), &[own], now),
+                "{ip}"
+            );
+        }
+        assert!(around.allow_hello("192.0.2.3".parse().unwrap(), &[own], now));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_key_found_by_this_computers_own_hello_has_answered() {
+        let mut around = Neighbors::new(&spki(0));
+        let now = Instant::now();
+        let desk = at("192.0.2.7:43119");
+        let hello = make_hello("desk", 43119, Vec::new(), false);
+        let answered =
+            |around: &Neighbors| around.strangers(&Config::default(), now).present[0].answered;
+        // A hello that came in shows a tile, but could be from anywhere.
+        let key = around.hello(&spki(1), desk, &hello, None, now).unwrap();
+        assert!(!answered(&around));
+        assert_eq!(
+            around.unplaced(&Config::default())[0].id,
+            format!("key:{key}")
+        );
+        // The answer to a hello sent to its record proves where it is.
+        around.instance_seen("zf-desk", vec![desk], true, Some("desk".into()));
+        around.take_due_hellos(4, now);
+        around.hello(&spki(1), desk, &hello, Some("zf-desk"), now);
+        assert!(answered(&around));
+        // Without the record, it is back to a hello that came in.
+        around.instance_gone("zf-desk", now);
+        assert!(!answered(&around));
+        // An address a person added counts like a record.
+        around.add_address(desk);
+        let added = format!("address:{desk}");
+        around.hello(&spki(1), desk, &hello, Some(&added), now);
+        assert!(answered(&around));
     }
 
     #[tokio::test(start_paused = true)]
