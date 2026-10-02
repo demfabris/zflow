@@ -30,6 +30,7 @@ Tags: **exists**, **partial**, **missing**. "Guess" marks anything not proven by
 | 6 | Clipboard? | **Text and images, synced when the pointer crosses, in Phase 4. Never files.** |
 | 7 | Mac pointer acceleration? | **None by default: one count moves one point.** Spike I showed posted motion is not accelerated. A libinput-style curve in Rust felt accelerated in the first sitting, so it is opt-in through `ZFLOW_MAC_POINTER`. A virtual HID device needs Karabiner's driver or Apple's CoreHID entitlement (`SPEC.md:581-590`). |
 | 8 | Protocol bumps? | **One batched `zflow/3` bump, no `zflow/2` fallback.** New desktop commands are strict JSON anyway. |
+| 9 | How do computers pair? | **Arrange to pair (0.3.0, `zflow/4`).** Computers find each other and a person drags one into place; a fresh install takes one lone computer by itself within 10 minutes. Code pairing and UDP 43120 are gone. See SPEC.md, "Arrange to pair". |
 
 ---
 
@@ -52,10 +53,10 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 | Three or more computers, pointer moves from peer to peer | The server routes between clients | partial. Crossing only starts from the local tile (`src/app/handoff.rs:61`) | same | build (Phase 4) | Needs a Returned reply that says which edge it left through. |
 | Wire compatibility with Barrier/Synergy | yes | no | no | skip | Different protocol by design. |
 | Reconnect | Fixed or backoff | exists (`src/macos/link.rs`) | exists: a live link per peer on the Mac's schedule (`src/daemon/links.rs`, `src/link.rs`) | have | |
-| Finds a peer whose IP changed | Several hostnames | exists: tries nearby addresses with the pinned key (`src/macos/link.rs`) | partial: a crossing tries nearby addresses with the pinned key (`ensure_session`); the live link dials only a computer advertised at the saved address | improve | Both sides advertise and browse. |
-| Encryption and trust | TLS, fingerprint on first use | exists: QUIC, pinned key, 6-digit code plus Allow | exists | have | Stronger than Deskflow. |
-| Discovery | none | browses only (`src/app/nearby.rs`) | the daemon advertises and browses (`start_discovery` in `src/daemon.rs`); the desktop agent browses for the pairing dialog (`src/app/nearby.rs`) | improve | Needed so Linux can find a Mac. |
-| Computer names | Must match on both ends, plus aliases | Host name at pairing | same | have; rename: skip | No name agreement needed. |
+| Finds a peer whose IP changed | Several hostnames | exists: links find a peer by the key its hello proved (0.3.0) | same | have | |
+| Encryption and trust | TLS, fingerprint on first use | exists: QUIC, pinned key, trust by placing a found computer; a fresh install's 10-minute window takes one lone computer (0.3.0) | same | have | Simpler than a code, and first use is bounded. |
+| Discovery | none | advertises its name and browses while it looks for computers | advertises its name and browses (`start_discovery` in `src/daemon.rs`) | have | Found computers wait on a shelf under the arrangement. |
+| Computer names | Must match on both ends, plus aliases | Host name from its hello | same | have; rename: skip | No name agreement needed. Marks tell namesakes apart. |
 
 ### Layout
 
@@ -320,7 +321,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 | 7 | Keys from this computer | Dropdown | `set_peer {keyboard}` | no | yes |
 | 8 | Reverse scrolling | Switch | `set_peer {reverse_scroll}` (new) | no | no |
 | 9 | Forget | Button plus confirm | `forget` | yes | yes |
-| 10 | Pair Computer… | Sheet: "your code" and "their code" side by side, plus nearby computers | `pair`, `pair_respond`, `pair_cancel` | yes | yes |
+| 10 | Found on your network (code pairing until 0.3.0) | Shelf under the arrangement: drag a computer in, or add one by address | `place`, `add_address`; `snapshot.unplaced`, `pairing_window` | yes | yes |
 | 11 | Pause at edges | Switch | `set_switching` (new) | no | no |
 | 12 | Shortcuts | Read-only rows | `snapshot.shortcuts` | hint only (`SettingsView.swift:186`) | no |
 | 13 | Start at login | Switch | Mac: Swift SMAppService (`Services.swift:106-126`); Linux: `set_autostart` (`gnome.rs:240-262`) | yes | yes |
@@ -467,7 +468,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - The shared layout (decision 4): the daemon keeps the newest copy and passes it on. The protocol is now `zflow/3`.
     - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
     - A computer paired after the layout exists gets a tile beside this one (`SharedLayout::with_tiles_for`), and so does one missing from a layout a peer sent.
-    - Live links (`src/daemon/links.rs`): the daemon keeps a session to each peer it may send to, with the Mac's retry schedule (`src/link.rs`), so the first crossing reuses it. A session the peer dialed counts. It dials only where mDNS shows a zflow computer at the peer's saved address, so it dials a Mac only while the Mac listens. GNOME shows each peer as Connected, Connecting or Unreachable with a reason, plus a "Paired computers" health row with Retry. The GNOME API level stays 2: the snapshot keeps its shape, and `connecting`, `unreachable` and health actions were already part of it.
+    - Live links (`src/daemon/links.rs`): the daemon keeps a session to each peer it may send to, with the Mac's retry schedule (`src/link.rs`), so the first crossing reuses it. A session the peer dialed counts. Since 0.3.0 it dials only where a hello found the peer's key, so it dials a Mac only while the Mac listens. GNOME shows each peer as Connected, Connecting or Unreachable with a reason, plus a "Paired computers" health row with Retry. The GNOME API level stayed 2 then: the snapshot kept its shape, and `connecting`, `unreachable` and health actions were already part of it. It is 3 since 0.3.0, which dropped the code pairing requests.
   - Left: the live checks in TESTPLAN.md, "Two-way input sitting".
   - Known limits:
     - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
@@ -500,6 +501,14 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - The pointer walks A, B, C and back.
 - **Size:** 1500 to 2200 LOC.
 - **Risks:** Wayland clipboard access; clipboard loops.
+
+### Arrange to pair (0.3.0)
+
+- **Scope:** replace code pairing. Computers on the network show up on a shelf, a person drags one into place, and a fresh install's one-shot window takes one lone computer by itself. One port, UDP 43119, for hellos and input.
+- **Status (2026-10-02):** built on both, on `arrange-to-pair`. The input ALPN is `zflow/4` and the version 0.3.0, so 0.2.0 computers show "Different zflow version".
+- **Left:**
+  - The live sitting in TESTPLAN.md, "Arrange to pair sitting".
+  - Introductions: a pair that trusts each other vouching for a third computer, so a fresh computer next to them is not a rival. Hellos carry the vouch slots already, filled with random bytes.
 
 ### Phase 5 (later)
 

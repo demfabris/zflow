@@ -185,9 +185,9 @@ The service-manager watchdog kills a killable hung daemon within the configured 
 
 ### Versioning and limits
 
-The QUIC ALPN is the only protocol version. Input connections use `zflow/N` and pairing connections `zflow-pair/N`; any change to the wire format bumps them, so a peer on another version fails the TLS handshake and reports a version mismatch. Messages carry no version field.
+The QUIC ALPN is the only protocol version. Input connections use `zflow/N` and hellos `zflow-hello/N`, both on the input port; any change to the wire format bumps them, so a peer on another version fails the TLS handshake and reports a version mismatch. Messages carry no version field.
 
-Each input-session message names its family and carries the session epoch, transport generation, and activation identifier. Control and motion messages add their channel-specific sequences. Pairing binds each exchange to its own TLS exporter value before an input session exists.
+Each input-session message names its family and carries the session epoch, transport generation, and activation identifier. Control and motion messages add their channel-specific sequences. A hello is the one message computers trade before either trusts the other; it travels on a connection of its own and carries no session fields.
 
 The decoder MUST:
 
@@ -199,7 +199,7 @@ Payloads are the core model types in postcard behind a three-byte header (magic 
 
 ### Shared layout
 
-Every paired computer keeps one arrangement of all their desktops. Tiles are keyed by key fingerprint, because each computer names the others differently, and hold at most 16 computers so one desktop message carries the whole layout. Each edit raises the layout's version and records its editor's fingerprint; the higher (version, editor) wins, so both ends keep the same layout without a coordinator. A computer sends its layout when a session starts and after each change, keeps a newer one it receives, passes it on to its other peers, and answers an older one with its own. A computer drops tiles for keys it has not paired, so a forgotten computer never returns through a peer's copy, and it computes its own crossing edges from its own tile. A computer paired after the layout exists gets a tile beside the tile of the computer that paired it, to the right, left, below or above, whichever is free, as a new version from that computer. A computer that adopts a layout without its own tile adds it beside the first tile, at its own desktop's size.
+Every paired computer keeps one arrangement of all their desktops. Tiles are keyed by key fingerprint, because each computer names the others differently, and hold at most 16 computers so one desktop message carries the whole layout. Each edit raises the layout's version and records its editor's fingerprint; the higher (version, editor) wins, so both ends keep the same layout without a coordinator. A computer sends its layout when a session starts and after each change, keeps a newer one it receives, passes it on to its other peers, and answers an older one with its own. A computer drops tiles for keys it does not trust, so a peer's layout never adds trust and a forgotten computer never returns through a peer's copy, and it computes its own crossing edges from its own tile. A computer a person places gets its tile where it was dropped, snapped to an edge within reach, as a new version from the computer it was placed on. One that joined through the pairing window or `zflow trust`, or was added to the configuration by hand, gets a tile beside the tile of the computer that added it, to the right, left, below or above, whichever is free. A computer that adopts a layout without its own tile adds it beside the first tile, at its own desktop's size.
 
 Authenticated session negotiation selects the maximum datagram size, input capabilities, pointer units, scroll fields, contact limit, receiver lease, and checkpoint bound. A required capability mismatch prevents activation.
 
@@ -384,7 +384,7 @@ zflow v1 uses application-level candidate racing:
 
 The prototype implements neither candidate racing nor SessionTakeover yet. A new input connection starts a new session.
 
-Each computer keeps one session to every paired peer it may send to, and a session either side dialed counts. A lost session that lasted at least 10 s is redialed at once; after a failed attempt or a shorter session the wait is 1, 2, 4 and 8 s, then 15 s. When both peers dial at once, both keep the connection dialed by the peer whose key fingerprint sorts first. The Linux daemon dials in the background only where mDNS shows a zflow computer at the peer's saved address, so it dials a Mac only while the Mac listens and advertises its port; a crossing with no session up still dials on demand.
+Each computer keeps one session to every paired peer it may send to, and a session either side dialed counts. A lost session that lasted at least 10 s is redialed at once; after a failed attempt or a shorter session the wait is 1, 2, 4 and 8 s, then 15 s. When both peers dial at once, both keep the connection dialed by the peer whose key fingerprint sorts first. A computer finds its peers by key, not by address: a hello to an mDNS record or to an address a person added proves the key behind it, and in the background a link dials only where a hello found the peer's key, at whatever address it has now. So a DHCP change or a move to another network reconnects once the peer answers a hello, and a computer that does not listen, such as a Mac that has not looked for computers yet, is never dialed; its own link is the session. A crossing with no session up still dials on demand, also trying the peer's saved addresses. Those are kept newest first, one per IP, at most 8, each the IP a hello or session came from on the input port the peer named; learning one never restarts a link.
 
 Endpoint::rebind does not implement simultaneous racing because it replaces an endpoint's socket for all connections.
 
@@ -401,9 +401,9 @@ The user may plug in Ethernet or Thunderbolt mid-session. zflow may move the ses
 
 ### Discovery
 
-mDNS advertises an ephemeral instance identifier, the input ALPN as its protocol version, a capability summary, and connection candidates. It MUST NOT advertise a long-lived certificate fingerprint. A browser skips TXT keys and capability names it does not know, so a computer on another version is listed as needing an update instead of disappearing.
+mDNS advertises an ephemeral instance identifier, the input ALPN as its protocol version, a capability summary, the computer's name cut to one DNS label (63 bytes), and connection candidates. It MUST NOT advertise a long-lived certificate fingerprint. A browser skips TXT keys and capability names it does not know, so a computer on another version is listed as needing an update instead of disappearing.
 
-DNS-SD data remains untrusted until pairing or known-peer authentication completes. Long-lived identifiers in multicast records expose device identity to passive observers; [RFC 8882](https://www.rfc-editor.org/rfc/rfc8882.html#section-3.2) describes that privacy risk.
+DNS-SD data is never trusted. The name only labels a computer's tile on the shelf until its hello comes back, and a record belongs to a peer only through the key a hello to it proved. Long-lived identifiers in multicast records expose device identity to passive observers; [RFC 8882](https://www.rfc-editor.org/rfc/rfc8882.html#section-3.2) describes that privacy risk.
 
 Known peers may derive rotating discovery tokens. Discovery loss cannot revoke or authorize a peer.
 
@@ -563,15 +563,19 @@ build script bundles and signs these executables with hardened runtime enabled;
 notarization and distribution qualification are separate release steps.
 
 The same process receives. It listens on `transport.listen` on its own QUIC
-endpoint for every paired computer that may connect, so a port in use only
-stops incoming connections, and it keeps one session per computer: when both
+endpoint while a paired computer may connect or while it looks for
+computers, answering hellos from any key and input from trusted keys, so a
+port in use only stops incoming connections. It keeps listening while
+Sharing is paused, as the Linux service does: a trusted computer's input is
+closed once it arrives, so that computer is never told this Mac has not
+added it. It keeps one session per computer: when both
 computers dial at once, both keep the connection dialed by the computer whose
 key sorts first. A peer may control the Mac over either connection. One
 ownership guard keeps input going one way at a time. While the Mac sends or
 is about to, a peer's activation or desktop handoff is refused; while a peer
 controls the Mac or holds a handoff, no crossing starts from it. While it
-listens and may use the network, the Mac advertises its port over mDNS without
-Touch.
+listens and may use the network, the Mac advertises its port and name over
+mDNS without Touch.
 
 Paired computers keep one shared layout. The newest version wins, each
 computer writes only its own tile's size, and every session gets the kept
@@ -662,9 +666,9 @@ zflow code on the encrypted Data volume cannot run before FileVault unlock. The 
 
 zflow defends against:
 
-- an active attacker on the local network during discovery, pairing, and normal use;
+- an active attacker on the local network during discovery, hellos, placing, and normal use;
 - replayed or reordered application messages;
-- an unpaired peer sending input;
+- a computer nobody here trusts sending input;
 - a paired peer without pre-login permission;
 - an unprivileged local process calling the daemon socket;
 - malformed messages, event floods, and state exhaustion;
@@ -672,25 +676,35 @@ zflow defends against:
 
 zflow does not defend a machine after its operating system, daemon account, or paired peer identity key has been compromised.
 
-### Pairing and peer identity
+The pairing window (below) is trust on first use, which cannot tell the computer a person meant from an attacker that answers first ([RFC 7469](https://www.rfc-editor.org/rfc/rfc7469.html) documents that limitation). An attacker on the local network while a fresh install's window is open, with the computer the person meant switched off or not yet installed, joins in its place. zflow bounds that risk rather than removing it: the window opens once per fresh install, only with a person at the computer, for 10 minutes; it takes one computer, only while that computer is the only one it does not know; the computer then says who joined, with its mark and a Forget button; and the computer that joined gets no pre-login permission. An attacker that answers while the real computer is also around makes two strangers, and nothing joins. Outside the window nothing is trusted unless a person places it. Anyone on the local network can say hello and learn a computer's name and key, which TLS already showed.
 
-Each peer creates a long-term identity key and presents it through a self-signed TLS certificate or an equivalent certificate binding. The user pairs while both machines have logged-in sessions.
+### Arrange to pair
 
-Pairing MUST authenticate the transcript through one reviewed method:
+Each computer creates a long-term identity key and presents it as a raw public key in TLS 1.3 ([RFC 7250](https://www.rfc-editor.org/rfc/rfc7250.html)). A computer trusts another by keeping a record of that key, pinned by SPKI, in its configuration. Nothing else grants trust, and a record means trust however it got there.
 
-- a QR code that binds both identities and the handshake transcript;
-- a short authentication string compared on both displays;
-- a PAKE such as [SPAKE2](https://www.rfc-editor.org/rfc/rfc9382.html).
+**Finding.** Computers find each other through mDNS (see Discovery) and through addresses a person adds, such as one across Tailscale. Each compatible record whose key is not known yet gets a hello on the input port, at most four at a time, and the computer that answers goes on a shelf under the arrangement with its name, system, version and mark. A hello is one `Hello` message each way over a `zflow-hello/N` connection: TLS proves the key that sent it, and every field is only the sender's word. A hello connection has no input, clipboard or desktop surface and closes after the exchange. A computer answers at most five hellos per IP address in 30 seconds and tracks at most 64 addresses; it keeps at most 64 records and 32 found computers, and a found computer leaves the shelf 60 seconds after its record went away and its last hello. A computer on another zflow version is shown as such and cannot be placed.
 
-Blind trust on first use is insufficient because it cannot detect a first-connection MITM. [RFC 7469](https://www.rfc-editor.org/rfc/rfc7469.html) documents that limitation.
+**Placing.** A person trusts a found computer by dragging its tile into the arrangement. That writes the record, puts its tile where it was dropped, and lets either computer control the other; pre-login permission stays off. Until the other computer places this one too, it refuses this one's input, and this computer shows it as "Hasn't added this computer yet". On Linux without a desktop, `zflow nearby` lists the found computers and `zflow trust NAME|MARK` places one, through the root-only control socket.
 
-zflow uses SPAKE2 (`zflow-pair/4`, through the RustCrypto `spake2` crate: the magic-wormhole variant, not exactly RFC 9382). The listening peer shows a random six-digit setup code and the user types it on the initiating peer. Knowing the code is not enough: after both proofs, the listener's user allows or declines the peer, shown by its sanitized name and address, and nothing is saved before Allow. A code seen over someone's shoulder or in a screen share therefore cannot pair silently. Over the unpinned pairing TLS connection, the initiator sends its offer and its SPAKE2 message; the listener answers with its own. The SPAKE2 identities are both presented SPKIs. Proof keys come from HKDF-SHA256 over the SPAKE2 secret, salted with the connection's TLS exporter value. Each proof is an HMAC-SHA256 over the exporter value, both SPKIs, both encoded offers, and both SPAKE2 messages. The initiator proves first. The listener verifies before it answers, so each connection tests one guess at the code. A listener stops after three wrong codes, which bounds an active attacker to three chances in a million per displayed code, plus one per attempt the initiator makes toward an address the attacker controls. A relay between two TLS sessions fails because the exporter values and SPKIs differ on each side. After Allow, the listener saves the peer and then tells the initiator whether it did; the connection keeps alive while the user decides, for up to two minutes. The initiator saves only after a yes, so a listener that could not save is never trusted one way. A new pairing lets either computer control the other; pre-login permission stays off. Pairing a known key again only refreshes its addresses, which repairs the rare case where the initiator fails to save after the listener did.
+**Marks.** A computer's mark is the first 24 bits of SHA-256(`zflow mark v1` followed by its SPKI), drawn as four colored squares on its tile, on the shelf and on its own screen. It tells two computers with one name apart and lets a person compare two screens. Twenty-four bits do not authenticate a key against an attacker who grinds keys.
 
-After confirmation, zflow pins the peer's public identity key or SPKI rather than a replaceable leaf certificate. It supports revocation and identity rotation through a new authenticated pairing.
+**The pairing window.** A fresh install may take one computer without anyone dragging it, once. Setup writes `eligible` to `state_dir/pairing-window` only when it creates the configuration: `host-setup.sh` on Linux, the first launch on a new configuration on the Mac. An upgrade, or an install that keeps a configuration, has no window. The window opens when a person is at the computer: on Linux when the desktop agent attaches from the active, unlocked seat, so an install over ssh alone never opens it, and on the Mac once Local Network access lets it look for computers. A computer that already trusts another closes the window as it would open (`had_peers`). While open, for 10 minutes, the window weighs the computers not trusted here. A computer is the candidate when:
+
+- it is the only computer here whose key is not trusted, and a hello proved that key in the last 30 seconds;
+- every compatible record around maps to a known key, so no computer that has not answered could be a second one;
+- its name is its own: one that shares its name with a trusted computer or another stranger is never taken by itself.
+
+The candidate joins once it stayed the candidate for 5 seconds; any change starts that wait again. A second stranger closes the window for good (`rival`), even after it leaves. The window also closes on the first computer that joins or is placed (`accepted`) and after 10 minutes (`expired`). A window still open when zflow stopped comes back closed (`restarted`), since nobody can tell how long it was open. A computer that joined is announced as "NAME joined", with Forget beside it.
+
+Every unknown key counts as its own stranger. A fresh computer next to two that already trust each other sees two strangers and closes as `rival`, so the person drags one in instead. Hellos carry 16 vouch slots so that two computers could one day introduce a third as one group; until then the slots are random.
+
+**Forget.** Forgetting a computer removes its record and closes its sessions. It goes back on the shelf and can be placed again; its key is not blocked.
+
+**Reset or reinstalled computers.** A computer that was reset or reinstalled answers with a new key, and links to its old record say "Reset or reinstalled. Drag its new tile onto its old one." The new key is never taken by itself, whatever name or address it uses. Dropping its new tile onto the old tile of the computer with its name replaces the key in that record: the computer keeps its name, settings and tile, its pre-login permission goes off, and its saved addresses are cleared.
 
 ### Connection authorization
 
-Every input-capable connection uses mutual authentication. Pairing connections may exist before trust, but they cannot reach an input backend.
+Every connection uses mutual authentication: the TLS handshake proves each side holds the key it presents and accepts any key. One listener on the input port takes both protocols and sorts each connection after the handshake. A hello is answered whatever its key and never reaches an input backend. Input is accepted only from a key on the allowlist built from the configuration; any other key is closed with application code 0x103, which its dialer shows as "hasn't added this computer yet". While sharing is paused the allowlist keeps every trusted key, and their input is closed once it arrives, so a paused computer never tells its peers it has not added them.
 
 Each peer has revocable capabilities:
 
@@ -701,7 +715,7 @@ Each peer has revocable capabilities:
 
 Clipboard sharing is a setting of each computer, not of each peer (see Clipboard). Pre-login injection defaults off. A local logged-in user must grant it.
 
-QUIC 0-RTT MUST NOT carry pairing, input, control, permission, or session-takeover messages because an attacker can replay 0-RTT application data. See [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html#section-9.2).
+QUIC 0-RTT MUST NOT carry hello, input, control, permission, or session-takeover messages because an attacker can replay 0-RTT application data. See [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html#section-9.2).
 
 ### Local authority
 
@@ -709,11 +723,11 @@ The local control socket uses restrictive filesystem ownership plus peer credent
 
 The network protocol exposes no remote configuration command. Local files and authenticated local IPC own configuration. A peer cannot disable the local escape chord, increase the receiver-configured lease duration, request arbitrary device grabs, or grant itself capabilities.
 
-The decoder caps event rates, message sizes, concurrent contacts, open streams, candidate count, and pairing attempts. The receiver releases held state when any bound trips.
+The decoder caps event rates, message sizes, concurrent contacts, open streams, candidate count, and hellos per address. The receiver releases held state when any bound trips.
 
 ### Secrets and logs
 
-The daemon account owns key files with mode 0600 in a mode 0700 state directory. Logs MUST NOT contain key content, clipboard content, typed keys, authentication strings after pairing, or raw event traces unless the user starts an explicit local diagnostic capture.
+The daemon account owns key files with mode 0600 in a mode 0700 state directory. Logs MUST NOT contain key content, clipboard content, typed keys, or raw event traces unless the user starts an explicit local diagnostic capture.
 
 ## Observability
 
@@ -731,7 +745,7 @@ Reports use p50, p95, p99, p99.9, maximum, and burst length where sample count s
 
 ## Validation
 
-**Decision (2026-08-31)**: the prototype gates on the protocol-level checks below. The full release matrices (Linux backbone, desktop edge switching, signed macOS package, radio/QoS/playout, path failover, pairing and authorization) moved to [TESTPLAN.md](TESTPLAN.md) and gate beta and 1.0, not the first working build.
+**Decision (2026-08-31)**: the prototype gates on the protocol-level checks below. The full release matrices (Linux backbone, desktop edge switching, signed macOS package, radio/QoS/playout, path failover, arrange to pair and authorization) moved to [TESTPLAN.md](TESTPLAN.md) and gate beta and 1.0, not the first working build.
 
 The prototype requires:
 
@@ -783,7 +797,7 @@ Release matrices from TESTPLAN.md gate each beta along the way.
 - The receiver owns release on lease or lifecycle failure.
 - QUIC carries the first transport prototype.
 - Bulk traffic uses a separate best-effort connection.
-- Pairing proves a setup code shown on the listening computer through SPAKE2, and the listening computer's user allows the result (maintainer decision, 2026-09-27; it replaced comparing a code on both displays).
+- Computers trust each other by placement: a person drags a found computer into the arrangement. A fresh install's one-shot pairing window may also take one lone computer by itself, after 5 seconds alone and within 10 minutes (maintainer decision, 2026-10-02; it replaced code pairing through SPAKE2, which had replaced comparing a code on both displays on 2026-09-27).
 - Discovery does not publish a long-lived identity fingerprint.
 - Path changes use candidate racing and application session takeover.
 - Raw Mac trackpad contact capture ships in the signed baseline behind a feature flag with mandatory graceful degradation (maintainer decision, 2026-08-31).
@@ -813,7 +827,7 @@ Release matrices from TESTPLAN.md gate each beta along the way.
 
 - Permanent evdev grab with local relay routing: rejected 2026-08-31 for its restart-until-reboot and hotplug costs; revisit only if measured switch-time leakage exceeds the frozen threshold.
 - Independent relative deltas with latest-wins delivery.
-- Blind trust on first use.
+- Unbounded trust on first use: trusting whatever computer shows up, at any time. The pairing window is the one accepted exception, bounded to one lone computer, once per fresh install, with a person present, for 10 minutes (2026-10-02).
 - A stable certificate fingerprint in mDNS.
 - Clipboard on the critical input stream.
 - Voice marking for all traffic.

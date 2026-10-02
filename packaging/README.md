@@ -114,13 +114,18 @@ application launcher, and D-Bus activation file under `/usr/share`. It also
 ships `/etc/xdg/autostart/io.zflow.desktop-agent.desktop`, which starts the
 desktop agent in every GNOME session. debhelper handles service lifecycle and
 respects `policy-rc.d`. Configuration and capture rules are generated only when
-absent; updates keep daemon-written settings and pairing state.
+absent; updates keep daemon-written settings and the computers added. Only
+creating the configuration writes `eligible` to `/var/lib/zflow/pairing-window`,
+so a fresh install may take one computer by itself and an update never does.
 
-On configure, `/usr/lib/zflow/firewall.sh open` allows UDP 43119 and 43120 when
-ufw is active (application profile `/etc/ufw/applications.d/zflow`) or firewalld
-is running (service `/etc/firewalld/services/zflow.xml` in the default zone). It
-prints what it opened and never turns a firewall on. apt runs it again on every
-upgrade, so a removed rule comes back with the next update.
+On configure, `/usr/lib/zflow/firewall.sh open` allows UDP 43119, the one port
+for hellos and input, when ufw is active (application profile
+`/etc/ufw/applications.d/zflow`) or firewalld is running (service
+`/etc/firewalld/services/zflow.xml` in the default zone). It prints what it
+opened and never turns a firewall on. apt runs it on every upgrade, but it
+opens the port only while zflow has no profile or service file yet, so an
+upgrade never brings back a rule you removed. A rule written by 0.2.0 or older
+also lists UDP 43120; nothing listens there now.
 
 `apt remove zflow` stops the service, closes those firewall rules, and moves
 selected-device rules out of udev's active directory, retaining them for
