@@ -199,6 +199,16 @@ pub(crate) fn on_edge(
     reaching(layout, geometry, current, |wanted| wanted == edge)
 }
 
+/// Whether `point` is on any of this desktop's outer edges.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn on_any_edge(geometry: &Geometry, point: Point) -> bool {
+    geometry.bounds().is_ok_and(|bounds| {
+        [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+            .into_iter()
+            .any(|edge| touches(&bounds, edge, point))
+    })
+}
+
 /// The crossing for a pointer at `current` on one of the `wanted` edges,
 /// clear of the corners, where the layout puts another computer.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

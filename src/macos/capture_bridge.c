@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define ZFLOW_QUEUE_CAPACITY 1024
 #define ZFLOW_MAX_CONTACTS 5
@@ -142,7 +143,8 @@ int zflow_mac_input_is_neutral(void) {
 }
 
 // inject.c marks every event it posts with this, so a peer's motion is not
-// taken for the Mac's own.
+// taken for the Mac's own. macOS also stamps a posted event with the ID of
+// the process that posted it.
 #define ZFLOW_POSTED_MARK 0x7A666C6F77LL
 
 // The Mac's own pointer motion since the last take, in points.
@@ -174,7 +176,8 @@ static CGEventRef motion_callback(CGEventTapProxy proxy, CGEventType type,
     return event;
   }
   if (type != kCGEventMouseMoved ||
-      CGEventGetIntegerValueField(event, kCGEventSourceUserData) == ZFLOW_POSTED_MARK)
+      CGEventGetIntegerValueField(event, kCGEventSourceUserData) == ZFLOW_POSTED_MARK ||
+      CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid())
     return event;
   pthread_mutex_lock(&g_motion_lock);
   if (!g_motion_pending) g_motion.dx = g_motion.dy = 0;

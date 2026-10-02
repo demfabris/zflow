@@ -871,6 +871,8 @@ static CGEventRef move_by(int64_t dx, int64_t dy) {
   assert(move);
   CGEventSetIntegerValueField(move, kCGMouseEventDeltaX, dx);
   CGEventSetIntegerValueField(move, kCGMouseEventDeltaY, dy);
+  // The HID system's own events carry no process.
+  CGEventSetIntegerValueField(move, kCGEventSourceUnixProcessID, 0);
   return move;
 }
 
@@ -900,9 +902,15 @@ static void motion_tests(void) {
   assert(zflow_mac_motion_take(&motion) == 1 && motion.dx == 3.0 && motion.dy == 0.0);
   assert(motion_callback(NULL, kCGEventMouseMoved, posted, NULL) == posted);
   assert(!zflow_mac_motion_take(&motion));
+  // One this process posted is a peer's even if it lost the mark.
+  CGEventRef unmarked = move_by(50, 0);
+  CGEventSetIntegerValueField(unmarked, kCGEventSourceUnixProcessID, getpid());
+  assert(motion_callback(NULL, kCGEventMouseMoved, unmarked, NULL) == unmarked);
+  assert(!zflow_mac_motion_take(&motion));
   CFRelease(move);
   CFRelease(posted);
   CFRelease(right);
+  CFRelease(unmarked);
 
   // One listen-only tap on its own thread; a refusal starts nothing.
   tap_available = false;
