@@ -593,6 +593,7 @@ impl NativeApp {
                 self.neighbors
                     .hello(&spki, remote, &hello, instance.as_deref(), now);
             }
+            Heard::Unanswered { instance } => self.neighbors.no_answer(&instance, now),
             Heard::TurnedAway => self.neighbors.turned_one_away(),
             Heard::Connected {
                 key,
