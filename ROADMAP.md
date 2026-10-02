@@ -404,7 +404,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - The `peer_view` rejection tests still pass.
 - **Size:** about 14 files, 900 to 1300 lines changed.
 - **Risk:** churn. No new features in this phase.
-- **Status (2026-09-28):** the Linux half is done on branch `one-settings-api`.
+- **Status (2026-10-02):** done on both sides, on main.
   - `src/app/api.rs` holds `Snapshot<P>` (the platform section is a type parameter), `Status`, `Peer`, `Health` and one `Request` enum. Status titles and peer row text come from Rust.
   - The GNOME agent, panel and settings window use it. Health rows and shortcut rows show on Linux. Nearby records carry `pair_address`, so the 43120 rewrite in `settings.js` is gone.
   - The GNOME API level went from 1 to 2, because the snapshot changed shape. Phase 3 needs no second raise if it ships in the same release.
@@ -422,7 +422,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A two-session unit test with a fake sender covers the desktop handoff.
 - **Size:** about 10 files, 1600 to 2200 LOC.
 - **Risks:** macOS 27 posting quirks; pointer feel; Caps Lock; a firewall prompt; duplicate connections.
-- **Status (2026-09-28):** built on branch `mac-receiver`; the live sitting has not run.
+- **Status (2026-10-02):** on main. A first sitting on 2026-09-29 led to the pointer and scroll defaults and to crossing from an edge the cursor already rests on. TESTPLAN.md has no recorded results for the rest yet.
   - Done:
     - The injector: `inject.c` and `media.m` post, and `inject.rs` turns receiver effects into Mac events, with the pointer clamp and an opt-in curve, click state, drags, flags, the ISO swap, receiver-made repeat, Caps Lock through IOKit, media keys, pixel scroll, and release on every exit path the app sees.
     - Receiving over the session the Mac dials and over connections peers open. The Mac listens on `transport.listen` and keeps one session per computer with the shared dial rule.
@@ -457,7 +457,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A layout edit shows up on the other machine within 2 s.
 - **Size:** about 15 files, 1500 to 2000 LOC.
 - **Risks:** barrier hits from local motion; held keys at the edge; remappers; extension review; wider device access.
-- **Status (2026-09-28):** in progress on branch `linux-edge-sending`.
+- **Status (2026-10-02):** built, on main.
   - Done:
     - Capture-all: an empty `capture_devices` list captures every keyboard and pointer, and a device another program grabbed (EBUSY) is skipped.
     - The daemon half of change 9, and the rule for two computers dialing each other at once (`identity::wins_simultaneous_dial`).
@@ -468,9 +468,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - The Linux layout editor: the settings window shows the shared layout, and a drag or an arrow key moves a computer through `move_tile`. With no layout yet, the daemon keeps a first one, with each paired computer to the right of this one, as soon as GNOME describes the desktop. Any layout a peer arranged replaces it.
     - A computer paired after the layout exists gets a tile beside this one (`SharedLayout::with_tiles_for`), and so does one missing from a layout a peer sent.
     - Live links (`src/daemon/links.rs`): the daemon keeps a session to each peer it may send to, with the Mac's retry schedule (`src/link.rs`), so the first crossing reuses it. A session the peer dialed counts. It dials only where mDNS shows a zflow computer at the peer's saved address, so it dials a Mac only while the Mac listens. GNOME shows each peer as Connected, Connecting or Unreachable with a reason, plus a "Paired computers" health row with Retry. The GNOME API level stays 2: the snapshot keeps its shape, and `connecting`, `unreachable` and health actions were already part of it.
-  - Left:
-    - The Mac sending and merging layouts, and switching its handoff to the shared functions (Phase 2 side).
-    - The live checks in TESTPLAN.md, "Two-way input sitting".
+  - Left: the live checks in TESTPLAN.md, "Two-way input sitting".
   - Known limits:
     - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
     - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
@@ -487,9 +485,15 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A Mac "switch to next computer" chord.
   - Mac media keys.
   - Open logs.
-- **Status (2026-09-28):** started on Linux, on branch `linux-edge-sending`.
-  - Done: dead corners (outbound barriers stop 8 px short of the desktop's corners, and the Mac's crossings 8 points short), pause at edges (`[switching] pause_at_edges`, `set_switching`, 250 ms rest against a barrier on Linux), and reverse scrolling per computer. `reverse_scroll` is on the peer record, in `set_peer` and in the snapshot; the Linux daemon turns that peer's scroll around, and the settings window has the switch. The Mac injector and Mac UI pick it up in Phase 2.
-  - Clipboard on Linux: done, merged into `linux-edge-sending`. The computer the pointer leaves sends its clipboard to the one it enters, as SPEC.md's Clipboard section says. `[clipboard] share` and the Share Clipboard switch (`set_clipboard`) turn it on for one computer. The GNOME extension reads and writes the clipboard through `St.Clipboard` in two D-Bus methods only the agent may call, and shows the over-limit notice. The agent carries clips to the service as base64 on its own stream, which alone allows messages that large. The Mac side (`NSPasteboard` and its switch) is pending.
+- **Status (2026-10-02):** about half done, on main.
+  - Done on both: dead corners (Linux's outbound barriers stop 8 px short of the desktop's corners, and the Mac's crossings 8 points short), pause at edges (`[switching] pause_at_edges`, `set_switching`, a 250 ms rest against the edge), and reverse scrolling per computer (`reverse_scroll` on the peer record, in `set_peer` and in the snapshot).
+  - Clipboard: done on both. The computer the pointer leaves sends its clipboard to the one it enters, as SPEC.md's Clipboard section says. `[clipboard] share` and the Share Clipboard switch (`set_clipboard`) turn it on for one computer. The GNOME extension reads and writes the clipboard through `St.Clipboard` in two D-Bus methods only the agent may call, and shows the over-limit notice. The agent carries clips to the service as base64 on its own stream, which alone allows messages that large. The Mac uses `NSPasteboard`.
+  - Left:
+    - Peer-to-peer hops.
+    - Locking the pointer to the current computer.
+    - The "switch to next computer" chord on the Mac. Linux's chord cycles through connected computers.
+    - Media keys from the Mac. Capture still swallows them while sending (`capture_bridge.c`).
+    - Open logs on the Mac, which still logs to stderr only. Linux has it.
 - **Acceptance:**
   - Text and PNG copy/paste work both ways.
   - A 5 MiB clip is refused with a notice, without disconnecting.
