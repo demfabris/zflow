@@ -124,6 +124,8 @@ impl PairingWindow {
 
     /// Opens an eligible window, when a person is at this computer. One
     /// that already trusts a computer was not a fresh install after all.
+    /// The file says open before the window is, so a restart finds it
+    /// closed; when that cannot be saved, the window does not open at all.
     pub fn open(&mut self, has_peers: bool, now: Instant) {
         if self.phase != Phase::Eligible {
             return;
@@ -132,14 +134,18 @@ impl PairingWindow {
             self.close(Reason::HadPeers);
             return;
         }
-        self.phase = Phase::Open {
-            until: now + OPEN_FOR,
-        };
         let since = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.save(&format!("open {since}\n"));
+        if let Err(error) = crate::config::save_text(&self.path, &format!("open {since}\n")) {
+            tracing::warn!(%error, "the pairing window stays shut, since it could not be saved open");
+            self.phase = Phase::Never;
+            return;
+        }
+        self.phase = Phase::Open {
+            until: now + OPEN_FOR,
+        };
     }
 
     /// A person placed a computer, which uses the window up.
@@ -457,6 +463,22 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "closed restarted\n"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_that_cannot_be_saved_open_stays_shut() {
+        let directory = tempfile::tempdir().unwrap();
+        PairingWindow::mark_eligible(directory.path()).unwrap();
+        let mut window = PairingWindow::load(directory.path());
+        // The write fails, as on a full or read-only disk.
+        let path = directory.path().join(FILE_NAME);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        window.open(false, Instant::now());
+        assert_eq!(window.view(Instant::now()), View::default());
+        let desk = around(&[stranger("k1", "desk")], 0);
+        window.tick(&desk, Instant::now());
+        assert_eq!(after(&mut window, HOLD_OFF * 2, &desk).await, None);
     }
 
     #[tokio::test(start_paused = true)]

@@ -95,6 +95,11 @@ Checks:
     `avahi-publish -s zf-$(openssl rand -hex 16) _zflow._udp 43119
     v=zflow/4 cap=keyboard,pointer name=x &` in a loop. The window closes as
     a rival and the computer that shows up next waits on the shelf.
+18. **A window that cannot be saved stays shut.** Make Ubuntu fresh, then
+    before logging in run `sudo chattr +i /var/lib/zflow/pairing-window`.
+    Log in: no "This computer is new" banner, `journalctl -u zflowd` says the
+    window stays shut, and a lone computer waits on the shelf, also after
+    `sudo systemctl restart zflowd`. Undo with `sudo chattr -i`.
 
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 
