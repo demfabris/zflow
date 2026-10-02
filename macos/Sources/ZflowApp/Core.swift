@@ -24,15 +24,67 @@ struct Pairing: Decodable, Equatable, Sendable {
 }
 struct Nearby: Decodable, Identifiable, Equatable, Sendable {
   var instance: String
+  /// The name its record gives; older versions give none.
+  var name: String?
   var addresses: [String]
   var compatible: Bool
   /// Where its pairing listener waits; computers advertise their input port.
   var pairAddress: String?
   var id: String { instance }
-  /// Discovery names nobody, so people know a computer by its address.
-  @MainActor var host: String {
-    (pairAddress ?? addresses.first).map { PairingView.host($0) } ?? "Unknown address"
+}
+/// src/neighbors.rs Unplaced: a computer found around this Mac that is not
+/// on the board yet, for the shelf.
+struct Unplaced: Decodable, Identifiable, Equatable, Sendable {
+  /// What `place` takes once its hello proved its key.
+  var id: String
+  var name: String
+  var os: Os?
+  /// Its key's mark; nil until its hello comes back.
+  var mark: String?
+  var version: String?
+  var state: State
+  /// Whether it says it already added this Mac.
+  var trustsYou: Bool
+  var via: Via
+
+  enum State: String, Decodable, Sendable {
+    case identifying, ready
+    case differentVersion = "different_version"
+    case duplicateName = "duplicate_name"
   }
+  enum Via: String, Decodable, Sendable { case mdns, address }
+  /// Only a computer whose key is known, on this version, can be placed.
+  var placeable: Bool { state == .ready || state == .duplicateName }
+}
+enum Os: String, Decodable, Sendable { case linux, macos }
+/// src/pairing_window.rs View: the ten minutes in which a fresh install
+/// lets the one new computer around join by itself.
+struct PairingWindow: Decodable, Equatable, Sendable {
+  var state: State
+  var secondsLeft: Int?
+  /// The computer about to join.
+  var holding: Holding?
+  var reason: Reason?
+
+  enum State: String, Decodable, Sendable { case never, eligible, open, closed }
+  enum Reason: String, Decodable, Sendable {
+    case accepted, expired, rival, restarted
+    case hadPeers = "had_peers"
+  }
+  struct Holding: Decodable, Equatable, Sendable {
+    var name: String
+    var mark: String
+    var msLeft: Int
+  }
+}
+/// src/hello.rs Notice: something to tell people once.
+struct Notice: Decodable, Identifiable, Equatable, Sendable {
+  /// Grows with each notice, so each is posted once.
+  var id: UInt64
+  var kind: Kind
+  var name: String
+
+  enum Kind: String, Decodable, Sendable { case joined }
 }
 /// src/app/api.rs Snapshot, which the GNOME settings window shows too. The
 /// shared rows come first, in window order, then the ones for this Mac.
@@ -41,7 +93,12 @@ struct Snapshot: Decodable, Equatable, Sendable {
   /// Nil while the part that shares input cannot be reached.
   var sharing: Bool?
   var health: [Health]
+  var pairingWindow: PairingWindow
   var layout: Layout?
+  /// This Mac's key mark, drawn on its tile.
+  var ownMark: String?
+  /// Computers found but not on the board yet.
+  var unplaced: [Unplaced]
   var peers: [Peer]
   var pairing: Pairing
   var nearby: [Nearby]
@@ -50,6 +107,7 @@ struct Snapshot: Decodable, Equatable, Sendable {
   /// Whether the clipboard goes along with the pointer.
   var shareClipboard: Bool?
   var configPath: String
+  var notices: [Notice]
   var platform: MacPlatform
 
   /// The rows the window shows as banners.
@@ -75,6 +133,8 @@ struct Peer: Decodable, Identifiable, Equatable, Sendable {
   var keyboard: KeyboardMode
   /// Whether its scrolling is turned around on this Mac.
   var reverseScroll: Bool
+  /// Its key's mark, as its tile showed it on the shelf.
+  var mark: String
   var id: String { name }
 
   enum State: String, Decodable, Sendable {

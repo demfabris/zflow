@@ -1,8 +1,9 @@
 import AppKit
 import SwiftUI
 
-/// The home page: sharing, the arrangement of the desk, and computers nearby.
-/// Until a computer is paired, it shows how to add the first one instead.
+/// The home page: sharing, and the arrangement of the desk with the
+/// computers found nearby on a shelf. Until a computer is paired, it shows
+/// how to add the first one instead.
 struct ComputersView: View {
   var model: AppModel
   var snapshot: Snapshot
@@ -16,7 +17,6 @@ struct ComputersView: View {
           status
           ForEach(snapshot.problems) { HealthBanner(model: model, row: $0) }
           arrangement
-          if !snapshot.nearby.isEmpty { nearby }
         }
       }
       .padding(24)
@@ -42,12 +42,11 @@ struct ComputersView: View {
           .disabled(snapshot.sharing == nil)
         }
         ToolbarSpacer(.fixed, placement: .primaryAction)
-        ToolbarItem(placement: .primaryAction) {
-          Button("Pair a Computer", systemImage: "plus") { model.pair() }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.glassProminent)
-            .help("Pair a computer")
-        }
+      }
+      ToolbarItem(placement: .primaryAction) {
+        Button("Add a Computer by Address", systemImage: "plus") { model.addingAddress = true }
+          .labelStyle(.iconOnly)
+          .help("Add a computer by address")
       }
     }
   }
@@ -72,7 +71,7 @@ struct ComputersView: View {
     case .controlled: "\(peer) is using this Mac. Its own keyboard and trackpad still work."
     case .paused: "Turn on Sharing to move between your computers."
     case .checking: "Reaching your other computers…"
-    case .setup: "Pair a computer to share this keyboard and pointer."
+    case .setup: "Add a computer to share this keyboard and pointer."
     case .attention: "Fix what is below to keep sharing."
     }
   }
@@ -80,30 +79,38 @@ struct ComputersView: View {
   private var arrangement: some View {
     VStack(alignment: .leading, spacing: 8) {
       if let layout = snapshot.layout {
-        ComputerLayout(tiles: LayoutTile.tiles(layout, peers: snapshot.peers)) {
-          computer, x, y, tolerance in
-          model.send(
-            CoreRequest(command: "move_tile", id: computer.id, x: x, y: y, tolerance: tolerance))
-        }
-        .frame(height: 300)
+        Arrangement(model: model, snapshot: snapshot, layout: layout, shelf: .bottom)
+          .frame(height: snapshot.unplaced.isEmpty ? 300 : 400)
         Text("Drag computers to match your desk. The pointer crosses where two edges touch.")
           .font(.callout).foregroundStyle(.secondary)
       }
     }
   }
+}
 
-  private var nearby: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      HStack(alignment: .firstTextBaseline, spacing: 8) {
-        Text("Nearby").font(.headline)
-        Text("Computers running zflow on this network").font(.callout).foregroundStyle(.secondary)
-      }
-      NearbyList(model: model, nearby: snapshot.nearby, searching: false)
+/// The canvas with the engine's layout and shelf, sending moves and drops.
+private struct Arrangement: View {
+  var model: AppModel
+  var snapshot: Snapshot
+  var layout: Layout
+  var shelf: ShelfEdge
+  var searching = false
+
+  var body: some View {
+    ComputerLayout(
+      tiles: LayoutTile.tiles(layout, peers: snapshot.peers, ownMark: snapshot.ownMark),
+      unplaced: snapshot.unplaced, shelf: shelf, searching: searching
+    ) { computer, x, y, tolerance in
+      model.send(
+        CoreRequest(command: "move_tile", id: computer.id, x: x, y: y, tolerance: tolerance))
+    } place: { computer, x, y, tolerance in
+      model.send(
+        CoreRequest(command: "place", id: computer.id, x: x, y: y, tolerance: tolerance))
     }
   }
 }
 
-/// The first pairing, on the Computers page while nothing is paired.
+/// The first computer, on the Computers page while nothing is paired.
 private struct FirstRun: View {
   var model: AppModel
   var snapshot: Snapshot
@@ -114,7 +121,7 @@ private struct FirstRun: View {
     "curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash"
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 20) {
+    VStack(alignment: .leading, spacing: 18) {
       if !snapshot.platform.accessibility {
         Card(
           symbol: "accessibility", title: "Let zflow move the pointer here",
@@ -136,30 +143,33 @@ private struct FirstRun: View {
       ForEach(snapshot.problems.filter { $0.id != "sharing" }) {
         HealthBanner(model: model, row: $0)
       }
-      VStack(alignment: .leading, spacing: 6) {
+      VStack(alignment: .leading, spacing: 4) {
         Text("Add your other computers").font(.title2.weight(.semibold))
-        Text(
-          "Computers running zflow on this network show up below by themselves. Pick one, then type the code it shows."
+        Text("Computers running zflow on this network show up here by themselves.")
+          .foregroundStyle(.secondary)
+      }
+      if let layout = snapshot.layout {
+        Arrangement(
+          model: model, snapshot: snapshot, layout: layout, shelf: .trailing, searching: true
         )
-        .foregroundStyle(.secondary)
+        .frame(height: 230)
       }
-      NearbyList(model: model, nearby: snapshot.nearby, searching: true)
-      VStack(alignment: .leading, spacing: 8) {
-        Text("Not listed? Run this on it:").foregroundStyle(.secondary)
-        HStack(alignment: .top) {
-          Text(Self.installCommand).font(.callout.monospaced())
-            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-          Button(copied ? "Copied" : "Copy") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(Self.installCommand, forType: .string)
-            copied = true
-          }
+      if let note = snapshot.finishNote {
+        Note(title: note.title, detail: note.detail)
+      }
+      HStack(spacing: 10) {
+        Text("Not listed? Run on it:").foregroundStyle(.secondary).fixedSize()
+        Text(Self.installCommand).font(.callout.monospaced()).lineLimit(1)
+          .truncationMode(.tail).textSelection(.enabled)
+          .frame(maxWidth: .infinity, alignment: .leading)
+        Button(copied ? "Copied" : "Copy") {
+          NSPasteboard.general.clearContents()
+          NSPasteboard.general.setString(Self.installCommand, forType: .string)
+          copied = true
         }
-        .padding(12)
-        .background(.quinary, in: .rect(cornerRadius: 10))
-        Button("Enter an address instead…") { model.pair() }.buttonStyle(.link)
       }
+      .padding(.vertical, 6).padding(.leading, 12).padding(.trailing, 6)
+      .background(.quinary, in: .rect(cornerRadius: 10))
     }
     // Looking for computers is what makes macOS ask for Local Network access.
     .task { model.send(CoreRequest(command: "discover")) }
@@ -170,6 +180,56 @@ private struct FirstRun: View {
       try? await Task.sleep(for: .seconds(5))
       if !Task.isCancelled { networkBlocked = true }
     }
+  }
+}
+
+extension Snapshot {
+  /// What a fresh Mac's pairing window means for the person: while it is
+  /// open, the other computer can finish on its own.
+  var finishNote: (title: String, detail: String)? {
+    switch pairingWindow.state {
+    case .open:
+      if let holding = pairingWindow.holding {
+        return (
+          "Adding \(holding.name)…",
+          "It is the only new computer around, so this Mac accepts it by itself."
+        )
+      }
+      let minutes = max(1, ((pairingWindow.secondsLeft ?? 0) + 59) / 60)
+      let other = unplaced.first(where: \.placeable)?.name
+      return (
+        "Or finish from \(other ?? "the other computer")",
+        "Drag \(AppModel.hostName) into place in zflow on \(other ?? "it"). This Mac is new, so for the next \(minutes) \(minutes == 1 ? "minute" : "minutes") it accepts that by itself."
+      )
+    case .closed where pairingWindow.reason == .rival:
+      return (
+        "Drag the one you want",
+        "More than one new computer showed up, so this Mac waits for you to choose."
+      )
+    default:
+      return nil
+    }
+  }
+}
+
+/// Something worth knowing that needs nothing done.
+private struct Note: View {
+  var title: String
+  var detail: String
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 12) {
+      Image(systemName: "info.circle").foregroundStyle(.tint)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(title).fontWeight(.semibold)
+        Text(detail).font(.callout).fixedSize(horizontal: false, vertical: true)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .padding(.vertical, 12).padding(.horizontal, 14)
+    .background(Color.accentColor.opacity(0.07), in: .rect(cornerRadius: 14))
+    .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(Color.accentColor.opacity(0.18)) }
+    .accessibilityElement(children: .combine)
   }
 }
 
@@ -191,44 +251,6 @@ private struct Card<Action: View>: View {
       action()
     }
     .padding(14)
-    .background(.quinary, in: .rect(cornerRadius: 12))
-  }
-}
-
-/// Computers running zflow on this network that are not paired yet.
-private struct NearbyList: View {
-  var model: AppModel
-  var nearby: [Nearby]
-  /// Ends the list with a row saying more may show up.
-  var searching: Bool
-
-  var body: some View {
-    VStack(spacing: 0) {
-      ForEach(nearby) { computer in
-        HStack(spacing: 12) {
-          Image(systemName: "desktopcomputer").font(.title3).foregroundStyle(.secondary)
-          VStack(alignment: .leading, spacing: 1) {
-            Text(computer.host).fontWeight(.semibold)
-            Text(computer.compatible ? "Ready to pair" : "Update zflow on it to pair")
-              .font(.callout).foregroundStyle(.secondary)
-          }
-          .frame(maxWidth: .infinity, alignment: .leading)
-          Button("Pair") { model.pair(computer.pairAddress) }
-            .disabled(!computer.compatible || computer.pairAddress == nil)
-        }
-        .padding(.vertical, 10).padding(.horizontal, 14)
-        if computer.id != nearby.last?.id || searching { Divider().padding(.leading, 14) }
-      }
-      if searching {
-        HStack(spacing: 10) {
-          ProgressView().controlSize(.small)
-          Text(nearby.isEmpty ? "Looking for computers…" : "Looking for more…")
-            .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 10).padding(.horizontal, 14)
-      }
-    }
     .background(.quinary, in: .rect(cornerRadius: 12))
   }
 }

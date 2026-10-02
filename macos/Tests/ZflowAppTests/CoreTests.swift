@@ -104,6 +104,20 @@ import Testing
       CoreRequest(command: "move_tile", id: "nowhere", x: 0, y: 0, tolerance: 8))
     Issue.record("An unknown tile cannot move")
   } catch { #expect(error.localizedDescription == "Unknown computer") }
+  // A computer added by address waits on the shelf until its hello comes back.
+  let added = try await core.request(CoreRequest(command: "add_address", address: "100.64.0.7"))
+  let tile = try #require(added.unplaced.first)
+  #expect(tile.state == .identifying && tile.via == .address && !tile.placeable)
+  do {
+    _ = try await core.request(
+      CoreRequest(command: "place", id: tile.id, x: 0, y: 0, tolerance: 8))
+    Issue.record("A computer still being identified cannot be placed")
+  } catch {
+    #expect(error.localizedDescription == "100.64.0.7:43119 is still being identified")
+  }
+  #expect(added.pairingWindow.state == .never)
+  #expect(added.ownMark == nil || added.ownMark?.count == 6)
+  #expect(added.notices.isEmpty)
   await core.shutdown()
 }
 
