@@ -174,6 +174,15 @@ impl Shared {
         });
     }
 
+    /// Browsing started, and finds this computer's own record too.
+    pub(super) fn own_record(&self, discovery: Option<&crate::discovery::Discovery>) {
+        let own = discovery.map(|discovery| discovery.instance_id().to_string());
+        self.neighbors.send_if_modified(|neighbors| {
+            neighbors.own_record(own);
+            false
+        });
+    }
+
     /// Browsing stopped, so the records it found are gone.
     pub(super) fn forget_records(&self, records: &mut std::collections::BTreeSet<String>) {
         let now = tokio::time::Instant::now();

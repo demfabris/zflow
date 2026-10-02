@@ -149,6 +149,8 @@ struct Instance {
 #[derive(Debug)]
 pub struct Neighbors {
     own: String,
+    /// This computer's own mDNS record, which browsing finds too.
+    own_record: Option<String>,
     instances: BTreeMap<String, Instance>,
     neighbors: BTreeMap<String, Neighbor>,
     added: Vec<String>,
@@ -161,6 +163,7 @@ impl Neighbors {
     pub fn new(own_spki: &[u8]) -> Self {
         Self {
             own: fingerprint(own_spki),
+            own_record: None,
             instances: BTreeMap::new(),
             neighbors: BTreeMap::new(),
             added: Vec::new(),
@@ -177,6 +180,16 @@ impl Neighbors {
         self.turned_away = true;
     }
 
+    /// Names this computer's own mDNS record. Its hellos would come back
+    /// to this computer, which hangs up on them, so it is never said hello
+    /// to and never holds the pairing window as a computer not known yet.
+    pub fn own_record(&mut self, instance: Option<String>) {
+        if let Some(instance) = &instance {
+            self.instances.remove(instance);
+        }
+        self.own_record = instance;
+    }
+
     /// An mDNS record was resolved. A record whose addresses changed gets a
     /// new hello, since another computer may have them now.
     pub fn instance_seen(
@@ -186,6 +199,9 @@ impl Neighbors {
         compatible: bool,
         name: Option<String>,
     ) {
+        if self.own_record.as_deref() == Some(instance) {
+            return;
+        }
         if let Some(known) = self.instances.get_mut(instance) {
             if known.addresses != addresses {
                 known.asked = None;
@@ -591,6 +607,36 @@ mod tests {
         tokio::time::advance(HELLO_RETRY).await;
         assert_eq!(around.take_due_hellos(10, Instant::now()).len(), 6);
         assert_eq!(around.strangers(&Config::default(), start).unidentified, 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn this_computers_own_record_is_never_asked_and_holds_nothing_up() {
+        let mut around = Neighbors::new(&spki(0));
+        let own = vec![at("192.0.2.2:43119"), at("[2001:db8::2]:43119")];
+        around.instance_seen("zf-me", own.clone(), true, Some("me".into()));
+        // Seen before its own advertisement was known, and dropped once it is.
+        around.own_record(Some("zf-me".into()));
+        around.instance_seen("zf-me", own, true, Some("me".into()));
+        around.instance_seen("zf-desk", vec![at("192.0.2.7:43119")], true, None);
+        let now = Instant::now();
+        let due = around.take_due_hellos(4, now);
+        assert_eq!(due, [("zf-desk".into(), vec![at("192.0.2.7:43119")])]);
+        let hello = make_hello("desk", 43119, Vec::new(), false);
+        around.hello(
+            &spki(1),
+            at("192.0.2.7:43119"),
+            &hello,
+            Some("zf-desk"),
+            now,
+        );
+        let strangers = around.strangers(&Config::default(), now);
+        assert_eq!((strangers.present.len(), strangers.unidentified), (1, 0));
+        assert!(
+            around
+                .unplaced(&Config::default())
+                .iter()
+                .all(|tile| tile.name != "me")
+        );
     }
 
     #[tokio::test(start_paused = true)]

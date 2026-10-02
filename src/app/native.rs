@@ -640,6 +640,8 @@ impl NativeApp {
         if nearby.turned_away {
             self.neighbors.turned_one_away();
         }
+        let own = self.advertiser.as_ref().and_then(Advertiser::instance);
+        self.neighbors.own_record(own.map(str::to_owned));
         let records = nearby.records;
         for gone in self
             .instances

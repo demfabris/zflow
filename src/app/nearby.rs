@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
@@ -7,7 +7,9 @@ use std::{
 
 use tokio::sync::oneshot;
 
-use crate::discovery::{Discovery, DiscoveryEvent, UntrustedCandidate, local_unicast_addresses};
+use crate::discovery::{
+    Discovery, DiscoveryEvent, UntrustedCandidate, remote_addresses, this_host_addresses,
+};
 
 const MAX_NEARBY: usize = 64;
 
@@ -50,13 +52,11 @@ pub(super) struct NearbySnapshot {
 }
 
 impl NearbySnapshot {
-    fn insert(&mut self, record: NearbyRecord, local: &BTreeSet<IpAddr>) {
-        if record.addresses.is_empty()
-            || record
-                .addresses
-                .iter()
-                .all(|address| address.ip().is_loopback() || local.contains(&address.ip()))
-        {
+    /// Keeps a record without this Mac's own addresses, `local`. One left
+    /// with none is this Mac's own.
+    fn insert(&mut self, mut record: NearbyRecord, local: &[IpAddr]) {
+        record.addresses = remote_addresses(&record.addresses, local);
+        if record.addresses.is_empty() {
             self.records.remove(&record.instance);
             return;
         }
@@ -157,14 +157,11 @@ async fn browse(shared: Arc<Mutex<NearbySnapshot>>, mut stop: oneshot::Receiver<
         return;
     }
     let setup = (|| {
-        let local = local_unicast_addresses()?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
         let mut discovery = Discovery::new()?;
         discovery.browse()?;
-        Ok::<_, crate::discovery::DiscoveryError>((discovery, local))
+        Ok::<_, crate::discovery::DiscoveryError>(discovery)
     })();
-    let (discovery, local) = match setup {
+    let discovery = match setup {
         Ok(value) => value,
         Err(error) => {
             update(&shared, |state| {
@@ -181,6 +178,9 @@ async fn browse(shared: Arc<Mutex<NearbySnapshot>>, mut stop: oneshot::Receiver<
             event = discovery.next_event() => match event {
                 Ok(DiscoveryEvent::Candidate(candidate)) => {
                     if let Some(record) = NearbyRecord::from_candidate(candidate) {
+                        // Every address, as they are now, not the 16 this
+                        // Mac's own record may name.
+                        let local = this_host_addresses();
                         update(&shared, |state| state.insert(record, &local));
                     }
                 }
@@ -230,11 +230,7 @@ mod tests {
         let mut browser = NearbyBrowser::default();
         assert!(!browser.is_running());
         assert!(browser.stop.is_none());
-        browser
-            .shared
-            .lock()
-            .unwrap()
-            .insert(record(1), &BTreeSet::new());
+        browser.shared.lock().unwrap().insert(record(1), &[]);
         browser.stop();
         assert!(browser.snapshot().records.is_empty());
         assert_eq!(browser.status(), BrowserStatus::Paused);
@@ -244,17 +240,17 @@ mod tests {
     fn records_are_bounded_but_existing_instances_can_update() {
         let mut snapshot = NearbySnapshot::default();
         for index in 0..MAX_NEARBY {
-            snapshot.insert(record(index), &BTreeSet::new());
+            snapshot.insert(record(index), &[]);
         }
         assert!(!snapshot.turned_away);
         for index in MAX_NEARBY..100 {
-            snapshot.insert(record(index), &BTreeSet::new());
+            snapshot.insert(record(index), &[]);
         }
         assert_eq!(snapshot.records.len(), MAX_NEARBY);
         assert!(snapshot.turned_away, "the app hears that some were dropped");
         let mut changed = record(0);
         changed.addresses = vec!["192.0.2.250:43119".parse().unwrap()];
-        snapshot.insert(changed.clone(), &BTreeSet::new());
+        snapshot.insert(changed.clone(), &[]);
         assert_eq!(snapshot.records[&changed.instance], changed);
         snapshot.records.remove(&changed.instance);
         assert_eq!(snapshot.records.len(), MAX_NEARBY - 1);
@@ -264,15 +260,18 @@ mod tests {
     }
 
     #[test]
-    fn only_fully_local_records_are_hidden() {
+    fn this_macs_own_addresses_are_dropped_and_its_own_record_hidden() {
         let mut snapshot = NearbySnapshot::default();
         let mut candidate = record(0);
-        let local = BTreeSet::from([candidate.addresses[0].ip()]);
+        let local = [candidate.addresses[0].ip()];
+        candidate.addresses.push("127.0.0.1:43119".parse().unwrap());
+        candidate.addresses.push("[::1]:43119".parse().unwrap());
         snapshot.insert(candidate.clone(), &local);
         assert!(snapshot.records.is_empty());
-        candidate.addresses.push("192.0.2.9:43119".parse().unwrap());
-        snapshot.insert(candidate, &local);
-        assert_eq!(snapshot.records.len(), 1);
+        let other: SocketAddr = "192.0.2.9:43119".parse().unwrap();
+        candidate.addresses.push(other);
+        snapshot.insert(candidate.clone(), &local);
+        assert_eq!(snapshot.records[&candidate.instance].addresses, [other]);
     }
 
     #[tokio::test]
@@ -289,7 +288,7 @@ mod tests {
         let mut browser = NearbyBrowser::default();
         let previous = Arc::clone(&browser.shared);
         browser.stop();
-        previous.lock().unwrap().insert(record(0), &BTreeSet::new());
+        previous.lock().unwrap().insert(record(0), &[]);
         assert!(browser.snapshot().records.is_empty());
     }
 
