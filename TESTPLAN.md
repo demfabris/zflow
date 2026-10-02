@@ -100,6 +100,11 @@ Checks:
     Log in: no "This computer is new" banner, `journalctl -u zflowd` says the
     window stays shut, and a lone computer waits on the shelf, also after
     `sudo systemctl restart zflowd`. Undo with `sudo chattr -i`.
+19. **Other addresses only to trusted computers.** With Tailscale up on
+    Ubuntu, place Ubuntu on a fresh Mac before Ubuntu places the Mac. The
+    Mac's record for Ubuntu in its `zflow.toml` has Ubuntu's LAN address and
+    not its Tailscale one, since Ubuntu's hellos to a key it does not trust
+    name no other addresses.
 
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 

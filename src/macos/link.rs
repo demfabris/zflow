@@ -2740,6 +2740,7 @@ mod tests {
         let ours = server.block_on(theirs).unwrap();
         assert_eq!(ours.input_port, address.port());
         assert!(!ours.trusts_you);
+        assert!(ours.candidates.is_empty(), "a stranger hears no addresses");
 
         // Input from a key not trusted here is refused, and said.
         server.block_on(async {

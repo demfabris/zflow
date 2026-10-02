@@ -37,14 +37,16 @@ pub enum NoticeKind {
 }
 
 /// This computer's hello. `trusts_you` says whether the computer it goes to
-/// is already trusted here, which the other side only shows.
+/// is already trusted here, which the other side only shows. Only a trusted
+/// computer hears this one's other addresses, such as Tailscale, VPN or
+/// container ones; anyone else gets only the address it reached.
 pub fn local_hello(input_port: u16, trusts_you: bool) -> Hello {
-    make_hello(
-        &local_name(),
-        input_port,
-        this_host_candidates(input_port),
-        trusts_you,
-    )
+    let candidates = if trusts_you {
+        this_host_candidates(input_port)
+    } else {
+        Vec::new()
+    };
+    make_hello(&local_name(), input_port, candidates, trusts_you)
 }
 
 pub fn make_hello(
@@ -294,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hello_carries_every_address_the_other_computer_can_use() {
+    fn a_hello_to_a_trusted_computer_carries_every_address_it_can_use() {
         let addresses = [
             "192.168.1.215",
             "100.114.101.60",
@@ -329,9 +331,13 @@ mod tests {
         assert_ne!(hello.candidates[1], advertised);
         // It encodes, so the bounds hold.
         crate::wire::encode(&crate::wire::WireMessage::Hello(hello)).unwrap();
-        let other = local_hello(43119, true);
-        assert!(other.trusts_you);
-        assert_ne!(other.vouches, local_hello(43119, true).vouches);
+        let trusted = local_hello(43119, true);
+        assert!(trusted.trusts_you);
+        assert_eq!(trusted.candidates, this_host_candidates(43119));
+        assert_ne!(trusted.vouches, local_hello(43119, true).vouches);
+        // A computer not trusted here learns none of them.
+        let stranger = local_hello(43119, false);
+        assert!(!stranger.trusts_you && stranger.candidates.is_empty());
     }
 
     #[test]
