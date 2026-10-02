@@ -9,9 +9,14 @@ use super::{
 };
 use crate::{
     config::Config,
-    desktop::SharedLayout,
+    desktop::{MAX_SHARED_TILES, SharedLayout},
+    discovery::UntrustedCandidate,
+    hello::{self, Notice, NoticeKind, hello_addresses, peer_name},
     identity::Identity,
-    macos::{self, Advertiser, LinkState, Links, LocalNetwork},
+    macos::{self, Advertiser, Found, Greeting, Heard, LinkState, Links, LocalNetwork},
+    neighbors::{Neighbors, UnplacedState, fingerprint, mark},
+    pairing_window::PairingWindow,
+    transport::{HelloClientConfig, hello_client_config},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -20,6 +25,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -33,6 +39,16 @@ const TAP_RECHECK: Duration = Duration::from_secs(10);
 /// A paired computer's tile until it writes its own size, as the Linux
 /// daemon starts one.
 const PEER_TILE_SIZE: (u32, u32) = (1920, 1080);
+/// How often the computers around are weighed: who to say hello to, where
+/// paired ones are now, and whether the pairing window lets one join.
+const NEIGHBORS_TICK: Duration = Duration::from_secs(1);
+/// Hellos this Mac sends at once.
+const MAX_HELLOS: usize = 4;
+/// Joined notices kept for the window to post.
+const MAX_NOTICES: usize = 8;
+/// Present in the state directory once setup asked to look for computers,
+/// so a Mac with nothing paired yet keeps listening after a restart.
+const DISCOVER_FILE: &str = "discover";
 
 /// The layout every paired computer keeps, saved beside the configuration
 /// as `NAME.shared-layout.toml`. Empty until this Mac first connects.
@@ -86,13 +102,26 @@ pub(crate) struct NativeApp {
     /// Tells the local network where peers connect, while this Mac listens.
     advertiser: Option<Advertiser>,
     nearby: NearbyBrowser,
+    /// The computers around and what their hellos said.
+    neighbors: Neighbors,
+    /// The records last given to `neighbors`.
+    instances: BTreeSet<String>,
+    neighbors_at: Instant,
+    /// This Mac's key, read once, and the hello client made with it.
+    identity: Option<Identity>,
+    hello_client: Option<HelloClientConfig>,
+    window: PairingWindow,
+    /// Computers that joined, newest last, for the window to post once.
+    notices: Vec<Notice>,
     pairing: Pairing,
     /// Receiver desktop sizes read over each peer's session.
     desktops: BTreeMap<String, (u32, u32)>,
     accessibility: bool,
     tap_refused: Option<Instant>,
-    /// Set once setup asks to look for computers.
+    /// Set once setup asks to look for computers, and kept across restarts.
     discover: bool,
+    /// Whether the links were last told to answer hellos.
+    welcome: bool,
     local_network: LocalNetwork,
     local_network_checked: Instant,
     helper_ready: bool,
@@ -108,11 +137,19 @@ impl NativeApp {
     pub fn open(path: PathBuf) -> Result<Self> {
         let mut document = ConfigDocument::open(path)?;
         document.validate()?;
+        let state_dir = document.saved().daemon.state_dir.clone();
         if document.is_new() {
             document.save()?;
+            // A fresh install may let one computer join on its own, once.
+            if let Err(error) = PairingWindow::mark_eligible(&state_dir) {
+                tracing::warn!(%error, "the pairing window cannot open");
+            }
         }
         let layout = LayoutDocument::beside(&document.path)?;
         let shared = Document::open(shared_layout_path(&document.path)?)?;
+        let identity = Identity::load_or_create(&state_dir)
+            .inspect_err(|error| tracing::warn!(%error, "could not read this Mac's key"))
+            .ok();
         let mut app = Self {
             document,
             layout,
@@ -121,11 +158,21 @@ impl NativeApp {
             links: Links::new()?,
             advertiser: None,
             nearby: NearbyBrowser::default(),
+            neighbors: Neighbors::new(identity.as_ref().map_or(&[][..], Identity::spki)),
+            instances: BTreeSet::new(),
+            neighbors_at: Instant::now(),
+            hello_client: identity
+                .as_ref()
+                .and_then(|identity| hello_client_config(identity).ok()),
+            identity,
+            window: PairingWindow::load(&state_dir),
+            notices: Vec::new(),
             pairing: Pairing::default(),
             desktops: BTreeMap::new(),
             accessibility: crate::macos::accessibility_authorized(false),
             tap_refused: None,
-            discover: false,
+            discover: state_dir.join(DISCOVER_FILE).exists(),
+            welcome: false,
             local_network: LocalNetwork::Unknown,
             local_network_checked: Instant::now(),
             helper_ready: false,
@@ -184,28 +231,21 @@ impl NativeApp {
                     .context("Computers cannot overlap")?;
                 moved.monitors[index].x = x;
                 moved.monitors[index].y = y;
-                match self.shared.draft.layout.clone() {
-                    // Until this Mac first connects, the arrangement is its own.
-                    None => {
-                        let previous = std::mem::replace(&mut self.layout.draft, moved);
-                        if let Err(error) = self.layout.save() {
-                            self.layout.draft = previous;
-                            return Err(error);
-                        }
-                    }
-                    Some(kept) => {
-                        let own = self.own_key().context("Could not read this Mac's key")?;
-                        let keys = peer_keys(self.document.saved());
-                        let version =
-                            next_version(Some(&kept)).context("The layout cannot change again")?;
-                        let next = moved.to_shared(version, &own, &keys);
-                        next.validate()?;
-                        self.keep_layout(next);
-                        self.show_shared()?;
-                        tracing::info!(%id, version, "tile moved");
-                    }
-                }
+                self.rearrange(moved)?;
+                tracing::info!(%id, "tile moved");
                 self.restart();
+            }
+            Request::Place {
+                id,
+                x,
+                y,
+                tolerance,
+            } => self.place(&id, x, y, tolerance)?,
+            Request::AddAddress { address } => {
+                let address = input_address(&address)?;
+                self.neighbors.add_address(address);
+                // Says hello on the next tick rather than in a second.
+                self.neighbors_at = Instant::now() - NEIGHBORS_TICK;
             }
             Request::Pair { address, code } => {
                 let remote = address
@@ -238,7 +278,14 @@ impl NativeApp {
             }
             Request::CheckAccessibility => self.accessibility = self.accessibility_granted(),
             Request::Discover => {
-                self.discover = true;
+                if !self.discover {
+                    self.discover = true;
+                    let state_dir = &self.document.saved().daemon.state_dir;
+                    let path = state_dir.join(DISCOVER_FILE);
+                    if let Err(error) = crate::config::save_text(&path, "") {
+                        tracing::warn!(%error, "looking for computers stops at restart");
+                    }
+                }
                 self.sync_discovery();
                 if self.discovers() {
                     self.check_local_network();
@@ -277,9 +324,7 @@ impl NativeApp {
             Request::SetAutostart { .. }
             | Request::OpenSettings
             | Request::OpenLogs
-            | Request::InstallExtension
-            | Request::Place { .. }
-            | Request::AddAddress { .. } => bail!("Not available on this computer"),
+            | Request::InstallExtension => bail!("Not available on this computer"),
         }
         Ok(serde_json::to_value(self.snapshot())?)
     }
@@ -322,13 +367,17 @@ impl NativeApp {
             self.nearby.stop();
             self.local_network = LocalNetwork::Unknown;
         }
-        self.links.set_nearby(self.nearby_addresses());
-        self.sync_advertiser();
+        // While it looks for computers, this Mac also answers their hellos.
+        if self.discovers() != self.welcome {
+            self.sync_links();
+        } else {
+            self.sync_advertiser();
+        }
     }
 
-    /// Advertises the port peers connect to while this Mac listens, and only
-    /// once it may use the network. One that failed waits for Retry or a new
-    /// port.
+    /// Advertises the port computers connect to while this Mac listens, and
+    /// only once it may use the network. One that failed waits for Retry or
+    /// a new port.
     fn sync_advertiser(&mut self) {
         let port = self.links.listen_port().filter(|_| self.discovers());
         if self.advertiser.as_ref().map(Advertiser::port) != port {
@@ -368,9 +417,10 @@ impl NativeApp {
     }
 
     fn sync_links(&mut self) {
+        self.welcome = self.discovers();
         let config = self.document.saved();
         let sharing = config.macos.sharing && !self.emergency_paused;
-        self.links.sync(sharing.then_some(config));
+        self.links.sync(sharing.then_some(config), self.welcome);
         self.sync_advertiser();
     }
 
@@ -378,8 +428,9 @@ impl NativeApp {
         match ConfigDocument::open(self.document.path.clone()).and_then(|doc| {doc.validate()?; Ok(doc)}) {
             Ok(document) if !document.is_new() => {
                 // Pairing saves the configuration itself, so a computer paired
-                // here gets its tile once the change is read.
-                if document.saved()!=self.document.saved() { self.document=document; self.restart(); self.place_new_peers(); }
+                // here gets its tile once the change is read. Links find each
+                // computer by key, so new addresses alone change nothing.
+                if without_addresses(document.saved())!=without_addresses(self.document.saved()) { self.document=document; self.restart(); self.place_new_peers(); }
                 else { self.document=document; }
                 self.config_error=None;
             },
@@ -452,6 +503,11 @@ impl NativeApp {
                 self.layout_error = Some(format!("{error:#}"));
             }
         }
+        self.take_heard();
+        if self.neighbors_at.elapsed() >= NEIGHBORS_TICK {
+            self.neighbors_at = Instant::now();
+            self.tick_neighbors(tokio::time::Instant::now());
+        }
         let changed = self.links.changed();
         if changed {
             self.desktops = self
@@ -508,14 +564,275 @@ impl NativeApp {
             .any(|(_, state)| matches!(state, LinkState::Ready(_)))
     }
 
-    /// Discovered receivers let a connection find a peer whose address changed.
-    /// Each connection still pins the peer's key, so other hosts are rejected.
-    fn nearby_addresses(&self) -> Vec<SocketAddr> {
-        let records = self.nearby.snapshot().records.into_values();
-        records
-            .filter(|record| record.compatible)
-            .flat_map(|record| record.addresses)
-            .collect()
+    /// What this Mac says in a hello, or None without its key.
+    fn greeting(&self) -> Option<Greeting> {
+        let config = self.document.saved();
+        let trusted = config
+            .peers
+            .values()
+            .filter_map(|peer| peer.spki_der().ok());
+        Some(Greeting {
+            client: self.hello_client.clone()?,
+            port: self
+                .links
+                .listen_port()
+                .unwrap_or(config.transport.listen.port()),
+            trusted: Arc::new(trusted.collect()),
+        })
+    }
+
+    /// Answers knocks, within each address's share, and keeps what hellos
+    /// and refusals told.
+    fn take_heard(&mut self) {
+        let now = tokio::time::Instant::now();
+        for heard in self.links.take_heard() {
+            match heard {
+                Heard::Knock(knock) => {
+                    let allowed = self.neighbors.allow_hello(knock.remote_address().ip(), now);
+                    match self.greeting().filter(|_| allowed) {
+                        Some(greeting) => self.links.answer(knock, greeting),
+                        None => knock.close(),
+                    }
+                }
+                Heard::Hello {
+                    instance,
+                    spki,
+                    remote,
+                    hello,
+                } => {
+                    self.neighbors
+                        .hello(&spki, remote, &hello, instance.as_deref(), now);
+                    self.learn(&spki, &hello_addresses(remote, &hello));
+                }
+                Heard::Refused { spki } => self.neighbors.refused_input(&spki),
+            }
+        }
+    }
+
+    /// Saves where a paired computer said it is. Links find it by key, so
+    /// nothing reconnects.
+    fn learn(&mut self, spki: &[u8], addresses: &[SocketAddr]) {
+        let mut peers = self.document.draft.peers.values_mut();
+        let Some(peer) = peers.find(|peer| peer.spki_der().is_ok_and(|key| key == spki)) else {
+            return;
+        };
+        if peer.learn_addresses(addresses.iter().copied())
+            && let Err(error) = self.save_config()
+        {
+            tracing::warn!(error = %format!("{error:#}"), "a computer's new address was not saved");
+        }
+    }
+
+    /// Feeds the records found to `neighbors`, says hello to the ones that
+    /// need it, tells the links where paired computers are, and lets the
+    /// pairing window weigh who is around.
+    fn tick_neighbors(&mut self, now: tokio::time::Instant) {
+        let records = self.nearby.snapshot().records;
+        for gone in self
+            .instances
+            .iter()
+            .filter(|id| !records.contains_key(*id))
+        {
+            self.neighbors.instance_gone(gone, now);
+        }
+        for record in records.values() {
+            let addresses = record.addresses.clone();
+            let name = record.name.clone();
+            self.neighbors
+                .instance_seen(&record.instance, addresses, record.compatible, name);
+        }
+        self.instances = records.into_keys().collect();
+        self.neighbors.expire(now);
+        let room = MAX_HELLOS.saturating_sub(self.links.hellos_in_flight());
+        if let Some(greeting) = self.greeting().filter(|_| room > 0) {
+            for (instance, addresses) in self.neighbors.take_due_hellos(room, now) {
+                self.links.say_hello(instance, addresses, greeting.clone());
+            }
+        }
+        let found: Found = self
+            .document
+            .saved()
+            .peers
+            .values()
+            .filter_map(|peer| {
+                let addresses = self
+                    .neighbors
+                    .addresses_for_key(&peer.fingerprint_hex().ok()?);
+                (!addresses.is_empty()).then(|| (peer.spki_der_hex.clone(), addresses))
+            })
+            .collect();
+        self.links.set_found(found);
+        self.tick_window(now);
+    }
+
+    /// Opens a fresh install's pairing window once this Mac can reach the
+    /// network, and trusts the lone computer it settles on.
+    fn tick_window(&mut self, now: tokio::time::Instant) {
+        if self.discovers() && self.local_network == LocalNetwork::Allowed {
+            self.window
+                .open(!self.document.saved().peers.is_empty(), now);
+        }
+        let strangers = self.neighbors.strangers(self.document.saved(), now);
+        let Some(stranger) = self.window.tick(&strangers, now) else {
+            return;
+        };
+        match self.trust(&stranger.key) {
+            Ok(name) => {
+                tracing::info!(%name, "joined while the pairing window was open");
+                self.restart();
+                self.place_new_peers();
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                tracing::warn!(%error, "could not add the computer that joined");
+            }
+        }
+    }
+
+    /// Saves the computer whose hello proved `key` as trusted, and tells
+    /// people it joined. Returns its name here.
+    fn trust(&mut self, key: &str) -> Result<String> {
+        let neighbor = self.neighbors.neighbor(key).context("That computer left")?;
+        let addresses = self.neighbors.addresses_for_key(key);
+        let config = &mut self.document.draft;
+        let name = hello::trust_peer(config, &neighbor.spki, &neighbor.name, &addresses)?;
+        self.save_config()?;
+        self.joined(&name);
+        Ok(name)
+    }
+
+    fn joined(&mut self, name: &str) {
+        let id = self.notices.last().map_or(1, |notice| notice.id + 1);
+        self.notices.push(Notice {
+            id,
+            kind: NoticeKind::Joined,
+            name: name.to_owned(),
+        });
+        if self.notices.len() > MAX_NOTICES {
+            self.notices.remove(0);
+        }
+    }
+
+    /// Trusts the computer dropped from the shelf, with its tile where it
+    /// landed: `(x, y)` is the tile's corner at the size a new tile gets.
+    /// Dropped onto the tile of a computer with its name, it takes that
+    /// computer's place, as one that was reset or reinstalled.
+    fn place(&mut self, id: &str, x: i32, y: i32, tolerance: u32) -> Result<()> {
+        let config = self.document.saved();
+        let tile = self
+            .neighbors
+            .unplaced(config)
+            .into_iter()
+            .find(|tile| tile.id == id);
+        let tile = tile.context("That computer is no longer around")?;
+        match tile.state {
+            UnplacedState::Ready | UnplacedState::DuplicateName => {}
+            UnplacedState::Identifying => bail!("{} is still being identified", tile.name),
+            UnplacedState::DifferentVersion => {
+                bail!(
+                    "{} runs another zflow version. Update both computers.",
+                    tile.name
+                )
+            }
+        }
+        let key = id.strip_prefix("key:").context("Unknown computer")?;
+        let neighbor = self.neighbors.neighbor(key).context("That computer left")?;
+        let (width, height) = PEER_TILE_SIZE;
+        let center = (
+            i64::from(x) + i64::from(width / 2),
+            i64::from(y) + i64::from(height / 2),
+        );
+        let namesake = self.layout.draft.monitors.iter().find(|monitor| {
+            let (left, top) = (i64::from(monitor.x), i64::from(monitor.y));
+            (left..left + i64::from(monitor.width)).contains(&center.0)
+                && (top..top + i64::from(monitor.height)).contains(&center.1)
+                && monitor
+                    .peer
+                    .as_ref()
+                    .is_some_and(|peer| peer_name(Some(peer)) == neighbor.name)
+        });
+        if let Some(name) = namesake.and_then(|monitor| monitor.peer.clone()) {
+            let old = config.peers.get(&name).context("Unknown computer")?;
+            let old = old.fingerprint_hex()?;
+            let spki = neighbor.spki.clone();
+            let addresses = self.neighbors.addresses_for_key(key);
+            hello::replace_key(&mut self.document.draft, &name, &spki, &addresses)?;
+            self.save_config()?;
+            let kept = self.shared.draft.layout.as_ref();
+            let own = self.own_key();
+            if let Some(next) = kept
+                .zip(own)
+                .and_then(|(kept, own)| kept.with_key_replaced(&own, &old, &fingerprint(&spki)))
+            {
+                self.keep_layout(next);
+                self.show_shared()?;
+            }
+            tracing::info!(%name, "placed onto its old tile with a new key");
+            self.joined(&name);
+        } else {
+            ensure!(
+                config.peers.len() + 1 < MAX_SHARED_TILES,
+                "The arrangement holds at most {MAX_SHARED_TILES} computers"
+            );
+            let name = self.trust(key)?;
+            self.put_tile(&name, x, y, tolerance);
+            tracing::info!(%name, "placed");
+        }
+        self.window.placed();
+        self.restart();
+        self.place_new_peers();
+        Ok(())
+    }
+
+    /// Gives a computer just placed its tile at `(x, y)`, snapped to an edge
+    /// nearby. Where it does not fit, it gets one beside this Mac as any new
+    /// computer does.
+    fn put_tile(&mut self, name: &str, x: i32, y: i32, tolerance: u32) {
+        let (width, height) = PEER_TILE_SIZE;
+        let mut next = self.layout.draft.clone();
+        next.monitors.push(Monitor {
+            id: format!("peer:{name}"),
+            label: name.to_owned(),
+            peer: Some(name.to_owned()),
+            x,
+            y,
+            width,
+            height,
+        });
+        let index = next.monitors.len() - 1;
+        let Some((x, y)) = next.snap_move(index, x, y, tolerance.min(2048) as i32) else {
+            return;
+        };
+        next.monitors[index].x = x;
+        next.monitors[index].y = y;
+        if let Err(error) = self.rearrange(next) {
+            tracing::warn!(error = %format!("{error:#}"), "the new tile was not kept where it landed");
+        }
+    }
+
+    /// Uses `next` as the arrangement: this Mac's own until it first
+    /// connects, then the next version of the shared layout.
+    fn rearrange(&mut self, next: Layout) -> Result<()> {
+        match self.shared.draft.layout.clone() {
+            None => {
+                let previous = std::mem::replace(&mut self.layout.draft, next);
+                if let Err(error) = self.layout.save() {
+                    self.layout.draft = previous;
+                    return Err(error);
+                }
+            }
+            Some(kept) => {
+                let own = self.own_key().context("Could not read this Mac's key")?;
+                let keys = peer_keys(self.document.saved());
+                let version =
+                    next_version(Some(&kept)).context("The layout cannot change again")?;
+                let shared = next.to_shared(version, &own, &keys);
+                shared.validate()?;
+                self.keep_layout(shared);
+                self.show_shared()?;
+            }
+        }
+        Ok(())
     }
 
     /// Takes the layouts peers sent. Returns whether one was kept.
@@ -810,11 +1127,10 @@ impl NativeApp {
             share_clipboard: Some(config.clipboard.share),
             autostart: None,
             config_path: self.document.path.clone(),
-            // Filled in once the Mac says hello and keeps a shelf.
-            pairing_window: Default::default(),
-            own_mark: None,
-            unplaced: Vec::new(),
-            notices: Vec::new(),
+            pairing_window: self.window.view(tokio::time::Instant::now()),
+            own_mark: self.identity.as_ref().map(|identity| mark(identity.spki())),
+            unplaced: self.neighbors.unplaced(config),
+            notices: self.notices.clone(),
             platform: MacPlatform {
                 accessibility: self.accessibility,
                 local_network: self.local_network,
@@ -889,6 +1205,35 @@ fn unpaired(config: &Config, records: impl Iterator<Item = NearbyRecord>) -> Vec
     records
         .filter(|record| !record.addresses.iter().any(|a| paired.contains(&a.ip())))
         .collect()
+}
+
+/// The configuration without the addresses saved for each computer, which
+/// change as computers move and are learned without reconnecting.
+fn without_addresses(config: &Config) -> Config {
+    let mut config = config.clone();
+    for peer in config.peers.values_mut() {
+        peer.addresses.clear();
+    }
+    config
+}
+
+/// Where a computer typed in by address takes input. A bare IP address
+/// means the port zflow listens on unless told otherwise.
+fn input_address(input: &str) -> Result<SocketAddr> {
+    let input = input.trim();
+    let address = match input.parse::<SocketAddr>() {
+        Ok(address) => address,
+        Err(_) => {
+            let ip = input.trim_start_matches('[').trim_end_matches(']');
+            let ip: IpAddr = ip
+                .parse()
+                .with_context(|| format!("{input:?} is not an IP address"))?;
+            SocketAddr::new(ip, Config::default().transport.listen.port())
+        }
+    };
+    UntrustedCandidate::explicit(address)
+        .with_context(|| format!("{address} cannot be reached"))?;
+    Ok(address)
 }
 
 fn retry() -> Action {
@@ -1359,6 +1704,244 @@ mod tests {
         let placed = kept(&app);
         assert_eq!((placed.version, placed.tiles.len()), (11, 4));
         assert_eq!(placed.tiles[3], tile(&tablet.fingerprint_hex(), -1920));
+    }
+
+    /// A Mac on its own state directory with sharing off, so nothing
+    /// listens, and with `peers` trusted.
+    fn mac_with(directory: &Path, peers: &[(&str, &Identity)]) -> NativeApp {
+        let mut config = Config::default();
+        config.daemon.state_dir = directory.join("state");
+        config.transport.discovery = false;
+        config.macos.sharing = false;
+        for (name, peer) in peers {
+            let permissions = crate::config::PeerPermissions::default();
+            let record = crate::config::PeerConfig::from_spki(peer.spki(), Vec::new(), permissions);
+            config.peers.insert((*name).into(), record.unwrap());
+        }
+        let path = directory.join("zflow.toml");
+        config.save(&path).unwrap();
+        NativeApp::open(path).unwrap()
+    }
+
+    /// `identity` says hello to `app` as `name`, and returns its shelf id.
+    fn says_hello(app: &mut NativeApp, identity: &Identity, name: &str) -> String {
+        let hello = hello::make_hello(name, 43119, Vec::new(), false);
+        let remote = "192.0.2.7:50000".parse().unwrap();
+        let now = tokio::time::Instant::now();
+        let key = app
+            .neighbors
+            .hello(identity.spki(), remote, &hello, None, now);
+        format!("key:{}", key.unwrap())
+    }
+
+    #[test]
+    fn a_computer_dropped_from_the_shelf_is_trusted_where_it_landed() {
+        let directory = tempfile::tempdir().unwrap();
+        let desk = Identity::load_or_create(&directory.path().join("desk")).unwrap();
+        let mut app = mac_with(directory.path(), &[]);
+        let id = says_hello(&mut app, &desk, "desk");
+        let value = app.request(Request::Snapshot).unwrap();
+        assert_eq!(value["unplaced"][0]["id"], id.as_str());
+        assert_eq!(value["unplaced"][0]["state"], "ready");
+        assert_eq!(value["unplaced"][0]["mark"], mark(desk.spki()));
+        let own = Identity::load_or_create(&directory.path().join("state")).unwrap();
+        assert_eq!(value["own_mark"], mark(own.spki()));
+
+        // One still being identified, or gone, cannot be placed.
+        app.request(Request::AddAddress {
+            address: "100.64.0.7".into(),
+        })
+        .unwrap();
+        let place = |id: &str, x| Request::Place {
+            id: id.into(),
+            x,
+            y: 0,
+            tolerance: 0,
+        };
+        let error = app
+            .request(place("instance:address:100.64.0.7:43119", 0))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "100.64.0.7:43119 is still being identified"
+        );
+        assert!(app.request(place("key:00", 0)).is_err());
+
+        let value = app.request(place(&id, 4000)).unwrap();
+        let saved = Config::load(&directory.path().join("zflow.toml")).unwrap();
+        let record = &saved.peers["desk"];
+        assert_eq!(record.spki_der().unwrap(), desk.spki());
+        assert!(record.permissions.connect && record.permissions.receive_normal);
+        assert_eq!(record.addresses, ["192.0.2.7:43119".parse().unwrap()]);
+        let tile = app
+            .layout
+            .draft
+            .monitors
+            .iter()
+            .find(|m| m.id == "peer:desk");
+        assert_eq!(tile.map(|m| (m.x, m.y)), Some((4000, 0)));
+        assert_eq!(
+            value["unplaced"].as_array().unwrap().len(),
+            1,
+            "only the address"
+        );
+        assert_eq!(value["peers"][0]["mark"], mark(desk.spki()));
+        assert_eq!(value["notices"][0]["kind"], "joined");
+        assert_eq!(value["notices"][0]["name"], "desk");
+        assert_eq!(value["notices"][0]["id"], 1);
+
+        // Forgotten, it is back on the shelf at once.
+        let value = app
+            .request(Request::Forget {
+                name: "desk".into(),
+            })
+            .unwrap();
+        let shelf = value["unplaced"].as_array().unwrap();
+        assert!(shelf.iter().any(|tile| tile["id"] == id.as_str()));
+    }
+
+    #[test]
+    fn dropped_onto_its_namesake_a_computer_takes_over_its_tile_and_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = |name: &str| Identity::load_or_create(&directory.path().join(name)).unwrap();
+        let (desk, reinstalled) = (identity("desk"), identity("desk-new"));
+        let mut app = mac_with(directory.path(), &[("desk", &desk)]);
+        app.request(Request::SetPeer {
+            name: "desk".into(),
+            allow_control: Some(true),
+            keyboard: Some(crate::core::KeyboardMode::PcPositions),
+            reverse_scroll: None,
+        })
+        .unwrap();
+        let (own, old) = (app.own_key().unwrap(), desk.fingerprint_hex());
+        let tile = |key: &str, x| Tile {
+            key: key.into(),
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let arranged = SharedLayout {
+            version: 3,
+            editor: old.clone(),
+            tiles: vec![tile(&own, 0), tile(&old, 1920)],
+        };
+        assert!(app.take_layout("desk", arranged));
+        app.show_shared().unwrap();
+        let id = says_hello(&mut app, &reinstalled, "desk");
+        let value = app.request(Request::Snapshot).unwrap();
+        assert_eq!(value["unplaced"][0]["state"], "duplicate_name");
+
+        // Its corner a little off the old tile's, so its middle is on it.
+        let request = Request::Place {
+            id,
+            x: 2000,
+            y: 100,
+            tolerance: 0,
+        };
+        app.request(request).unwrap();
+        let saved = Config::load(&directory.path().join("zflow.toml")).unwrap();
+        assert_eq!(saved.peers.len(), 1);
+        let record = &saved.peers["desk"];
+        assert_eq!(record.spki_der().unwrap(), reinstalled.spki());
+        assert_eq!(record.keyboard, crate::core::KeyboardMode::PcPositions);
+        let kept = app.shared.draft.layout.clone().unwrap();
+        assert_eq!(kept.tiles[1], tile(&reinstalled.fingerprint_hex(), 1920));
+        assert_eq!((kept.version, &kept.editor), (4, &own));
+        let shown = app
+            .layout
+            .draft
+            .monitors
+            .iter()
+            .find(|m| m.id == "peer:desk");
+        assert_eq!(shown.map(|m| m.x), Some(1920));
+    }
+
+    #[test]
+    fn a_fresh_mac_lets_the_lone_computer_around_join_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let mut app = NativeApp::open(path.clone()).unwrap();
+        // Nothing listens on the real port while this runs.
+        app.document.draft.macos.sharing = false;
+        app.save_config().unwrap();
+        let start = tokio::time::Instant::now();
+        let window = |app: &NativeApp| app.snapshot().pairing_window;
+        // It waits for Local Network access before it opens.
+        app.tick_window(start);
+        assert_eq!(window(&app).state, crate::pairing_window::State::Eligible);
+        app.discover = true;
+        app.local_network = LocalNetwork::Allowed;
+        let desk = Identity::load_or_create(&directory.path().join("desk")).unwrap();
+        says_hello(&mut app, &desk, "desk");
+        app.tick_window(start);
+        let open = window(&app);
+        assert_eq!(open.state, crate::pairing_window::State::Open);
+        assert_eq!(open.holding.unwrap().name, "desk");
+        app.tick_window(start + crate::pairing_window::HOLD_OFF);
+        assert!(Config::load(&path).unwrap().peers.contains_key("desk"));
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(
+            window(&app).reason,
+            Some(crate::pairing_window::Reason::Accepted)
+        );
+        drop(app);
+
+        // Once only, even across a restart.
+        let app = NativeApp::open(path).unwrap();
+        assert_eq!(window(&app).state, crate::pairing_window::State::Closed);
+    }
+
+    #[test]
+    fn looking_for_computers_is_remembered_across_restarts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = mac_with(directory.path(), &[]);
+        assert!(!app.discover);
+        app.request(Request::Discover).unwrap();
+        drop(app);
+        let app = NativeApp::open(directory.path().join("zflow.toml")).unwrap();
+        assert!(app.discover);
+        // Discovery is off in this configuration, so nothing goes out.
+        assert!(!app.discovers() && app.links.listen_port().is_none());
+    }
+
+    #[test]
+    fn new_addresses_for_a_computer_change_nothing_else() {
+        let directory = tempfile::tempdir().unwrap();
+        let desk = Identity::load_or_create(&directory.path().join("desk")).unwrap();
+        let mut app = mac_with(directory.path(), &[("desk", &desk)]);
+        let path = directory.path().join("zflow.toml");
+        let armed_at = app.retry_at;
+        let moved: SocketAddr = "192.0.2.70:43119".parse().unwrap();
+        app.learn(desk.spki(), &[moved]);
+        assert_eq!(
+            Config::load(&path).unwrap().peers["desk"].addresses,
+            [moved]
+        );
+        // Another computer's key teaches nothing.
+        app.learn(&[1; 91], &["192.0.2.9:43119".parse().unwrap()]);
+        assert_eq!(
+            Config::load(&path).unwrap().peers["desk"].addresses,
+            [moved]
+        );
+        // Nor does an edit of the file that only moves it.
+        let mut config = Config::load(&path).unwrap();
+        config.peers.get_mut("desk").unwrap().addresses = vec!["192.0.2.71:43119".parse().unwrap()];
+        config.save(&path).unwrap();
+        app.reload();
+        assert_eq!(app.document.saved(), &config);
+        assert_eq!(app.retry_at, armed_at, "sharing did not restart");
+    }
+
+    #[test]
+    fn computers_are_added_by_ip_address_with_an_optional_port() {
+        let parse = |input| input_address(input).map(|address| address.to_string());
+        assert_eq!(parse(" 100.64.0.7 ").unwrap(), "100.64.0.7:43119");
+        assert_eq!(parse("[2001:db8::1]").unwrap(), "[2001:db8::1]:43119");
+        assert_eq!(parse("100.64.0.7:5000").unwrap(), "100.64.0.7:5000");
+        for wrong in ["desk.local", "100.64.0.7:0", "0.0.0.0", ""] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
     }
 
     #[test]
