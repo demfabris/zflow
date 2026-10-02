@@ -114,7 +114,8 @@ pub struct Hello {
     pub input_port: u16,
     /// Addresses it says it has, tried after the one it spoke from.
     pub candidates: Vec<SocketAddr>,
-    /// Whether it already trusts the receiver's key. Shown, never obeyed.
+    /// Whether it already trusts the receiver's key. Anyone can claim it,
+    /// so the receiver neither shows nor obeys it.
     pub trusts_you: bool,
     /// Room for introducing a third computer later. Random until then.
     pub vouches: [[u8; 16]; HELLO_VOUCHES],

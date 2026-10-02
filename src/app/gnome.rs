@@ -731,7 +731,6 @@ mod tests {
             mark: Some("1abc9e".into()),
             version: Some("0.3.0".into()),
             state: crate::neighbors::UnplacedState::Ready,
-            trusts_you: false,
             via: crate::neighbors::Via::Mdns,
         };
         let joined = crate::hello::Notice {

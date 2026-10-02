@@ -97,7 +97,7 @@ private func temporary() -> URL {
 @Test func theOtherComputerCanFinishWhileTheWindowIsOpen() throws {
   let ubuntu = """
     {"id":"key:ab","name":"ubuntu","os":"linux","mark":"a1b2c3","version":"0.3.0",
-    "state":"ready","trusts_you":false,"via":"mdns"}
+    "state":"ready","via":"mdns"}
     """
   let open = #"{"state":"open","seconds_left":521,"holding":null,"reason":null}"#
   let note = try #require(try snapshot(window: open, unplaced: ubuntu).finishNote)

@@ -22,8 +22,6 @@ struct Unplaced: Decodable, Identifiable, Equatable, Sendable {
   var mark: String?
   var version: String?
   var state: State
-  /// Whether it says it already added this Mac.
-  var trustsYou: Bool
   var via: Via
 
   enum State: String, Decodable, Sendable {

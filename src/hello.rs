@@ -37,9 +37,9 @@ pub enum NoticeKind {
 }
 
 /// This computer's hello. `trusts_you` says whether the computer it goes to
-/// is already trusted here, which the other side only shows. Only a trusted
-/// computer hears this one's other addresses, such as Tailscale, VPN or
-/// container ones; anyone else gets only the address it reached.
+/// is already trusted here. Only a trusted computer hears this one's other
+/// addresses, such as Tailscale, VPN or container ones; anyone else gets
+/// only the address it reached.
 pub fn local_hello(input_port: u16, trusts_you: bool) -> Hello {
     let candidates = if trusts_you {
         this_host_candidates(input_port)

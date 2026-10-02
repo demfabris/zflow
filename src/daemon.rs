@@ -227,12 +227,8 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                                 tokio::spawn(async move { shared.answer_hello(hello).await });
                             }
                             // It trusts this computer, which does not trust it.
-                            Ok(Accepted::NotTrusted { peer_spki, remote_address }) => {
+                            Ok(Accepted::NotTrusted { remote_address, .. }) => {
                                 tracing::debug!(%remote_address, "input refused from a computer not added here");
-                                shared.neighbors.send_if_modified(|neighbors| {
-                                    neighbors.refused_input(&peer_spki);
-                                    false
-                                });
                             }
                             Ok(Accepted::Input(connection)) => {
                                 let Ok(permit) = session_setup_slots.clone().try_acquire_owned() else {

@@ -77,8 +77,6 @@ pub struct Unplaced {
     pub mark: Option<String>,
     pub version: Option<String>,
     pub state: UnplacedState,
-    /// Whether it says it already trusts this computer.
-    pub trusts_you: bool,
     pub via: Via,
 }
 
@@ -131,7 +129,6 @@ pub struct Neighbor {
     pub mark: String,
     /// Where it takes input, best first.
     pub addresses: Vec<SocketAddr>,
-    pub trusts_us: bool,
     pub via: Via,
     last_hello: Instant,
     /// When its last record went away, or when it was learned without one.
@@ -322,7 +319,6 @@ impl Neighbors {
                 version: String::new(),
                 mark: mark(spki),
                 addresses: Vec::new(),
-                trusts_us: false,
                 via,
                 last_hello: now,
                 last_seen: now,
@@ -335,21 +331,12 @@ impl Neighbors {
             .filter(char::is_ascii_graphic)
             .collect();
         neighbor.addresses = hello_addresses(remote, hello);
-        neighbor.trusts_us |= hello.trusts_you;
         if via == Via::Address {
             neighbor.via = via;
         }
         neighbor.last_hello = now;
         neighbor.last_seen = now;
         Some(key)
-    }
-
-    /// A key that is not trusted here asked for input, so it trusts this
-    /// computer already.
-    pub fn refused_input(&mut self, spki: &[u8]) {
-        if let Some(neighbor) = self.neighbors.get_mut(&fingerprint(spki)) {
-            neighbor.trusts_us = true;
-        }
     }
 
     pub fn neighbor(&self, key: &str) -> Option<&Neighbor> {
@@ -412,7 +399,6 @@ impl Neighbors {
                 } else {
                     UnplacedState::DifferentVersion
                 },
-                trusts_you: false,
                 via: if id.starts_with(ADDED_PREFIX) {
                     Via::Address
                 } else {
@@ -433,7 +419,6 @@ impl Neighbors {
                 } else {
                     UnplacedState::Ready
                 },
-                trusts_you: neighbor.trusts_us,
                 via: neighbor.via,
             }
         }));
@@ -561,7 +546,6 @@ mod tests {
         let neighbor = around.neighbor(&key).unwrap();
         assert_eq!(neighbor.name, "desk");
         assert_eq!(neighbor.mark, mark(&spki(1)));
-        assert!(neighbor.trusts_us);
         assert!(around.addresses_for_key(&fingerprint(&spki(2))).is_empty());
 
         // New addresses for the record mean a new hello.
@@ -587,6 +571,11 @@ mod tests {
         assert_eq!(shelf[0].name, "Computer");
         assert_eq!(shelf[0].state, UnplacedState::DifferentVersion);
         assert_eq!(shelf[1].state, UnplacedState::Ready);
+        // It claimed to trust this computer, which anyone can claim, so the
+        // shelf does not repeat it.
+        assert!(hello.trusts_you);
+        let tile = serde_json::to_value(&shelf[1]).unwrap();
+        assert!(tile.get("trusts_you").is_none(), "{tile}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -831,10 +820,6 @@ mod tests {
             .unwrap();
         assert_eq!(around.neighbor(&key).unwrap().via, Via::Address);
         assert_eq!(around.addresses_for_key(&key), [tailnet]);
-        // An input attempt from it says it trusts this computer.
-        let other = around.hello(&spki(2), tailnet, &hello, None, now).unwrap();
-        around.refused_input(&spki(2));
-        assert!(around.neighbor(&other).unwrap().trusts_us);
 
         for host in 1..=MAX_ADDED as u8 {
             around.add_address(SocketAddr::from(([100, 64, 1, host], 43119)));

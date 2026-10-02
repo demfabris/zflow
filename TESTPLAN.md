@@ -36,9 +36,9 @@ Checks:
    Dragging one in still works.
 3. **A pair and a fresh computer.** With Ubuntu and a VM that already trust
    each other, a fresh Mac sees two strangers and adds neither by itself. Drag
-   Ubuntu in on the Mac: Ubuntu's shelf shows the Mac as "Added you", and the
-   Mac's row for Ubuntu says "Hasn't added this computer yet" until Ubuntu
-   places the Mac.
+   Ubuntu in on the Mac: Ubuntu's shelf shows the Mac with only its system,
+   never a claim that it added Ubuntu, and the Mac's row for Ubuntu says
+   "Hasn't added this computer yet" until Ubuntu places the Mac.
 4. **Namesakes.** Give the VM the Ubuntu box's host name. A fresh computer
    never takes either by itself; both show "Same name as another" with
    different marks, and either can be dragged in. The second one placed is

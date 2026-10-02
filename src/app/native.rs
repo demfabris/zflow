@@ -571,8 +571,8 @@ impl NativeApp {
         }
     }
 
-    /// Answers a knock, within its address's share, keeps what a hello or
-    /// refusal told, and saves where a trusted computer's session came from.
+    /// Answers a knock, within its address's share, keeps what a hello
+    /// told, and saves where a trusted computer's session came from.
     fn hear(&mut self, heard: Heard, now: tokio::time::Instant) {
         match heard {
             Heard::Knock(knock) => {
@@ -593,7 +593,6 @@ impl NativeApp {
                 self.neighbors
                     .hello(&spki, remote, &hello, instance.as_deref(), now);
             }
-            Heard::Refused { spki } => self.neighbors.refused_input(&spki),
             Heard::TurnedAway => self.neighbors.turned_one_away(),
             Heard::Connected {
                 key,

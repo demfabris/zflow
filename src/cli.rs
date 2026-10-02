@@ -1433,16 +1433,12 @@ fn nearby_line(computer: &crate::neighbors::Unplaced) -> String {
         Some(crate::wire::Os::Macos) => "macOS",
         None => "-",
     };
-    let mut line = format!(
+    format!(
         "{}  mark {}  {os}  {}  {state}",
         computer.name,
         computer.mark.as_deref().unwrap_or("-"),
         computer.version.as_deref().unwrap_or("-"),
-    );
-    if computer.trusts_you {
-        line.push_str("  (has added this computer)");
-    }
-    line
+    )
 }
 
 fn trust(path: PathBuf, computer: String) -> Result<()> {

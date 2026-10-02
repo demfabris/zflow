@@ -471,7 +471,7 @@ export class Settings {
                 identifying: 'Looking it up…',
                 different_version: 'Different zflow version',
                 duplicate_name: 'Same name as another',
-            }[computer.state] ?? [OS_NAMES[computer.os], computer.trusts_you ? 'Added you' : null].filter(Boolean).join(' · ');
+            }[computer.state] ?? OS_NAMES[computer.os] ?? '';
             showMark(tile.mark, computer.mark ?? null);
             tile.button.sensitive = placeable;
             tile.button.update_property([Gtk.AccessibleProperty.DESCRIPTION], [placeable

@@ -53,7 +53,7 @@ function waitFor(predicate) {
 // src/app/api.rs Snapshot, as the agent sends it.
 const peer = (name, fields = {}) => ({name, state: 'paired', detail: 'Paired', allow_control: true, keyboard: 'standard', reverse_scroll: false, mark: '3d4f00', ...fields});
 // src/neighbors.rs Unplaced: a computer found on the network.
-const found = (id, name, state, fields = {}) => ({id, name, os: null, mark: null, version: null, state, trusts_you: false, via: 'mdns', ...fields});
+const found = (id, name, state, fields = {}) => ({id, name, os: null, mark: null, version: null, state, via: 'mdns', ...fields});
 const closedWindow = {state: 'never', seconds_left: null, holding: null, reason: null};
 const ready = {state: 'ready', peer: null, title: 'Ready'};
 // src/app/layout_model.rs Layout: this computer's view, where its own tile has no peer.
@@ -274,14 +274,14 @@ app.connect('activate', () => {
         // Computers found on the network wait on a shelf under the board.
         assert(!settings._shelf.visible && settings._found.size === 0, 'no shelf while nothing is found');
         snapshot.unplaced = [
-            found('key:aa', 'fedora', 'ready', {os: 'linux', mark: '1abc9e', trusts_you: true}),
+            found('key:aa', 'fedora', 'ready', {os: 'linux', mark: '1abc9e'}),
             found('key:bb', 'laptop', 'duplicate_name', {os: 'macos', mark: 'ffffff'}),
             found('instance:zf-old', 'old', 'different_version'),
         ];
         await settings.client.refresh();
         await waitFor(() => settings._found.size === 3 && settings._shelf.visible);
         const fedora = settings._found.get('key:aa');
-        assert(fedora.name.label === 'fedora' && fedora.detail.label === 'Linux · Added you', `a found tile says what it is: ${fedora.detail.label}`);
+        assert(fedora.name.label === 'fedora' && fedora.detail.label === 'Linux', `a found tile says what it is: ${fedora.detail.label}`);
         assert(drawnMark(fedora.mark) === markColors('1abc9e').join(), 'a found tile shows its mark');
         assert(settings._found.get('key:bb').detail.label === 'Same name as another' && settings._found.get('key:bb').button.sensitive, 'a namesake can still be placed');
         const old = settings._found.get('instance:zf-old');

@@ -115,8 +115,6 @@ pub enum Heard {
         remote: SocketAddr,
         hello: Box<Hello>,
     },
-    /// A key that is not trusted here asked for input, so it trusts this Mac.
-    Refused { spki: Vec<u8> },
     /// A connection was turned away because too many were being set up at
     /// once. It could have been a computer not seen otherwise.
     TurnedAway,
@@ -1068,12 +1066,8 @@ async fn open_inbound(
             let _ = heard.send(Heard::Knock(knock));
             return Ok(());
         }
-        Accepted::NotTrusted {
-            peer_spki,
-            remote_address,
-        } => {
+        Accepted::NotTrusted { remote_address, .. } => {
             tracing::info!(%remote_address, "a computer not added here asked for input");
-            let _ = heard.send(Heard::Refused { spki: peer_spki });
             return Ok(());
         }
     };
@@ -2744,7 +2738,10 @@ mod tests {
 
     #[test]
     fn computers_that_do_not_trust_each_other_trade_hellos_on_the_input_port() {
-        use crate::{hello::make_hello, transport::hello_client_config};
+        use crate::{
+            hello::make_hello,
+            transport::{TransportError, hello_client_config},
+        };
         let server = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -2797,16 +2794,21 @@ mod tests {
         assert!(!ours.trusts_you);
         assert!(ours.candidates.is_empty(), "a stranger hears no addresses");
 
-        // Input from a key not trusted here is refused, and said.
-        server.block_on(async {
+        // Input from a key not trusted here is refused. That it asked says
+        // nothing anyone could not claim, so the app hears nothing.
+        let refused = server.block_on(async {
             let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
             let client = input_client_config(&linux_key, mac_key.spki()).unwrap();
-            let _ = connect_input(&endpoint, address, &client).await;
+            match connect_input(&endpoint, address, &client).await {
+                Ok(connection) => {
+                    let closed = tokio::time::timeout(Duration::from_secs(2), connection.closed());
+                    TransportError::from(closed.await.expect("the Mac closed the input"))
+                }
+                Err(error) => error,
+            }
         });
-        let Heard::Refused { spki } = heard(&mut links) else {
-            panic!("expected a refusal");
-        };
-        assert_eq!(spki, linux_key.spki());
+        assert!(matches!(refused, TransportError::NotTrusted), "{refused}");
+        assert!(links.take_heard().is_empty(), "nothing was heard");
 
         // The Mac says hello to a record, and hears back from it.
         let answering = linux_key.clone();
