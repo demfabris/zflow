@@ -22,19 +22,27 @@ use crate::{
         MotionFrame, NegotiatedSession, NegotiationOffer, ProbeMessage, ReliableControlMessage,
     },
     wire::{
-        Family, MAX_PAIRING_PAYLOAD_BYTES, MAX_RELIABLE_PAYLOAD_BYTES, PairingOffer, WireMessage,
-        decode as decode_wire, decode_family, encode as encode_wire,
+        Family, Hello, MAX_HELLO_PAYLOAD_BYTES, MAX_PAIRING_PAYLOAD_BYTES,
+        MAX_RELIABLE_PAYLOAD_BYTES, PairingOffer, WireMessage, decode as decode_wire,
+        decode_family, encode as encode_wire,
     },
 };
 
 use super::{
-    INPUT_ALPN_PROTOCOL, InputClientConfig, InputServerConfig, PAIRING_ALPN_PROTOCOL,
-    PairingClientConfig, TransportError,
+    HELLO_ALPN_PROTOCOL, HelloClientConfig, INPUT_ALPN_PROTOCOL, InputClientConfig,
+    InputServerConfig, PAIRING_ALPN_PROTOCOL, PairingClientConfig, TransportError,
+    error::NOT_TRUSTED,
 };
 
 const SERVER_NAME_PLACEHOLDER: &str = "zflow.invalid";
 const CONTROL_STREAM_PREFACE: &[u8] = b"zflow-control\0";
 const PAIRING_STREAM_PREFACE: &[u8] = b"zflow-pair\0";
+const HELLO_STREAM_PREFACE: &[u8] = b"zflow-hello\0";
+const HELLO_EXPORTER_LABEL: &[u8] = b"EXPORTER-zflow-hello-v1";
+const MAX_HELLO_FRAME_BYTES: usize = MAX_HELLO_PAYLOAD_BYTES + 64;
+/// How long a listener keeps a hello open for the initiator to read the
+/// answer and close.
+const HELLO_LINGER: Duration = Duration::from_secs(3);
 const PAIRING_PASSWORD_LABEL: &[u8] = b"zflow pairing setup code v4\0";
 const PAIRING_TRANSCRIPT_LABEL: &[u8] = b"zflow pairing transcript v4\0";
 const PAIRING_CLIENT_PROOF_LABEL: &[u8] = b"zflow pairing client proof v4";
@@ -654,18 +662,56 @@ pub async fn connect_input(
     ))
 }
 
-pub async fn accept_input(
+/// What arrived on the input port.
+#[derive(Debug)]
+pub enum Accepted {
+    /// A trusted computer's input connection.
+    Input(InputConnection),
+    /// Any computer saying hello, trusted or not.
+    Hello(HelloConnection),
+    /// A key off the allowlist asked for input. Its connection is already
+    /// closed with a code that tells the other computer why.
+    NotTrusted {
+        peer_spki: Vec<u8>,
+        remote_address: SocketAddr,
+    },
+}
+
+/// Finishes one handshake on the input port and sorts it by protocol and key.
+/// Pass the configuration the endpoint uses now: a peer revoked while its
+/// handshake was in flight is refused too.
+pub async fn accept(
     incoming: Incoming,
     config: &InputServerConfig,
-) -> Result<InputConnection, TransportError> {
+) -> Result<Accepted, TransportError> {
     let connection = incoming.await?;
+    if negotiated_protocol(&connection).as_deref() == Some(HELLO_ALPN_PROTOCOL) {
+        let peer_spki = verify_connection(&connection, None, HELLO_ALPN_PROTOCOL)?;
+        let (send, mut receive) = connection.accept_bi().await?;
+        let mut preface = vec![0_u8; HELLO_STREAM_PREFACE.len()];
+        receive
+            .read_exact(&mut preface)
+            .await
+            .map_err(|error| TransportError::HelloStream(error.to_string()))?;
+        if preface != HELLO_STREAM_PREFACE {
+            close_protocol(&connection, b"invalid hello stream preface");
+            return Err(TransportError::InvalidHelloPreface);
+        }
+        return Ok(Accepted::Hello(HelloConnection {
+            connection,
+            peer_spki,
+            send,
+            receive,
+            role: Role::Server,
+        }));
+    }
     let peer_spki = verify_connection(&connection, None, INPUT_ALPN_PROTOCOL)?;
-    // TLS rejects keys outside the allowlist. Recheck the snapshot supplied by
-    // the caller so a runtime revocation also covers handshakes already in
-    // flight when Endpoint::set_server_config replaced the TLS configuration.
     if !config.allows_peer(&peer_spki) {
-        close_protocol(&connection, b"peer RPK is no longer allowed");
-        return Err(TransportError::PeerIdentityMismatch);
+        connection.close(NOT_TRUSTED, b"this computer has not added yours");
+        return Ok(Accepted::NotTrusted {
+            peer_spki: peer_spki.to_vec(),
+            remote_address: connection.remote_address(),
+        });
     }
     let (send, mut receive) = connection.accept_bi().await?;
     let mut preface = vec![0_u8; CONTROL_STREAM_PREFACE.len()];
@@ -677,7 +723,25 @@ pub async fn accept_input(
         close_protocol(&connection, b"invalid critical stream preface");
         return Err(TransportError::InvalidControlPreface);
     }
-    Ok(input_connection(connection, send, receive, peer_spki))
+    Ok(Accepted::Input(input_connection(
+        connection, send, receive, peer_spki,
+    )))
+}
+
+/// [`accept`] for a caller that takes only input: a hello is closed, and a
+/// key off the allowlist is an error.
+pub async fn accept_input(
+    incoming: Incoming,
+    config: &InputServerConfig,
+) -> Result<InputConnection, TransportError> {
+    match accept(incoming, config).await? {
+        Accepted::Input(connection) => Ok(connection),
+        Accepted::Hello(hello) => {
+            hello.close();
+            Err(TransportError::InvalidAlpn)
+        }
+        Accepted::NotTrusted { .. } => Err(TransportError::NotTrusted),
+    }
 }
 
 fn input_connection(
@@ -721,6 +785,132 @@ fn monitor_send_half(
     });
 }
 
+/// A connection between computers that may not trust each other yet. TLS
+/// proved each side holds the key it presented; the two trade one [`Hello`]
+/// and close. It has no input, clipboard or desktop surface.
+pub struct HelloConnection {
+    connection: Connection,
+    peer_spki: Arc<[u8]>,
+    send: SendStream,
+    receive: RecvStream,
+    role: Role,
+}
+
+impl fmt::Debug for HelloConnection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HelloConnection")
+            .field("peer_spki", &"[redacted]")
+            .field("remote_address", &self.connection.remote_address())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HelloConnection {
+    pub fn peer_spki(&self) -> &[u8] {
+        &self.peer_spki
+    }
+
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
+    /// A value both ends derive from this TLS session and no other, for
+    /// vouching for a third computer inside this hello alone.
+    pub fn binding(&self) -> Result<[u8; 32], TransportError> {
+        let mut binding = [0_u8; 32];
+        self.connection
+            .export_keying_material(&mut binding, HELLO_EXPORTER_LABEL, b"")
+            .map_err(|_| TransportError::HelloExporter)?;
+        Ok(binding)
+    }
+
+    /// Sends this computer's hello and returns the other's. The initiator
+    /// closes once it has the answer. The listener keeps the connection a
+    /// moment longer in the background, so its own hello is not cut off.
+    pub async fn exchange(mut self, local: &Hello) -> Result<Hello, TransportError> {
+        let frame = encode_wire(&WireMessage::Hello(local.clone()))?;
+        if frame.len() > MAX_HELLO_FRAME_BYTES {
+            return Err(TransportError::HelloFrameTooLarge {
+                actual: frame.len(),
+                maximum: MAX_HELLO_FRAME_BYTES,
+            });
+        }
+        let length = u32::try_from(frame.len()).expect("hello frame bound fits u32");
+        let failed = |error: quinn::WriteError| TransportError::HelloStream(error.to_string());
+        self.send
+            .write_all(&length.to_be_bytes())
+            .await
+            .map_err(failed)?;
+        self.send.write_all(&frame).await.map_err(failed)?;
+        let _ = self.send.finish();
+        let peer = self.read_hello().await;
+        match self.role {
+            Role::Client => self.close(),
+            Role::Server => {
+                let connection = self.connection.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(HELLO_LINGER, connection.closed()).await;
+                    connection.close(VarInt::from_u32(0), b"");
+                });
+            }
+        }
+        peer
+    }
+
+    async fn read_hello(&mut self) -> Result<Hello, TransportError> {
+        let failed = |error: quinn::ReadExactError| TransportError::HelloStream(error.to_string());
+        let mut length = [0_u8; 4];
+        self.receive.read_exact(&mut length).await.map_err(failed)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > MAX_HELLO_FRAME_BYTES {
+            close_protocol(&self.connection, b"invalid hello frame size");
+            return Err(TransportError::HelloFrameTooLarge {
+                actual: length,
+                maximum: MAX_HELLO_FRAME_BYTES,
+            });
+        }
+        let mut frame = vec![0_u8; length];
+        self.receive.read_exact(&mut frame).await.map_err(failed)?;
+        // Only the hello decoder is reachable before trust exists.
+        match decode_family(&frame, Family::Hello) {
+            Ok(WireMessage::Hello(hello)) => Ok(hello),
+            Ok(_) => unreachable!("decode_family returns only the family asked for"),
+            Err(error) => {
+                close_protocol(&self.connection, b"invalid hello");
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn close(&self) {
+        self.connection.close(VarInt::from_u32(0), b"");
+    }
+}
+
+/// Says hello to whatever answers at `remote`, whatever its key.
+pub async fn connect_hello(
+    endpoint: &Endpoint,
+    remote: SocketAddr,
+    config: &HelloClientConfig,
+) -> Result<HelloConnection, TransportError> {
+    let connection = endpoint
+        .connect_with(config.quinn.clone(), remote, SERVER_NAME_PLACEHOLDER)?
+        .await?;
+    let peer_spki = verify_connection(&connection, None, HELLO_ALPN_PROTOCOL)?;
+    let (mut send, receive) = connection.open_bi().await?;
+    send.write_all(HELLO_STREAM_PREFACE)
+        .await
+        .map_err(|error| TransportError::HelloStream(error.to_string()))?;
+    Ok(HelloConnection {
+        connection,
+        peer_spki,
+        send,
+        receive,
+        role: Role::Client,
+    })
+}
+
 /// Pairing-only result. It proves possession of the presented RPK and exposes
 /// a TLS-exporter transcript binding, but deliberately has no input API.
 pub struct PairingConnection {
@@ -728,11 +918,11 @@ pub struct PairingConnection {
     peer_spki: Arc<[u8]>,
     send: SendStream,
     receive: RecvStream,
-    role: PairingRole,
+    role: Role,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PairingRole {
+enum Role {
     Client,
     Server,
 }
@@ -789,14 +979,14 @@ impl PairingConnection {
         let binding = self.transcript_binding()?;
         let peer_spki = self.peer_spki.clone();
         let (client_spki, server_spki) = match self.role {
-            PairingRole::Client => (local_spki, peer_spki.as_ref()),
-            PairingRole::Server => (peer_spki.as_ref(), local_spki),
+            Role::Client => (local_spki, peer_spki.as_ref()),
+            Role::Server => (peer_spki.as_ref(), local_spki),
         };
         let password = spake2::Password::new([PAIRING_PASSWORD_LABEL, code].concat());
         let client_id = spake2::Identity::new(client_spki);
         let server_id = spake2::Identity::new(server_spki);
         match self.role {
-            PairingRole::Client => {
+            Role::Client => {
                 let (exchange, client_message) =
                     Spake2::<Ed25519Group>::start_a(&password, &client_id, &server_id);
                 self.write_frame(&local_frame).await?;
@@ -817,8 +1007,7 @@ impl PairingConnection {
                         &server_message,
                     ],
                 );
-                self.write(&proofs.sign(PairingRole::Client, &transcript))
-                    .await?;
+                self.write(&proofs.sign(Role::Client, &transcript)).await?;
                 let mut proof = [0_u8; PAIRING_PROOF_BYTES];
                 if let Err(error) = self.read_exact(&mut proof).await {
                     return Err(if self.closed_for_wrong_code() {
@@ -827,13 +1016,13 @@ impl PairingConnection {
                         error
                     });
                 }
-                if !proofs.verify(PairingRole::Server, &transcript, &proof) {
+                if !proofs.verify(Role::Server, &transcript, &proof) {
                     close_protocol(&self.connection, b"pairing proof mismatch");
                     return Err(TransportError::PairingCodeMismatch);
                 }
                 Ok(peer)
             }
-            PairingRole::Server => {
+            Role::Server => {
                 let peer_frame = self.read_frame().await?;
                 let peer = self.decode_offer(&peer_frame)?;
                 let mut client_message = [0_u8; PAIRING_KEY_EXCHANGE_BYTES];
@@ -856,13 +1045,12 @@ impl PairingConnection {
                 );
                 let mut proof = [0_u8; PAIRING_PROOF_BYTES];
                 self.read_exact(&mut proof).await?;
-                if !proofs.verify(PairingRole::Client, &transcript, &proof) {
+                if !proofs.verify(Role::Client, &transcript, &proof) {
                     self.connection
                         .close(PAIRING_CODE_MISMATCH, b"wrong setup code");
                     return Err(TransportError::PairingCodeMismatch);
                 }
-                self.write(&proofs.sign(PairingRole::Server, &transcript))
-                    .await?;
+                self.write(&proofs.sign(Role::Server, &transcript)).await?;
                 Ok(peer)
             }
         }
@@ -873,8 +1061,8 @@ impl PairingConnection {
     /// then waits briefly for the initiator to close, so the answer arrives.
     pub async fn finish(&mut self, saved: bool) -> Result<(), TransportError> {
         match self.role {
-            PairingRole::Client => self.close(),
-            PairingRole::Server => {
+            Role::Client => self.close(),
+            Role::Server => {
                 self.write(&[u8::from(saved)]).await?;
                 let _ = self.send.finish();
                 let _ =
@@ -982,7 +1170,7 @@ pub async fn connect_pairing(
         peer_spki,
         send,
         receive,
-        role: PairingRole::Client,
+        role: Role::Client,
     })
 }
 
@@ -1004,8 +1192,16 @@ pub async fn accept_pairing(incoming: Incoming) -> Result<PairingConnection, Tra
         peer_spki,
         send,
         receive,
-        role: PairingRole::Server,
+        role: Role::Server,
     })
+}
+
+fn negotiated_protocol(connection: &Connection) -> Option<Vec<u8>> {
+    connection
+        .handshake_data()?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?
+        .protocol
 }
 
 fn verify_connection(
@@ -1013,12 +1209,7 @@ fn verify_connection(
     expected_spki: Option<&[u8]>,
     expected_alpn: &[u8],
 ) -> Result<Arc<[u8]>, TransportError> {
-    let handshake = connection
-        .handshake_data()
-        .ok_or(TransportError::InvalidAlpn)?
-        .downcast::<quinn::crypto::rustls::HandshakeData>()
-        .map_err(|_| TransportError::InvalidAlpn)?;
-    if handshake.protocol.as_deref() != Some(expected_alpn) {
+    if negotiated_protocol(connection).as_deref() != Some(expected_alpn) {
         close_protocol(connection, b"ALPN mismatch");
         return Err(TransportError::InvalidAlpn);
     }
@@ -1058,21 +1249,21 @@ impl PairingProofKeys {
         Self { client, server }
     }
 
-    fn mac(&self, role: PairingRole, transcript: &[u8]) -> Hmac<Sha256> {
+    fn mac(&self, role: Role, transcript: &[u8]) -> Hmac<Sha256> {
         let key = match role {
-            PairingRole::Client => &self.client,
-            PairingRole::Server => &self.server,
+            Role::Client => &self.client,
+            Role::Server => &self.server,
         };
         let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(transcript);
         mac
     }
 
-    fn sign(&self, role: PairingRole, transcript: &[u8]) -> [u8; PAIRING_PROOF_BYTES] {
+    fn sign(&self, role: Role, transcript: &[u8]) -> [u8; PAIRING_PROOF_BYTES] {
         self.mac(role, transcript).finalize().into_bytes().into()
     }
 
-    fn verify(&self, role: PairingRole, transcript: &[u8], proof: &[u8]) -> bool {
+    fn verify(&self, role: Role, transcript: &[u8], proof: &[u8]) -> bool {
         self.mac(role, transcript).verify_slice(proof).is_ok()
     }
 }

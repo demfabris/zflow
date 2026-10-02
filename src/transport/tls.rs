@@ -28,8 +28,12 @@ use super::TransportError;
 
 pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/3";
 pub const PAIRING_ALPN_PROTOCOL: &[u8] = b"zflow-pair/4";
+/// Answered on the input port by computers that do not trust each other yet.
+pub const HELLO_ALPN_PROTOCOL: &[u8] = b"zflow-hello/4";
 const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 const INPUT_IDLE_TIMEOUT_MS: u32 = 15_000;
+/// A hello is two short messages, so a silent peer is dropped quickly.
+const HELLO_IDLE_TIMEOUT_MS: u32 = 5_000;
 
 /// A Quinn client configuration that authenticates one exact peer SPKI.
 #[derive(Clone)]
@@ -47,7 +51,8 @@ impl fmt::Debug for InputClientConfig {
     }
 }
 
-/// A Quinn server configuration that requires a client SPKI from a fixed allowlist.
+/// The one listener on the input port. It answers hellos from any key and
+/// input connections only from keys on a fixed allowlist.
 #[derive(Clone)]
 pub struct InputServerConfig {
     pub(super) quinn: quinn::ServerConfig,
@@ -68,13 +73,11 @@ impl InputServerConfig {
     ///
     /// To add or revoke local authorization at runtime, build a replacement
     /// with [`input_server_config_for_peers`] and install this value with
-    /// [`quinn::Endpoint::set_server_config`]. Quinn uses the replacement for
-    /// new handshakes. Pass the same replacement to [`super::accept_input`] so
-    /// its second check also rejects a revoked peer whose older handshake was
-    /// already in flight. Established [`super::InputConnection`] values remain
-    /// authenticated until the caller closes them. When the last peer is
-    /// revoked, install `None` instead because an empty input-server allowlist
-    /// is intentionally invalid.
+    /// [`quinn::Endpoint::set_server_config`]. Pass the same replacement to
+    /// [`super::accept`], which checks the allowlist once the handshake is
+    /// done, so a peer revoked while its handshake was in flight is refused
+    /// too. Established [`super::InputConnection`] values remain
+    /// authenticated until the caller closes them.
     pub fn quinn_config(&self) -> quinn::ServerConfig {
         self.quinn.clone()
     }
@@ -83,6 +86,22 @@ impl InputServerConfig {
         self.allowed_peer_spkis
             .iter()
             .any(|allowed| allowed.as_ref() == spki)
+    }
+}
+
+/// A client configuration for saying hello to a computer whose key is not
+/// known yet. It carries no pin: connections made with it are exposed only
+/// as [`super::HelloConnection`], which has no input surface.
+#[derive(Clone)]
+pub struct HelloClientConfig {
+    pub(super) quinn: quinn::ClientConfig,
+}
+
+impl fmt::Debug for HelloClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HelloClientConfig")
+            .finish_non_exhaustive()
     }
 }
 
@@ -153,11 +172,12 @@ pub fn input_server_config(
 
 /// Build one input listener configuration for every currently allowed peer.
 ///
-/// Authentication happens inside the TLS 1.3 handshake: a client whose raw
-/// public key is absent from this immutable snapshot is rejected before any
-/// input stream is accepted. Empty allowlists and empty keys are rejected.
-/// Install a newly built snapshot with [`quinn::Endpoint::set_server_config`]
-/// when the local peer set changes.
+/// The TLS 1.3 handshake proves the client holds the key it presents, and
+/// [`super::accept`] then refuses input from a key absent from this
+/// immutable snapshot before any input stream is accepted. An empty
+/// allowlist still answers hellos. Empty keys are rejected. Install a newly
+/// built snapshot with [`quinn::Endpoint::set_server_config`] when the local
+/// peer set changes.
 pub fn input_server_config_for_peers<I, S>(
     identity: &Identity,
     allowed_peer_spkis: I,
@@ -167,11 +187,7 @@ where
     S: AsRef<[u8]>,
 {
     let allowed_peer_spkis = required_allowlist(allowed_peer_spkis)?;
-    let tls = tls_server_config(
-        identity,
-        Some(allowed_peer_spkis.clone()),
-        INPUT_ALPN_PROTOCOL,
-    )?;
+    let tls = tls_server_config(identity, &[INPUT_ALPN_PROTOCOL, HELLO_ALPN_PROTOCOL])?;
     let crypto = QuicServerConfig::try_from(tls)
         .map_err(|error| TransportError::Configuration(error.to_string()))?;
     let mut quinn = quinn::ServerConfig::with_crypto(Arc::new(crypto));
@@ -180,6 +196,15 @@ where
         quinn,
         allowed_peer_spkis,
     })
+}
+
+pub fn hello_client_config(identity: &Identity) -> Result<HelloClientConfig, TransportError> {
+    let tls = tls_client_config(identity, None, HELLO_ALPN_PROTOCOL)?;
+    let crypto = QuicClientConfig::try_from(tls)
+        .map_err(|error| TransportError::Configuration(error.to_string()))?;
+    let mut quinn = quinn::ClientConfig::new(Arc::new(crypto));
+    quinn.transport_config(Arc::new(hello_client_transport_config()));
+    Ok(HelloClientConfig { quinn })
 }
 
 pub fn pairing_client_config(identity: &Identity) -> Result<PairingClientConfig, TransportError> {
@@ -192,7 +217,7 @@ pub fn pairing_client_config(identity: &Identity) -> Result<PairingClientConfig,
 }
 
 pub fn pairing_server_config(identity: &Identity) -> Result<PairingServerConfig, TransportError> {
-    let tls = tls_server_config(identity, None, PAIRING_ALPN_PROTOCOL)?;
+    let tls = tls_server_config(identity, &[PAIRING_ALPN_PROTOCOL])?;
     let crypto = QuicServerConfig::try_from(tls)
         .map_err(|error| TransportError::Configuration(error.to_string()))?;
     let mut quinn = quinn::ServerConfig::with_crypto(Arc::new(crypto));
@@ -218,11 +243,6 @@ where
         .into_iter()
         .map(|spki| required_pin(spki.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    if spkis.is_empty() {
-        return Err(TransportError::Configuration(
-            "input server peer allowlist cannot be empty".into(),
-        ));
-    }
     spkis.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
     spkis.dedup_by(|left, right| left.as_ref() == right.as_ref());
     Ok(spkis.into())
@@ -281,15 +301,15 @@ fn tls_client_config(
     Ok(config)
 }
 
+/// The handshake only proves the client holds the key it presents. Which
+/// keys may do what is decided after it, per protocol.
 fn tls_server_config(
     identity: &Identity,
-    allowed_peer_spkis: Option<Arc<[Arc<[u8]>]>>,
-    alpn_protocol: &[u8],
+    alpn_protocols: &[&[u8]],
 ) -> Result<TlsServerConfig, TransportError> {
     let provider = provider();
     let verifier = Arc::new(RpkClientVerifier::new(
         provider.signature_verification_algorithms,
-        allowed_peer_spkis,
     ));
     let resolver = Arc::new(AlwaysResolvesServerRawPublicKeys::new(certified_raw_key(
         identity,
@@ -299,7 +319,10 @@ fn tls_server_config(
         .map_err(|error| TransportError::Configuration(error.to_string()))?
         .with_client_cert_verifier(verifier)
         .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![alpn_protocol.to_vec()];
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|protocol| protocol.to_vec())
+        .collect();
     config.max_early_data_size = 0;
     config.send_half_rtt_data = false;
     config.send_tls13_tickets = 0;
@@ -335,6 +358,18 @@ fn datagram_transport_config() -> quinn::TransportConfig {
         // the idle timeout so the source reconnects.
         .keep_alive_interval(Some(INPUT_KEEP_ALIVE))
         .max_idle_timeout(Some(quinn::VarInt::from_u32(INPUT_IDLE_TIMEOUT_MS).into()));
+    config
+}
+
+fn hello_client_transport_config() -> quinn::TransportConfig {
+    let mut config = quinn::TransportConfig::default();
+    // The initiator opens the one hello stream and accepts nothing.
+    config
+        .max_concurrent_bidi_streams(0_u8.into())
+        .max_concurrent_uni_streams(0_u8.into())
+        .datagram_receive_buffer_size(None)
+        .datagram_send_buffer_size(0)
+        .max_idle_timeout(Some(quinn::VarInt::from_u32(HELLO_IDLE_TIMEOUT_MS).into()));
     config
 }
 
@@ -435,15 +470,13 @@ impl ServerCertVerifier for RpkServerVerifier {
 
 struct RpkClientVerifier {
     algorithms: WebPkiSupportedAlgorithms,
-    allowed: Option<Arc<[Arc<[u8]>]>>,
     roots: Vec<DistinguishedName>,
 }
 
 impl RpkClientVerifier {
-    fn new(algorithms: WebPkiSupportedAlgorithms, allowed: Option<Arc<[Arc<[u8]>]>>) -> Self {
+    fn new(algorithms: WebPkiSupportedAlgorithms) -> Self {
         Self {
             algorithms,
-            allowed,
             roots: Vec::new(),
         }
     }
@@ -453,15 +486,7 @@ impl fmt::Debug for RpkClientVerifier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RpkClientVerifier")
-            .field(
-                "mode",
-                &if self.allowed.is_some() {
-                    "allowlist"
-                } else {
-                    "pairing"
-                },
-            )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -477,15 +502,6 @@ impl ClientCertVerifier for RpkClientVerifier {
         _now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
         verify_presented_spki(end_entity, intermediates, None)?;
-        if self.allowed.as_ref().is_some_and(|allowed| {
-            !allowed
-                .iter()
-                .any(|expected| expected.as_ref() == end_entity.as_ref())
-        }) {
-            return Err(TlsError::InvalidCertificate(
-                CertificateError::ApplicationVerificationFailure,
-            ));
-        }
         Ok(ClientCertVerified::assertion())
     }
 

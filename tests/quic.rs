@@ -13,11 +13,12 @@ use zflow::{
     },
     identity::Identity,
     transport::{
-        InputControlMessage, InputDatagram, TransportError, accept_input, accept_pairing,
-        connect_input, connect_pairing, input_client_config, input_server_config,
-        input_server_config_for_peers, pairing_client_config, pairing_server_config,
+        Accepted, InputControlMessage, InputDatagram, TransportError, accept, accept_input,
+        accept_pairing, connect_hello, connect_input, connect_pairing, hello_client_config,
+        input_client_config, input_server_config, input_server_config_for_peers,
+        pairing_client_config, pairing_server_config,
     },
-    wire::{PairingOffer, WireMessage, encode},
+    wire::{Hello, Os, PairingOffer, WireMessage, encode},
 };
 
 const LOOPBACK: SocketAddr =
@@ -30,15 +31,16 @@ fn identity() -> (tempfile::TempDir, Identity) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_input_listener_authenticates_every_allowed_peer_and_rejects_an_unknown_key() {
+async fn one_listener_takes_every_allowed_key_and_tells_an_unknown_one_why() {
     let (_server_directory, server_identity) = identity();
     let (_first_directory, first_identity) = identity();
     let (_second_directory, second_identity) = identity();
     let (_unknown_directory, unknown_identity) = identity();
 
+    // A computer that trusts nobody yet still listens, for hellos.
     assert!(
         input_server_config_for_peers(&server_identity, std::iter::empty::<&'static [u8]>())
-            .is_err()
+            .is_ok()
     );
     let server_config = input_server_config_for_peers(
         &server_identity,
@@ -53,11 +55,11 @@ async fn one_input_listener_authenticates_every_allowed_peer_and_rejects_an_unkn
     let server_address = server_endpoint.local_addr().unwrap();
     let accept_endpoint = server_endpoint.clone();
     let accept_config = server_config.clone();
-    let accept = tokio::spawn(async move {
+    let accepting = tokio::spawn(async move {
         let mut accepted = Vec::new();
         for _ in 0..3 {
             let incoming = accept_endpoint.accept().await.unwrap();
-            accepted.push(accept_input(incoming, &accept_config).await);
+            accepted.push(accept(incoming, &accept_config).await.unwrap());
         }
         accepted
     });
@@ -73,20 +75,21 @@ async fn one_input_listener_authenticates_every_allowed_peer_and_rejects_an_unkn
     let first = first.unwrap();
     let second = second.unwrap();
 
-    let accepted = tokio::time::timeout(Duration::from_secs(2), accept)
+    let accepted = tokio::time::timeout(Duration::from_secs(2), accepting)
         .await
-        .expect("server did not finish authenticating three handshakes")
+        .expect("server did not finish sorting three handshakes")
         .unwrap();
     let mut accepted_spkis = Vec::new();
-    let mut rejected = 0;
+    let mut refused = Vec::new();
     let mut server_connections = Vec::new();
     for result in accepted {
         match result {
-            Ok(connection) => {
+            Accepted::Input(connection) => {
                 accepted_spkis.push(connection.peer_spki().to_vec());
                 server_connections.push(connection);
             }
-            Err(_) => rejected += 1,
+            Accepted::NotTrusted { peer_spki, .. } => refused.push(peer_spki),
+            Accepted::Hello(_) => panic!("an input client was taken for a hello"),
         }
     }
     accepted_spkis.sort();
@@ -96,23 +99,97 @@ async fn one_input_listener_authenticates_every_allowed_peer_and_rejects_an_unkn
     ];
     expected.sort();
     assert_eq!(accepted_spkis, expected);
-    assert_eq!(rejected, 1);
+    // The listener learns who asked, and the asker learns why it was turned
+    // away, wherever it notices: the handshake, the stream, or the close.
+    assert_eq!(refused, [unknown_identity.spki().to_vec()]);
+    let why = match unknown {
+        Err(error) => error,
+        Ok(unknown) => tokio::time::timeout(
+            Duration::from_secs(2),
+            unknown.into_channels().control_receive.receive(),
+        )
+        .await
+        .expect("unknown peer remained connected after it was refused")
+        .unwrap_err(),
+    };
+    assert!(matches!(why, TransportError::NotTrusted), "{why:?}");
 
-    if let Ok(unknown) = unknown {
-        tokio::time::timeout(Duration::from_secs(2), unknown.closed())
-            .await
-            .expect("unknown peer remained connected after TLS rejection");
-    }
+    // The trusted keys still have working input on the same port.
+    let mut first = first.into_channels();
+    let mut server_side = server_connections
+        .into_iter()
+        .find(|connection| connection.peer_spki() == first_identity.spki())
+        .unwrap()
+        .into_channels();
+    let control = ReliableControlMessage {
+        session: session(),
+        sequence: ControlSequence(1),
+        payload: ReliableControl::Enter,
+    };
+    first.control_send.send_control(&control).await.unwrap();
+    assert_eq!(
+        server_side.control_receive.receive().await.unwrap(),
+        InputControlMessage::Reliable(control)
+    );
 
-    first.close();
+    first.datagrams.close();
     second.close();
-    for connection in server_connections {
-        connection.close();
-    }
+    server_side.datagrams.close();
     first_endpoint.wait_idle().await;
     second_endpoint.wait_idle().await;
     unknown_endpoint.wait_idle().await;
-    server_endpoint.wait_idle().await;
+    server_endpoint.close(0_u32.into(), b"test finished");
+}
+
+fn hello(name: &str, input_port: u16, trusts_you: bool) -> Hello {
+    Hello {
+        name: name.into(),
+        os: Os::Linux,
+        version: "0.3.0".into(),
+        input_port,
+        candidates: vec![SocketAddr::from(([192, 0, 2, 7], input_port))],
+        trusts_you,
+        vouches: [[0; 16]; 16],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_key_says_hello_on_the_input_port_and_both_sides_learn_each_other() {
+    let (_server_directory, server_identity) = identity();
+    let (_client_directory, client_identity) = identity();
+    let (_known_directory, known_identity) = identity();
+    // The listener trusts someone else, and never this client.
+    let server_config =
+        input_server_config_for_peers(&server_identity, [known_identity.spki()]).unwrap();
+    let server_endpoint = quinn::Endpoint::server(server_config.quinn_config(), LOOPBACK).unwrap();
+    let server_address = server_endpoint.local_addr().unwrap();
+    let accept_endpoint = server_endpoint.clone();
+    let accepting = tokio::spawn(async move {
+        let incoming = accept_endpoint.accept().await.unwrap();
+        match accept(incoming, &server_config).await.unwrap() {
+            Accepted::Hello(hello) => hello,
+            other => panic!("a hello was taken for {other:?}"),
+        }
+    });
+
+    let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
+    let client_config = hello_client_config(&client_identity).unwrap();
+    let client = connect_hello(&client_endpoint, server_address, &client_config)
+        .await
+        .unwrap();
+    let server = accepting.await.unwrap();
+    assert_eq!(client.peer_spki(), server_identity.spki());
+    assert_eq!(server.peer_spki(), client_identity.spki());
+    // Both ends derive the same value from this session, for vouches.
+    assert_eq!(client.binding().unwrap(), server.binding().unwrap());
+
+    let (from_client, from_server) = (hello("client", 43119, false), hello("server", 43121, true));
+    let (seen_by_client, seen_by_server) =
+        tokio::join!(client.exchange(&from_client), server.exchange(&from_server),);
+    assert_eq!(seen_by_client.unwrap(), hello("server", 43121, true));
+    assert_eq!(seen_by_server.unwrap(), hello("client", 43119, false));
+    client_endpoint.wait_idle().await;
+    server_endpoint.close(0_u32.into(), b"test finished");
 }
 
 fn session() -> SessionContext {
@@ -329,23 +406,41 @@ async fn unread_control_stream_hits_the_bounded_fail_closed_write_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_on_another_protocol_version_gets_a_clear_error() {
-    // The input and pairing ALPNs differ the same way two zflow versions do.
-    let (_client_directory, client_identity) = identity();
     let (_server_directory, server_identity) = identity();
-    let client_config = input_client_config(&client_identity, server_identity.spki()).unwrap();
-    let server_config = pairing_server_config(&server_identity).unwrap();
-
+    let (_client_directory, client_identity) = identity();
+    let server_config = input_server_config(&server_identity, client_identity.spki()).unwrap();
     let server_endpoint = quinn::Endpoint::server(server_config.quinn_config(), LOOPBACK).unwrap();
     let server_address = server_endpoint.local_addr().unwrap();
-    let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
     let accept_endpoint = server_endpoint.clone();
-    let accept =
-        tokio::spawn(async move { accept_pairing(accept_endpoint.accept().await.unwrap()).await });
+    let accepting = tokio::spawn(async move {
+        accept(accept_endpoint.accept().await.unwrap(), &server_config).await
+    });
 
-    let client = connect_input(&client_endpoint, server_address, &client_config).await;
-    assert!(matches!(client, Err(TransportError::InvalidAlpn)));
+    // A build from another version offers only its own protocol. The listener
+    // turns it away before any key is shown, so this client needs none.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"zflow/2".to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
+    let old = client_endpoint
+        .connect_with(
+            quinn::ClientConfig::new(Arc::new(crypto)),
+            server_address,
+            "zflow.invalid",
+        )
+        .unwrap()
+        .await;
     assert!(matches!(
-        accept.await.unwrap(),
+        old.map_err(TransportError::from),
+        Err(TransportError::InvalidAlpn)
+    ));
+    assert!(matches!(
+        accepting.await.unwrap(),
         Err(TransportError::InvalidAlpn)
     ));
 }
@@ -380,39 +475,6 @@ async fn wrong_server_spki_pin_rejects_the_handshake() {
             .unwrap()
             .is_err()
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wrong_client_spki_pin_is_rejected_by_the_server() {
-    let (_client_directory, client_identity) = identity();
-    let (_server_directory, server_identity) = identity();
-    let (_impostor_directory, impostor_identity) = identity();
-    let client_config = input_client_config(&client_identity, server_identity.spki()).unwrap();
-    let server_config = input_server_config(&server_identity, impostor_identity.spki()).unwrap();
-
-    let server_endpoint = quinn::Endpoint::server(server_config.quinn_config(), LOOPBACK).unwrap();
-    let server_address = server_endpoint.local_addr().unwrap();
-    let client_endpoint = quinn::Endpoint::client(LOOPBACK).unwrap();
-    let accept_endpoint = server_endpoint.clone();
-    let accept_config = server_config.clone();
-    let accept = tokio::spawn(async move {
-        let incoming = accept_endpoint.accept().await.unwrap();
-        accept_input(incoming, &accept_config).await
-    });
-
-    let client = connect_input(&client_endpoint, server_address, &client_config).await;
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), accept)
-            .await
-            .unwrap()
-            .unwrap(),
-        Err(TransportError::PeerIdentityMismatch)
-    ));
-    if let Ok(client) = client {
-        tokio::time::timeout(Duration::from_secs(2), client.closed())
-            .await
-            .expect("client remained open after server rejected its RPK");
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

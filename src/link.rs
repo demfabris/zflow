@@ -27,6 +27,9 @@ pub enum Fix {
     Update,
     /// The other computer's key is not the one paired here.
     PairAgain,
+    /// The other computer answered with the right key but has not added
+    /// this one, so a person has to place it there.
+    WaitingForThem,
 }
 
 impl Fix {
@@ -40,6 +43,7 @@ impl Fix {
         match error {
             TransportError::InvalidAlpn => Some(Self::Update),
             TransportError::PeerIdentityMismatch => Some(Self::PairAgain),
+            TransportError::NotTrusted => Some(Self::WaitingForThem),
             _ => None,
         }
     }
@@ -52,6 +56,7 @@ pub fn reason(error: &anyhow::Error) -> String {
     match Fix::of(error) {
         Some(Fix::Update) => "Different zflow version. Update both computers.".into(),
         Some(Fix::PairAgain) => "Reset or reinstalled. Pair it again.".into(),
+        Some(Fix::WaitingForThem) => "Hasn't added this computer yet.".into(),
         None => format!("{error:#}"),
     }
 }
@@ -82,6 +87,10 @@ mod tests {
             reason(&failed(TransportError::PeerIdentityMismatch)),
             "Reset or reinstalled. Pair it again."
         );
+        // Read under or after the name: "desk: Hasn't added this computer yet."
+        let refused = failed(TransportError::NotTrusted);
+        assert_eq!(Fix::of(&refused), Some(Fix::WaitingForThem));
+        assert_eq!(reason(&refused), "Hasn't added this computer yet.");
         let timeout = anyhow::anyhow!("input connection to 192.0.2.7:43119 timed out");
         assert_eq!(Fix::of(&timeout), None);
         assert_eq!(reason(&timeout), timeout.to_string());
