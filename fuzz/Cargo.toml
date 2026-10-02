@@ -58,6 +58,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "hello"
+path = "fuzz_targets/hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "desktop"
 path = "fuzz_targets/desktop.rs"
 test = false

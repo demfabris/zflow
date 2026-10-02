@@ -3,7 +3,7 @@
 
 use crate::core::{ReliableControl, TouchState};
 
-use super::{WireError, WireMessage};
+use super::{MAX_NAME_BYTES, MAX_VERSION_BYTES, WireError, WireMessage};
 
 pub use crate::discovery::MAX_DISCOVERY_CANDIDATES;
 
@@ -63,6 +63,19 @@ pub(super) fn validate(message: &WireMessage) -> Result<(), WireError> {
             candidates.iter().try_for_each(|candidate| {
                 limit("input candidate bytes", candidate.len(), MAX_STRING_BYTES)
             })
+        }
+        WireMessage::Hello(hello) => {
+            limit("name bytes", hello.name.len(), MAX_NAME_BYTES)?;
+            limit("version bytes", hello.version.len(), MAX_VERSION_BYTES)?;
+            limit(
+                "hello candidates",
+                hello.candidates.len(),
+                MAX_DISCOVERY_CANDIDATES,
+            )?;
+            if hello.input_port == 0 {
+                return Err(WireError::Invalid("input port must be non-zero".into()));
+            }
+            Ok(())
         }
         WireMessage::Desktop(message) => message
             .validate()

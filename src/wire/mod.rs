@@ -7,6 +7,8 @@ mod bounds;
 mod codec;
 mod error;
 
+use std::net::SocketAddr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -26,6 +28,12 @@ pub const MAX_RELIABLE_PAYLOAD_BYTES: usize = 32 * 1_024;
 pub const MAX_MOTION_PAYLOAD_BYTES: usize = 8 * 1_024;
 pub const MAX_PROBE_PAYLOAD_BYTES: usize = 128;
 pub const MAX_PAIRING_PAYLOAD_BYTES: usize = 2 * 1_024;
+pub const MAX_HELLO_PAYLOAD_BYTES: usize = 1_024;
+/// A computer's name fits one DNS label, so the mDNS record can carry it.
+pub const MAX_NAME_BYTES: usize = 63;
+pub const MAX_VERSION_BYTES: usize = 32;
+/// Vouches a hello carries, real or random padding.
+pub const HELLO_VOUCHES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -37,6 +45,7 @@ pub enum Family {
     Probe = 5,
     Pairing = 6,
     Desktop = 7,
+    Hello = 8,
 }
 
 impl Family {
@@ -48,6 +57,7 @@ impl Family {
             Self::Probe => MAX_PROBE_PAYLOAD_BYTES,
             Self::Pairing => MAX_PAIRING_PAYLOAD_BYTES,
             Self::Desktop => crate::desktop::MAX_MESSAGE_BYTES,
+            Self::Hello => MAX_HELLO_PAYLOAD_BYTES,
         }
     }
 }
@@ -64,6 +74,7 @@ impl TryFrom<u8> for Family {
             5 => Ok(Self::Probe),
             6 => Ok(Self::Pairing),
             7 => Ok(Self::Desktop),
+            8 => Ok(Self::Hello),
             other => Err(WireError::UnknownFamily(other)),
         }
     }
@@ -78,6 +89,7 @@ pub enum WireMessage {
     Probe(ProbeMessage),
     Pairing(PairingOffer),
     Desktop(DesktopMessage),
+    Hello(Hello),
 }
 
 impl WireMessage {
@@ -90,6 +102,7 @@ impl WireMessage {
             Self::Probe(_) => Family::Probe,
             Self::Pairing(_) => Family::Pairing,
             Self::Desktop(_) => Family::Desktop,
+            Self::Hello(_) => Family::Hello,
         }
     }
 }
@@ -100,6 +113,31 @@ pub struct PairingOffer {
     pub device_label: Option<String>,
     pub input_port: u16,
     pub input_candidates: Vec<String>,
+}
+
+/// What a computer says about itself before either side trusts the other.
+/// TLS proves the key that sent it; every field is only the sender's word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    /// Its host name, already reduced to plain text by the sender.
+    pub name: String,
+    pub os: Os,
+    /// Its zflow version, so a person knows which computer to update.
+    pub version: String,
+    pub input_port: u16,
+    /// Addresses it says it has, tried after the one it spoke from.
+    pub candidates: Vec<SocketAddr>,
+    /// Whether it already trusts the receiver's key. Shown, never obeyed.
+    pub trusts_you: bool,
+    /// Room for introducing a third computer later. Random until then.
+    pub vouches: [[u8; 16]; HELLO_VOUCHES],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Os {
+    Linux,
+    Macos,
 }
 
 pub fn encode(message: &WireMessage) -> Result<Vec<u8>, WireError> {
@@ -127,6 +165,7 @@ fn frame(message: &WireMessage) -> Result<Vec<u8>, WireError> {
         WireMessage::Motion(frame) => codec::encode(frame, header)?,
         WireMessage::Probe(probe) => codec::encode(probe, header)?,
         WireMessage::Pairing(offer) => codec::encode(offer, header)?,
+        WireMessage::Hello(hello) => codec::encode(hello, header)?,
         WireMessage::Desktop(message) => {
             let mut bytes = header;
             serde_json::to_writer(&mut bytes, message)
@@ -162,6 +201,7 @@ fn decode_inner(bytes: &[u8], expected: Option<Family>) -> Result<WireMessage, W
         Family::Motion => WireMessage::Motion(codec::decode(payload)?),
         Family::Probe => WireMessage::Probe(codec::decode(payload)?),
         Family::Pairing => WireMessage::Pairing(codec::decode(payload)?),
+        Family::Hello => WireMessage::Hello(codec::decode(payload)?),
         Family::Desktop => WireMessage::Desktop(
             serde_json::from_slice(payload)
                 .map_err(|error| WireError::Invalid(error.to_string()))?,
@@ -293,6 +333,21 @@ mod tests {
         }
     }
 
+    fn hello() -> Hello {
+        Hello {
+            name: "workstation".into(),
+            os: Os::Linux,
+            version: "0.3.0".into(),
+            input_port: 43119,
+            candidates: vec![
+                "192.0.2.1:43119".parse().unwrap(),
+                "[2001:db8::1]:43119".parse().unwrap(),
+            ],
+            trusts_you: true,
+            vouches: [[0x5a; 16]; HELLO_VOUCHES],
+        }
+    }
+
     fn corpus() -> Vec<WireMessage> {
         vec![
             WireMessage::NegotiationOffer(offer()),
@@ -324,6 +379,7 @@ mod tests {
                 },
             }),
             WireMessage::Pairing(pairing()),
+            WireMessage::Hello(hello()),
         ]
     }
 
@@ -468,6 +524,29 @@ mod tests {
                 }),
                 "input candidates",
             ),
+            (
+                WireMessage::Hello(Hello {
+                    name: "x".repeat(MAX_NAME_BYTES + 1),
+                    ..hello()
+                }),
+                "name bytes",
+            ),
+            (
+                WireMessage::Hello(Hello {
+                    version: "9".repeat(MAX_VERSION_BYTES + 1),
+                    ..hello()
+                }),
+                "version bytes",
+            ),
+            (
+                WireMessage::Hello(Hello {
+                    candidates: (0..=bounds::MAX_DISCOVERY_CANDIDATES as u16)
+                        .map(|port| SocketAddr::from(([192, 0, 2, 1], port + 1)))
+                        .collect(),
+                    ..hello()
+                }),
+                "hello candidates",
+            ),
         ];
         for (message, limit) in cases {
             assert!(
@@ -478,6 +557,33 @@ mod tests {
                 matches!(decode(&bytes), Err(WireError::SizeLimit { what, .. }) if what == limit)
             );
         }
+    }
+
+    #[test]
+    fn a_hello_fits_its_family_and_needs_an_input_port() {
+        let largest = WireMessage::Hello(Hello {
+            name: "n".repeat(MAX_NAME_BYTES),
+            version: "v".repeat(MAX_VERSION_BYTES),
+            candidates: vec![
+                "[2001:db8::1]:65535".parse().unwrap();
+                bounds::MAX_DISCOVERY_CANDIDATES
+            ],
+            ..hello()
+        });
+        let bytes = encode(&largest).unwrap();
+        assert!(bytes.len() - HEADER_BYTES <= MAX_HELLO_PAYLOAD_BYTES);
+        // A hello is never mistaken for the pairing offer it replaces.
+        assert!(decode_family(&bytes, Family::Pairing).is_err());
+
+        let portless = WireMessage::Hello(Hello {
+            input_port: 0,
+            ..hello()
+        });
+        assert!(matches!(encode(&portless), Err(WireError::Invalid(_))));
+        assert!(matches!(
+            decode(&frame(&portless).unwrap()),
+            Err(WireError::Invalid(_))
+        ));
     }
 
     #[test]
