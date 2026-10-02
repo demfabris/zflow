@@ -90,6 +90,11 @@ Checks:
     and nothing joins; dragging it in still works. As an ordinary user on the
     fresh computer, a hello to `127.0.0.1:43119` or to its own LAN address
     puts nothing on the shelf.
+17. **A flood closes the window.** On a fresh computer during its window,
+    publish more than 64 zflow records from a third computer, for example
+    `avahi-publish -s zf-$(openssl rand -hex 16) _zflow._udp 43119
+    v=zflow/4 cap=keyboard,pointer name=x &` in a loop. The window closes as
+    a rival and the computer that shows up next waits on the shelf.
 
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 

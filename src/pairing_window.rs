@@ -154,7 +154,8 @@ impl PairingWindow {
     /// around has a known key, it answered a hello this computer sent, its
     /// name is its own, and it said hello lately. It joins once it stayed
     /// the candidate for [`HOLD_OFF`]; any change starts the wait again, and
-    /// a second stranger closes the window, even one that only said hello.
+    /// a second stranger closes the window, even one that only said hello,
+    /// and so does anything turned away because a table was full.
     pub fn tick(&mut self, strangers: &Strangers, now: Instant) -> Option<Stranger> {
         let Phase::Open { until } = self.phase else {
             return None;
@@ -163,7 +164,8 @@ impl PairingWindow {
             self.close(Reason::Expired);
             return None;
         }
-        if strangers.present.len() > 1 {
+        // A stranger turned away for want of room could be the second one.
+        if strangers.present.len() > 1 || strangers.turned_away {
             self.close(Reason::Rival);
             return None;
         }
@@ -258,6 +260,7 @@ mod tests {
         Strangers {
             present: present.to_vec(),
             unidentified,
+            turned_away: false,
         }
     }
 
@@ -389,6 +392,22 @@ mod tests {
         };
         let both = around(&[stranger("k1", "desk"), evil], 0);
         assert_eq!(after(&mut window, Duration::ZERO, &both).await, None);
+        assert_eq!(window.view(Instant::now()).reason, Some(Reason::Rival));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anything_turned_away_for_want_of_room_closes_the_window() {
+        let (_directory, mut window) = opened();
+        let desk = around(&[stranger("k1", "desk")], 0);
+        window.tick(&desk, Instant::now());
+        // A flood filled a table, so the real second computer may be the
+        // one that was dropped.
+        let full = Strangers {
+            turned_away: true,
+            ..desk.clone()
+        };
+        assert_eq!(after(&mut window, HOLD_OFF / 2, &full).await, None);
+        assert_eq!(after(&mut window, HOLD_OFF * 2, &desk).await, None);
         assert_eq!(window.view(Instant::now()).reason, Some(Reason::Rival));
     }
 

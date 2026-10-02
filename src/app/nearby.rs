@@ -45,6 +45,8 @@ impl NearbyRecord {
 pub(super) struct NearbySnapshot {
     pub status: BrowserStatus,
     pub records: BTreeMap<String, NearbyRecord>,
+    /// A new record was dropped because there were too many.
+    pub turned_away: bool,
 }
 
 impl NearbySnapshot {
@@ -60,6 +62,8 @@ impl NearbySnapshot {
         }
         if self.records.len() < MAX_NEARBY || self.records.contains_key(&record.instance) {
             self.records.insert(record.instance.clone(), record);
+        } else {
+            self.turned_away = true;
         }
     }
 
@@ -239,10 +243,15 @@ mod tests {
     #[test]
     fn records_are_bounded_but_existing_instances_can_update() {
         let mut snapshot = NearbySnapshot::default();
-        for index in 0..100 {
+        for index in 0..MAX_NEARBY {
+            snapshot.insert(record(index), &BTreeSet::new());
+        }
+        assert!(!snapshot.turned_away);
+        for index in MAX_NEARBY..100 {
             snapshot.insert(record(index), &BTreeSet::new());
         }
         assert_eq!(snapshot.records.len(), MAX_NEARBY);
+        assert!(snapshot.turned_away, "the app hears that some were dropped");
         let mut changed = record(0);
         changed.addresses = vec!["192.0.2.250:43119".parse().unwrap()];
         snapshot.insert(changed.clone(), &BTreeSet::new());

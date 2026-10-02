@@ -201,6 +201,11 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                     let Ok(permit) = handshake_slots.clone().try_acquire_owned() else {
                         incoming.refuse();
                         tracing::warn!("input handshake limit reached");
+                        // The one refused could be a second stranger.
+                        shared.neighbors.send_if_modified(|neighbors| {
+                            neighbors.turned_one_away();
+                            false
+                        });
                         continue;
                     };
                     let config = shared.server_config.read().await.clone();

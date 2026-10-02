@@ -101,6 +101,9 @@ pub struct Strangers {
     pub present: Vec<Stranger>,
     /// Compatible records whose key is not known yet. One might be anyone.
     pub unidentified: usize,
+    /// A record, hello or connection was turned away because a table was
+    /// full, so a stranger may be missing from `present`.
+    pub turned_away: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +156,8 @@ pub struct Neighbors {
     neighbors: BTreeMap<String, Neighbor>,
     added: Vec<String>,
     hellos: BTreeMap<IpAddr, (Instant, u32)>,
+    /// Set for good once anything was turned away for want of room.
+    turned_away: bool,
 }
 
 impl Neighbors {
@@ -163,7 +168,16 @@ impl Neighbors {
             neighbors: BTreeMap::new(),
             added: Vec::new(),
             hellos: BTreeMap::new(),
+            turned_away: false,
         }
+    }
+
+    /// Notes that something was turned away because a table was full, here
+    /// or elsewhere, such as a handshake while too many were under way. The
+    /// computer turned away could be a second stranger, so the pairing
+    /// window can no longer take one by itself.
+    pub fn turned_one_away(&mut self) {
+        self.turned_away = true;
     }
 
     /// An mDNS record was resolved. A record whose addresses changed gets a
@@ -182,7 +196,9 @@ impl Neighbors {
             known.addresses = addresses;
             known.compatible = compatible;
             known.name = name;
-        } else if self.instances.len() < MAX_INSTANCES {
+        } else if self.instances.len() >= MAX_INSTANCES {
+            self.turned_one_away();
+        } else {
             self.instances.insert(
                 instance.to_owned(),
                 Instance {
@@ -260,6 +276,7 @@ impl Neighbors {
         self.hellos
             .retain(|_, (start, _)| now.duration_since(*start) < HELLO_WINDOW);
         if !self.hellos.contains_key(&ip) && self.hellos.len() >= MAX_TRACKED_IPS {
+            self.turned_one_away();
             return false;
         }
         let (_, count) = self.hellos.entry(ip).or_insert((now, 0));
@@ -292,6 +309,7 @@ impl Neighbors {
         }
         self.expire(now);
         if !self.neighbors.contains_key(&key) && self.neighbors.len() >= MAX_NEIGHBORS {
+            self.turned_one_away();
             return None;
         }
         let neighbor = self
@@ -433,6 +451,7 @@ impl Neighbors {
                 .values()
                 .filter(|instance| instance.compatible && instance.key.is_none())
                 .count(),
+            turned_away: self.turned_away,
         }
     }
 
@@ -703,6 +722,53 @@ mod tests {
         let added = format!("address:{desk}");
         around.hello(&spki(1), desk, &hello, Some(&added), now);
         assert!(answered(&around));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_table_says_something_was_turned_away() {
+        let now = Instant::now();
+        let turned_away =
+            |around: &Neighbors| around.strangers(&Config::default(), now).turned_away;
+        let hello = make_hello("x", 43119, Vec::new(), false);
+        let remote = at("192.0.2.7:43119");
+
+        let mut around = Neighbors::new(&spki(0));
+        for index in 0..MAX_INSTANCES {
+            let address = SocketAddr::from(([198, 51, 100, (index % 250) as u8], 43119));
+            around.instance_seen(&format!("zf-{index}"), vec![address], true, None);
+        }
+        // A known record still updates; only a new one is turned away.
+        around.instance_seen("zf-0", vec![remote], true, None);
+        assert!(!turned_away(&around));
+        around.instance_seen("zf-new", vec![remote], true, None);
+        assert!(turned_away(&around));
+
+        let mut around = Neighbors::new(&spki(0));
+        for byte in 1..=MAX_NEIGHBORS as u8 {
+            around.hello(&spki(byte), remote, &hello, None, now);
+        }
+        assert!(!turned_away(&around));
+        around.hello(&spki(200), remote, &hello, None, now);
+        assert!(turned_away(&around));
+
+        let mut around = Neighbors::new(&spki(0));
+        for host in 0..MAX_TRACKED_IPS as u32 {
+            let ip = std::net::Ipv4Addr::from(0xc633_6400 + host);
+            assert!(around.allow_hello(ip.into(), &[], now));
+        }
+        // Too many hellos from one address is that address's own limit.
+        let first: IpAddr = "198.51.100.0".parse().unwrap();
+        for _ in 0..HELLOS_PER_IP {
+            around.allow_hello(first, &[], now);
+        }
+        assert!(!turned_away(&around));
+        assert!(!around.allow_hello("192.0.2.99".parse().unwrap(), &[], now));
+        assert!(turned_away(&around));
+
+        // Elsewhere, such as too many handshakes at once, counts the same.
+        let mut around = Neighbors::new(&spki(0));
+        around.turned_one_away();
+        assert!(turned_away(&around));
     }
 
     #[tokio::test(start_paused = true)]

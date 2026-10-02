@@ -116,6 +116,9 @@ pub enum Heard {
     },
     /// A key that is not trusted here asked for input, so it trusts this Mac.
     Refused { spki: Vec<u8> },
+    /// A connection was turned away because too many were being set up at
+    /// once. It could have been a computer not seen otherwise.
+    TurnedAway,
 }
 
 /// Where each paired computer was found just now, by its key
@@ -1004,6 +1007,7 @@ async fn take_connections(
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             tracing::warn!("too many computers connecting at once");
             incoming.refuse();
+            let _ = heard.send(Heard::TurnedAway);
             continue;
         };
         let (accepting, heard) = (accepting.clone(), heard.clone());

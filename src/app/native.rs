@@ -565,33 +565,37 @@ impl NativeApp {
         })
     }
 
-    /// Answers knocks, within each address's share, and keeps what hellos
-    /// and refusals told.
     fn take_heard(&mut self) {
-        let now = tokio::time::Instant::now();
         for heard in self.links.take_heard() {
-            match heard {
-                Heard::Knock(knock) => {
-                    let local = crate::discovery::this_host_addresses();
-                    let ip = knock.remote_address().ip();
-                    let allowed = self.neighbors.allow_hello(ip, &local, now);
-                    match self.greeting().filter(|_| allowed) {
-                        Some(greeting) => self.links.answer(knock, greeting),
-                        None => knock.close(),
-                    }
+            self.hear(heard, tokio::time::Instant::now());
+        }
+    }
+
+    /// Answers a knock, within its address's share, and keeps what a hello
+    /// or refusal told.
+    fn hear(&mut self, heard: Heard, now: tokio::time::Instant) {
+        match heard {
+            Heard::Knock(knock) => {
+                let local = crate::discovery::this_host_addresses();
+                let ip = knock.remote_address().ip();
+                let allowed = self.neighbors.allow_hello(ip, &local, now);
+                match self.greeting().filter(|_| allowed) {
+                    Some(greeting) => self.links.answer(knock, greeting),
+                    None => knock.close(),
                 }
-                Heard::Hello {
-                    instance,
-                    spki,
-                    remote,
-                    hello,
-                } => {
-                    self.neighbors
-                        .hello(&spki, remote, &hello, instance.as_deref(), now);
-                    self.learn(&spki, &hello_addresses(remote, &hello));
-                }
-                Heard::Refused { spki } => self.neighbors.refused_input(&spki),
             }
+            Heard::Hello {
+                instance,
+                spki,
+                remote,
+                hello,
+            } => {
+                self.neighbors
+                    .hello(&spki, remote, &hello, instance.as_deref(), now);
+                self.learn(&spki, &hello_addresses(remote, &hello));
+            }
+            Heard::Refused { spki } => self.neighbors.refused_input(&spki),
+            Heard::TurnedAway => self.neighbors.turned_one_away(),
         }
     }
 
@@ -613,7 +617,11 @@ impl NativeApp {
     /// need it, tells the links where paired computers are, and lets the
     /// pairing window weigh who is around.
     fn tick_neighbors(&mut self, now: tokio::time::Instant) {
-        let records = self.nearby.snapshot().records;
+        let nearby = self.nearby.snapshot();
+        if nearby.turned_away {
+            self.neighbors.turned_one_away();
+        }
+        let records = nearby.records;
         for gone in self
             .instances
             .iter()
@@ -1856,6 +1864,27 @@ mod tests {
         // Once only, even across a restart.
         let app = NativeApp::open(path).unwrap();
         assert_eq!(window(&app).state, crate::pairing_window::State::Closed);
+    }
+
+    #[test]
+    fn a_connection_turned_away_closes_a_fresh_macs_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zflow.toml");
+        let mut app = NativeApp::open(path).unwrap();
+        app.document.draft.macos.sharing = false;
+        app.save_config().unwrap();
+        (app.discover, app.local_network) = (true, LocalNetwork::Allowed);
+        let desk = Identity::load_or_create(&directory.path().join("desk")).unwrap();
+        answers_hello(&mut app, &desk, "desk");
+        let start = tokio::time::Instant::now();
+        app.tick_window(start);
+        assert_eq!(app.snapshot().pairing_window.holding.unwrap().name, "desk");
+        // Too many handshakes at once: the one refused could be a rival.
+        app.hear(Heard::TurnedAway, start);
+        app.tick_window(start + crate::pairing_window::HOLD_OFF);
+        let window = app.snapshot().pairing_window;
+        assert_eq!(window.reason, Some(crate::pairing_window::Reason::Rival));
+        assert!(app.document.saved().peers.is_empty());
     }
 
     #[test]
