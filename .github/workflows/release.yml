@@ -189,10 +189,15 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           tag="v$version"
-          # Never overwrite an existing release, including an incomplete draft.
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists; inspect it before retrying." >&2
-            exit 1
+          # Never overwrite a published release. A draft is what a run that
+          # failed before publishing left behind, so this run replaces it.
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$draft" != true ]]; then
+              echo "Release $tag is already published; inspect it before retrying." >&2
+              exit 1
+            fi
+            echo "Deleting the draft release $tag left by an earlier run."
+            gh release delete "$tag" --yes
           fi
           if [[ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]]; then
             git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag"
