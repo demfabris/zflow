@@ -25,9 +25,11 @@ package for arm64 and x86_64, so both Mac files hold one universal app. The disk
 image is for people; `install.sh` uses the archive. Releases up to v0.1.0 had
 one Mac archive per CPU, and `install.sh` falls back to those names when a
 release lists no universal archive. Rust is pinned in the workflow; the app's
-minimum macOS version remains 26. After all builds and tests
-pass, the publish job combines the artifacts, computes `SHA256SUMS`, uploads a
-draft release, and publishes it. It refuses to replace an existing release.
+minimum macOS version remains 26. The code checks run in CI on the
+tagged commit, not again here. After all builds pass, the publish job combines
+the artifacts, computes `SHA256SUMS`, uploads a draft release, and publishes
+it. It refuses to replace a published release, and replaces a draft that an
+earlier failed run left behind.
 The release also contains `install.sh`. Checksums detect corrupt or mismatched
 downloads; they rely on the same GitHub/HTTPS trust as the artifacts.
 

@@ -195,12 +195,15 @@ checks paths and permissions, edits configuration/device selections, and checks
 update, removal, reinstallation, purge, and rejection of a source installation.
 No host service, input device, or system package is changed by these tests.
 
-The release workflow runs the bootstrap tests on Linux and macOS runners,
-Linux Rust/GNOME checks and package lifecycle tests on both Linux architectures,
-and one universal (Apple silicon and Intel) Mac app build with Swift bridge tests
-on Apple silicon. The Mac job also runs `python3 tests/macos_notarization_test.py`,
-signs with Developer ID and a secure timestamp, requires Apple's acceptance for the
-app and then the disk image, and staples both. It extracts the release archive and
+CI runs the installer tests on Linux and macOS runners, the Rust tests on both
+Linux architectures, the GNOME checks, the Swift bridge tests, and
+`python3 tests/macos_notarization_test.py` on every pull request and main push.
+A release tag points at a commit CI already passed, so the release workflow
+does not repeat them. It runs the package lifecycle tests on both Linux
+architectures and builds one universal (Apple silicon and Intel) Mac app on
+Apple silicon. The Mac job signs with Developer ID and a secure timestamp,
+requires Apple's acceptance for the app and then the disk image, and staples
+both. It extracts the release archive and
 checks the app's and the image's signature, ticket, and Gatekeeper assessment
 before upload.
 Only a complete build matrix can publish a release.
