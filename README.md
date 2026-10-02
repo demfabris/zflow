@@ -37,8 +37,7 @@ by policy, no version for your GNOME, or you choose Cancel), zflow uses the
 copy it ships and asks you to log out and back in once. Every GNOME user on the computer gets the zflow launcher
 and starts the desktop agent at login; **Start at Login** in Settings turns
 that off for one account. When ufw or firewalld is on, the installer allows
-UDP ports 43119 (input) and 43120 (pairing) and says so. It never turns a
-firewall on.
+UDP port 43119 and says so. It never turns a firewall on.
 
 On macOS, download `zflow-vVERSION-macos.dmg` from
 [Releases](https://github.com/demfabris/zflow/releases/latest), open it, and
@@ -52,8 +51,10 @@ v0.1.0 was built before that: its Mac apps are ad-hoc signed. Input sharing work
 but they can't install the optional AWDL helper. Releases built by the signing
 workflow can install it from the app with administrator approval.
 
-Repeat the command to update. It keeps your configuration and paired identities;
-updating the Linux service interrupts an active connection. GNOME updates an
+Repeat the command to update. It keeps your configuration and the computers
+you added; updating the Linux service interrupts an active connection.
+Computers on 0.3.0 and on 0.2.0 or older cannot connect, so update every
+computer. GNOME updates an
 extension from extensions.gnome.org by itself when the Extensions app or
 Extension Manager is installed; a bundled copy changes at your next login. If the extension and the app get too far apart,
 the panel and settings say **Update zflow**. Until the extension is set up,
@@ -63,7 +64,7 @@ the zflow window shows a banner with the step that is left: **Install**,
 Pass options after `bash -s --`:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.2.0 --no-launch
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.3.0 --no-launch
 ```
 
 Omit `--version` for the latest release. `--headless` skips GNOME integration.
@@ -71,7 +72,7 @@ Omit `--version` for the latest release. `--headless` skips GNOME integration.
 The script does not fall back to compiling if a release is unavailable.
 
 You can also download a `.deb` from [Releases](https://github.com/demfabris/zflow/releases)
-and install it with `sudo apt install ./zflow_0.2.0_amd64.deb` (use `arm64` on ARM).
+and install it with `sudo apt install ./zflow_0.3.0_amd64.deb` (use `arm64` on ARM).
 Then open zflow from Applications and follow its banner, or run
 `zflow desktop-agent --install` as yourself for the same setup the installer does.
 See [packaging/README.md](packaging/README.md) for migration from a source/archive
@@ -80,9 +81,8 @@ installation, package removal, and building releases.
 To remove zflow from Linux, run `sudo apt remove zflow` on a `.deb` install
 (`apt purge zflow` also deletes the configuration and device selections). An
 archive install keeps its uninstaller at `/usr/local/lib/zflow/uninstall.sh`;
-run it with `sudo`, adding `--purge` to also delete the configuration, paired
-identities, and the service account. Both close the firewall ports the
-installer opened. The GNOME extension stays in each account until you remove
+run it with `sudo`, adding `--purge` to also delete the configuration, keys,
+and the service account. Both close the firewall port the installer opened. The GNOME extension stays in each account until you remove
 it in Extensions.
 
 ## Mac → Ubuntu setup
@@ -92,50 +92,65 @@ Applications on GNOME and `/Applications/zflow.app` on macOS. Keep the GNOME
 desktop agent running during use; it supplies cursor placement, desktop
 dimensions, and return barriers.
 
-On Ubuntu, open zflow. A fresh install opens **Pair Computer** by itself and
-shows a six-digit setup code; otherwise choose **Pair Computer…**.
+On Ubuntu, open zflow. Computers running zflow on the same network show up
+under **Found on your network**, below the arrangement.
 
-The Mac app lives in the menu bar. While no computer is paired, it opens its
+The Mac app lives in the menu bar. While no computer is added, it opens its
 window at launch; otherwise choose **Open zflow** from the menu-bar icon, or
 open zflow again from Applications. When zflow runs from its disk image or
 another temporary place, it first asks you to drag it into Applications and
-open it from there. Until a computer is paired, **Computers** walks through the
+open it from there. Until a computer is added, **Computers** walks through the
 first one:
 
 1. **Let zflow move the pointer here**, shown until Accessibility is on:
    choose **Allow…** and turn on zflow in the list.
 2. **Add your other computers**: zflow starts looking for computers here, so
    macOS asks for Local Network access now. Choose **Allow**. If access stays
-   off, the page says where to turn it on. Linux computers running zflow
-   nearby are listed by address. Choose **Pair** and type the code Ubuntu
-   shows, or use **Enter an address instead…**. Ubuntu then asks whether to
-   allow your Mac; choose **Allow**. Each side names the other after its host
-   name. A network announcement or a code alone never authorizes a computer.
-   For a computer not listed, the page shows the install command with a copy
-   button.
+   off, the page says where to turn it on. Computers running zflow on the
+   network show up beside the arrangement, each with its name and a mark of
+   four colored squares. Drag one next to a screen to add it. For a computer
+   not listed, the page shows the install command with a copy button.
 
-Once paired, **Computers** shows the arrangement. The receiver's tile is
-placed against the Mac's right edge, so move the pointer off that edge until
-you rearrange the tiles. **Start at login** and **Reduce Wi-Fi lag**, which
-installs the AWDL helper described below, are in **Settings** (⌘,).
+Each computer adds the other: drag the Mac into place on Ubuntu too. Until
+then, the Mac's row for Ubuntu says **Hasn't added this computer yet**, and
+Ubuntu's shelf tile for the Mac says **Added you**.
 
-To pair another computer later, use **+** on **Computers**, or **Pair** beside
-it under **Nearby**. Move through a touching edge with keys and mouse buttons
-released. With **Pause at edges** on in Settings, the pointer has to rest
-against the edge for 250 ms before it crosses, and moving away first cancels.
+Two fresh installs can skip the dragging. For its first 10 minutes with
+someone at the desktop, a fresh install adds a new computer by itself when it
+is the only new one around, after 5 seconds, and says **NAME joined**. If that
+is not your computer, forget it. When two new computers show up at once, or
+two share a name, nothing is added by itself: compare the marks on both
+screens and drag the one you want. An update, or an install over ssh with
+nobody at the desktop, never adds a computer by itself.
+
+Once added, **Computers** shows the arrangement, with the new tile where you
+dropped it. **Start at login** and **Reduce Wi-Fi lag**, which installs the
+AWDL helper described below, are in **Settings** (⌘,).
+
+To add another computer later, drag it in from **Found on your network** on
+**Computers**; the menu-bar menu lists it with **Place…**. For one zflow
+cannot find on the network, such as a computer across Tailscale, use **+**
+(**Add a Computer by Address**) and type its IP address: it joins the shelf
+once it answers. A computer that was reset or reinstalled shows up with a new
+key and its old row says **Reset or reinstalled. Drag its new tile onto its
+old one.** Doing that keeps its name, settings and place.
+
+Move through a touching edge with keys and mouse buttons released. With
+**Pause at edges** on in Settings, the pointer has to rest against the edge
+for 250 ms before it crosses, and moving away first cancels.
 Cross back from Ubuntu to return. **Ctrl+Cmd+Backspace** returns input and
 pauses sharing. Turn **Sharing** back on from the menu-bar icon when you are
 ready. Later problems, such as Accessibility or Local Network access being
 turned off, show as banners on **Computers**, and **Settings** lists each
 permission with an **Allow…** button.
 
-Ubuntu can control the Mac over the same pairing. On Ubuntu, press
+Ubuntu can control the Mac over the same connection. On Ubuntu, press
 Ctrl+Super+F12, or push the pointer through the edge that touches the Mac's
 tile; Ctrl+Super+Backspace brings input back. The Mac needs Accessibility for
 this too. In the Mac's window, each paired computer has a page in the sidebar
 with three rows:
 
-- **NAME can control this Mac**, on for a new pairing. Turning it off ends
+- **NAME can control this Mac**, on for a newly added computer. Turning it off ends
   control at once.
 - **Keys from NAME**: how that computer's keys act on the Mac. See Keyboard
   modes below.
@@ -143,8 +158,9 @@ with three rows:
 
 While Ubuntu controls the Mac, the Mac's own keyboard and trackpad still work,
 and the Mac starts no crossing of its own. The Mac listens on UDP port 43119
-for computers that connect first. If macOS asks whether zflow may accept
-incoming connections, choose **Allow**; if it can't listen, a health row says
+for computers that connect first, also while sharing is paused, so the
+others still find it and never hear that it has not added them. If macOS
+asks whether zflow may accept incoming connections, choose **Allow**; if it can't listen, a health row says
 so, the Mac tries again every 2 seconds, and Ubuntu still controls the Mac
 over the connection the Mac opens.
 
@@ -189,7 +205,7 @@ it finds one of them while a computer uses another mode.
 
 ## Settings and configuration
 
-The Mac window exposes computer pairing and arrangement, each computer's
+The Mac window exposes finding, adding and arranging computers, each computer's
 settings, **Reduce Wi-Fi lag**, **Start at login**, banners for problems with
 their fixes, and the permissions zflow needs. Network, pointer, scrolling, raw
 touch, and playout settings live in TOML, which **zflow › Open Configuration…**
@@ -211,17 +227,19 @@ comments. External edits reload automatically; invalid edits display an error
 while the last valid configuration stays in use. Conflicting writes fail instead
 of overwriting an external edit.
 
-The GNOME window exposes sharing, pairing, keyboard modes, forgetting
-computers, **Share Clipboard**, and **Start at Login**. Each paired computer
+The GNOME window exposes sharing, the arrangement with the computers found
+on the network, **Add by Address…**, keyboard modes, forgetting computers,
+**Share Clipboard**, and **Start at Login**. Forget asks nothing: the computer
+goes back on the shelf. Each paired computer
 shows as Connected, Connecting, or why it cannot be reached, such as
 **Different zflow version. Update both computers.** or **Reset or
-reinstalled. Pair it again.** Only those two make the status say
+reinstalled. Drag its new tile onto its old one.** Only those two make the status say
 **Needs attention**; a computer that is asleep or away is a warning, and
 zflow keeps trying. A **Retry** button tries again without waiting. Its
 panel menu shows
 the current sender or receiver and a sharing switch. The extension
 preferences show the same GTK settings. Closing either window leaves the
-desktop agent running. Pairing closes when its dialog closes.
+desktop agent running.
 
 With **Share Clipboard** on at both ends, the clipboard goes with the
 pointer: the computer the pointer leaves sends its text, or one PNG image,
@@ -233,7 +251,9 @@ password manager marks as concealed or transient stays on the Mac.
 
 Linux stores the sharing switch in `[daemon].sharing`; pausing closes active
 input sessions and blocks sending and receiving, including pre-login input,
-until you resume. Paired identities and permissions stay unchanged. Set
+until you resume. The service still answers hellos and keeps every added
+computer's key, so the others see it as paused rather than as a stranger.
+Added computers and their permissions stay unchanged. Set
 `sharing = true` in that section and restart the service to resume from the CLI.
 
 Advanced Linux settings remain in
@@ -254,30 +274,31 @@ the shared layout in `zflow.toml.shared-layout.toml` and its own view of it in
 checked again at each crossing. Moving, resizing, or removing a tile stops the
 old arrangement before the updated layout arms.
 
-## Discover nearby computers
+## Find computers
 
-Pairing lists receivers advertised on the local network. Discovery does not
-verify identity; only the setup code shown on the receiver does. Manual
-addresses remain available. The Linux daemon advertises itself and also
-browses. While sharing is on, it keeps a connection open to each paired
-computer that mDNS shows listening at its saved address, and reconnects on the
-Mac app's schedule, so the first crossing does not wait for a handshake. The
-Mac advertises its input port the same way while it listens for paired
-computers, so the daemon keeps a connection to it too. When both computers
-dial at once, both keep the same one. When a crossing or the chord finds no
-connection up, the daemon dials the saved addresses and nearby addresses too,
-with that computer's pinned key, so a changed address does not break the link.
-Pairing saves every address the other computer has, VPN ones such as
-Tailscale's included, so paired computers still reach each other away from the
-network they paired on. A nearby computer running another zflow version stays
-in the list and says to update it; one that shares an address with a paired
-computer is left out. macOS asks for Local Network access the first time the
-Mac browses, so the Mac waits for the first-pairing page or **+** on
-**Computers**. Once a computer is paired, it browses from launch. Browsing then
-continues while the Mac app is running, even with its window closed.
+Each computer advertises its input port and its name over mDNS and browses
+for others. A record is never trusted: the name only labels a tile on the
+shelf. zflow says hello to each zflow computer it finds, on the same UDP port
+43119, and the hello proves which key answered. The computer then shows on the
+shelf with its name, system, version and mark, or as **Different zflow
+version** if it cannot be added. Adding one is always a person's choice,
+apart from a fresh install's first 10 minutes described above.
 
-If the list stays empty, check zflow under **System Settings → Privacy & Security
-→ Local Network**, or use a manual address. Terminal tools have different
+zflow finds an added computer by its key, not its address, so a new DHCP
+lease or another network reconnects on its own once the computer answers.
+It saves the last addresses each computer used, so a computer across a VPN
+such as Tailscale is still reached after it was added by address. While
+sharing is on, each computer keeps a connection open to every added computer
+it found, so the first crossing does not wait for a handshake, and when both
+dial at once both keep the same one. When a crossing or the chord finds no
+connection up, it dials the saved addresses too, with that computer's pinned
+key. macOS asks for Local Network access the first time the Mac looks for
+computers, so the Mac waits for the first-computer page. Once a computer is
+added, it looks from launch, and keeps looking while the app runs, even with
+its window closed.
+
+If nothing shows up, check zflow under **System Settings → Privacy & Security
+→ Local Network**, or add the computer by address. Terminal tools have different
 permission rules from app bundles. See [Apple's local-network guidance](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
 
 ## Install and select devices
@@ -334,30 +355,27 @@ returns ownership to the local machine. You can replace either chord during
 setup by repeating `--activation-key` or `--escape-key` with evdev names such
 as `KEY_LEFTCTRL`.
 
-## Pair two machines
+## Add computers from the command line
 
-Pairing uses a temporary listener on UDP port 43120. The normal input service
-listens on UDP port 43119.
-
-On the first machine, which prints a six-digit setup code:
+On a Linux computer without a desktop, list the zflow computers the service
+found:
 
 ```sh
-sudo zflow pair listen laptop
+sudo zflow nearby
 ```
 
-On the second machine, connect to the first machine's LAN address and type
-that code at the prompt (or pass `--code`):
+Each line shows a name, its mark, its system and version, and whether it can
+be added. `--add 192.0.2.10` says hello to an address mDNS cannot reach first.
+Add one by name, or by mark when two share a name:
 
 ```sh
-sudo zflow pair connect desk 192.0.2.10:43120
+sudo zflow trust desk
 ```
 
-The code never crosses the network: both sides prove they know it through
-SPAKE2, so a wrong code writes no trust record. The listener then asks whether
-to allow the connecting computer (pass `--yes` to skip the question in
-scripts). It accepts three wrong codes, then stops and needs a new code.
+That trusts it as dragging its tile would. The other computer still has to
+add this one. The service listens on UDP port 43119 for both hellos and input.
 
-Normal pairing never grants pre-login input. Grant that permission separately
+Adding a computer never grants pre-login input. Grant that permission separately
 only if you need input at a greeter or lock screen:
 
 ```sh

@@ -20,25 +20,22 @@ pub(super) enum BrowserStatus {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct NearbyRecord {
     pub instance: String,
+    /// The name its record gives, which versions before arrange to pair
+    /// leave out. Anyone can claim any name, so it only labels the row.
+    pub name: Option<String>,
     pub addresses: Vec<SocketAddr>,
     pub compatible: bool,
-    /// Where its pairing listener waits. Computers advertise their input
-    /// port, and pairing listens on another.
-    pub pair_address: Option<SocketAddr>,
 }
 
 impl NearbyRecord {
     fn from_candidate(candidate: UntrustedCandidate) -> Option<Self> {
-        let addresses = candidate.socket_addresses().to_vec();
         Some(Self {
             instance: candidate.ephemeral_instance_id()?.to_string(),
-            pair_address: addresses
-                .first()
-                .map(|address| SocketAddr::new(address.ip(), crate::pairing::DEFAULT_PAIRING_PORT)),
-            addresses,
+            name: candidate.name().map(str::to_owned),
+            addresses: candidate.socket_addresses().to_vec(),
             compatible: candidate.is_compatible(),
         })
     }
@@ -48,6 +45,8 @@ impl NearbyRecord {
 pub(super) struct NearbySnapshot {
     pub status: BrowserStatus,
     pub records: BTreeMap<String, NearbyRecord>,
+    /// A new record was dropped because there were too many.
+    pub turned_away: bool,
 }
 
 impl NearbySnapshot {
@@ -63,6 +62,8 @@ impl NearbySnapshot {
         }
         if self.records.len() < MAX_NEARBY || self.records.contains_key(&record.instance) {
             self.records.insert(record.instance.clone(), record);
+        } else {
+            self.turned_away = true;
         }
     }
 
@@ -214,13 +215,13 @@ mod tests {
     fn record(index: usize) -> NearbyRecord {
         NearbyRecord {
             instance: format!("zf-{index:032x}"),
+            name: None,
             addresses: vec![
                 format!("192.0.2.{}:43119", index % 250 + 1)
                     .parse()
                     .unwrap(),
             ],
             compatible: true,
-            pair_address: None,
         }
     }
 
@@ -242,10 +243,15 @@ mod tests {
     #[test]
     fn records_are_bounded_but_existing_instances_can_update() {
         let mut snapshot = NearbySnapshot::default();
-        for index in 0..100 {
+        for index in 0..MAX_NEARBY {
+            snapshot.insert(record(index), &BTreeSet::new());
+        }
+        assert!(!snapshot.turned_away);
+        for index in MAX_NEARBY..100 {
             snapshot.insert(record(index), &BTreeSet::new());
         }
         assert_eq!(snapshot.records.len(), MAX_NEARBY);
+        assert!(snapshot.turned_away, "the app hears that some were dropped");
         let mut changed = record(0);
         changed.addresses = vec!["192.0.2.250:43119".parse().unwrap()];
         snapshot.insert(changed.clone(), &BTreeSet::new());
@@ -312,17 +318,18 @@ mod tests {
                 &format!("{instance}.local."),
                 "192.0.2.1",
                 43119,
-                &[("v", version.as_str()), ("cap", "keyboard,pointer")][..],
+                &[
+                    ("v", version.as_str()),
+                    ("cap", "keyboard,pointer"),
+                    ("name", "desk"),
+                ][..],
             )
             .unwrap()
             .as_resolved_service();
             let candidate = crate::discovery::parse_resolved_service(&service).unwrap();
             let record = NearbyRecord::from_candidate(candidate).unwrap();
             assert_eq!(record.compatible, compatible);
-            assert_eq!(
-                record.pair_address,
-                Some("192.0.2.1:43120".parse().unwrap())
-            );
+            assert_eq!(record.name.as_deref(), Some("desk"));
         }
     }
 }

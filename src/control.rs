@@ -1,13 +1,12 @@
-use std::{collections::BTreeMap, io};
+use std::{collections::BTreeMap, io, net::SocketAddr};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    config::{PeerConfig, PeerPermissions},
-    core::KeyboardMode,
-    metrics::SessionMetricsSnapshot,
+    config::PeerPermissions, core::KeyboardMode, metrics::SessionMetricsSnapshot,
+    neighbors::Unplaced, pairing_window::View as PairingWindow,
 };
 
 pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
@@ -22,10 +21,6 @@ pub enum Request {
     },
     Local,
     ListPeers,
-    AddPeer {
-        peer: String,
-        record: PeerConfig,
-    },
     RevokePeer {
         peer: String,
     },
@@ -37,6 +32,16 @@ pub enum Request {
         peer: String,
         keyboard: KeyboardMode,
     },
+    /// Lists the computers found around this one that it does not trust,
+    /// after saying hello to `add` if given.
+    Nearby {
+        add: Option<SocketAddr>,
+    },
+    /// Trusts the found computer with this name or key mark, as dropping
+    /// its tile on the board does.
+    Trust {
+        computer: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +51,15 @@ pub enum Response {
     Status(Box<DaemonStatus>),
     Peers {
         peers: BTreeMap<String, PeerPermissions>,
+    },
+    Nearby {
+        computers: Vec<Unplaced>,
+        pairing_window: PairingWindow,
+    },
+    /// The name the computer was saved under, and its key mark.
+    Trusted {
+        name: String,
+        mark: String,
     },
     Error {
         message: String,

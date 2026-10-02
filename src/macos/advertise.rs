@@ -1,6 +1,7 @@
-//! Tells computers on the local network where this Mac takes input, as the
-//! Linux daemon does, so a paired computer finds it after its address
-//! changes. The record carries no Touch: the Mac cannot post contacts.
+//! Tells computers on the local network where this Mac takes input and
+//! what it is called, as the Linux daemon does, so a paired computer finds
+//! it after its address changes and others can show it before they trust
+//! it. The record carries no Touch: the Mac cannot post contacts.
 
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use tokio::sync::oneshot;
 use crate::{
     core::InputCapability,
     discovery::{Advertisement, Discovery, DiscoveryError},
+    hello::local_name,
 };
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -56,14 +58,12 @@ impl Drop for Advertiser {
 }
 
 fn advertisement(port: u16) -> Result<Advertisement, DiscoveryError> {
-    Advertisement::new(
-        port,
-        [
-            InputCapability::Keyboard,
-            InputCapability::Pointer,
-            InputCapability::Scroll,
-        ],
-    )
+    let capabilities = [
+        InputCapability::Keyboard,
+        InputCapability::Pointer,
+        InputCapability::Scroll,
+    ];
+    Ok(Advertisement::new(port, capabilities)?.with_name(&local_name()))
 }
 
 async fn advertise(port: u16, stop: oneshot::Receiver<()>) {

@@ -20,13 +20,11 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
     tokio::spawn(async move {
         let _guard = guard;
         let slots = Arc::new(Semaphore::new(8));
-        let pairing_slot = Arc::new(Semaphore::new(1));
         while let Ok((mut stream, _)) = listener.accept().await {
             let Ok(permit) = slots.clone().try_acquire_owned() else {
                 continue;
             };
             let shared = shared.clone();
-            let pairing_slot = pairing_slot.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let result = async {
@@ -37,28 +35,6 @@ pub(super) fn start(shared: Arc<Shared>) -> Result<()> {
                     match request {
                         crate::peer_view::Request::Desktop {} => {
                             super::desktop::serve(shared.clone(), stream, daemon_uid).await?;
-                        }
-                        crate::peer_view::Request::Pair { remote, code } => {
-                            let result = async {
-                                let _slot = pairing_slot
-                                    .try_acquire_owned()
-                                    .context("Another pairing is already open")?;
-                                pair(&mut stream, &shared, daemon_uid, remote, code).await
-                            }
-                            .await;
-                            if let Err(error) = result {
-                                let response = crate::peer_view::PairingEvent::Error {
-                                    message: format!("{error:#}"),
-                                };
-                                let _ = tokio::time::timeout(
-                                    Duration::from_secs(1),
-                                    write_message(&mut stream, &response),
-                                )
-                                .await;
-                            }
-                        }
-                        crate::peer_view::Request::PairRespond { .. } => {
-                            bail!("No pairing is waiting for an answer")
                         }
                         request => {
                             let reply = desktop_command(&mut stream, &shared, daemon_uid, request)
@@ -108,11 +84,16 @@ async fn desktop_command(
         shared.retry_links().await;
         return Ok(DesktopReply::Ack);
     }
+    if let Request::AddAddress { address } = request {
+        authorize_peer(stream, daemon_uid, shared.active_uid())?;
+        shared.add_address(address)?;
+        return Ok(DesktopReply::Ack);
+    }
     let _mutation = shared.config_mutation.lock().await;
     let uid = authorize_peer(stream, daemon_uid, shared.active_uid())?;
     let mut config = shared.config.read().await.clone();
     match request {
-        Request::Status {} => Ok(DesktopReply::Status(DesktopStatus {
+        Request::Status {} => Ok(DesktopReply::Status(Box::new(DesktopStatus {
             receiving_from: shared
                 .inbound_owner
                 .lock()
@@ -128,8 +109,12 @@ async fn desktop_command(
             connected: shared.sessions.lock().await.keys().cloned().collect(),
             links: shared.link_status().await,
             layout: shared.layout_status().await,
+            pairing_window: shared.window().view(tokio::time::Instant::now()),
+            own_mark: Some(crate::neighbors::mark(shared.identity.spki())),
+            unplaced: shared.unplaced(&config),
+            notices: shared.notices(),
             ..DesktopStatus::from_config(&config)
-        })),
+        }))),
         Request::SetSharing { enabled } => {
             let was = config.daemon.sharing;
             config.daemon.sharing = enabled;
@@ -185,91 +170,17 @@ async fn desktop_command(
             shared.move_tile(&id, x, y, tolerance).await?;
             Ok(DesktopReply::Ack)
         }
+        Request::Place {
+            id,
+            x,
+            y,
+            tolerance,
+        } => {
+            let spot = super::arrange::Spot { x, y, tolerance };
+            let name = shared.trust(config, &id, Some(spot)).await?;
+            tracing::info!(peer = %name, uid, "computer placed and trusted");
+            Ok(DesktopReply::Ack)
+        }
         _ => bail!("Unsupported desktop operation"),
     }
-}
-
-/// A listener here waits up to this long for the other computer to be set up.
-const LISTEN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-async fn pair(
-    stream: &mut tokio::net::UnixStream,
-    shared: &Arc<Shared>,
-    daemon_uid: u32,
-    remote: Option<std::net::SocketAddr>,
-    code: Option<String>,
-) -> Result<()> {
-    use crate::{
-        pairing::SetupCode,
-        peer_view::{PairingEvent, Request},
-    };
-    let input_port = shared.config.read().await.transport.listen.port();
-    let (code, limit) = match remote {
-        Some(_) => (
-            SetupCode::parse(code.as_deref().unwrap_or_default())?,
-            CONNECT_TIMEOUT,
-        ),
-        None => {
-            let code = SetupCode::generate()?;
-            write_message(
-                stream,
-                &PairingEvent::Listening {
-                    code: code.to_string(),
-                },
-            )
-            .await?;
-            (code, LISTEN_TIMEOUT)
-        }
-    };
-    let mut session = tokio::select! {
-        session = tokio::time::timeout(limit, crate::pairing::begin(&shared.identity, remote, input_port, &code)) => {
-            session.context("Pairing expired; try again")??
-        }
-        _ = read_message::<_, Request>(stream) => bail!("Pairing cancelled"),
-    };
-    if remote.is_some() {
-        write_message(stream, &PairingEvent::Approving).await?;
-        tokio::select! {
-            approved = session.approved() => approved?,
-            _ = read_message::<_, Request>(stream) => bail!("Pairing cancelled"),
-        }
-    } else {
-        // Knowing the code is not enough; the person at this computer allows it.
-        write_message(
-            stream,
-            &PairingEvent::Confirm {
-                name: session.display_name(),
-                address: session.peer_ip().to_string(),
-            },
-        )
-        .await?;
-        let answer = tokio::time::timeout(
-            crate::pairing::APPROVAL_TIMEOUT,
-            read_message::<_, Request>(stream),
-        )
-        .await;
-        if !matches!(answer, Ok(Ok(Request::PairRespond { allow: true }))) {
-            session.finish(false).await;
-            bail!("Pairing declined");
-        }
-    }
-    let saved = async {
-        let _mutation = shared.config_mutation.lock().await;
-        authorize_peer(stream, daemon_uid, shared.active_uid())?;
-        let mut config = shared.config.read().await.clone();
-        let name = crate::pairing::add_paired_peer(&mut config, session.observation())?;
-        shared.apply_config_locked(config, true).await?;
-        Ok::<_, anyhow::Error>(name)
-    }
-    .await;
-    // The other computer saves this one only after hearing that we kept it.
-    session.finish(saved.is_ok()).await;
-    let name = saved?;
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        write_message(stream, &PairingEvent::Paired { name }),
-    )
-    .await??;
-    Ok(())
 }

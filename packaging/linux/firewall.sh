@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Open zflow's UDP ports in an active ufw or a running firewalld, or close them.
+# Open zflow's UDP port in an active ufw or a running firewalld, or close it.
 # It never turns a firewall on, and closing removes only the rules it added.
 # A firewall that refuses a change gets a warning; installation continues.
 set -Eeuo pipefail
@@ -7,7 +7,7 @@ IFS=$'\n\t'
 
 readonly UFW_PROFILE="/etc/ufw/applications.d/zflow"
 readonly FIREWALLD_SERVICE="/etc/firewalld/services/zflow.xml"
-readonly PORTS="UDP ports 43119 (input) and 43120 (pairing)"
+readonly PORTS="UDP port 43119"
 
 die() {
     printf 'zflow firewall: %s\n' "$*" >&2
@@ -26,14 +26,14 @@ firewalld_running() {
     command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1
 }
 
-# Only a first install opens the ports. After that the admin owns the rules,
+# Only a first install opens the port. After that the admin owns the rules,
 # so an upgrade neither re-adds a removed rule nor reloads firewalld, which
 # would drop its runtime-only rules.
 open_ports() {
     if ufw_active && [[ ! -e "$UFW_PROFILE" ]]; then
         [[ ! -L "$UFW_PROFILE" ]] || die "refusing symlink: $UFW_PROFILE"
         install -d -m 0755 "${UFW_PROFILE%/*}"
-        printf '[zflow]\ntitle=zflow\ndescription=Keyboard and pointer sharing between paired computers\nports=43119/udp|43120/udp\n' \
+        printf '[zflow]\ntitle=zflow\ndescription=Keyboard and pointer sharing between paired computers\nports=43119/udp\n' \
             > "$UFW_PROFILE"
         chmod 0644 "$UFW_PROFILE"
         if ufw allow zflow >/dev/null; then
@@ -51,7 +51,6 @@ open_ports() {
   <short>zflow</short>
   <description>Keyboard and pointer sharing between paired computers.</description>
   <port protocol="udp" port="43119"/>
-  <port protocol="udp" port="43120"/>
 </service>
 XML
         chmod 0644 "$FIREWALLD_SERVICE"

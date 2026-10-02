@@ -1,6 +1,9 @@
-//! Desktop peer metadata, setup-code pairing, and desktop session attachment.
+//! Desktop peer metadata, placing found computers, and desktop session attachment.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
@@ -11,9 +14,14 @@ use crate::{
     config::{Config, PeerConfig},
     core::KeyboardMode,
     desktop::{DesktopRequest, DesktopResponse, Edge, FRACTION_MAX, Point},
+    hello::Notice,
+    neighbors::Unplaced,
+    pairing_window::View as PairingWindow,
 };
 
 pub const SOCKET_PATH: &str = "/run/zflow-gui/peers.sock";
+/// The port zflow takes input on unless its configuration says otherwise.
+pub const DEFAULT_INPUT_PORT: u16 = 43119;
 /// The largest message between the service and the desktop agent: a whole
 /// clip in base64, plus room for the JSON around it. Every other local
 /// stream keeps [`crate::control::MAX_CONTROL_MESSAGE`].
@@ -47,16 +55,6 @@ pub enum Request {
         terminal: bool,
     },
     Desktop {},
-    /// Listens and shows a fresh setup code, or connects to `remote` with the
-    /// code shown on it.
-    Pair {
-        remote: Option<std::net::SocketAddr>,
-        code: Option<String>,
-    },
-    /// Answers [`PairingEvent::Confirm`] on the same connection.
-    PairRespond {
-        allow: bool,
-    },
     SetSwitching {
         pause_at_edges: bool,
     },
@@ -82,6 +80,22 @@ pub enum Request {
     /// Tries each paired computer that is not connected again now, instead
     /// of after its link's wait.
     Retry {},
+    /// Trusts a computer from [`DesktopStatus::unplaced`] by putting its
+    /// tile on the board. `id` is its `key:` id; `x`, `y` is where the top
+    /// left corner of its new tile lands, in layout units, as for
+    /// [`Request::MoveTile`]. Dropped on the tile of a saved computer with
+    /// its name, it takes that computer's place with its new key.
+    Place {
+        id: String,
+        x: i32,
+        y: i32,
+        tolerance: u32,
+    },
+    /// Says hello to an address mDNS cannot reach, such as one on
+    /// Tailscale. What answers shows up in [`DesktopStatus::unplaced`].
+    AddAddress {
+        address: SocketAddr,
+    },
 }
 
 /// What the service asks the desktop agent to do through GNOME Shell. Only
@@ -244,29 +258,6 @@ impl AgentReply {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PairingEvent {
-    /// The setup code this computer shows while it waits.
-    Listening {
-        code: String,
-    },
-    /// A computer proved the code; the person here allows it or not.
-    Confirm {
-        name: String,
-        address: String,
-    },
-    /// Connected with the code; the other computer's user has to allow it.
-    Approving,
-    /// Both computers proved the code and this one saved the other as `name`.
-    Paired {
-        name: String,
-    },
-    Error {
-        message: String,
-    },
-}
-
 /// Applies a settings change to a paired computer. Any change also lets this
 /// computer send to it, which brings a record saved by one-way pairing up to
 /// two-way. Pre-login input stays a root-only setting.
@@ -337,6 +328,18 @@ pub struct DesktopStatus {
     /// it was paired. A service from before live links leaves it out.
     #[serde(default)]
     pub links: BTreeMap<String, LinkStatus>,
+    /// The fresh install's one-shot window for taking a computer by itself.
+    #[serde(default)]
+    pub pairing_window: PairingWindow,
+    /// This computer's key mark.
+    #[serde(default)]
+    pub own_mark: Option<String>,
+    /// Computers found around this one that are not trusted here.
+    #[serde(default)]
+    pub unplaced: Vec<Unplaced>,
+    /// Computers that joined lately, for a window to tell people once.
+    #[serde(default)]
+    pub notices: Vec<Notice>,
 }
 
 /// A link to a paired computer that has no session yet.
@@ -370,14 +373,35 @@ impl DesktopStatus {
             layout: None,
             share_clipboard: config.clipboard.share,
             links: BTreeMap::new(),
+            pairing_window: PairingWindow::default(),
+            own_mark: None,
+            unplaced: Vec::new(),
+            notices: Vec::new(),
         }
     }
+}
+
+/// An address a person typed: an IP address, with a port or without, which
+/// then is [`DEFAULT_INPUT_PORT`].
+pub fn parse_address(input: &str) -> anyhow::Result<SocketAddr> {
+    use anyhow::Context;
+    let input = input.trim();
+    if let Ok(address) = input.parse::<SocketAddr>() {
+        return Ok(address);
+    }
+    let ip = input
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(input)
+        .parse::<IpAddr>()
+        .with_context(|| format!("{input:?} is not an IP address"))?;
+    Ok(SocketAddr::new(ip, DEFAULT_INPUT_PORT))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopReply {
-    Status(DesktopStatus),
+    Status(Box<DesktopStatus>),
     Ack,
     Error { message: String },
 }
@@ -398,7 +422,7 @@ pub async fn request(request: &Request) -> anyhow::Result<DesktopReply> {
 #[cfg(target_os = "linux")]
 pub async fn status() -> anyhow::Result<DesktopStatus> {
     match request(&Request::Status {}).await? {
-        DesktopReply::Status(status) => Ok(status),
+        DesktopReply::Status(status) => Ok(*status),
         _ => anyhow::bail!("Unexpected response; update the zflow service"),
     }
 }
@@ -417,8 +441,9 @@ mod tests {
             r#"{"command":"reload_config"}"#,
             r#"{"command":"status","path":"/etc/zflow"}"#,
             r#"{"command":"snapshot"}"#,
-            r#"{"command":"pair","remote":null,"identity":"attacker"}"#,
-            r#"{"command":"pair","remote":null,"code":null,"name":"desk","permissions":{"inject_prelogin":true}}"#,
+            // Code pairing is gone.
+            r#"{"command":"pair","remote":null,"code":null}"#,
+            r#"{"command":"pair_respond","allow":true}"#,
             r#"{"command":"set_keyboard","name":"desk","mode":"mac"}"#,
             r#"{"command":"set_peer","name":"desk","keyboard":"dvorak"}"#,
             r#"{"command":"set_peer","name":"desk","keyboard":"mac","permissions":{"inject_prelogin":true}}"#,
@@ -440,6 +465,13 @@ mod tests {
             r#"{"command":"set_clipboard","share":"yes"}"#,
             r#"{"command":"set_clipboard","share":true,"peer":"desk"}"#,
             r#"{"command":"retry","peer":"desk"}"#,
+            // Placing names a found computer and a spot, never a name,
+            // permissions or a key to trust.
+            r#"{"command":"place","id":"key:ab","x":1,"y":2,"tolerance":8,"name":"desk"}"#,
+            r#"{"command":"place","id":"key:ab","x":1,"y":2,"tolerance":8,"spki":"00"}"#,
+            r#"{"command":"place","id":"key:ab","x":1,"y":2}"#,
+            r#"{"command":"add_address","address":"100.64.0.7"}"#,
+            r#"{"command":"add_address","address":"100.64.0.7:43119","trust":true}"#,
             // Only the service asks the agent for these, on its own stream.
             r#"{"command":"read_clipboard"}"#,
             r#"{"command":"write_clipboard","kind":"text","data":"aGk="}"#,
@@ -451,6 +483,30 @@ mod tests {
             serde_json::from_str(r#"{"command":"set_clipboard","share":true}"#).unwrap(),
             Request::SetClipboard { share: true }
         ));
+        assert!(matches!(
+            serde_json::from_str(
+                r#"{"command":"place","id":"key:ab","x":-1920,"y":0,"tolerance":150}"#
+            )
+            .unwrap(),
+            Request::Place { x: -1920, .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str(r#"{"command":"add_address","address":"[fd7a:115c::7]:43119"}"#)
+                .unwrap(),
+            Request::AddAddress { .. }
+        ));
+    }
+
+    #[test]
+    fn typed_addresses_take_the_input_port_when_they_name_none() {
+        let parse = |input| parse_address(input).unwrap().to_string();
+        assert_eq!(parse(" 100.64.0.7 "), "100.64.0.7:43119");
+        assert_eq!(parse("100.64.0.7:5000"), "100.64.0.7:5000");
+        assert_eq!(parse("fd7a:115c::7"), "[fd7a:115c::7]:43119");
+        assert_eq!(parse("[fd7a:115c::7]"), "[fd7a:115c::7]:43119");
+        assert_eq!(parse("[fd7a:115c::7]:5000"), "[fd7a:115c::7]:5000");
+        assert!(parse_address("ubuntu.local").is_err());
+        assert!(parse_address("").is_err());
     }
 
     #[test]
@@ -642,24 +698,35 @@ mod tests {
         config.transport.discovery = false;
         config.clipboard.share = true;
         let value = serde_json::to_value(DesktopStatus::from_config(&config)).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 12);
+        assert_eq!(value.as_object().unwrap().len(), 16);
         assert!(value.get("peers").is_some());
         assert_eq!(value["discovery"], false);
         assert_eq!(value["share_clipboard"], true);
+        assert_eq!(value["pairing_window"]["state"], "never");
         assert!(!value.to_string().contains("identity-location"));
-        // A service from before clipboard sharing or live links leaves them out.
+        // A service from before clipboard sharing, live links or the shelf
+        // leaves them out.
         let mut old = value;
-        old.as_object_mut().unwrap().remove("share_clipboard");
-        old.as_object_mut().unwrap().remove("links");
+        for field in [
+            "share_clipboard",
+            "links",
+            "pairing_window",
+            "own_mark",
+            "unplaced",
+            "notices",
+        ] {
+            old.as_object_mut().unwrap().remove(field);
+        }
         let old = serde_json::from_value::<DesktopStatus>(old).unwrap();
         assert!(!old.share_clipboard && old.links.is_empty());
+        assert!(old.unplaced.is_empty() && old.own_mark.is_none());
         let down = LinkStatus::Unreachable {
-            reason: "Reset or reinstalled. Pair it again.".into(),
+            reason: "Reset or reinstalled. Drag its new tile onto its old one.".into(),
             needs_fix: true,
         };
         assert_eq!(
             serde_json::to_string(&down).unwrap(),
-            r#"{"state":"unreachable","reason":"Reset or reinstalled. Pair it again.","needs_fix":true}"#
+            r#"{"state":"unreachable","reason":"Reset or reinstalled. Drag its new tile onto its old one.","needs_fix":true}"#
         );
     }
 

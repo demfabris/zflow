@@ -2,8 +2,6 @@
 use super::{
     api::{self, Action, Health, Level, Peer, PeerState, Request, Shortcut, Status},
     desktop::DesktopReceiver,
-    nearby::{BrowserStatus, NearbyBrowser},
-    pairing::Pairing,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -15,7 +13,7 @@ pub const BUS: &str = "io.zflow.Desktop";
 const PATH: &str = "/io/zflow/Desktop";
 /// packaging/gnome-extension/client.js mirrors this. Raise both when the agent
 /// and the extension stop understanding each other.
-pub(super) const API: u32 = 2;
+pub(super) const API: u32 = 3;
 const AUTOSTART: &str = "autostart/io.zflow.desktop-agent.desktop";
 /// Where the package keeps the service's settings.
 const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";
@@ -23,8 +21,6 @@ const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";
 #[derive(Default)]
 pub(super) struct State {
     pub receiver: DesktopReceiver,
-    pub nearby: NearbyBrowser,
-    pub pairing: Pairing,
 }
 
 pub(super) struct Service(pub Arc<Mutex<State>>);
@@ -94,27 +90,6 @@ impl Service {
             Request::SetClipboard { share } => {
                 crate::peer_view::request(&DaemonRequest::SetClipboard { share }).await?;
             }
-            Request::Pair { address, code } => {
-                let remote = address
-                    .as_deref()
-                    .map(crate::pairing::parse_pairing_address)
-                    .transpose()?;
-                let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-                ensure!(!state.pairing.active(), "Pairing is already open");
-                state.pairing.start(PathBuf::new(), remote, code)?;
-            }
-            Request::PairRespond { allow } => self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pairing
-                .respond(allow)?,
-            Request::PairCancel => self
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pairing
-                .cancel(),
             Request::OpenSettings => {
                 let mut child = tokio::process::Command::new(std::env::current_exe()?)
                     .arg("settings")
@@ -145,6 +120,25 @@ impl Service {
             Request::Retry => {
                 crate::peer_view::request(&DaemonRequest::Retry {}).await?;
             }
+            Request::Place {
+                id,
+                x,
+                y,
+                tolerance,
+            } => {
+                crate::peer_view::request(&DaemonRequest::Place {
+                    id,
+                    x,
+                    y,
+                    tolerance,
+                })
+                .await?;
+            }
+            Request::AddAddress { address } => {
+                let address = crate::peer_view::parse_address(&address)?;
+                crate::peer_view::request(&DaemonRequest::AddAddress { address }).await?;
+            }
+            // The service looks for computers whenever discovery is on.
             Request::Reload
             | Request::SetAwdl { .. }
             | Request::HelperReady { .. }
@@ -162,7 +156,6 @@ fn snapshot(
     daemon: Result<crate::peer_view::DesktopStatus>,
     state: &State,
 ) -> Result<api::Snapshot<()>> {
-    let nearby = state.nearby.snapshot();
     let mut health = Vec::new();
     let (sharing, peers, shortcuts, layout) = match &daemon {
         Ok(daemon) => {
@@ -204,14 +197,6 @@ fn snapshot(
             (None, Vec::new(), Vec::new(), None)
         }
     };
-    if let BrowserStatus::Failed(error) = nearby.status {
-        health.push(Health::new(
-            "discovery",
-            Level::Warning,
-            "Nearby computers",
-            error,
-        ));
-    }
     let connected = peers.iter().any(|peer| {
         matches!(
             peer.state,
@@ -219,19 +204,28 @@ fn snapshot(
         )
     });
     let checking = !connected && peers.iter().any(|peer| peer.state == PeerState::Connecting);
+    let daemon = daemon.ok();
     Ok(api::Snapshot {
         status: Status::new(sharing, &peers, &health, checking),
         sharing,
         health,
+        pairing_window: daemon
+            .as_ref()
+            .map(|daemon| daemon.pairing_window.clone())
+            .unwrap_or_default(),
         layout,
+        own_mark: daemon.as_ref().and_then(|daemon| daemon.own_mark.clone()),
+        unplaced: daemon
+            .as_ref()
+            .map(|daemon| daemon.unplaced.clone())
+            .unwrap_or_default(),
         peers,
-        pairing: state.pairing.snapshot(),
-        nearby: nearby.records.into_values().collect(),
-        pause_at_edges: daemon.as_ref().ok().map(|daemon| daemon.pause_at_edges),
+        pause_at_edges: daemon.as_ref().map(|daemon| daemon.pause_at_edges),
         shortcuts,
-        share_clipboard: daemon.as_ref().ok().map(|daemon| daemon.share_clipboard),
+        share_clipboard: daemon.as_ref().map(|daemon| daemon.share_clipboard),
         autostart: Some(autostart_enabled()?),
         config_path: CONFIG_PATH.into(),
+        notices: daemon.map(|daemon| daemon.notices).unwrap_or_default(),
         platform: (),
     })
 }
@@ -284,7 +278,7 @@ fn peers(daemon: &crate::peer_view::DesktopStatus) -> Vec<Peer> {
 
 /// One row for the links to paired computers, with Retry while one cannot
 /// be reached. Each computer's own row says why. A computer that is asleep
-/// or away only warns; one a person has to update or pair again needs
+/// or away only warns; one a person has to update or place again needs
 /// attention.
 fn link_health(
     peers: &[Peer],
@@ -622,12 +616,12 @@ mod tests {
         let result: zbus::Result<String> = proxy.call("Call", &(r#"{"command":"set_sharing","enabled":true,"permissions":{"inject_prelogin":true}}"#,)).await;
         assert!(result.is_err());
         let reply: String = proxy
-            .call("Call", &(r#"{"command":"pair_cancel"}"#,))
+            .call("Call", &(r#"{"command":"snapshot"}"#,))
             .await
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&reply).unwrap()["ok"],
-            true
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap()["api"],
+            API
         );
         drop(connection);
     }
@@ -653,7 +647,7 @@ mod tests {
                 },
             );
         }
-        let reinstalled = "Reset or reinstalled. Pair it again.";
+        let reinstalled = "Reset or reinstalled. Drag its new tile onto its old one.";
         let status = crate::peer_view::DesktopStatus {
             receiving_from: Some("mac".into()),
             connected: vec!["desk".into(), "mac".into()],
@@ -729,10 +723,29 @@ mod tests {
                 height: 1440,
             }],
         };
+        // The shelf, the window and the notices come from the service.
+        let fedora = crate::neighbors::Unplaced {
+            id: "key:aa".into(),
+            name: "fedora".into(),
+            os: Some(crate::wire::Os::Linux),
+            mark: Some("1abc9e".into()),
+            version: Some("0.3.0".into()),
+            state: crate::neighbors::UnplacedState::Ready,
+            via: crate::neighbors::Via::Mdns,
+        };
+        let joined = crate::hello::Notice {
+            id: 1,
+            kind: crate::hello::NoticeKind::Joined,
+            name: "desk".into(),
+            mark: "a1b2c3".into(),
+        };
         let up = snapshot(
             Ok(crate::peer_view::DesktopStatus {
                 layout: Some(layout.clone()),
                 share_clipboard: true,
+                own_mark: Some("a1b2c3".into()),
+                unplaced: vec![fedora.clone()],
+                notices: vec![joined.clone()],
                 ..status
             }),
             &State::default(),
@@ -740,6 +753,8 @@ mod tests {
         .unwrap();
         assert_eq!(up.layout, Some(layout));
         assert_eq!(up.share_clipboard, Some(true));
+        assert_eq!(up.own_mark.as_deref(), Some("a1b2c3"));
+        assert_eq!((up.unplaced, up.notices), (vec![fedora], vec![joined]));
         // While sharing, a computer that cannot be reached is a problem.
         assert!(
             up.health

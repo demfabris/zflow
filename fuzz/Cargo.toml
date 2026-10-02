@@ -51,8 +51,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "pairing"
-path = "fuzz_targets/pairing.rs"
+name = "hello"
+path = "fuzz_targets/hello.rs"
 test = false
 doc = false
 bench = false

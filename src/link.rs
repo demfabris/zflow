@@ -25,8 +25,12 @@ pub fn retry_delay(failures: u32) -> Duration {
 pub enum Fix {
     /// The other computer speaks another zflow protocol version.
     Update,
-    /// The other computer's key is not the one paired here.
-    PairAgain,
+    /// The other computer answered with a key other than the one saved
+    /// here, as after a reset or reinstall. Its new key is on the shelf.
+    NewKey,
+    /// The other computer answered with the right key but has not added
+    /// this one, so a person has to place it there.
+    WaitingForThem,
 }
 
 impl Fix {
@@ -39,7 +43,8 @@ impl Fix {
     pub fn of_transport(error: &TransportError) -> Option<Self> {
         match error {
             TransportError::InvalidAlpn => Some(Self::Update),
-            TransportError::PeerIdentityMismatch => Some(Self::PairAgain),
+            TransportError::PeerIdentityMismatch => Some(Self::NewKey),
+            TransportError::NotTrusted => Some(Self::WaitingForThem),
             _ => None,
         }
     }
@@ -51,7 +56,8 @@ impl Fix {
 pub fn reason(error: &anyhow::Error) -> String {
     match Fix::of(error) {
         Some(Fix::Update) => "Different zflow version. Update both computers.".into(),
-        Some(Fix::PairAgain) => "Reset or reinstalled. Pair it again.".into(),
+        Some(Fix::NewKey) => "Reset or reinstalled. Drag its new tile onto its old one.".into(),
+        Some(Fix::WaitingForThem) => "Hasn't added this computer yet.".into(),
         None => format!("{error:#}"),
     }
 }
@@ -80,8 +86,12 @@ mod tests {
         );
         assert_eq!(
             reason(&failed(TransportError::PeerIdentityMismatch)),
-            "Reset or reinstalled. Pair it again."
+            "Reset or reinstalled. Drag its new tile onto its old one."
         );
+        // Read under or after the name: "desk: Hasn't added this computer yet."
+        let refused = failed(TransportError::NotTrusted);
+        assert_eq!(Fix::of(&refused), Some(Fix::WaitingForThem));
+        assert_eq!(reason(&refused), "Hasn't added this computer yet.");
         let timeout = anyhow::anyhow!("input connection to 192.0.2.7:43119 timed out");
         assert_eq!(Fix::of(&timeout), None);
         assert_eq!(reason(&timeout), timeout.to_string());

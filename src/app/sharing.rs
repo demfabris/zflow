@@ -221,7 +221,7 @@ impl Observer {
                 let peer = config
                     .peers
                     .get(name)
-                    .with_context(|| format!("Pair {name} before enabling sharing"))?;
+                    .with_context(|| format!("Add {name} before enabling sharing"))?;
                 anyhow::ensure!(
                     peer.permissions.connect && peer.permissions.receive_normal,
                     "{name} does not allow this Mac to send input"

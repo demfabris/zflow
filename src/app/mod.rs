@@ -13,10 +13,9 @@ pub mod layout_model;
 pub mod model;
 #[cfg(target_os = "macos")]
 mod native;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// On Linux the service finds computers itself.
+#[cfg(target_os = "macos")]
 mod nearby;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-mod pairing;
 #[cfg(target_os = "macos")]
 mod sharing;
 #[cfg(target_os = "macos")]

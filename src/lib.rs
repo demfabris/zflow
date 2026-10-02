@@ -13,6 +13,7 @@ pub mod desktop;
 pub mod discovery;
 #[cfg(target_os = "macos")]
 mod ffi;
+pub mod hello;
 pub mod identity;
 pub mod link;
 #[cfg(target_os = "linux")]
@@ -20,7 +21,8 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod metrics;
-pub mod pairing;
+pub mod neighbors;
+pub mod pairing_window;
 pub mod peer_view;
 #[cfg(target_os = "linux")]
 pub mod runtime;

@@ -317,7 +317,7 @@ class InstallerTest(unittest.TestCase):
         self.assertNotIn("[y/N]", result.stdout)
         # The elevated step starts right after "Installing the service".
         summary = result.stdout[:result.stdout.index("Installing the service")]
-        for line in ("This installs:", "UDP ports 43119 and 43120", "for every GNOME user", "GNOME extension"):
+        for line in ("This installs:", "UDP port 43119 when", "for every GNOME user", "GNOME extension"):
             self.assertIn(line, summary)
         # --yes stays accepted so older command lines keep working.
         self.log.write_text("")

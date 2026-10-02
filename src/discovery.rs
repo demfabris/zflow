@@ -18,13 +18,14 @@ use thiserror::Error;
 
 use crate::{
     core::{InputCapabilities, InputCapability},
+    hello::peer_name,
     identity::encode_hex,
     transport::INPUT_ALPN_PROTOCOL,
 };
 
 pub const SERVICE_TYPE: &str = "_zflow._udp.local.";
 pub const MAX_DISCOVERY_CANDIDATES: usize = 16;
-/// What a record may carry. zflow sends two; the room is for keys a newer
+/// What a record may carry. zflow sends three; the room is for keys a newer
 /// version adds, which this one skips so it can still list that computer.
 pub const MAX_TXT_PROPERTIES: usize = 8;
 pub const MAX_TXT_BYTES: usize = 384;
@@ -35,6 +36,8 @@ const INSTANCE_HEX_BYTES: usize = INSTANCE_ENTROPY_BYTES * 2;
 /// Carries the input ALPN, the only protocol version zflow has.
 const TXT_PROTOCOL: &str = "v";
 const TXT_CAPABILITIES: &str = "cap";
+/// The computer's name, so its tile has one before its hello arrives.
+const TXT_NAME: &str = "name";
 
 /// Lists this host's current addresses. Loopback and non-unicast addresses
 /// never help another machine connect.
@@ -44,6 +47,15 @@ pub fn local_unicast_addresses() -> Result<Vec<IpAddr>, DiscoveryError> {
         .into_iter()
         .map(|interface| interface.ip());
     Ok(select_advertisable_addresses(addresses))
+}
+
+/// Every address on this host's interfaces, with none left out. A
+/// connection from one of them, or from loopback, comes from a process here
+/// rather than another computer. Empty if they cannot be listed.
+pub fn this_host_addresses() -> Vec<IpAddr> {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| interfaces.iter().map(if_addrs::Interface::ip).collect())
+        .unwrap_or_default()
 }
 
 fn select_advertisable_addresses(addresses: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
@@ -105,6 +117,7 @@ impl fmt::Display for EphemeralInstanceId {
 pub struct Advertisement {
     quic_port: u16,
     capability_summary: InputCapabilities,
+    name: Option<String>,
 }
 
 impl Advertisement {
@@ -129,7 +142,14 @@ impl Advertisement {
         Ok(Self {
             quic_port,
             capability_summary,
+            name: None,
         })
+    }
+
+    /// Names the computer in the record, in the plain form a tile shows.
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = Some(peer_name(Some(name)));
+        self
     }
 }
 
@@ -140,6 +160,7 @@ pub struct UntrustedCandidate {
     compatible: bool,
     capability_summary: InputCapabilities,
     socket_addresses: Vec<SocketAddr>,
+    name: Option<String>,
 }
 
 impl UntrustedCandidate {
@@ -151,6 +172,7 @@ impl UntrustedCandidate {
             compatible: false,
             capability_summary: InputCapabilities::default(),
             socket_addresses: vec![address],
+            name: None,
         })
     }
 
@@ -169,6 +191,12 @@ impl UntrustedCandidate {
 
     pub fn socket_addresses(&self) -> &[SocketAddr] {
         &self.socket_addresses
+    }
+
+    /// The name the record claims, already plain. Versions before arrange
+    /// to pair send none.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
 
@@ -409,6 +437,7 @@ fn parse_candidate_fields(
         compatible: txt.compatible,
         capability_summary: txt.capability_summary,
         socket_addresses,
+        name: txt.name,
     })
 }
 
@@ -418,10 +447,13 @@ fn build_service_info(
 ) -> Result<ServiceInfo, DiscoveryError> {
     let protocol = String::from_utf8_lossy(INPUT_ALPN_PROTOCOL).into_owned();
     let capabilities = format_capabilities(&advertisement.capability_summary);
-    let properties = [
+    let mut properties = vec![
         (TXT_PROTOCOL.to_owned(), protocol),
         (TXT_CAPABILITIES.to_owned(), capabilities),
     ];
+    if let Some(name) = &advertisement.name {
+        properties.push((TXT_NAME.to_owned(), name.clone()));
+    }
     debug_assert!(txt_size(&properties) <= MAX_TXT_BYTES);
 
     // No address list: with addr_auto, mdns-sd adds and drops addresses as
@@ -441,6 +473,7 @@ fn build_service_info(
 struct ParsedTxt {
     compatible: bool,
     capability_summary: InputCapabilities,
+    name: Option<String>,
 }
 
 fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseError> {
@@ -451,6 +484,7 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
     let mut total_size = 0usize;
     let mut compatible = None;
     let mut capabilities = None;
+    let mut name = None;
 
     for property in properties.iter() {
         let value = property.val().ok_or(CandidateParseError::InvalidTxtValue)?;
@@ -469,7 +503,8 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
             TXT_CAPABILITIES if capabilities.is_none() => {
                 capabilities = Some(parse_capabilities(value)?);
             }
-            TXT_PROTOCOL | TXT_CAPABILITIES => {
+            TXT_NAME if name.is_none() => name = Some(peer_name(Some(value))),
+            TXT_PROTOCOL | TXT_CAPABILITIES | TXT_NAME => {
                 return Err(CandidateParseError::DuplicateTxtProperty);
             }
             // Another version's key. Rejecting the record would hide that
@@ -482,6 +517,7 @@ fn parse_txt(properties: &TxtProperties) -> Result<ParsedTxt, CandidateParseErro
         compatible: compatible.ok_or(CandidateParseError::MissingTxtProperty(TXT_PROTOCOL))?,
         capability_summary: capabilities
             .ok_or(CandidateParseError::MissingTxtProperty(TXT_CAPABILITIES))?,
+        name,
     })
 }
 
@@ -635,6 +671,14 @@ mod tests {
         EphemeralInstanceId([0xab; 16])
     }
 
+    #[test]
+    fn this_host_has_every_address_it_could_advertise() {
+        let all = this_host_addresses();
+        for address in local_unicast_addresses().unwrap() {
+            assert!(all.contains(&address), "{address}");
+        }
+    }
+
     fn advertisement() -> Advertisement {
         Advertisement::new(
             43_119,
@@ -645,6 +689,7 @@ mod tests {
             ],
         )
         .unwrap()
+        .with_name("Fabricios-MacBook-Pro.local")
     }
 
     #[test]
@@ -671,12 +716,20 @@ mod tests {
             properties.get_property_val_str("cap"),
             Some("keyboard,pointer,scroll")
         );
+        // The name is the one thing that says which computer this is, and
+        // the hello repeats it over TLS, where the key is proven.
+        assert_eq!(
+            properties.get_property_val_str("name"),
+            Some("Fabricios-MacBook-Pro")
+        );
 
         let rendered = format!("{service:?}").to_ascii_lowercase();
         for forbidden in [
             "spki",
             "fingerprint",
             "certificate",
+            "vouch",
+            "mark",
             "config_path",
             "/home/",
             "/var/lib/",
@@ -685,6 +738,38 @@ mod tests {
         ] {
             assert!(!rendered.contains(forbidden), "leaked marker {forbidden}");
         }
+        // Nothing in the record looks like a key's hash either.
+        assert!(
+            properties
+                .iter()
+                .all(|property| property.val().is_none_or(|value| value.len() < 32)),
+            "{properties:?}"
+        );
+    }
+
+    #[test]
+    fn the_advertised_name_is_plain_and_fits_a_dns_label() {
+        let long = advertisement().with_name(&format!("{}\u{202e}", "a".repeat(300)));
+        let service = build_service_info(test_instance(), &long).unwrap();
+        let name = service
+            .get_properties()
+            .get_property_val_str("name")
+            .unwrap();
+        assert_eq!(name, "a".repeat(crate::wire::MAX_NAME_BYTES));
+
+        let parsed = parse_txt_record(&[
+            ("v", "zflow/x"),
+            ("cap", "keyboard"),
+            ("name", "desk\u{200b} pc.local"),
+        ])
+        .unwrap();
+        assert_eq!(parsed.name(), Some("desk pc"));
+        assert_eq!(
+            parse_txt_record(&[("v", "1"), ("cap", "keyboard")])
+                .unwrap()
+                .name(),
+            None
+        );
     }
 
     #[test]

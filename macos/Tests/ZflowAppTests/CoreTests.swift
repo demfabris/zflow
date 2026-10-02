@@ -90,13 +90,13 @@ import Testing
   let core = CoreBridge(path: file.path)
   let snapshot = try await core.request(CoreRequest(command: "snapshot"))
   #expect(snapshot.status.state == .setup)
-  #expect(snapshot.status.title == "Pair a computer")
+  #expect(snapshot.status.title == "Add a computer")
   #expect(snapshot.health.first?.id == "sharing")
   #expect(snapshot.layout != nil)
   #expect(snapshot.peers.isEmpty)
   #expect(snapshot.configPath == file.path)
   // The old names are gone; the shared ones reach the engine.
-  for old in ["move", "pair_start"] {
+  for old in ["move", "pair_start", "pair", "pair_cancel"] {
     await #expect(throws: AppError.self) { try await core.request(CoreRequest(command: old)) }
   }
   do {
@@ -104,6 +104,20 @@ import Testing
       CoreRequest(command: "move_tile", id: "nowhere", x: 0, y: 0, tolerance: 8))
     Issue.record("An unknown tile cannot move")
   } catch { #expect(error.localizedDescription == "Unknown computer") }
+  // A computer added by address waits on the shelf until its hello comes back.
+  let added = try await core.request(CoreRequest(command: "add_address", address: "100.64.0.7"))
+  let tile = try #require(added.unplaced.first)
+  #expect(tile.state == .identifying && tile.via == .address && !tile.placeable)
+  do {
+    _ = try await core.request(
+      CoreRequest(command: "place", id: tile.id, x: 0, y: 0, tolerance: 8))
+    Issue.record("A computer still being identified cannot be placed")
+  } catch {
+    #expect(error.localizedDescription == "100.64.0.7:43119 is still being identified")
+  }
+  #expect(added.pairingWindow.state == .never)
+  #expect(added.ownMark == nil || added.ownMark?.count == 6)
+  #expect(added.notices.isEmpty)
   await core.shutdown()
 }
 
@@ -165,6 +179,6 @@ import Testing
   try await Task.sleep(for: .milliseconds(200))
   let snapshot = try await core.request(CoreRequest(command: "snapshot"))
   #expect(snapshot.platform.localNetwork == .unknown)
-  #expect(snapshot.nearby.isEmpty)
+  #expect(snapshot.unplaced.isEmpty)
   await core.shutdown()
 }

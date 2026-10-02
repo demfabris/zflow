@@ -6,7 +6,7 @@ const timers = new Map();
 const calls = [];
 // While true, the desktop agent is not running yet, as right after login.
 let agentDown = false;
-let snapshot = {api: 2, status: {state: 'controlled', peer: 'Mac', title: 'Controlled by Mac'}, sharing: true, health: []};
+let snapshot = {api: 3, status: {state: 'controlled', peer: 'Mac', title: 'Controlled by Mac'}, sharing: true, health: []};
 const context = {
     GLib: {
         Variant: class { constructor(_type, value) { this.value = value; } },
@@ -76,10 +76,10 @@ assert.equal(panel._sharing.state, false);
 agentDown = false;
 snapshot.sharing = null;
 await panel._client.refresh();
-snapshot.api = 3;
+snapshot.api = 4;
 await panel._client.refresh();
 assert.equal(panel._status.label.text, 'Update zflow');
-snapshot.api = 2;
+snapshot.api = 3;
 snapshot.sharing = true;
 await panel._client.refresh();
 assert.equal(panel._sharing.state, true);
@@ -92,11 +92,11 @@ assert.equal(panel._status.label.text, 'Paused');
 assert.equal(panel._sharing.state, false);
 assert.equal(panel._icon.icon_name, 'media-playback-pause-symbolic');
 // An agent from another API level gets "Update zflow" instead of a broken menu.
-snapshot.api = 3;
+snapshot.api = 4;
 await panel._client.refresh();
 assert.equal(panel._status.label.text, 'Update zflow');
 assert.equal(panel._icon.icon_name, 'dialog-warning-symbolic');
-snapshot.api = 2;
+snapshot.api = 3;
 await panel._client.refresh();
 assert.equal(panel._status.label.text, 'Paused');
 // A failing check warns even while the menu has nothing else to say.

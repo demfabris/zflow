@@ -4,12 +4,124 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Arrange to pair sitting (0.3.0)
+
+One sitting with the Mac and the Ubuntu box, both on 0.3.0 from main. A third
+computer helps for the rival and namesake checks; a Linux VM bridged onto the
+same network works. Allow about 90 minutes. Code pairing is gone: computers
+find each other, and trust comes from placing a tile or from a fresh install's
+pairing window.
+
+To make a computer fresh without losing its setup:
+
+- Ubuntu: `sudo systemctl stop zflowd`, move `/etc/zflow/zflow.toml` and
+  `/var/lib/zflow` aside, then `sudo just install-linux`. Setup writes
+  `eligible` to `/var/lib/zflow/pairing-window`. Log in at the desktop. To
+  restore, stop the service and move both back.
+- Mac: quit zflow, then open it on a new configuration, which gets its own key
+  and window: `open -n target/debug/zflow.app --args --config /tmp/zflow-fresh/zflow.toml`.
+
+Checks:
+
+1. **Two fresh installs.** Make both computers fresh and open zflow on both.
+   Each shows "This computer is new" with its minutes left, then "Adding NAME"
+   for about 5 s, then the other on its arrangement and "NAME joined" (a
+   notification on the Mac, a row with Forget on Ubuntu). Each computer's mark
+   matches the one the other shows for it. Crossing works both ways without a
+   drag.
+2. **Rival.** With two strangers around a fresh computer at once (a third
+   computer, or the Ubuntu box and a VM), nothing joins and the window closes
+   as a rival. Bring the second one in during the 5 s hold-off of the first:
+   the countdown stops and nothing joins, even after the second leaves.
+   Dragging one in still works.
+3. **A pair and a fresh computer.** With Ubuntu and a VM that already trust
+   each other, a fresh Mac sees two strangers and adds neither by itself. Drag
+   Ubuntu in on the Mac: Ubuntu's shelf shows the Mac with only its system,
+   never a claim that it added Ubuntu, and the Mac's row for Ubuntu says
+   "Hasn't added this computer yet" until Ubuntu places the Mac.
+4. **Namesakes.** Give the VM the Ubuntu box's host name. A fresh computer
+   never takes either by itself; both show "Same name as another" with
+   different marks, and either can be dragged in. The second one placed is
+   saved with part of its fingerprint after its name.
+5. **Window ends.** On a fresh computer with nobody else around, wait 10
+   minutes: the banner goes, and a computer that shows up afterwards waits on
+   the shelf. Restarting `zflowd` or the Mac app while the window is open
+   closes it too.
+6. **No window without a fresh install.** An upgrade over 0.2.0 (`sudo just
+   install-linux` with the configuration in place), an install over ssh with
+   nobody logged in at the desktop, and a computer that already trusts one
+   never add a computer by themselves.
+7. **Layouts add no trust.** On a computer that has not placed the VM, a
+   layout from Ubuntu that has the VM's tile shows no tile for it and adds no
+   record (`sudo zflow peers`).
+8. **Forget.** Forget a computer: it goes back to Found on your network at
+   once and can be dragged in again. On Ubuntu, Forget asks nothing.
+9. **Reinstalled.** Make Ubuntu fresh while the Mac still trusts its old key.
+   The Mac's row says "Reset or reinstalled. Drag its new tile onto its old
+   one." and the new key waits on the shelf. Drop it onto Ubuntu's old tile:
+   it keeps its name, settings and tile, and pre-login input is off.
+10. **New address.** Renew Ubuntu's DHCP lease to a new address, or move it
+    to another network the Mac can reach. The link reconnects within a minute,
+    without a drag, and `journalctl -u zflowd` shows the new address learned
+    without the link restarting.
+11. **Add by address.** With mDNS blocked (another subnet, or Tailscale), add
+    the other computer's Tailscale IP with Add by Address on both. It shows up
+    on the shelf; place it on both and cross. On Ubuntu without the window,
+    `sudo zflow nearby --add 100.64.0.7` and `sudo zflow trust NAME` do the
+    same.
+12. **One port.** With ufw on, `sudo ufw status verbose` lists only UDP 43119
+    for zflow on a fresh install, and both checks above pass through it.
+    `ss -lunp | grep 43120` shows nothing.
+13. **Different version.** A computer still on 0.2.0 shows on the shelf as
+    "Different zflow version" and cannot be dragged. A computer that trusted
+    it before says "Different zflow version. Update both computers."
+14. **Paused still answers.** Pause sharing on the Mac. Ubuntu's row for the
+    Mac does not say "Hasn't added this computer yet", and a fresh computer
+    still finds the Mac. Resume: crossing works within 5 s.
+15. **Hello flood.** From a third computer, open `zflow-hello/4` connections
+    to Ubuntu's port 43119 in a tight loop, for example a few lines around
+    `zflow::transport::connect_hello`. Ubuntu answers at most five per 30 s
+    from that address and closes the rest, the shelf keeps one tile for that
+    key, and crossings with the Mac do not stutter.
+16. **Only computers it found join.** On a fresh computer with nobody else
+    around, make a computer it cannot see over mDNS (another subnet, or over
+    Tailscale) say hello to it: `sudo zflow nearby --add FRESH_IP` there. It
+    shows on the fresh computer's shelf, but the window never holds for it
+    and nothing joins; dragging it in still works. As an ordinary user on the
+    fresh computer, a hello to `127.0.0.1:43119` or to its own LAN address
+    puts nothing on the shelf.
+17. **A flood closes the window.** On a fresh computer during its window,
+    publish more than 64 zflow records from a third computer, for example
+    `avahi-publish -s zf-$(openssl rand -hex 16) _zflow._udp 43119
+    v=zflow/4 cap=keyboard,pointer name=x &` in a loop. The window closes as
+    a rival and the computer that shows up next waits on the shelf.
+18. **A window that cannot be saved stays shut.** Make Ubuntu fresh, then
+    before logging in run `sudo chattr +i /var/lib/zflow/pairing-window`.
+    Log in: no "This computer is new" banner, `journalctl -u zflowd` says the
+    window stays shut, and a lone computer waits on the shelf, also after
+    `sudo systemctl restart zflowd`. Undo with `sudo chattr -i`.
+19. **Other addresses only to trusted computers.** With Tailscale up on
+    Ubuntu, place Ubuntu on a fresh Mac before Ubuntu places the Mac. The
+    Mac's record for Ubuntu in its `zflow.toml` has Ubuntu's LAN address and
+    not its Tailscale one, since Ubuntu's hellos to a key it does not trust
+    name no other addresses.
+20. **Only session addresses are saved on the Mac.** With the Mac and Ubuntu
+    trusting each other, give Ubuntu an extra address (`sudo ip addr add
+    192.0.2.50/32 dev lo`) and restart zflowd. The Mac's `zflow.toml` never
+    gains 192.0.2.50, while a DHCP change (check 10) still saves the new
+    address once a session comes up there.
+21. **No tile passes for this one.** Name the VM `This-Mac` (`sudo
+    hostnamectl set-hostname This-Mac`) and restart its zflowd. On the Mac,
+    and on Ubuntu, its shelf tile says "Computer" with its mark.
+22. **The mark comes with the name.** In check 1, each "NAME joined"
+    notification gives the other computer's mark as six hex digits, and
+    hovering the squares on that computer's own tile shows the same digits.
+    `sudo zflow trust NAME` prints "trusted NAME, mark MARK".
+
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 
-One sitting with the Mac and the Ubuntu box, run from one branch that holds both
-halves (`linux-edge-sending` merged into the Mac's Phase 2 branch). Both ends
-speak `zflow/3`, so a build from before it cannot join. To roll back, install
-`main` on both computers.
+One sitting with the Mac and the Ubuntu box, both from main. Both ends speak
+`zflow/4`, so a build from before 0.3.0 cannot join.
 
 Setup on Ubuntu:
 
@@ -21,7 +133,7 @@ Setup on Ubuntu:
    grabs the PRO X 60 and OpenLogi grabs the PRO X 2, so a crossing grabs their
    virtual outputs and the journal names the busy sources it skipped.
 3. As the desktop user, run `zflow desktop-agent --install`, then log out and
-   back in so GNOME Shell loads the API 2 extension. The panel shows a status,
+   back in so GNOME Shell loads the API 3 extension. The panel shows a status,
    not "Update zflow".
 4. After the Mac connects, `journalctl -u zflowd` shows "layout adopted" and
    "outbound edges placed", and `/var/lib/zflow/layout.json` holds the layout.
@@ -885,8 +997,8 @@ Test:
 
 The gate requires bounded input release, one accepted session owner, no duplicate transition, and no old-path event after takeover.
 
-## Pairing and authorization (gates 1.0)
+## Arrange to pair and authorization (gates 1.0)
 
-Test an active LAN MITM, spoofed mDNS instances, transcript mismatch, pairing-window expiry, revoked identities, replayed 0-RTT data, malformed floods, and unauthorized local-socket callers.
+Test an active LAN attacker during a fresh install's pairing window, spoofed mDNS instances and names, hellos from unknown keys on the input port, pairing-window expiry and rivals, revoked identities, replayed 0-RTT data, malformed and flooding hellos, and unauthorized local-socket callers.
 
 Verify that a normal paired peer cannot inject at a greeter, lock screen, unauthenticated VT, or unknown seat state until a local logged-in user grants allow_prelogin_input.
