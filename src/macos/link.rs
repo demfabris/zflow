@@ -447,7 +447,7 @@ impl Links {
                 );
                 let accepting = Arc::new(Mutex::new(accepting));
                 let task = runtime.spawn(accept(endpoint.clone(), accepting.clone()));
-                tracing::info!(address = %endpoint.local_addr().map_or(address, |bound| bound), "listening for paired computers");
+                tracing::info!(address = %endpoint.local_addr().unwrap_or(address), "listening for paired computers");
                 self.listener = Some(Listener {
                     address,
                     endpoint,

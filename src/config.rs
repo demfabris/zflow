@@ -428,12 +428,10 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = hex_digit(pair[0])?;
-            let low = hex_digit(pair[1])?;
-            Some((high << 4) | low)
-        })
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| Some((hex_digit(high)? << 4) | hex_digit(low)?))
         .collect()
 }
 

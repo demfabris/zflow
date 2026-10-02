@@ -79,7 +79,7 @@ impl EphemeralInstanceId {
         }
 
         let mut bytes = [0; INSTANCE_ENTROPY_BYTES];
-        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             bytes[index] = decode_hex_pair(pair).ok_or(CandidateParseError::InvalidInstanceId)?;
         }
         Ok(Self(bytes))
