@@ -21,7 +21,9 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod metrics;
+pub mod neighbors;
 pub mod pairing;
+pub mod pairing_window;
 pub mod peer_view;
 #[cfg(target_os = "linux")]
 pub mod runtime;
