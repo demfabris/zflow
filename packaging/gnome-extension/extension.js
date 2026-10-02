@@ -120,8 +120,8 @@ export default class ZflowExtension extends Extension {
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
-        this._clear();
         this._edges = [];
+        this._clear();
         this._placeEdges();
         this._setHidden(false);
         // An entry still waiting for the cursor stops here and never answers.
@@ -140,11 +140,14 @@ export default class ZflowExtension extends Extension {
     }
 
     _clear() {
+        const leased = this._lease !== null;
         if (this._lease)
             for (const reply of this._lease.polls) reply(new Error('Desktop handoff expired or ended'));
         for (const barrier of this._barriers) barrier.destroy();
         this._barriers = [];
         this._lease = null;
+        // This computer's own edges come back once nobody controls it.
+        if (leased) this._placeEdges();
     }
 
     _placeEdges() {
@@ -153,7 +156,9 @@ export default class ZflowExtension extends Extension {
         for (const id of this._waits) GLib.Source.remove(id);
         this._waits.clear();
         const ms = Main.layoutManager.monitors;
-        if (!this._edges.length || !ms.length || (global.backend.capabilities & Meta.BackendCapabilities.BARRIERS) === 0)
+        // While another computer controls this one, it has no edges of its own.
+        if (this._lease || !this._edges.length || !ms.length
+            || (global.backend.capabilities & Meta.BackendCapabilities.BARRIERS) === 0)
             return;
         for (const {edge, start, end} of this._edges) {
             const g = edgeGeometry(ms, edge, start, end);
@@ -165,8 +170,7 @@ export default class ZflowExtension extends Extension {
             for (const segment of segments) {
                 const barrier = edgeBarrier(edge, g, segment);
                 // Shell sends a hit for every motion against the barrier; report
-                // each push once. While another computer controls this one, its
-                // own return barrier on this edge answers instead.
+                // each push once.
                 let push = null;
                 let latest = 0;
                 let waiting = 0;
@@ -418,19 +422,15 @@ export default class ZflowExtension extends Extension {
         const lease = {token: r.token, renewed: GLib.get_monotonic_time(), returned: null, polls: new Set()};
         this._lease = lease;
         try {
+            // Mutter runs a warp through the pointer barriers like any motion,
+            // and a barrier the pointer rests on pins it to the edge when the
+            // warp also moves along it, as after a return through this edge.
+            // So this computer's own barriers go first, and the return barriers
+            // go up only once the pointer is in.
+            this._placeEdges();
             // GNOME 51 removed Clutter.get_default_backend().
             const backend = global.stage.get_context?.().get_backend() ?? Clutter.get_default_backend();
             backend.get_default_seat().warp_pointer(point.x, point.y);
-            for (const s of segments) {
-                const barrier = edgeBarrier(r.edge, g, s);
-                barrier.connect('hit', (_barrier, event) => {
-                    if (this._lease !== lease || lease.returned !== null) return;
-                    const axis = vertical ? event.y : event.x;
-                    lease.returned = Math.max(r.start, Math.min(r.end, Math.round((axis - origin) * MAX / span)));
-                    for (const reply of lease.polls) reply();
-                });
-                this._barriers.push(barrier);
-            }
             // Mutter applies the warp on its input thread, and a slow frame can
             // delay it past the next main-loop turn. Keep checking for a while.
             const deadline = GLib.get_monotonic_time() + WARP_US;
@@ -445,10 +445,23 @@ export default class ZflowExtension extends Extension {
                 });
                 if (this._lease !== lease) throw new Error('Desktop changed during entry');
                 const actual = this._snapshot();
-                if (Math.abs(actual.position.x - point.x) <= 2 && Math.abs(actual.position.y - point.y) <= 2)
+                if (Math.abs(actual.position.x - point.x) <= 2 && Math.abs(actual.position.y - point.y) <= 2) {
+                    for (const s of segments) {
+                        const barrier = edgeBarrier(r.edge, g, s);
+                        barrier.connect('hit', (_barrier, event) => {
+                            if (this._lease !== lease || lease.returned !== null) return;
+                            const axis = vertical ? event.y : event.x;
+                            lease.returned = Math.max(r.start, Math.min(r.end, Math.round((axis - origin) * MAX / span)));
+                            for (const reply of lease.polls) reply();
+                        });
+                        this._barriers.push(barrier);
+                    }
                     return {status: 'prepared', ...actual};
-                if (GLib.get_monotonic_time() >= deadline)
-                    throw new Error('GNOME did not place the cursor at the requested entry');
+                }
+                if (GLib.get_monotonic_time() >= deadline) {
+                    const {x, y} = actual.position;
+                    throw new Error(`GNOME did not place the cursor at the requested entry: asked for ${point.x},${point.y} and it is at ${x},${y}`);
+                }
             }
         } catch (error) {
             if (this._lease === lease) this._clear();

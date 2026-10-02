@@ -244,9 +244,48 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     const idle = d.context.GLib.idle_add;
     d.context.GLib.idle_add = (priority, fn) => {d.advance(10); return idle(priority, fn);};
     d.seat.warp_pointer = () => {};
-    await assert.rejects(d.extension._request(prepare()), /did not place/);
+    await assert.rejects(d.extension._request(prepare()), /did not place the cursor at the requested entry: asked for 3,540 and it is at 100,100/);
     assert.ok(d.barriers.every(b => b.destroyed));
     assert.equal(d.extension._lease, null);
+    d.extension.disable();
+}
+{
+    // Mutter runs a warp through the pointer barriers on its input thread, like
+    // any motion (meta-seat-impl.c warp_pointer_in_impl, constrain_coordinates).
+    // A barrier the pointer rests on that blocks a direction of the warp pins
+    // the pointer to it (meta-border.c meta_border_is_blocking_directions,
+    // meta-barrier-native.c clamp_to_barrier).
+    const d = desktop();
+    const warp = d.seat.warp_pointer;
+    d.seat.warp_pointer = (x, y) => queueMicrotask(() => {
+        const [px, py] = d.context.global.get_pointer();
+        const motion = (x > px ? 1 : x < px ? 2 : 0) | (y > py ? 4 : y < py ? 8 : 0);
+        for (const barrier of d.barriers.filter(b => !b.destroyed)) {
+            const {x1, x2, y1, y2, directions} = barrier.properties;
+            const vertical = x1 === x2;
+            const on = vertical ? px === x1 && py >= Math.min(y1, y2) && py <= Math.max(y1, y2)
+                : py === y1 && px >= Math.min(x1, x2) && px <= Math.max(x1, x2);
+            if (on && motion & (vertical ? 3 : 12) && motion & ~directions) {
+                if (vertical) x = x1;
+                else y = y1;
+            }
+        }
+        warp(x, y);
+    });
+    const idle = d.context.GLib.idle_add;
+    d.context.GLib.idle_add = (priority, fn) => {d.advance(10); return idle(priority, fn);};
+    // As in the live test: the pointer came back from the Mac and rests on
+    // this computer's own left edge, where its barrier to the Mac is.
+    await d.extension._request({command: 'edges', edges: [{edge: 'left', start: 0, end: 1000000}]});
+    warp(0, 270);
+    const result = await d.extension._request(prepare());
+    assert.deepEqual({...result.position}, {x: 3, y: 540}, 'the entry is not pinned to the edge');
+    assert.ok(d.barriers.filter(b => !b.destroyed).every(b => b.properties.y2 === 1080),
+        'only the return barrier is up while the Mac controls this computer');
+    await d.extension._request({command: 'finish', token: 7});
+    const own = d.barriers.filter(b => !b.destroyed);
+    assert.equal(own.length, 1, 'its own barrier comes back');
+    assert.deepEqual([own[0].properties.y1, own[0].properties.y2, own[0].properties.directions], [8, 1072, 1]);
     d.extension.disable();
 }
 {

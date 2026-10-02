@@ -151,6 +151,11 @@ Checks:
 - **One direction at a time:** while the Mac controls Linux, pushing against a
   Linux edge starts nothing. Crossing from both computers at the same moment
   leaves both local.
+- **Entry at a resting edge:** cross from the Mac, return to it, and leave the
+  Linux pointer where it came back, on the edge. Cross from the Mac again at
+  another height, five times: each enters at the matching point, with no
+  "GNOME did not place the cursor" line. After each return, pushing the Linux
+  pointer into that edge still crosses to the Mac.
 - **Hotplug:** a mouse plugged in between crossings is grabbed at the next one.
 - **Shared layout:** a tile moved on the Mac shows up on Linux within 2 s, and
   the barriers follow. Changing the Linux resolution logs "this computer's tile
