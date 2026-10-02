@@ -29,7 +29,8 @@ use crate::{
         SessionContext, SessionEpoch, TransportGeneration,
     },
     discovery::{
-        Advertisement, Discovery, DiscoveryError, DiscoveryEvent, local_unicast_addresses,
+        Advertisement, Discovery, DiscoveryError, DiscoveryEvent, remote_addresses,
+        this_host_addresses,
     },
     identity::{Identity, encode_hex},
     linux::{InjectionGate, OwnershipPhase, SeatState, watch_primary_seat},
@@ -151,6 +152,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
     shared.restore_layout().await;
     shared.sync_links().await;
     let mut discovery = start_discovery(&config, shared.endpoint.local_addr()?);
+    shared.own_record(discovery.as_ref());
     let daemon_uid = nix::unistd::geteuid().as_raw();
     let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
     let session_setup_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
@@ -292,7 +294,9 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                             let Some(instance) = candidate.ephemeral_instance_id() else {
                                 continue;
                             };
-                            let local = local_unicast_addresses().unwrap_or_default();
+                            // Every address here, not the 16 a record may
+                            // name, which can leave some of this one's out.
+                            let local = this_host_addresses();
                             let addresses = remote_addresses(candidate.socket_addresses(), &local);
                             let instance = instance.to_string();
                             let now = tokio::time::Instant::now();
@@ -325,6 +329,7 @@ async fn run_async(config_path: PathBuf) -> Result<()> {
                 _ = discovery_retry.tick(), if discovery.is_none() => {
                     let config = shared.config.read().await.clone();
                     discovery = start_discovery(&config, shared.endpoint.local_addr()?);
+                    shared.own_record(discovery.as_ref());
                 }
             }
         }
@@ -2090,16 +2095,6 @@ async fn next_discovery_event(
         .await
 }
 
-/// A record's addresses without this computer's own, which include its own
-/// advertisement coming back.
-fn remote_addresses(addresses: &[SocketAddr], local: &[std::net::IpAddr]) -> Vec<SocketAddr> {
-    addresses
-        .iter()
-        .filter(|address| !address.ip().is_loopback() && !local.contains(&address.ip()))
-        .copied()
-        .collect()
-}
-
 async fn next_discovery_error(
     discovery: Option<&Discovery>,
 ) -> Result<mdns_sd::Error, DiscoveryError> {
@@ -2797,19 +2792,6 @@ mod tests {
         assert!(claim_inbound(&mut owner, "authorized", 2, true, idle));
         assert_eq!(owner, Some(("authorized".to_owned(), 2)));
         assert!(!claim_inbound(&mut owner, "denied", 1, true, idle));
-    }
-
-    #[test]
-    fn nearby_records_drop_this_computers_own_addresses() {
-        let own = "192.0.2.5".parse().unwrap();
-        let addresses: Vec<SocketAddr> = ["192.0.2.5:43119", "127.0.0.1:43119", "192.0.2.9:43119"]
-            .iter()
-            .map(|address| address.parse().unwrap())
-            .collect();
-        assert_eq!(
-            remote_addresses(&addresses, &[own]),
-            ["192.0.2.9:43119".parse::<SocketAddr>().unwrap()]
-        );
     }
 
     #[test]

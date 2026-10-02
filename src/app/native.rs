@@ -593,6 +593,7 @@ impl NativeApp {
                 self.neighbors
                     .hello(&spki, remote, &hello, instance.as_deref(), now);
             }
+            Heard::Unanswered { instance } => self.neighbors.no_answer(&instance, now),
             Heard::TurnedAway => self.neighbors.turned_one_away(),
             Heard::Connected {
                 key,
@@ -640,6 +641,8 @@ impl NativeApp {
         if nearby.turned_away {
             self.neighbors.turned_one_away();
         }
+        let own = self.advertiser.as_ref().and_then(Advertiser::instance);
+        self.neighbors.own_record(own.map(str::to_owned));
         let records = nearby.records;
         for gone in self
             .instances
@@ -691,13 +694,15 @@ impl NativeApp {
         };
         match self.trust(&stranger.key) {
             Ok(name) => {
+                self.window.placed();
                 tracing::info!(%name, "joined while the pairing window was open");
                 self.restart();
                 self.place_new_peers();
             }
             Err(error) => {
+                self.window.not_added();
                 let error = format!("{error:#}");
-                tracing::warn!(%error, "could not add the computer that joined");
+                tracing::warn!(%error, name = %stranger.name, "could not add the computer that joined, so the pairing window closed");
             }
         }
     }

@@ -115,6 +115,8 @@ pub enum Heard {
         remote: SocketAddr,
         hello: Box<Hello>,
     },
+    /// Nothing answered the hello this Mac sent to the record `instance`.
+    Unanswered { instance: String },
     /// A connection was turned away because too many were being set up at
     /// once. It could have been a computer not seen otherwise.
     TurnedAway,
@@ -645,31 +647,42 @@ impl Links {
         });
     }
 
-    /// Says hello to the record `instance` at `addresses`, trying each in
-    /// turn. The answer comes back from [`Self::take_heard`]; a record that
-    /// never answers comes back as nothing.
+    /// Says hello to the record `instance` at every one of `addresses` at
+    /// once, as Linux does, and keeps the first computer that answers. The
+    /// answer comes back from [`Self::take_heard`], or
+    /// [`Heard::Unanswered`] when none came.
     pub fn say_hello(&mut self, instance: String, addresses: Vec<SocketAddr>, greeting: Greeting) {
         let Some(runtime) = &self.runtime else {
             return;
         };
         let heard = self.heard_sender.clone();
         self.dialing.push(runtime.spawn(async move {
+            let mut attempts = tokio::task::JoinSet::new();
             for remote in addresses {
-                let said = tokio::time::timeout(CONNECT_TIMEOUT, dial_hello(remote, &greeting));
-                match said.await.unwrap_or_else(|_| Err(anyhow!("timed out"))) {
-                    Ok((spki, hello)) => {
-                        let instance = Some(instance);
-                        let _ = heard.send(Heard::Hello {
-                            instance,
-                            spki,
-                            remote,
-                            hello: Box::new(hello),
-                        });
-                        return;
+                let greeting = greeting.clone();
+                attempts.spawn(async move {
+                    let said = tokio::time::timeout(CONNECT_TIMEOUT, dial_hello(remote, &greeting));
+                    match said.await.unwrap_or_else(|_| Err(anyhow!("timed out"))) {
+                        Ok(answer) => Some((remote, answer)),
+                        Err(error) => {
+                            tracing::debug!(%remote, error = %format!("{error:#}"), "no hello");
+                            None
+                        }
                     }
-                    Err(error) => tracing::debug!(%instance, %remote, error = %format!("{error:#}"), "no hello"),
+                });
+            }
+            while let Some(attempt) = attempts.join_next().await {
+                if let Ok(Some((remote, (spki, hello)))) = attempt {
+                    let _ = heard.send(Heard::Hello {
+                        instance: Some(instance),
+                        spki,
+                        remote,
+                        hello: Box::new(hello),
+                    });
+                    return;
                 }
             }
+            let _ = heard.send(Heard::Unanswered { instance });
         }));
     }
 
@@ -2830,7 +2843,12 @@ mod tests {
             endpoint
         });
         let record = endpoint.local_addr().unwrap();
-        links.say_hello("zf-linux".into(), vec![record], greeting);
+        // Its first address swallows every packet, so a hello there would
+        // only time out. The Mac asks at every address at once.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addresses = vec![silent.local_addr().unwrap(), record];
+        links.say_hello("zf-linux".into(), addresses, greeting.clone());
+        let asked = Instant::now();
         let Heard::Hello {
             instance,
             remote,
@@ -2840,8 +2858,15 @@ mod tests {
         else {
             panic!("expected the record's hello");
         };
+        assert!(asked.elapsed() < CONNECT_TIMEOUT, "{:?}", asked.elapsed());
         assert_eq!((instance.as_deref(), remote), (Some("zf-linux"), record));
         assert!(hello.trusts_you);
+        // A record nothing answers at says so, so it is asked again.
+        links.say_hello("zf-gone".into(), Vec::new(), greeting);
+        let Heard::Unanswered { instance } = heard(&mut links) else {
+            panic!("expected no answer");
+        };
+        assert_eq!(instance, "zf-gone");
         let deadline = Instant::now() + Duration::from_secs(2);
         while links.hellos_in_flight() > 0 {
             assert!(Instant::now() < deadline);

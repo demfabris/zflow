@@ -8,7 +8,7 @@ use super::*;
 use crate::{
     discovery::UntrustedCandidate,
     hello::{Notice, NoticeKind, peer_name},
-    neighbors::{Unplaced, UnplacedState, fingerprint},
+    neighbors::{Stranger, Unplaced, UnplacedState, fingerprint},
     transport::{HelloConnection, connect_hello},
     wire::Hello,
 };
@@ -68,21 +68,39 @@ impl Shared {
         };
         let joining = self.window().tick(&strangers, now);
         if let Some(stranger) = joining {
-            let _mutation = self.config_mutation.lock().await;
-            let config = self.config.read().await.clone();
-            match self.trust(config, &stranger.key, None).await {
-                Ok(name) => {
-                    tracing::info!(peer = %name, mark = %stranger.mark, "computer joined while the pairing window was open")
-                }
-                Err(error) => {
-                    tracing::warn!(error = %format_args!("{error:#}"), "pairing window could not add a computer")
-                }
+            self.join(&stranger).await;
+        }
+    }
+
+    /// Trusts the lone stranger the pairing window settled on. Saving it
+    /// closes the window as accepted; if it cannot be saved, the window
+    /// closes as failed and a person places it.
+    async fn join(self: &Arc<Self>, stranger: &Stranger) {
+        let _mutation = self.config_mutation.lock().await;
+        // A person placed a computer while this waited, which used it up.
+        if !self.window().is_open() {
+            return;
+        }
+        let config = self.config.read().await.clone();
+        let id = format!("key:{}", stranger.key);
+        match self.trust(config, &id, None).await {
+            Ok(name) => {
+                tracing::info!(peer = %name, mark = %stranger.mark, "computer joined while the pairing window was open");
+            }
+            Err(error) => {
+                self.window().not_added();
+                tracing::warn!(
+                    peer = %stranger.name,
+                    mark = %stranger.mark,
+                    error = %format_args!("{error:#}"),
+                    "pairing window could not add a computer and closed; place it by hand"
+                );
             }
         }
     }
 
     /// Says hello at every address of a record at once and keeps the first
-    /// computer that answers.
+    /// computer that answers. A record nothing answers at is asked again.
     async fn say_hello(&self, instance: &str, addresses: &[SocketAddr]) {
         let mut attempts = tokio::task::JoinSet::new();
         for &address in addresses {
@@ -103,11 +121,18 @@ impl Shared {
             }
         }
         drop(attempts);
-        let Some((address, connection)) = answered else {
-            tracing::debug!(instance, "no hello came back");
-            return;
+        let heard = match answered {
+            Some((address, connection)) => self.exchange(connection, address, Some(instance)).await,
+            None => false,
         };
-        self.exchange(connection, address, Some(instance)).await;
+        if !heard {
+            tracing::debug!(instance, "no hello came back");
+            let now = tokio::time::Instant::now();
+            self.neighbors.send_if_modified(|neighbors| {
+                neighbors.no_answer(instance, now);
+                false
+            });
+        }
     }
 
     /// Answers a hello that came to the input port, from any key, unless
@@ -128,12 +153,13 @@ impl Shared {
         self.exchange(connection, remote, None).await;
     }
 
+    /// Trades hellos on `connection` and returns whether one came back.
     async fn exchange(
         &self,
         connection: HelloConnection,
         remote: SocketAddr,
         instance: Option<&str>,
-    ) {
+    ) -> bool {
         let spki = connection.peer_spki().to_vec();
         let ours = {
             let config = self.config.read().await;
@@ -143,16 +169,29 @@ impl Shared {
             crate::hello::local_hello(config.transport.listen.port(), trusts_you)
         };
         match tokio::time::timeout(CONNECT_TIMEOUT, connection.exchange(&ours)).await {
-            Ok(Ok(hello)) => self.heard(&spki, remote, &hello, instance),
+            Ok(Ok(hello)) => {
+                self.heard(&spki, remote, &hello, instance);
+                return true;
+            }
             Ok(Err(error)) => tracing::debug!(%error, %remote, "hello failed"),
             Err(_) => tracing::debug!(%remote, "hello timed out"),
         }
+        false
     }
 
     fn heard(&self, spki: &[u8], remote: SocketAddr, hello: &Hello, instance: Option<&str>) {
         let now = tokio::time::Instant::now();
         self.neighbors.send_modify(|neighbors| {
             neighbors.hello(spki, remote, hello, instance, now);
+        });
+    }
+
+    /// Browsing started, and finds this computer's own record too.
+    pub(super) fn own_record(&self, discovery: Option<&crate::discovery::Discovery>) {
+        let own = discovery.map(|discovery| discovery.instance_id().to_string());
+        self.neighbors.send_if_modified(|neighbors| {
+            neighbors.own_record(own);
+            false
         });
     }
 
@@ -463,6 +502,53 @@ mod tests {
         let layout = shared.layout.lock().await.clone().unwrap();
         assert_eq!(tile_at(&layout, &after), Some((x, y)));
         assert_eq!(tile_at(&layout, &before), None);
+    }
+
+    #[tokio::test]
+    async fn a_computer_the_window_cannot_save_closes_it_as_failed() {
+        use crate::pairing_window::{Reason, State};
+        let (shared, _kept) = test_daemon();
+        let state_dir = shared.config.read().await.daemon.state_dir.clone();
+        PairingWindow::mark_eligible(&state_dir).unwrap();
+        *shared.window() = PairingWindow::load(&state_dir);
+        shared.open_pairing_window().await;
+        let (_directory, desk) = identity();
+        found(&shared, desk.spki(), "desk");
+        let now = tokio::time::Instant::now();
+        let config = shared.config.read().await.clone();
+        let stranger = shared.neighbors.borrow().strangers(&config, now).present[0].clone();
+        // Someone edited the file meanwhile, so saving it refuses.
+        let mut edited = config.clone();
+        edited.clipboard.share = !edited.clipboard.share;
+        edited.save(&shared.config_path).unwrap();
+
+        shared.join(&stranger).await;
+        let window = shared.window().view(now);
+        assert_eq!(
+            (window.state, window.reason),
+            (State::Closed, Some(Reason::Failed))
+        );
+        assert!(shared.config.read().await.peers.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_record_nothing_answers_at_is_asked_again_soon() {
+        let (shared, _kept) = test_daemon();
+        let now = tokio::time::Instant::now();
+        let take = |at| {
+            let mut due = Vec::new();
+            shared
+                .neighbors
+                .send_modify(|neighbors| due = neighbors.take_due_hellos(4, at));
+            due
+        };
+        shared.neighbors.send_modify(|neighbors| {
+            neighbors.instance_seen("zf-desk", Vec::new(), true, None);
+        });
+        assert_eq!(take(now).len(), 1);
+        shared.say_hello("zf-desk", &[]).await;
+        assert!(take(now + Duration::from_millis(1999)).is_empty());
+        assert_eq!(take(now + Duration::from_secs(2)).len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

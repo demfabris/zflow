@@ -45,7 +45,7 @@ struct PairingWindow: Decodable, Equatable, Sendable {
 
   enum State: String, Decodable, Sendable { case never, eligible, open, closed }
   enum Reason: String, Decodable, Sendable {
-    case accepted, expired, rival, restarted
+    case accepted, expired, rival, restarted, failed
     case hadPeers = "had_peers"
   }
   struct Holding: Decodable, Equatable, Sendable {

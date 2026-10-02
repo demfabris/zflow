@@ -31,8 +31,18 @@ pub const MAX_ADDED: usize = 8;
 pub const NEIGHBOR_TTL: Duration = Duration::from_secs(60);
 /// A hello this recent means the computer is here now.
 pub const FRESH_HELLO: Duration = Duration::from_secs(30);
-/// How soon a hello that got no answer is tried again.
-const HELLO_RETRY: Duration = Duration::from_secs(10);
+/// How long after a hello got no answer it is tried again: soon at first,
+/// since a computer whose Wi-Fi was asleep drops the first packets, then
+/// every [`HELLO_RETRY_LAST`] while its record is around.
+const HELLO_RETRIES: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+const HELLO_RETRY_LAST: Duration = Duration::from_secs(30);
+/// A hello that never said how it went, such as one dropped with its task,
+/// is tried again after this long.
+const HELLO_LOST: Duration = Duration::from_secs(30);
 /// Hellos one IP address may start here per window, so a flood from one
 /// host cannot keep this computer busy.
 const HELLOS_PER_IP: u32 = 5;
@@ -142,13 +152,28 @@ struct Instance {
     name: Option<String>,
     /// The key a hello to these addresses proved.
     key: Option<String>,
-    /// When a hello last went to these addresses.
-    asked: Option<Instant>,
+    asking: Asking,
+}
+
+/// Where the hellos to a record's addresses stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asking {
+    /// Not asked since its addresses changed.
+    Due,
+    /// Asked, and `unanswered` hellos got no answer. It is asked again at
+    /// `again`, unless one answers first.
+    Waiting {
+        again: Instant,
+        unanswered: u32,
+    },
+    Answered,
 }
 
 #[derive(Debug)]
 pub struct Neighbors {
     own: String,
+    /// This computer's own mDNS record, which browsing finds too.
+    own_record: Option<String>,
     instances: BTreeMap<String, Instance>,
     neighbors: BTreeMap<String, Neighbor>,
     added: Vec<String>,
@@ -161,6 +186,7 @@ impl Neighbors {
     pub fn new(own_spki: &[u8]) -> Self {
         Self {
             own: fingerprint(own_spki),
+            own_record: None,
             instances: BTreeMap::new(),
             neighbors: BTreeMap::new(),
             added: Vec::new(),
@@ -177,6 +203,16 @@ impl Neighbors {
         self.turned_away = true;
     }
 
+    /// Names this computer's own mDNS record. Its hellos would come back
+    /// to this computer, which hangs up on them, so it is never said hello
+    /// to and never holds the pairing window as a computer not known yet.
+    pub fn own_record(&mut self, instance: Option<String>) {
+        if let Some(instance) = &instance {
+            self.instances.remove(instance);
+        }
+        self.own_record = instance;
+    }
+
     /// An mDNS record was resolved. A record whose addresses changed gets a
     /// new hello, since another computer may have them now.
     pub fn instance_seen(
@@ -186,9 +222,12 @@ impl Neighbors {
         compatible: bool,
         name: Option<String>,
     ) {
+        if self.own_record.as_deref() == Some(instance) {
+            return;
+        }
         if let Some(known) = self.instances.get_mut(instance) {
             if known.addresses != addresses {
-                known.asked = None;
+                known.asking = Asking::Due;
             }
             known.addresses = addresses;
             known.compatible = compatible;
@@ -203,7 +242,7 @@ impl Neighbors {
                     compatible,
                     name,
                     key: None,
-                    asked: None,
+                    asking: Asking::Due,
                 },
             );
         }
@@ -236,30 +275,51 @@ impl Neighbors {
                 compatible: true,
                 name: None,
                 key: None,
-                asked: None,
+                asking: Asking::Due,
             },
         );
     }
 
     /// Records that need a hello now, at most `room` of them: those never
-    /// asked since their addresses changed, and unknown ones again after a
-    /// while. Each is marked asked. Pass the record back to [`Self::hello`].
+    /// asked since their addresses changed, and those whose last hello got
+    /// no answer, once their wait is over. Pass the record back to
+    /// [`Self::hello`] with the answer, or to [`Self::no_answer`].
     pub fn take_due_hellos(&mut self, room: usize, now: Instant) -> Vec<(String, Vec<SocketAddr>)> {
         let mut due = Vec::new();
         for (id, instance) in &mut self.instances {
             if due.len() == room {
                 break;
             }
-            let retry = instance.key.is_none()
-                && instance
-                    .asked
-                    .is_some_and(|asked| now.duration_since(asked) >= HELLO_RETRY);
-            if instance.compatible && (instance.asked.is_none() || retry) {
-                instance.asked = Some(now);
+            let unanswered = match instance.asking {
+                Asking::Due => 0,
+                Asking::Waiting { again, unanswered } if now >= again => unanswered,
+                _ => continue,
+            };
+            if instance.compatible {
+                let again = now + HELLO_LOST;
+                instance.asking = Asking::Waiting { again, unanswered };
                 due.push((id.clone(), instance.addresses.clone()));
             }
         }
         due
+    }
+
+    /// The hello to the record `instance` got no answer at any of its
+    /// addresses, so it is asked again after a wait that grows.
+    pub fn no_answer(&mut self, instance: &str, now: Instant) {
+        let Some(instance) = self.instances.get_mut(instance) else {
+            return;
+        };
+        if let Asking::Waiting { unanswered, .. } = instance.asking {
+            let wait = HELLO_RETRIES
+                .get(unanswered as usize)
+                .copied()
+                .unwrap_or(HELLO_RETRY_LAST);
+            instance.asking = Asking::Waiting {
+                again: now + wait,
+                unanswered: unanswered + 1,
+            };
+        }
     }
 
     /// Whether to answer one more hello from `ip` now. One from loopback or
@@ -300,6 +360,7 @@ impl Neighbors {
         };
         if let Some((_, instance)) = instance {
             instance.key = Some(key.clone());
+            instance.asking = Asking::Answered;
         }
         if key == self.own {
             return None;
@@ -579,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn unanswered_records_are_asked_again_after_a_while_and_in_batches() {
+    async fn unanswered_records_are_asked_again_sooner_then_later_and_in_batches() {
         let mut around = Neighbors::new(&spki(0));
         for index in 1..=6 {
             let address = SocketAddr::from(([192, 0, 2, index], 43119));
@@ -588,9 +649,69 @@ mod tests {
         let start = Instant::now();
         assert_eq!(around.take_due_hellos(4, start).len(), 4);
         assert_eq!(around.take_due_hellos(4, start).len(), 2);
-        tokio::time::advance(HELLO_RETRY).await;
-        assert_eq!(around.take_due_hellos(10, Instant::now()).len(), 6);
+        // A hello still out is not sent again, unless it never says how it
+        // went.
+        assert!(around.take_due_hellos(4, start).is_empty());
         assert_eq!(around.strangers(&Config::default(), start).unidentified, 6);
+        assert_eq!(around.take_due_hellos(10, start + HELLO_LOST).len(), 6);
+
+        // A record that never answers is asked again after 2, 5 and 15
+        // seconds, then every 30, as a computer whose Wi-Fi was asleep
+        // wakes up.
+        let mut around = Neighbors::new(&spki(0));
+        around.instance_seen("zf-desk", vec![at("192.0.2.7:43119")], true, None);
+        let mut now = Instant::now();
+        around.take_due_hellos(1, now);
+        for wait in [2, 5, 15, 30, 30].map(Duration::from_secs) {
+            around.no_answer("zf-desk", now);
+            let early = now + wait - Duration::from_millis(1);
+            assert!(around.take_due_hellos(1, early).is_empty(), "{wait:?}");
+            now += wait;
+            assert_eq!(around.take_due_hellos(1, now).len(), 1, "{wait:?}");
+        }
+
+        // New addresses start the waits over, and an answer ends them.
+        around.no_answer("zf-desk", now);
+        let moved = at("192.0.2.70:43119");
+        around.instance_seen("zf-desk", vec![moved], true, None);
+        assert_eq!(around.take_due_hellos(1, now).len(), 1);
+        around.no_answer("zf-desk", now);
+        now += HELLO_RETRIES[0];
+        assert_eq!(around.take_due_hellos(1, now).len(), 1);
+        let hello = make_hello("desk", 43119, Vec::new(), false);
+        around.hello(&spki(1), moved, &hello, Some("zf-desk"), now);
+        around.no_answer("zf-desk", now);
+        assert!(around.take_due_hellos(1, now + HELLO_LOST * 10).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn this_computers_own_record_is_never_asked_and_holds_nothing_up() {
+        let mut around = Neighbors::new(&spki(0));
+        let own = vec![at("192.0.2.2:43119"), at("[2001:db8::2]:43119")];
+        around.instance_seen("zf-me", own.clone(), true, Some("me".into()));
+        // Seen before its own advertisement was known, and dropped once it is.
+        around.own_record(Some("zf-me".into()));
+        around.instance_seen("zf-me", own, true, Some("me".into()));
+        around.instance_seen("zf-desk", vec![at("192.0.2.7:43119")], true, None);
+        let now = Instant::now();
+        let due = around.take_due_hellos(4, now);
+        assert_eq!(due, [("zf-desk".into(), vec![at("192.0.2.7:43119")])]);
+        let hello = make_hello("desk", 43119, Vec::new(), false);
+        around.hello(
+            &spki(1),
+            at("192.0.2.7:43119"),
+            &hello,
+            Some("zf-desk"),
+            now,
+        );
+        let strangers = around.strangers(&Config::default(), now);
+        assert_eq!((strangers.present.len(), strangers.unidentified), (1, 0));
+        assert!(
+            around
+                .unplaced(&Config::default())
+                .iter()
+                .all(|tile| tile.name != "me")
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -75,7 +75,8 @@ private func temporary() -> URL {
   _ = try decode([Os].self, #"["linux","macos"]"#)
   _ = try decode([PairingWindow.State].self, #"["never","eligible","open","closed"]"#)
   _ = try decode(
-    [PairingWindow.Reason].self, #"["had_peers","accepted","expired","rival","restarted"]"#)
+    [PairingWindow.Reason].self,
+    #"["had_peers","accepted","expired","rival","restarted","failed"]"#)
   _ = try decode([Notice.Kind].self, #"["joined"]"#)
   #expect(throws: DecodingError.self) { try decode([Peer.State].self, #"["asleep"]"#) }
 }
@@ -108,6 +109,8 @@ private func temporary() -> URL {
   #expect(try snapshot(window: holding).finishNote?.title == "Adding ubuntu…")
   let rival = #"{"state":"closed","reason":"rival"}"#
   #expect(try snapshot(window: rival).finishNote?.title == "Drag the one you want")
+  let failed = #"{"state":"closed","reason":"failed"}"#
+  #expect(try snapshot(window: failed).finishNote?.title == "Drag the new computer into place")
   for done in [#"{"state":"closed","reason":"expired"}"#, #"{"state":"never"}"#] {
     #expect(try snapshot(window: done).finishNote == nil)
   }

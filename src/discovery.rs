@@ -58,6 +58,20 @@ pub fn this_host_addresses() -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
+/// A record's addresses without this computer's own, `local`. Browsing
+/// finds this computer's own record too, and two computers can share an
+/// address, such as a container bridge's; dialing one reaches this one.
+pub fn remote_addresses(addresses: &[SocketAddr], local: &[IpAddr]) -> Vec<SocketAddr> {
+    addresses
+        .iter()
+        .filter(|address| {
+            let ip = address.ip().to_canonical();
+            !ip.is_loopback() && !local.contains(&ip)
+        })
+        .copied()
+        .collect()
+}
+
 fn select_advertisable_addresses(addresses: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
     addresses
         .into_iter()
@@ -241,6 +255,12 @@ impl Discovery {
         self.daemon.register(service)?;
         self.registration = Some(advertisement);
         Ok(())
+    }
+
+    /// The instance this computer's own record has, which its browser
+    /// finds like any other.
+    pub fn instance_id(&self) -> EphemeralInstanceId {
+        self.instance_id
     }
 
     pub fn browse(&mut self) -> Result<(), DiscoveryError> {
@@ -677,6 +697,24 @@ mod tests {
         for address in local_unicast_addresses().unwrap() {
             assert!(all.contains(&address), "{address}");
         }
+    }
+
+    #[test]
+    fn records_drop_this_computers_own_addresses() {
+        let own = "192.0.2.5".parse().unwrap();
+        let addresses: Vec<SocketAddr> = [
+            "192.0.2.5:43119",
+            "127.0.0.1:43119",
+            "[::ffff:192.0.2.5]:43119",
+            "192.0.2.9:43119",
+        ]
+        .iter()
+        .map(|address| address.parse().unwrap())
+        .collect();
+        assert_eq!(
+            remote_addresses(&addresses, &[own]),
+            ["192.0.2.9:43119".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     fn advertisement() -> Advertisement {
