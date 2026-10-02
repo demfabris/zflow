@@ -90,7 +90,7 @@ import Testing
   let core = CoreBridge(path: file.path)
   let snapshot = try await core.request(CoreRequest(command: "snapshot"))
   #expect(snapshot.status.state == .setup)
-  #expect(snapshot.status.title == "Pair a computer")
+  #expect(snapshot.status.title == "Add a computer")
   #expect(snapshot.health.first?.id == "sharing")
   #expect(snapshot.layout != nil)
   #expect(snapshot.peers.isEmpty)

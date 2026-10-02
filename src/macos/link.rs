@@ -329,27 +329,20 @@ impl Links {
         })
     }
 
-    /// Keeps one link per peer that may connect, and closes the others,
-    /// and listens while any may, or while `welcome` lets computers that do
-    /// not trust this Mac yet say hello. `None` closes every link and the
-    /// listener. A peer whose key or permission to receive changed
-    /// reconnects, and so does every peer when the session settings change.
-    pub fn sync(&mut self, config: Option<&Config>, welcome: bool) {
+    /// While `sharing`, keeps one link per peer that may connect and closes
+    /// the others; while paused, closes every link. Either way it listens
+    /// while any peer may connect, or while `welcome` lets computers that do
+    /// not trust this Mac yet say hello. A peer whose key or permission to
+    /// receive changed reconnects, and so does every peer when the session
+    /// settings change.
+    pub fn sync(&mut self, config: &Config, sharing: bool, welcome: bool) {
         // Made here once, so link tasks and the listener never race to
         // create it.
-        if let Some(config) = config
-            && let Err(error) = Identity::load_or_create(&config.daemon.state_dir)
-        {
+        if let Err(error) = Identity::load_or_create(&config.daemon.state_dir) {
             tracing::warn!(%error, "could not read this Mac's key");
         }
-        self.sync_links(config);
-        match config {
-            Some(config) => self.listen(config, welcome),
-            None => {
-                self.listener = None;
-                self.listen_error = None;
-            }
-        }
+        self.sync_links(sharing.then_some(config));
+        self.listen(config, welcome);
     }
 
     fn sync_links(&mut self, config: Option<&Config>) {
@@ -426,7 +419,9 @@ impl Links {
 
     /// Listens on `transport.listen` for every peer that may connect, and
     /// for hellos while `welcome`, or on nothing. The Mac still dials when
-    /// this fails.
+    /// this fails. While sharing is paused there are no links, so input
+    /// from a peer is closed once it arrives. The allowlist keeps its key,
+    /// or the peer would hear that this Mac never added it.
     fn listen(&mut self, config: &Config, welcome: bool) {
         let peers: Vec<(&String, Vec<u8>)> = config
             .peers
@@ -1061,7 +1056,7 @@ async fn open_inbound(
     let route = lock().routes.get(connection.peer_spki()).cloned();
     let Some((name, commands)) = route else {
         connection.close();
-        bail!("the computer that connected has no link here");
+        bail!("the computer that connected has no link here, as while sharing is paused");
     };
     let address = connection.remote_address();
     let (sender, events) = mpsc::channel(128);
@@ -1816,7 +1811,7 @@ mod tests {
         let mut config = mac_config(mac.path(), linux.path(), receiver.address);
         let mut links = Links::with_backend(FakeBackend::default()).unwrap();
         assert!(links.cross(handoff("linux"), ENTRY, false).is_none());
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert!(links.changed());
         wait_until(&mut links, ready);
         let first = server.block_on(receiver.sessions.recv()).unwrap();
@@ -1826,7 +1821,7 @@ mod tests {
         config.clipboard.share = true;
         config.switching.pause_at_edges = true;
         let task = links.links["linux"].task.id();
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert_eq!(links.links["linux"].task.id(), task);
 
         // The receiver drops the session, as when its daemon restarts.
@@ -1856,8 +1851,9 @@ mod tests {
             "no crossing kept input"
         );
 
-        // Closing the link reaches the receiver now, not at its idle timeout.
-        links.sync(None, false);
+        // Pausing closes the link, and that reaches the receiver now, not
+        // at its idle timeout.
+        links.sync(&config, false, false);
         assert!(links.states().next().is_none());
         server.block_on(async {
             loop {
@@ -1903,7 +1899,7 @@ mod tests {
         let pasteboard = FakePasteboard::default();
         let mut links = Links::with_fakes(fake.clone(), pasteboard.clone()).unwrap();
         links.set_receive_policy(true, false);
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         wait_until(&mut links, |links| {
             links
                 .states()
@@ -2115,7 +2111,7 @@ mod tests {
         assert_eq!(pair.pasteboard.board().reads, 0);
 
         pair.config.clipboard.share = true;
-        pair.links.sync(Some(&pair.config), false);
+        pair.links.sync(&pair.config, true, false);
         control_once(&mut pair, &linux, 2);
         let sent = clip(&mut pair, Duration::from_secs(2)).expect("the clipboard went along");
         assert_eq!(sent.kind(), ClipKind::Text);
@@ -2368,7 +2364,7 @@ mod tests {
             .unwrap()
             .permissions
             .send_normal = false;
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert_eq!(links.links["linux"].task.id(), task, "the link stays");
         posted(&fake, "key 0 up", Duration::from_secs(1));
         closed(&server, &mut receiver, linux.id());
@@ -2458,7 +2454,7 @@ mod tests {
         peer.permissions.send_normal = false;
         peer.keyboard = crate::core::KeyboardMode::Mac;
         peer.reverse_scroll = true;
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert_eq!(links.links["linux"].task.id(), task);
 
         // Taking input from this Mac needs the desktop, so it reconnects.
@@ -2468,7 +2464,7 @@ mod tests {
             .unwrap()
             .permissions
             .receive_normal = true;
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert_ne!(links.links["linux"].task.id(), task);
         wait_until(&mut links, ready);
         let second = server.block_on(receiver.sessions.recv()).unwrap();
@@ -2572,7 +2568,7 @@ mod tests {
             let mut receiver = server.block_on(receiver(linux.path(), &spki, false));
             let config = mac_config(mac.path(), linux.path(), receiver.address);
             let mut links = Links::with_backend(FakeBackend::default()).unwrap();
-            links.sync(Some(&config), false);
+            links.sync(&config, true, false);
             wait_until(&mut links, ready);
             let ours = server.block_on(receiver.sessions.recv()).unwrap();
             let (theirs, mut seen, _endpoint) =
@@ -2611,7 +2607,7 @@ mod tests {
         let mut config = mac_config(mac.path(), linux.path(), receiver.address);
         let mut links = Links::with_backend(FakeBackend::default()).unwrap();
         links.dial_window = Duration::ZERO;
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         wait_until(&mut links, ready);
         let ours = server.block_on(receiver.sessions.recv()).unwrap();
         let (theirs, mut seen, _endpoint) =
@@ -2624,7 +2620,7 @@ mod tests {
         // A computer this Mac has no address for connects on its own.
         config.peers.get_mut("linux").unwrap().addresses.clear();
         let mut links = Links::with_backend(FakeBackend::default()).unwrap();
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         wait_until(&mut links, |links| {
             links
                 .states()
@@ -2657,7 +2653,7 @@ mod tests {
         peer.addresses.clear();
         let key = peer.spki_der_hex.clone();
         let mut links = Links::with_backend(FakeBackend::default()).unwrap();
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         wait_until(&mut links, |links| {
             links
                 .states()
@@ -2670,7 +2666,7 @@ mod tests {
         let task = links.links["linux"].task.id();
         let peer = config.peers.get_mut("linux").unwrap();
         assert!(peer.learn_addresses([receiver.address]));
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert_eq!(links.links["linux"].task.id(), task);
         drop(links);
     }
@@ -2703,9 +2699,9 @@ mod tests {
         config.transport.listen = "127.0.0.1:0".parse().unwrap();
         let mut links = Links::with_backend(FakeBackend::default()).unwrap();
         // Nobody is trusted, so only a welcome listens.
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert!(links.listener.is_none());
-        links.sync(Some(&config), true);
+        links.sync(&config, true, true);
         let address = listening(&links);
         let greeting = Greeting {
             client: hello_client_config(&mac_key).unwrap(),
@@ -2793,13 +2789,66 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_mac_answers_hellos_and_closes_a_peers_input_without_disowning_it() {
+        use crate::{
+            hello::make_hello,
+            transport::{TransportError, hello_client_config},
+        };
+        let server = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mac, linux) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mac_spki = Identity::load_or_create(mac.path())
+            .unwrap()
+            .spki()
+            .to_vec();
+        let linux_key = Arc::new(Identity::load_or_create(linux.path()).unwrap());
+        let config = mac_config(mac.path(), linux.path(), "127.0.0.1:9".parse().unwrap());
+        let mut links = Links::with_backend(FakeBackend::default()).unwrap();
+        links.sync(&config, false, false);
+        assert!(
+            links.states().next().is_none(),
+            "nothing dials while paused"
+        );
+        let address = listening(&links);
+
+        // A hello still reaches the app.
+        let knocking = linux_key.clone();
+        server.spawn(async move {
+            let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let client = hello_client_config(&knocking).unwrap();
+            let connection = connect_hello(&endpoint, address, &client).await.unwrap();
+            let _ = connection
+                .exchange(&make_hello("linux", 43119, Vec::new(), true))
+                .await;
+        });
+        let Heard::Knock(knock) = heard(&mut links) else {
+            panic!("expected a knock");
+        };
+        knock.close();
+
+        // The peer's input is closed, but not as from a key never added.
+        let closed = server.block_on(async move {
+            let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let client = input_client_config(&linux_key, &mac_spki).unwrap();
+            let connection = connect_input(&endpoint, address, &client).await.unwrap();
+            let closed = tokio::time::timeout(Duration::from_secs(2), connection.closed());
+            TransportError::from(closed.await.expect("the Mac closed the input"))
+        });
+        assert!(!matches!(closed, TransportError::NotTrusted), "{closed}");
+        assert!(links.take_heard().is_empty(), "no refusal was heard");
+    }
+
+    #[test]
     fn a_port_in_use_only_stops_connections_coming_in() {
         let busy = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let (mac, linux) = identities(true);
         let mut config = mac_config(mac.path(), linux.path(), busy.local_addr().unwrap());
         config.transport.listen = busy.local_addr().unwrap();
         let mut links = Links::with_backend(FakeBackend::default()).unwrap();
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         let error = links.listen_error().unwrap();
         assert!(
             error.starts_with("Other computers cannot connect"),
@@ -2808,18 +2857,19 @@ mod tests {
         assert_eq!(links.states().count(), 1, "the link still dials");
         // Once the port is free, the next sync listens on it.
         drop(busy);
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert_eq!(links.listen_error(), None);
         assert!(links.listener.is_some());
         config.transport.listen = "127.0.0.1:0".parse().unwrap();
-        links.sync(Some(&config), false);
+        links.sync(&config, true, false);
         assert_eq!(links.listen_error(), None);
         assert!(links.listener.is_some());
-        // Sharing off, or nobody who may connect, listens on nothing.
+        // Paused, it still listens, so peers hear it is there.
+        links.sync(&config, false, false);
+        assert!(links.listener.is_some() && links.states().next().is_none());
+        // Nobody who may connect, and no welcome, listens on nothing.
         config.peers.get_mut("linux").unwrap().permissions.connect = false;
-        links.sync(Some(&config), false);
-        assert!(links.listener.is_none());
-        links.sync(None, false);
+        links.sync(&config, true, false);
         assert!(links.listener.is_none() && links.listen_error().is_none());
     }
 

@@ -40,7 +40,7 @@ struct ComputerView: View {
       Section {
         Button("Forget \(name)…", role: .destructive) { forgetting = true }
       } footer: {
-        Text("\(name) has to pair again before it can send input here.")
+        Text("To use \(name) again, drag it back into place from Found on your network.")
       }
     }
     .formStyle(.grouped)
@@ -51,7 +51,7 @@ struct ComputerView: View {
       }
     } message: {
       Text(
-        "This stops input between the two computers and removes its trusted identity. Pair it again to reconnect."
+        "This stops input between the two computers and removes its trusted identity. It goes back to Found on your network."
       )
     }
   }

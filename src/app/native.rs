@@ -404,16 +404,16 @@ impl NativeApp {
         self.welcome = self.discovers();
         let config = self.document.saved();
         let sharing = config.macos.sharing && !self.emergency_paused;
-        self.links.sync(sharing.then_some(config), self.welcome);
+        self.links.sync(config, sharing, self.welcome);
         self.sync_advertiser();
     }
 
     fn reload(&mut self) {
         match ConfigDocument::open(self.document.path.clone()).and_then(|doc| {doc.validate()?; Ok(doc)}) {
             Ok(document) if !document.is_new() => {
-                // Pairing saves the configuration itself, so a computer paired
-                // here gets its tile once the change is read. Links find each
-                // computer by key, so new addresses alone change nothing.
+                // A computer added to the file by hand gets its tile once the
+                // change is read. Links find each computer by key, so new
+                // addresses alone change nothing.
                 if without_addresses(document.saved())!=without_addresses(self.document.saved()) { self.document=document; self.restart(); self.place_new_peers(); }
                 else { self.document=document; }
                 self.config_error=None;
@@ -1290,7 +1290,7 @@ fn link_health(peers: &[Peer], refused: &[String]) -> Option<Health> {
             "computers",
             Level::Error,
             title,
-            "No paired computer takes input from this Mac. Pair again to fix this.",
+            "No computer takes input from this Mac. Forget one and drag it back into place to fix this.",
         )
     } else if peers.iter().any(|peer| peer.state == PeerState::Connecting) {
         Health::new("computers", Level::Ok, title, "Checking…")
@@ -1486,8 +1486,13 @@ mod tests {
         assert!(app.advertiser.is_none());
         app.request(Request::Discover).unwrap();
         assert!(!app.discovers() && app.advertiser.is_none());
+        // Paused, it still listens, so its computers are not told it never
+        // added them.
         app.request(Request::SetSharing { enabled: false }).unwrap();
-        assert_eq!(app.links.listen_port(), None);
+        assert_eq!(
+            app.links.listen_port(),
+            Some(config.transport.listen.port())
+        );
         assert!(app.advertiser.is_none());
     }
 
@@ -1598,7 +1603,7 @@ mod tests {
         assert!(app.take_layout("desk", arranged.clone()));
         assert_eq!(kept(&app), arranged, "nothing missing");
 
-        // Pairing saves the configuration, and the app reads it from there.
+        // A computer added to the file by hand reaches the app from there.
         config.peers.insert("laptop".into(), record(&laptop));
         config.save(&path).unwrap();
         app.reload();

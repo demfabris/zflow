@@ -555,8 +555,8 @@ impl SharedLayout {
     }
 
     /// A new version, edited by `own`, in which `new` takes over `old`'s
-    /// tile, as when a computer was reinstalled and paired again with a new
-    /// key. None when `old` has no tile or `new` already has one.
+    /// tile, as when a reinstalled computer's new key is dropped onto its
+    /// old tile. None when `old` has no tile or `new` already has one.
     pub fn with_key_replaced(&self, own: &str, old: &str, new: &str) -> Option<Self> {
         if self.tiles.iter().any(|tile| tile.key == new) {
             return None;

@@ -13,7 +13,7 @@ pub const BUS: &str = "io.zflow.Desktop";
 const PATH: &str = "/io/zflow/Desktop";
 /// packaging/gnome-extension/client.js mirrors this. Raise both when the agent
 /// and the extension stop understanding each other.
-pub(super) const API: u32 = 2;
+pub(super) const API: u32 = 3;
 const AUTOSTART: &str = "autostart/io.zflow.desktop-agent.desktop";
 /// Where the package keeps the service's settings.
 const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";
@@ -278,7 +278,7 @@ fn peers(daemon: &crate::peer_view::DesktopStatus) -> Vec<Peer> {
 
 /// One row for the links to paired computers, with Retry while one cannot
 /// be reached. Each computer's own row says why. A computer that is asleep
-/// or away only warns; one a person has to update or pair again needs
+/// or away only warns; one a person has to update or place again needs
 /// attention.
 fn link_health(
     peers: &[Peer],
@@ -647,7 +647,7 @@ mod tests {
                 },
             );
         }
-        let reinstalled = "Reset or reinstalled. Pair it again.";
+        let reinstalled = "Reset or reinstalled. Drag its new tile onto its old one.";
         let status = crate::peer_view::DesktopStatus {
             receiving_from: Some("mac".into()),
             connected: vec!["desk".into(), "mac".into()],

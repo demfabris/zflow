@@ -1146,7 +1146,7 @@ fn reload_running_daemon(config: &Config) -> Result<()> {
     }
 }
 
-/// Run as root, setup and pairing would leave a root-owned 0600 key that the
+/// Run as root, setup would leave a root-owned 0600 key that the
 /// zflow service account cannot read, so zflowd would fail to start. Anything
 /// created here is handed to that account instead.
 fn load_or_create_identity(state_dir: &Path) -> Result<Identity> {
@@ -1159,7 +1159,7 @@ fn load_or_create_identity(state_dir: &Path) -> Result<Identity> {
             .collect::<Vec<_>>();
         let owner = if nix::unistd::geteuid().is_root() && !created.is_empty() {
             let user = nix::unistd::User::from_name("zflow")?.context(
-                "the zflow service account does not exist; install zflow before running setup or pairing as root",
+                "the zflow service account does not exist; install zflow before running setup as root",
             )?;
             Some((user.uid.as_raw(), user.gid.as_raw()))
         } else {

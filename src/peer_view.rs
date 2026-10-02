@@ -721,12 +721,12 @@ mod tests {
         assert!(!old.share_clipboard && old.links.is_empty());
         assert!(old.unplaced.is_empty() && old.own_mark.is_none());
         let down = LinkStatus::Unreachable {
-            reason: "Reset or reinstalled. Pair it again.".into(),
+            reason: "Reset or reinstalled. Drag its new tile onto its old one.".into(),
             needs_fix: true,
         };
         assert_eq!(
             serde_json::to_string(&down).unwrap(),
-            r#"{"state":"unreachable","reason":"Reset or reinstalled. Pair it again.","needs_fix":true}"#
+            r#"{"state":"unreachable","reason":"Reset or reinstalled. Drag its new tile onto its old one.","needs_fix":true}"#
         );
     }
 

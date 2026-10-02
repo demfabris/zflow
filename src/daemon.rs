@@ -604,8 +604,9 @@ impl Shared {
         self.apply_layout().await;
     }
 
-    /// Gives a computer paired again with a new key, after a reinstall, the
-    /// tile its old key had, instead of a new one beside this computer.
+    /// Gives a computer whose new key was dropped onto its old tile, after
+    /// a reset or reinstall, the tile its old key had, instead of a new one
+    /// beside this computer.
     async fn move_reinstalled_tiles(&self, old: &Config) {
         let before = peer_keys(old);
         let after = peer_keys(&*self.config.read().await);
@@ -2039,10 +2040,11 @@ fn start_discovery(config: &Config, listen: SocketAddr) -> Option<Discovery> {
     // Browsing finds a paired computer whose address changed.
     let result = (|| {
         let mut discovery = Discovery::new()?;
-        discovery.register(Advertisement::new(
-            listen.port(),
-            advertised_capabilities(config),
-        )?)?;
+        // The name labels the shelf tile until its hello comes back.
+        discovery.register(
+            Advertisement::new(listen.port(), advertised_capabilities(config))?
+                .with_name(&crate::hello::local_name()),
+        )?;
         discovery.browse()?;
         Ok::<_, anyhow::Error>(discovery)
     })();
@@ -2607,10 +2609,7 @@ mod tests {
                 .contains("another zflow computer answered")
         );
         let saved = dial(vec![other_address]).await.err().unwrap();
-        assert_eq!(
-            crate::link::Fix::of(&saved),
-            Some(crate::link::Fix::PairAgain)
-        );
+        assert_eq!(crate::link::Fix::of(&saved), Some(crate::link::Fix::NewKey));
     }
 
     #[test]
@@ -2627,7 +2626,7 @@ mod tests {
         assert_eq!(fix(TransportError::PeerIdentityMismatch, false), None);
         assert_eq!(
             fix(TransportError::PeerIdentityMismatch, true),
-            Some(Fix::PairAgain)
+            Some(Fix::NewKey)
         );
     }
 

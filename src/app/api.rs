@@ -63,7 +63,7 @@ pub(super) enum State {
     Controlled,
     Paused,
     Checking,
-    /// Nothing is paired yet.
+    /// No computer is added yet.
     Setup,
     Attention,
 }
@@ -98,7 +98,7 @@ impl Status {
             (State::Ready, _) => "Ready".into(),
             (State::Paused, _) => "Paused".into(),
             (State::Checking, _) => "Checking…".into(),
-            (State::Setup, _) => "Pair a computer".into(),
+            (State::Setup, _) => "Add a computer".into(),
             _ => "Needs attention".into(),
         };
         Self { state, peer, title }
@@ -434,7 +434,7 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value.as_object().unwrap().len(), order.len());
-        assert_eq!(value["status"]["title"], "Pair a computer");
+        assert_eq!(value["status"]["title"], "Add a computer");
         // Before a platform fills them, the new rows say nothing is going on.
         assert_eq!(value["pairing_window"]["state"], "never");
         assert_eq!(value["unplaced"], serde_json::json!([]));
