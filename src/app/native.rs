@@ -659,6 +659,9 @@ impl NativeApp {
         }
         self.instances = records.into_keys().collect();
         self.neighbors.expire(now);
+        if self.window.is_open() {
+            self.neighbors.keep_fresh(now);
+        }
         let room = MAX_HELLOS.saturating_sub(self.links.hellos_in_flight());
         if let Some(greeting) = self.greeting().filter(|_| room > 0) {
             for (instance, addresses) in self.neighbors.take_due_hellos(room, now) {

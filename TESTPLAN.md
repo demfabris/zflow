@@ -117,6 +117,11 @@ Checks:
     notification gives the other computer's mark as six hex digits, and
     hovering the squares on that computer's own tile shows the same digits.
     `sudo zflow trust NAME` prints "trusted NAME, mark MARK".
+23. **Late login.** With the Ubuntu screen locked or nobody logged in, run
+    `sudo apt purge zflow`, then install the `.deb` over ssh. The install
+    passes even though the purge left `/var/lib/zflow` behind, and
+    `pairing-window` reads `eligible`. Wait two minutes, then log in: the
+    window still takes the Mac within about 20 s.
 
 ## Two-way input sitting, Ubuntu side (ROADMAP Phases 2 and 3)
 

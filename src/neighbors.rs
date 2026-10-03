@@ -40,6 +40,10 @@ const HELLO_RETRIES: [Duration; 3] = [
     Duration::from_secs(15),
 ];
 const HELLO_RETRY_LAST: Duration = Duration::from_secs(30);
+/// While a pairing window is open, a record that answered is asked again
+/// this long after, half of [`FRESH_HELLO`], so its computer never goes
+/// stale while it is still around.
+const ASK_AGAIN: Duration = Duration::from_secs(15);
 /// A hello that never said how it went, such as one dropped with its task,
 /// is tried again after this long.
 const HELLO_LOST: Duration = Duration::from_secs(30);
@@ -162,11 +166,10 @@ enum Asking {
     Due,
     /// Asked, and `unanswered` hellos got no answer. It is asked again at
     /// `again`, unless one answers first.
-    Waiting {
-        again: Instant,
-        unanswered: u32,
-    },
-    Answered,
+    Waiting { again: Instant, unanswered: u32 },
+    /// Its hello came back at `at`. Only an open pairing window asks it
+    /// again, see [`Neighbors::keep_fresh`].
+    Answered { at: Instant },
 }
 
 #[derive(Debug)]
@@ -280,6 +283,19 @@ impl Neighbors {
         );
     }
 
+    /// Makes the records that answered [`ASK_AGAIN`] ago due, for an open
+    /// pairing window: it takes only a computer heard from within
+    /// [`FRESH_HELLO`], and it may open long after the last hello.
+    pub fn keep_fresh(&mut self, now: Instant) {
+        for instance in self.instances.values_mut() {
+            if let Asking::Answered { at } = instance.asking
+                && now.duration_since(at) >= ASK_AGAIN
+            {
+                instance.asking = Asking::Due;
+            }
+        }
+    }
+
     /// Records that need a hello now, at most `room` of them: those never
     /// asked since their addresses changed, and those whose last hello got
     /// no answer, once their wait is over. Pass the record back to
@@ -360,7 +376,7 @@ impl Neighbors {
         };
         if let Some((_, instance)) = instance {
             instance.key = Some(key.clone());
-            instance.asking = Asking::Answered;
+            instance.asking = Asking::Answered { at: now };
         }
         if key == self.own {
             return None;
@@ -922,6 +938,34 @@ mod tests {
         tokio::time::advance(FRESH_HELLO).await;
         let stale = around.strangers(&config, Instant::now());
         assert!(stale.present.iter().all(|stranger| !stranger.fresh));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_open_window_asks_a_record_again_before_its_hello_goes_stale() {
+        let mut around = Neighbors::new(&spki(0));
+        let desk = at("192.168.1.20:43119");
+        around.instance_seen("zf-desk", vec![desk], true, None);
+        let start = Instant::now();
+        around.take_due_hellos(4, start);
+        let hello = make_hello("desk", 43119, Vec::new(), false);
+        around.hello(&spki(1), desk, &hello, Some("zf-desk"), start);
+        // Nothing asks an answered record again by itself, so a window
+        // that opens a minute later would find its computer stale.
+        let later = start + Duration::from_secs(60);
+        assert!(around.take_due_hellos(4, later).is_empty());
+        assert!(!around.strangers(&Config::default(), later).present[0].fresh);
+
+        around.keep_fresh(start + ASK_AGAIN - Duration::from_millis(1));
+        assert!(around.take_due_hellos(4, later).is_empty());
+        around.keep_fresh(later);
+        assert_eq!(
+            around.take_due_hellos(4, later),
+            [("zf-desk".to_owned(), vec![desk])]
+        );
+        around.hello(&spki(1), desk, &hello, Some("zf-desk"), later);
+        let strangers = around.strangers(&Config::default(), later);
+        assert!(strangers.present[0].fresh && strangers.present[0].answered);
+        assert_eq!(strangers.unidentified, 0);
     }
 
     #[tokio::test(start_paused = true)]

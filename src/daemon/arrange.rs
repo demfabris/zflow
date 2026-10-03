@@ -47,9 +47,13 @@ impl Shared {
     async fn look_around(self: &Arc<Self>) {
         let now = tokio::time::Instant::now();
         let room = self.hello_slots.available_permits();
+        let open = self.window().is_open();
         let mut due = Vec::new();
         self.neighbors.send_modify(|neighbors| {
             neighbors.expire(now);
+            if open {
+                neighbors.keep_fresh(now);
+            }
             due = neighbors.take_due_hellos(room, now);
         });
         for (instance, addresses) in due {
