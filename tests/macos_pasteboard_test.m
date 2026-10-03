@@ -205,17 +205,20 @@ static void *checks(void *unused) {
     assert(zflow_mac_pasteboard_write(board_name, ZFLOW_CLIP_TEXT, NULL, 4, &count) == -1);
 
     // A busy main thread makes a call give up, and the write it gave up on
-    // never happens later.
+    // never happens later. The main thread stays busy until both calls gave
+    // up, however late a loaded machine runs them.
     zflow_pasteboard_wait = 0.05;
     dispatch_semaphore_t busy = dispatch_semaphore_create(0);
+    dispatch_semaphore_t gave_up = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_main_queue(), ^{
       dispatch_semaphore_signal(busy);
-      usleep(300 * 1000);
+      dispatch_semaphore_wait(gave_up, DISPATCH_TIME_FOREVER);
     });
     dispatch_semaphore_wait(busy, DISPATCH_TIME_FOREVER);
     assert(zflow_mac_pasteboard_write(board_name, ZFLOW_CLIP_TEXT, text.bytes, text.length,
                                       &count) == -1);
     assert(read_board(NULL, 8).status == -1);
+    dispatch_semaphore_signal(gave_up);
     zflow_pasteboard_wait = 3.0;
     on_main_thread(^{
       assert(board.changeCount == image_written);

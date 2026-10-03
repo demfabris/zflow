@@ -2109,8 +2109,14 @@ mod tests {
             .blocking_recv()
             .unwrap();
         assert!(applied.is_ok());
-        std::thread::sleep(Duration::from_millis(150));
-        let log = fake.take_log();
+        // Timers run late on a busy CI machine, so this waits for three
+        // repeats rather than for a fixed time.
+        let mut log = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while log.len() < 5 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            log.extend(fake.take_log());
+        }
         assert_eq!(log[..2], ["release all", "key 40 down"]);
         assert!(log[2..].len() >= 3, "{log:?}");
         assert!(log[2..].iter().all(|line| line == "key 40 down repeat"));
