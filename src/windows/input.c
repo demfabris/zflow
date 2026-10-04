@@ -63,7 +63,10 @@ static BOOL stop_at_boundary(const MSLLHOOKSTRUCT *m) {
         GetTickCount64() - (ULONGLONG)InterlockedCompareExchange64(&heartbeat, 0, 0) > 1000)
         return FALSE;
     POINT from, hit;
-    if (!GetCursorPos(&from) || !TryAcquireSRWLockShared(&boundary_lock)) return FALSE;
+    // Low-level callbacks can run in a DPI-unaware context even though the
+    // hook thread was set per-monitor aware. MSLLHOOKSTRUCT and our boundaries
+    // use physical pixels; Get/SetCursorPos would scale them a second time.
+    if (!GetPhysicalCursorPos(&from) || !TryAcquireSRWLockShared(&boundary_lock)) return FALSE;
     int edge = -1, returning = 0;
     for (int i = 0; i < boundary_count; ++i) {
         const zflow_boundary *b = &boundaries[i];
@@ -79,7 +82,7 @@ static BOOL stop_at_boundary(const MSLLHOOKSTRUCT *m) {
     if (edge < 0 || !zflow_input_clean()) return FALSE;
     for (int i = 0; i < 256; ++i) if (keys[i]) return FALSE;
     warping = TRUE;
-    BOOL placed = SetCursorPos(hit.x, hit.y);
+    BOOL placed = SetPhysicalCursorPos(hit.x, hit.y);
     warping = FALSE;
     if (!placed) return FALSE;
     if (!returning && emit && !emit(7, hit.x, hit.y, edge)) {
@@ -114,7 +117,7 @@ static LRESULT CALLBACK keyboard(int n, WPARAM w, LPARAM l) {
     return CallNextHookEx(NULL, n, w, l);
 }
 
-static LRESULT CALLBACK mouse(int n, WPARAM w, LPARAM l) {
+static LRESULT handle_mouse(int n, WPARAM w, LPARAM l) {
     if (n < 0) return CallNextHookEx(NULL, n, w, l);
     const MSLLHOOKSTRUCT *m = (const MSLLHOOKSTRUCT *)l;
     if (w == WM_MOUSEMOVE && !InterlockedCompareExchange(&remote_input, 0, 0) && stop_at_boundary(m)) return 1;
@@ -129,6 +132,15 @@ static LRESULT CALLBACK mouse(int n, WPARAM w, LPARAM l) {
         case WM_MOUSEHWHEEL: event(4, (SHORT)HIWORD(m->mouseData), 0, 0); break;
     }
     return 1;
+}
+
+static LRESULT CALLBACK mouse(int n, WPARAM w, LPARAM l) {
+    // Windows invokes low-level hooks with a callback-specific DPI context;
+    // setting it once in zflow_input_run does not cover these calls.
+    DPI_AWARENESS_CONTEXT previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    LRESULT result = handle_mouse(n, w, l);
+    SetThreadDpiAwarenessContext(previous);
+    return result;
 }
 
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM w, LPARAM l) {

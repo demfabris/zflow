@@ -355,6 +355,61 @@ mod boundary_tests {
             .is_none()
         );
     }
+
+    #[tokio::test]
+    #[ignore = "moves and restores the real pointer; pause other zflow instances first"]
+    async fn native_return_guard_stops_injected_motion_at_an_internal_edge() {
+        let geometry = geometry().unwrap();
+        // Place the boundary inside a real screen so OS desktop clamping cannot
+        // hide a missed interception. This also works with one active monitor.
+        let mut source = geometry.monitors[0];
+        source.width /= 2;
+        let original = cursor().unwrap();
+        let (_capture, _events) = Capture::start().await.unwrap();
+        struct Restore(Point);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                boundaries(&[]);
+                let _ = move_to(self.0);
+            }
+        }
+        let _restore = Restore(original);
+        let start = Point {
+            x: source.x + source.width as i32 - 40,
+            y: source.y + source.height as i32 / 2,
+        };
+        move_to(start).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(cursor().unwrap(), start);
+        assert!(
+            clean(),
+            "release all keys and buttons before running the probe"
+        );
+        boundaries(&[Boundary::new(source, Edge::Right, 0, FRACTION_MAX, true).unwrap()]);
+        pulse();
+        post(4, 200, 0, 0).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let actual = cursor().unwrap();
+        eprintln!(
+            "native return: from={start:?}, actual={actual:?}, expected_x={}",
+            source.x + source.width as i32 - 1
+        );
+        assert_eq!(actual.x, source.x + source.width as i32 - 1);
+        assert_eq!(actual.y, start.y);
+        post(4, 200, 0, 0).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            cursor().unwrap(),
+            actual,
+            "a continued push stays at the edge"
+        );
+        post(4, -100, 0, 0).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            cursor().unwrap().x < actual.x,
+            "reversing stays on this screen"
+        );
+    }
 }
 pub fn clean() -> bool {
     unsafe { zflow_input_clean() != 0 }

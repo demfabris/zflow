@@ -121,6 +121,11 @@ cargo test --locked --all-targets
 ./scripts/build-windows.ps1
 ```
 
+With sharing paused, `cargo test --lib native_return_guard_stops_injected_motion_at_an_internal_edge -- --ignored --nocapture`
+checks the real Windows hook at the current display scaling. It briefly moves
+and restores the pointer, without clicking or typing. Run it at scaling above
+100% to cover the return-edge coordinate regression.
+
 Before treating the preview as qualified, exercise both directions with a
 Mac and GNOME desktop: typing, held keys, drag, wheel, crossing and return,
 emergency pause, disconnect while a key is held, lock/unlock, sleep/wake,
