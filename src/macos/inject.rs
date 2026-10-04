@@ -770,7 +770,10 @@ impl Injector {
         let core = InjectorCore::new(backend, profile);
         let thread = std::thread::Builder::new()
             .name("zflow-inject".to_owned())
-            .spawn(move || run(core, receiver))
+            .spawn(move || {
+                super::user_interactive();
+                run(core, receiver)
+            })
             .context("could not start the Mac input thread")?;
         Ok(Self {
             commands: Some(commands),

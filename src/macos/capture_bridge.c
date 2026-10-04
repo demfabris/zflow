@@ -205,6 +205,7 @@ int zflow_mac_motion_take(ZFlowMacMotion *motion) {
 
 static void *motion_thread(void *context) {
   CFRunLoopSourceRef source = context;
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
   CGEventTapEnable(g_motion_tap, true);
   // Runs until macOS invalidates the tap, as after sleep or a session
@@ -874,6 +875,9 @@ static void signal_started(int status) {
 
 static void *capture_thread(void *context) {
   (void)context;
+  // At the default QoS a busy Mac shares the CPU evenly with this thread,
+  // and the pointer on the other computer stutters.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   bool raw_active = g_request_raw_touch && load_multitouch();
   if (!raw_active) g_request_raw_touch = false;
 

@@ -64,6 +64,16 @@ const AWDL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(crate::desktop::LEA
 /// Woken by the capture bridge whenever it queues an event or stops.
 static CAPTURE_WAKE: Notify = Notify::const_new();
 
+/// Puts the calling thread at the QoS of input handling. Input passes
+/// through the capture, sharing and inject threads; at the default QoS a
+/// busy Mac shares the CPU evenly with them and the pointer stutters.
+pub(crate) fn user_interactive() {
+    // SAFETY: changes only the calling thread's scheduling class.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
 extern "C" fn wake_capture() {
     CAPTURE_WAKE.notify_one();
 }
