@@ -426,7 +426,9 @@ static CFRunLoopRunResult fake_run_loop(CFRunLoopMode mode, CFTimeInterval secon
 }
 
 static void reset(void) {
-  assert(!g_cursor_hidden && !g_cursor_disconnected && !g_cursor_background);
+  assert(!g_cursor_hidden && !g_cursor_disconnected);
+  // A fresh process: the background cursor property is not set yet.
+  g_cursor_background = false;
   call_count = 0;
   calls[0] = '\0';
   fail_call = 0;
@@ -513,7 +515,7 @@ static void invalidated_tap_tests(void) {
   assert(zflow_mac_capture_stop() == -1);
   assert(strstr(g_error, "macOS stopped input capture"));
   assert(zflow_mac_capture_pause_requested() == 0);
-  assert(strcmp(calls, "BHDCSb") == 0);
+  assert(strcmp(calls, "BHDSC") == 0);
   g_wake = NULL;
 }
 
@@ -526,7 +528,7 @@ static void lost_stop_tests(void) {
   // The join returns only if the loop rechecks the flag it missed.
   assert(zflow_mac_capture_stop() == 0);
   assert(!g_thread_valid && !lose_stop);
-  assert(strcmp(calls, "BHDCSb") == 0);
+  assert(strcmp(calls, "BHDSC") == 0);
 }
 
 static void return_cursor_tests(void) {
@@ -535,20 +537,20 @@ static void return_cursor_tests(void) {
   expect_return_warp = true;
   start_capture();
   assert(zflow_mac_capture_stop_at(&target) == 0);
-  assert(strcmp(calls, "BHDWCSb") == 0);
+  assert(strcmp(calls, "BHDWSC") == 0);
   assert(warped_position.x == target.x && warped_position.y == target.y);
   assert(!g_return_pending && !g_thread_valid);
   assert(zflow_mac_capture_stop() == 0);
   assert(zflow_mac_capture_stop_at(&target) == -1);
-  assert(strcmp(calls, "BHDWCSb") == 0);
+  assert(strcmp(calls, "BHDWSC") == 0);
 
   reset();
   start_capture();
   atomic_store(&g_stop, true);
   stop_capture_run_loop();
   assert(zflow_mac_capture_stop_at(&target) == -1);
-  assert(strcmp(calls, "BHDCSb") == 0);
-  assert(connected && hide_count == 0 && !background);
+  assert(strcmp(calls, "BHDSC") == 0);
+  assert(connected && hide_count == 0 && background);
 
   const ZFlowMacPosition invalid[] = {{NAN, 0}, {0, INFINITY},
                                     {1920, 0}, {-1200, -201}};
@@ -556,8 +558,8 @@ static void return_cursor_tests(void) {
     reset();
     start_capture();
     assert(zflow_mac_capture_stop_at(&invalid[i]) == -1);
-    assert(strcmp(calls, "BHDCSb") == 0);
-    assert(connected && hide_count == 0 && !background);
+    assert(strcmp(calls, "BHDSC") == 0);
+    assert(connected && hide_count == 0 && background);
   }
 
   reset();
@@ -565,13 +567,13 @@ static void return_cursor_tests(void) {
   start_capture();
   fail_call = 'W';
   assert(zflow_mac_capture_stop_at(&target) == -1);
-  assert(strcmp(calls, "BHDWCSb") == 0);
-  assert(connected && hide_count == 0 && !background);
+  assert(strcmp(calls, "BHDWSC") == 0);
+  assert(connected && hide_count == 0 && background);
 
   reset();
   start_capture();
   assert(zflow_mac_capture_stop() == 0);
-  assert(strcmp(calls, "BHDCSb") == 0);
+  assert(strcmp(calls, "BHDSC") == 0);
 }
 
 static void cursor_lifecycle_tests(void) {
@@ -581,21 +583,25 @@ static void cursor_lifecycle_tests(void) {
     assert(!connected && hide_count == 1 && background);
     assert(strcmp(calls, "BHD") == 0);
     assert(release_cursor());
-    assert(connected && hide_count == 0 && !background);
-    assert(strcmp(calls, "BHDCSb") == 0);
+    assert(connected && hide_count == 0 && background);
+    assert(strcmp(calls, "BHDSC") == 0);
     assert(release_cursor());
-    assert(strcmp(calls, "BHDCSb") == 0);
+    assert(strcmp(calls, "BHDSC") == 0);
+    // The property stays on, so the next capture only hides and disconnects.
+    assert(capture_cursor());
+    assert(strcmp(calls, "BHDSCHD") == 0);
+    assert(release_cursor());
   }
 
   const char failures[] = {'B', 'H', 'D'};
-  const char *expected[] = {"B", "BHb", "BHDCSb"};
+  const char *expected[] = {"B", "BH", "BHDSC"};
   for (size_t i = 0; i < sizeof(failures); i++) {
     reset();
     fail_call = failures[i];
     assert(!capture_cursor());
     assert(strstr(g_error, "CGError"));
     assert(release_cursor());
-    assert(connected && hide_count == 0 && !background);
+    assert(connected && hide_count == 0 && background == (failures[i] != 'B'));
     assert(strcmp(calls, expected[i]) == 0);
   }
 
@@ -605,16 +611,16 @@ static void cursor_lifecycle_tests(void) {
   assert(release_cursor());
   assert(call_count == 0);
 
-  const char release_failures[] = {'C', 'S', 'b'};
+  const char release_failures[] = {'S', 'C'};
   for (size_t i = 0; i < sizeof(release_failures); i++) {
     reset();
     assert(capture_cursor());
     fail_call = release_failures[i];
     assert(!release_cursor());
-    assert(strcmp(calls, "BHDCSb") == 0);
+    assert(strcmp(calls, "BHDSC") == 0);
     fail_call = 0;
     assert(release_cursor());
-    assert(connected && hide_count == 0 && !background);
+    assert(connected && hide_count == 0 && background);
   }
 }
 
