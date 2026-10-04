@@ -316,6 +316,7 @@ impl Links {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("zflow-sharing")
+            .on_thread_start(super::user_interactive)
             .enable_all()
             .build()
             .context("Could not start the sharing runtime")?;

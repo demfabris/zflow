@@ -205,6 +205,7 @@ int zflow_mac_motion_take(ZFlowMacMotion *motion) {
 
 static void *motion_thread(void *context) {
   CFRunLoopSourceRef source = context;
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
   CGEventTapEnable(g_motion_tap, true);
   // Runs until macOS invalidates the tap, as after sleep or a session
@@ -369,13 +370,6 @@ static bool cursor_result(CGError error, const char *operation) {
 
 static bool release_cursor(void) {
   bool ok = true;
-  if (g_cursor_disconnected) {
-    if (cursor_result(CGAssociateMouseAndMouseCursorPosition(true),
-                      "could not reconnect the Mac cursor"))
-      g_cursor_disconnected = false;
-    else
-      ok = false;
-  }
   if (g_cursor_hidden) {
     if (cursor_result(CGDisplayShowCursor(kCGNullDirectDisplay),
                       "could not show the Mac cursor"))
@@ -383,12 +377,13 @@ static bool release_cursor(void) {
     else
       ok = false;
   }
-  if (g_cursor_background) {
-    if (cursor_result(g_set_connection_property(
-            g_cursor_connection, g_cursor_connection,
-            CFSTR("SetsCursorInBackground"), kCFBooleanFalse),
-            "could not release background cursor control"))
-      g_cursor_background = false;
+  // SetsCursorInBackground stays on, and reconnecting comes after the show,
+  // as in input-leap. Turning the property off right after the show now and
+  // then left the cursor hidden until another app came to the front.
+  if (g_cursor_disconnected) {
+    if (cursor_result(CGAssociateMouseAndMouseCursorPosition(true),
+                      "could not reconnect the Mac cursor"))
+      g_cursor_disconnected = false;
     else
       ok = false;
   }
@@ -427,8 +422,20 @@ static bool release_cursor_at(const ZFlowMacPosition *position) {
   return ok;
 }
 
+// macOS drops local mouse input for 0.25 s after a warp, so after a return
+// the cursor sat still at the edge while the mouse kept moving. 0.05 s lets
+// it move on almost at once; at 0.01 s it sometimes showed across the screen
+// for a frame before the warp held. lan-mouse settled on 0.05 s too. The
+// setting lasts as long as its source, so this one stays.
+static void shorten_warp_freeze(void) {
+  CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+  if (source) CGEventSourceSetLocalEventsSuppressionInterval(source, 0.05);
+}
+
 static bool capture_cursor(void) {
-  if (g_cursor_hidden || g_cursor_disconnected || g_cursor_background) {
+  static pthread_once_t warp_freeze = PTHREAD_ONCE_INIT;
+  pthread_once(&warp_freeze, shorten_warp_freeze);
+  if (g_cursor_hidden || g_cursor_disconnected) {
     set_error("previous capture did not release cursor control");
     return false;
   }
@@ -441,11 +448,13 @@ static bool capture_cursor(void) {
     return false;
   }
   g_cursor_connection = default_connection();
-  if (!cursor_result(g_set_connection_property(
-          g_cursor_connection, g_cursor_connection,
-          CFSTR("SetsCursorInBackground"), kCFBooleanTrue),
-          "could not enable background cursor control")) return false;
-  g_cursor_background = true;
+  if (!g_cursor_background) {
+    if (!cursor_result(g_set_connection_property(
+            g_cursor_connection, g_cursor_connection,
+            CFSTR("SetsCursorInBackground"), kCFBooleanTrue),
+            "could not enable background cursor control")) return false;
+    g_cursor_background = true;
+  }
   if (!cursor_result(CGDisplayHideCursor(kCGNullDirectDisplay),
                      "could not hide the Mac cursor")) return false;
   g_cursor_hidden = true;
@@ -866,6 +875,9 @@ static void signal_started(int status) {
 
 static void *capture_thread(void *context) {
   (void)context;
+  // At the default QoS a busy Mac shares the CPU evenly with this thread,
+  // and the pointer on the other computer stutters.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
   bool raw_active = g_request_raw_touch && load_multitouch();
   if (!raw_active) g_request_raw_touch = false;
 

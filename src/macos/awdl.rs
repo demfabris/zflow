@@ -187,10 +187,17 @@ type Acquire =
 pub(super) struct Shared {
     acquire: Acquire,
     linger: Duration,
-    users: Mutex<usize>,
+    users: Mutex<Users>,
     lease: tokio::sync::Mutex<Option<HeldLease>>,
     /// Failures in a row, and the last one.
     trouble: Mutex<(u32, String)>,
+}
+
+/// Who wants AWDL down now, and how many times nobody did.
+#[derive(Default)]
+struct Users {
+    wanting: usize,
+    emptied: u64,
 }
 
 /// The app's shared lease, from the real helper.
@@ -208,19 +215,19 @@ impl Shared {
         Arc::new(Self {
             acquire,
             linger,
-            users: Mutex::new(0),
+            users: Mutex::default(),
             lease: tokio::sync::Mutex::new(None),
             trouble: Mutex::default(),
         })
     }
 
-    fn users(&self) -> MutexGuard<'_, usize> {
+    fn users(&self) -> MutexGuard<'_, Users> {
         self.users.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Wants AWDL down until the guard drops. [`Self::down`] takes it down.
     pub(super) fn want(self: &Arc<Self>) -> Wanted {
-        *self.users() += 1;
+        self.users().wanting += 1;
         Wanted(self.clone())
     }
 
@@ -249,7 +256,7 @@ impl Shared {
     pub(super) async fn down(&self, peer: &str, limit: Duration) {
         let attempt = async {
             let mut lease = self.lease.lock().await;
-            if *self.users() == 0 {
+            if self.users().wanting == 0 {
                 return Ok(false);
             }
             if let Some(mut lapsed) = lease.take_if(|held| held.lapsed()) {
@@ -280,12 +287,17 @@ impl Shared {
         }
     }
 
-    /// Gives AWDL back once nobody has wanted it for the linger time.
-    async fn restore(&self) {
+    /// Gives AWDL back once nobody has wanted it for the linger time since
+    /// it was `emptied`. Someone who came and went meanwhile waits anew, so
+    /// quick crossings back and forth keep AWDL down until the last one.
+    async fn restore(&self, emptied: u64) {
         tokio::time::sleep(self.linger).await;
         let mut lease = self.lease.lock().await;
-        if *self.users() > 0 {
-            return;
+        {
+            let users = self.users();
+            if users.wanting > 0 || users.emptied != emptied {
+                return;
+            }
         }
         if let Some(held) = lease.take() {
             match held.release().await {
@@ -304,16 +316,19 @@ pub(super) struct Wanted(Arc<Shared>);
 
 impl Drop for Wanted {
     fn drop(&mut self) {
-        let last = {
+        let emptied = {
             let mut users = self.0.users();
-            *users -= 1;
-            *users == 0
+            users.wanting -= 1;
+            (users.wanting == 0).then(|| {
+                users.emptied += 1;
+                users.emptied
+            })
         };
         // Outside a runtime nothing can give it back; the helper restores
         // AWDL once the lease lapses.
-        if let (true, Ok(runtime)) = (last, tokio::runtime::Handle::try_current()) {
+        if let (Some(emptied), Ok(runtime)) = (emptied, tokio::runtime::Handle::try_current()) {
             let shared = self.0.clone();
-            runtime.spawn(async move { shared.restore().await });
+            runtime.spawn(async move { shared.restore(emptied).await });
         }
     }
 }
@@ -521,6 +536,29 @@ exit 4
         let second = leases.lock().unwrap()[1].clone();
         drop(again);
         restored(&second).await;
+    }
+
+    #[tokio::test]
+    async fn awdl_stays_down_until_the_last_of_quick_crossings_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let (acquire, leases) = one_at_a_time(directory.path());
+        let linger = Duration::from_secs(2);
+        let shared = Shared::new(acquire, linger);
+        let first = shared.want();
+        shared.down("ubuntu", RESPONSE_TIMEOUT).await;
+        drop(first);
+        let first_ended = tokio::time::Instant::now();
+        // As in the live test: the person crosses again before AWDL is back.
+        tokio::time::sleep(linger / 2).await;
+        let second = shared.want();
+        shared.down("ubuntu", RESPONSE_TIMEOUT).await;
+        drop(second);
+        let marker = leases.lock().unwrap()[0].clone();
+        // The first crossing's wait is over, the second's is not.
+        tokio::time::sleep_until(first_ended + linger + linger / 4).await;
+        assert!(!marker.exists(), "AWDL came back mid-burst");
+        assert_eq!(leases.lock().unwrap().len(), 1);
+        restored(&marker).await;
     }
 
     #[tokio::test]
