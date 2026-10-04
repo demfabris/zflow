@@ -224,86 +224,22 @@ impl Layout {
                 let start = a_start.max(b_start);
                 let end = a_end.min(b_end);
                 if start < end {
-                    let opposite = match edge {
-                        Edge::Left => Edge::Right,
-                        Edge::Right => Edge::Left,
-                        Edge::Top => Edge::Bottom,
-                        Edge::Bottom => Edge::Top,
-                    };
-                    // Keep OS navigation between a computer's own displays. Only
-                    // exposed portions of both monitor edges can be shared.
-                    for (s0, s1) in self.exposed(a, edge) {
-                        for (t0, t1) in self.exposed(b, opposite) {
-                            let low = (start as f64)
-                                .max(a_start as f64 + s0 * (a_end - a_start) as f64)
-                                .max(b_start as f64 + t0 * (b_end - b_start) as f64);
-                            let high = (end as f64)
-                                .min(a_start as f64 + s1 * (a_end - a_start) as f64)
-                                .min(b_start as f64 + t1 * (b_end - b_start) as f64);
-                            if low >= high {
-                                continue;
-                            }
-                            transitions.push(Transition {
-                                source,
-                                target,
-                                edge,
-                                source_start: (low - a_start as f64) / (a_end - a_start) as f64,
-                                source_end: (high - a_start as f64) / (a_end - a_start) as f64,
-                                target_start: (low - b_start as f64) / (b_end - b_start) as f64,
-                                target_end: (high - b_start as f64) / (b_end - b_start) as f64,
-                            });
-                        }
-                    }
+                    // The desk arrangement takes priority even when the OS has
+                    // another local display across this edge. Native adapters
+                    // intercept these crossings before the cursor leaves it.
+                    transitions.push(Transition {
+                        source,
+                        target,
+                        edge,
+                        source_start: (start - a_start) as f64 / (a_end - a_start) as f64,
+                        source_end: (end - a_start) as f64 / (a_end - a_start) as f64,
+                        target_start: (start - b_start) as f64 / (b_end - b_start) as f64,
+                        target_end: (end - b_start) as f64 / (b_end - b_start) as f64,
+                    });
                 }
             }
         }
         transitions
-    }
-
-    fn exposed(&self, monitor: &Monitor, edge: Edge) -> Vec<(f64, f64)> {
-        let Some(display) = &monitor.display else {
-            return vec![(0.0, 1.0)];
-        };
-        let r = display.bounds;
-        let vertical = matches!(edge, Edge::Left | Edge::Right);
-        let (origin, span) = if vertical {
-            (r.y, r.height)
-        } else {
-            (r.x, r.width)
-        };
-        let outside = match edge {
-            Edge::Left => r.x - 1,
-            Edge::Right => r.x + r.width as i32,
-            Edge::Top => r.y - 1,
-            Edge::Bottom => r.y + r.height as i32,
-        };
-        let mut ranges = vec![(0.0_f64, 1.0_f64)];
-        for other in self
-            .monitors
-            .iter()
-            .filter(|m| m.peer == monitor.peer && m.active())
-        {
-            let Some(d) = &other.display else {
-                continue;
-            };
-            let b = d.bounds;
-            let (across, extent, along, length) = if vertical {
-                (b.x, b.width, b.y, b.height)
-            } else {
-                (b.y, b.height, b.x, b.width)
-            };
-            if outside < across || outside >= across + extent as i32 {
-                continue;
-            }
-            let low = f64::from(along - origin) / f64::from(span);
-            let high = (f64::from(along - origin) + f64::from(length)) / f64::from(span);
-            ranges = ranges
-                .into_iter()
-                .flat_map(|(a, b)| [(a, b.min(low)), (a.max(high), b)])
-                .filter(|(a, b)| a < b)
-                .collect();
-        }
-        ranges
     }
 
     /// Snap to a nearby shared edge, or keep a valid free position. Reject overlap.

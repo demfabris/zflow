@@ -26,9 +26,9 @@ protocols cannot connect; pairing keys are preserved.
    or `host:port`. Bracket IPv6 when including a port.
 3. Compare the six-character marks on both computers. Add each computer on
    the other one too; discovery alone never grants input access.
-4. Drag individual monitor tiles, including this PC's, until their exposed
-   edges touch. The arrangement propagates to connected peers. Local monitor
-   boundaries remain controlled by Windows Display Settings. Disabled monitors
+4. Drag individual monitor tiles, including this PC's, until their edges touch.
+   The arrangement propagates to connected peers. A remote monitor at an edge
+   takes priority over a Windows monitor across that boundary. Disabled monitors
    leave the canvas and retain their saved positions for reconnection.
 5. Leave all keys and buttons released, then move across a touching edge.
    **Pause at edges** adds a 250 ms dwell before crossing.

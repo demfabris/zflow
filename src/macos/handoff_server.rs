@@ -166,8 +166,8 @@ impl ArmedEdge {
         let line = f64::from(self.boundary);
         let (across, along) = self.axes(cursor);
         let on_edge = match self.edge {
-            Edge::Left | Edge::Top => across < line + 1.0,
-            Edge::Right | Edge::Bottom => across >= line - 1.0,
+            Edge::Left | Edge::Top => across >= line && across < line + 1.0,
+            Edge::Right | Edge::Bottom => across >= line - 1.0 && across < line,
         };
         on_edge.then(|| self.position(along)).flatten()
     }
@@ -254,6 +254,7 @@ struct Lease {
     generation: u32,
     geometry: Geometry,
     edge: ArmedEdge,
+    sampled: CursorPosition,
     /// Where the pointer left, once it has.
     returned: Option<u32>,
     _guard: LeaseGuard,
@@ -383,6 +384,10 @@ impl<D: Desk> HandoffServer<D> {
                 generation,
                 geometry: geometry.clone(),
                 edge: armed,
+                sampled: CursorPosition {
+                    x: f64::from(entry.x),
+                    y: f64::from(entry.y),
+                },
                 returned: None,
                 _guard: guard,
             });
@@ -491,17 +496,24 @@ impl<D: Desk> HandoffServer<D> {
         true
     }
 
-    /// Latches the return when the cursor sits on the handoff's edge.
+    /// Also catches a local trackpad move that skips an internal edge's pixels
+    /// between polls. Injected peer moves are checked before posting by moved().
     fn sample(&self, cursor: CursorPosition) {
         let mut lease = self.lease();
         if let Some(active) = lease.as_mut()
             && active.returned.is_none()
-            && let Some(position) = active.edge.at_edge(cursor)
         {
-            active.returned = Some(position);
-            drop(lease);
-            tracing::info!(position, "cursor reached the desktop handoff edge");
-            self.changed.notify_waiters();
+            let previous = std::mem::replace(&mut active.sampled, cursor);
+            if let Some(position) = active
+                .edge
+                .crossing(previous, cursor)
+                .or_else(|| active.edge.at_edge(cursor))
+            {
+                active.returned = Some(position);
+                drop(lease);
+                tracing::info!(position, "cursor reached the desktop handoff edge");
+                self.changed.notify_waiters();
+            }
         }
     }
 
@@ -863,6 +875,69 @@ mod tests {
             DesktopResponse::Finished
         );
         assert_eq!(ownership.controller(), None);
+    }
+
+    #[tokio::test]
+    async fn an_internal_return_edge_catches_fast_moves_before_the_adjacent_display() {
+        let mut geometry = desktop(&[(-1920, 0, 1920, 1080), (0, 0, 2560, 1440)]);
+        geometry.displays = geometry
+            .monitors
+            .iter()
+            .enumerate()
+            .map(|(i, bounds)| crate::desktop::Display {
+                id: format!("panel-{i}"),
+                name: format!("Display {i}"),
+                bounds: *bounds,
+                width_mm: 0,
+                height_mm: 0,
+                active: true,
+            })
+            .collect();
+        let (server, desk, _) = setup(geometry);
+        for local_trackpad in [false, true] {
+            let prepare = DesktopRequest::Prepare {
+                monitor: Some("panel-0".into()),
+                token: 7,
+                edge: Edge::Right,
+                start: 0,
+                end: MAX,
+                position: 500_000,
+            };
+            assert!(matches!(
+                server.request("linux", 1, prepare).await,
+                DesktopResponse::Prepared {
+                    position: Point { x: -4, y: 540 },
+                    ..
+                }
+            ));
+            if local_trackpad {
+                desk.state().cursor = Some(at(300.0, 540.0));
+            } else {
+                assert!(
+                    server.moved(at(-4.0, 540.0), at(300.0, 540.0)),
+                    "the injector drops a move onto the adjacent local display"
+                );
+                assert!(server.moved(at(-4.0, 540.0), at(500.0, 540.0)));
+            }
+            assert_eq!(
+                server
+                    .request("linux", 1, DesktopRequest::Poll { token: 7 })
+                    .await,
+                DesktopResponse::Returned { position: 500_000 }
+            );
+            assert_eq!(
+                server
+                    .request("linux", 1, DesktopRequest::Finish { token: 7 })
+                    .await,
+                DesktopResponse::Finished
+            );
+        }
+        let edge = ArmedEdge::new(&single(), Edge::Left, 0, MAX).unwrap();
+        assert_eq!(
+            edge.at_edge(at(-100.0, 540.0)),
+            None,
+            "another local display is not itself the selected edge"
+        );
     }
 
     #[tokio::test]

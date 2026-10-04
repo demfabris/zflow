@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <wchar.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef int (*event_fn)(int kind, int code, int value, int extra);
 static event_fn emit;
@@ -16,6 +17,77 @@ static HHOOK keyboard_hook, mouse_hook;
 static HWND clipboard_window;
 #define ZFLOW_TAG ((ULONG_PTR)0x5a464c4f)
 int zflow_input_clean(void);
+
+// Configured cross-computer edges only; other local monitor seams stay native.
+// The hook never waits for the engine: publishing briefly holds the write lock,
+// while a contended reader simply lets this motion through.
+typedef struct { int left, top, right, bottom, edge, start, end, returning; } zflow_boundary;
+static SRWLOCK boundary_lock = SRWLOCK_INIT;
+static zflow_boundary boundaries[128];
+static int boundary_count;
+static volatile LONG boundaries_enabled;
+static BOOL warping;
+
+void zflow_input_boundaries(const zflow_boundary *items, int count) {
+    AcquireSRWLockExclusive(&boundary_lock);
+    boundary_count = count >= 0 && count <= 128 ? count : 0;
+    if (boundary_count) memcpy(boundaries, items, boundary_count * sizeof(*items));
+    InterlockedExchange(&boundaries_enabled, boundary_count != 0);
+    ReleaseSRWLockExclusive(&boundary_lock);
+}
+
+// Pure segment intersection, also exercised by Rust tests against this C code.
+// Stop at the last source pixel, including large moves that skip over a seam.
+int zflow_boundary_hit(const zflow_boundary *b, int x, int y, int nx, int ny, int *hx, int *hy) {
+    if (x < b->left || x >= b->right || y < b->top || y >= b->bottom) return 0;
+    int vertical = b->edge < 2;
+    int from = vertical ? x : y, to = vertical ? nx : ny;
+    int plane = b->edge == 0 ? b->left : b->edge == 1 ? b->right - 1 :
+        b->edge == 2 ? b->top : b->bottom - 1;
+    int positive = b->edge == 1 || b->edge == 3;
+    if (positive ? (to <= from || to < plane) : (to >= from || to > plane)) return 0;
+    double t = from == plane ? 1.0 : (double)(plane - from) / (to - from);
+    double along = vertical ? y + t * (ny - y) : x + t * (nx - x);
+    if (along < b->start || along >= b->end) return 0;
+    // Round to the closest pixel, including negative desktop coordinates.
+    int pixel = (int)(along >= 0 ? along + 0.5 : along - 0.5);
+    if (pixel < b->start) pixel = b->start;
+    if (pixel >= b->end) pixel = b->end - 1;
+    *hx = vertical ? plane : pixel;
+    *hy = vertical ? pixel : plane;
+    return 1;
+}
+
+static BOOL stop_at_boundary(const MSLLHOOKSTRUCT *m) {
+    if (warping || !InterlockedCompareExchange(&boundaries_enabled, 0, 0) ||
+        GetTickCount64() - (ULONGLONG)InterlockedCompareExchange64(&heartbeat, 0, 0) > 1000)
+        return FALSE;
+    POINT from, hit;
+    if (!GetCursorPos(&from) || !TryAcquireSRWLockShared(&boundary_lock)) return FALSE;
+    int edge = -1, returning = 0;
+    for (int i = 0; i < boundary_count; ++i) {
+        const zflow_boundary *b = &boundaries[i];
+        // Remote return guards see our injected motion too. Outbound guards
+        // only see the user's mouse, never accessibility tools or our warps.
+        if ((m->flags & LLMHF_INJECTED) && (!b->returning || m->dwExtraInfo != ZFLOW_TAG)) continue;
+        int x, y;
+        if (zflow_boundary_hit(b, from.x, from.y, m->pt.x, m->pt.y, &x, &y)) {
+            hit.x = x; hit.y = y; edge = b->edge; returning = b->returning; break;
+        }
+    }
+    ReleaseSRWLockShared(&boundary_lock);
+    if (edge < 0 || !zflow_input_clean()) return FALSE;
+    for (int i = 0; i < 256; ++i) if (keys[i]) return FALSE;
+    warping = TRUE;
+    BOOL placed = SetCursorPos(hit.x, hit.y);
+    warping = FALSE;
+    if (!placed) return FALSE;
+    if (!returning && emit && !emit(7, hit.x, hit.y, edge)) {
+        InterlockedExchange(&boundaries_enabled, 0);
+        return FALSE;
+    }
+    return TRUE;
+}
 
 static void event(int kind, int code, int value, int extra) {
     if (emit && !emit(kind, code, value, extra)) InterlockedExchange(&remote_input, 0);
@@ -45,6 +117,7 @@ static LRESULT CALLBACK keyboard(int n, WPARAM w, LPARAM l) {
 static LRESULT CALLBACK mouse(int n, WPARAM w, LPARAM l) {
     if (n < 0) return CallNextHookEx(NULL, n, w, l);
     const MSLLHOOKSTRUCT *m = (const MSLLHOOKSTRUCT *)l;
+    if (w == WM_MOUSEMOVE && !InterlockedCompareExchange(&remote_input, 0, 0) && stop_at_boundary(m)) return 1;
     if (m->flags & LLMHF_INJECTED) return CallNextHookEx(NULL, n, w, l);
     if (!InterlockedCompareExchange(&remote_input, 0, 0)) return CallNextHookEx(NULL, n, w, l);
     switch (w) {
@@ -114,6 +187,7 @@ int zflow_input_run(event_fn callback) {
         if (result < 0) ok = 0;
     }
     InterlockedExchange(&remote_input, 0);
+    zflow_input_boundaries(NULL, 0);
     if (keyboard_hook) UnhookWindowsHookEx(keyboard_hook);
     if (mouse_hook) UnhookWindowsHookEx(mouse_hook);
     device.dwFlags = RIDEV_REMOVE;

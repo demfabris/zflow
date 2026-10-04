@@ -546,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn local_monitor_boundaries_are_excluded_but_exposed_remainders_can_cross() {
+    fn arranged_remote_monitor_takes_priority_over_a_native_local_neighbor() {
         let left = named(
             "left",
             Rect {
@@ -599,9 +599,10 @@ mod tests {
                 },
             ],
         };
-        assert!(
-            layout.transitions().is_empty(),
-            "do not hijack movement onto another local monitor"
+        assert_eq!(
+            layout.transitions().len(),
+            2,
+            "both directions cross the native seam"
         );
         right.bounds.height = 540;
         layout.monitors[1].display = Some(right.clone());
@@ -609,14 +610,17 @@ mod tests {
             monitors: vec![left.bounds, right.bounds],
             displays: vec![left, right],
         };
-        assert!(
-            crossing(
-                &layout,
-                &geometry,
-                Point { x: 1910, y: 200 },
-                Point { x: 1919, y: 200 }
-            )
-            .is_none()
+        let internal = crossing(
+            &layout,
+            &geometry,
+            Point { x: 1910, y: 200 },
+            Point { x: 1919, y: 200 },
+        )
+        .unwrap();
+        assert_eq!(internal.peer, "mac");
+        assert_eq!(
+            internal.return_mapping.position(internal.position).unwrap(),
+            Point { x: 1916, y: 200 }
         );
         let h = crossing(
             &layout,
@@ -625,8 +629,14 @@ mod tests {
             Point { x: 1919, y: 800 },
         )
         .unwrap();
-        assert_eq!(h.start, 500000);
+        assert_eq!(h.start, 0);
         assert_eq!(h.end, 1000000);
+        // Gaps and same-computer neighbors continue to use native navigation.
+        layout.monitors[2].x += 1;
+        assert!(layout.transitions().is_empty());
+        layout.monitors[2].x -= 1;
+        layout.monitors[2].peer = None;
+        assert!(layout.transitions().is_empty());
     }
 
     fn setup() -> (Layout, Geometry) {

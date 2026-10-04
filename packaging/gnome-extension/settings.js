@@ -8,7 +8,7 @@ import {Client, compatible, statusText} from './client.js';
 const KEYBOARD_MODES = ['standard', 'pc_positions', 'mac'];
 const HEALTH_ICONS = {ok: 'object-select-symbolic', warning: 'dialog-warning-symbolic', error: 'dialog-error-symbolic'};
 const NO_LAYOUT = 'Arrange computers in zflow on the other computer.';
-const LAYOUT_HINT = 'Arrange individual monitors. Use exposed edges to switch computers; system display settings control movement between local monitors.';
+const LAYOUT_HINT = 'Arrange individual monitors. Drag their edges together to switch computers.';
 // As in the Mac app (ComputerLayout.swift): an arrow key moves a tile 100
 // layout units and snaps within 150; a drag snaps within 14 pixels.
 const KEY_STEP = 100;

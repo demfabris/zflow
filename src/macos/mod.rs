@@ -270,10 +270,25 @@ struct NativeMotion {
     age_ns: u64,
 }
 
+/// A configured monitor edge held before the cursor can enter another local display.
+#[repr(C)]
+pub(crate) struct EdgeGuard {
+    pub bounds: DesktopRect,
+    pub start: f64,
+    pub end: f64,
+    pub edge: u32,
+}
+
+/// Refreshes the native guards' short lease; an empty list releases every edge.
+pub(crate) fn set_edge_guards(guards: &[EdgeGuard]) {
+    // SAFETY: the C bridge copies the C-layout array before returning.
+    unsafe { zflow_mac_edge_guards(guards.as_ptr(), guards.len() as u32) };
+}
+
 /// Starts watching the Mac's own pointer motion, if it is not watched yet.
 /// Motion zflow posts for a peer is left out.
 pub fn watch_local_motion() -> Result<()> {
-    // SAFETY: the bridge creates its listen-only tap and thread once.
+    // SAFETY: the bridge creates its motion tap and thread once.
     ensure!(
         unsafe { zflow_mac_motion_watch() } == 0,
         "macOS refused to show zflow the Mac's pointer motion"
@@ -977,6 +992,7 @@ unsafe extern "C" {
     fn zflow_mac_display_generation() -> u32;
     fn zflow_mac_input_is_neutral() -> i32;
     fn zflow_mac_motion_watch() -> i32;
+    fn zflow_mac_edge_guards(guards: *const EdgeGuard, count: u32);
     fn zflow_mac_motion_take(motion: *mut NativeMotion) -> i32;
     fn zflow_mac_secure_input_enabled() -> i32;
     fn zflow_mac_capture_start(

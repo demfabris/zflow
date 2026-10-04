@@ -12,9 +12,12 @@ Existing layouts must migrate without losing paired computers or keys.
 - Verify one named tile per active logical monitor, independently draggable on
   Windows, macOS, and GNOME. Mirrored outputs are one logical surface.
 - Check mixed DPI, portrait rotation, negative origins, and partial edge
-  overlap. Cross an exposed edge of each monitor and return to that monitor.
-- Keep moving across native boundaries between local monitors: zflow must not
-  intercept these, even if another computer touches that edge in its canvas.
+  overlap. Cross an edge of each monitor and return to that monitor. Place a
+  remote monitor between two native local monitors and cross both internal
+  boundaries, with slow and fast motion, partial edges, edge dwell, and held
+  keys/buttons. A gap or disconnected peer must leave native navigation usable.
+- Keep moving across native boundaries where no connected remote monitor is
+  arranged: zflow must leave these local crossings alone.
 - Disable a monitor (including BetterDisplay disconnect), unplug it, and change
   resolution while receiving or sending. Input must release safely, the tile
   must disappear, and reconnecting must restore its position when still free.

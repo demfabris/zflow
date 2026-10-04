@@ -169,6 +169,31 @@ for (const monitorData of [{resources: {serial: 'replaced', 'width-mm': 530, 'he
     d.extension.disable();
 }
 
+{
+    // An arranged remote edge takes precedence over the adjacent local screen.
+    // This matches the XPS's native GNOME topology and barrier validation.
+    const d = desktop([{x: 0, y: 0, width: 1536, height: 960}, {x: 1536, y: 0, width: 1920, height: 1080}]);
+    const {displays} = (await d.extension._request({command: 'snapshot'})).geometry;
+    for (const [index, edge, entryX] of [[0, 'right', 1532], [1, 'left', 1539]]) {
+        const monitor = displays[index].id;
+        const prepared = await d.extension._request(prepare(edge, {monitor}));
+        assert.equal(prepared.position.x, entryX);
+        const returning = d.barriers.findLast(b => !b.destroyed);
+        assert.equal(returning.properties.x1, 1536, 'return barrier stays on the selected internal edge');
+        returning.hit(returning, {x: 1536, y: prepared.position.y});
+        assert.equal((await d.extension._request({command: 'poll', token: 7})).position, 500000);
+        await d.extension._request({command: 'finish', token: 7});
+        await d.extension._request({command: 'edges', edges: [{monitor, edge, start: 0, end: 1000000}]});
+        const outbound = d.barriers.findLast(b => !b.destroyed);
+        assert.equal(outbound.properties.x1, 1536, 'a local neighbor does not remove the outbound barrier');
+        outbound.hit(outbound, {x: 1536, y: prepared.position.y, event_id: index + 30});
+        const hit = d.emitted.findLast(args => args[3] === 'EdgeHit')[4].value;
+        assert.deepEqual(Array.from(hit), [monitor, edge, 500000]);
+        await d.extension._request({command: 'edges', edges: []});
+    }
+    d.extension.disable();
+}
+
 for (const [edge, expectedY, direction] of [['top', 3, 4], ['bottom', 1076, 8]]) {
     const d = desktop();
     const result = await d.extension._request(prepare(edge));

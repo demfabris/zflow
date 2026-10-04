@@ -273,6 +273,7 @@ impl Observer {
     }
 
     pub fn stop(&mut self) {
+        macos::set_edge_guards(&[]);
         if self.enabled {
             tracing::info!("edge sharing disarmed");
         }
@@ -290,6 +291,7 @@ impl Observer {
     /// Stops arming with the current layout, and lets a crossing in progress
     /// finish with its own. The app arms again with the new layout.
     pub fn disarm(&mut self) {
+        macos::set_edge_guards(&[]);
         if self.enabled {
             tracing::info!("edge sharing disarmed for a new layout");
         }
@@ -326,6 +328,7 @@ impl Observer {
     }
 
     pub fn tick(&mut self, links: &Links) {
+        self.refresh_edge_guards(links);
         // Left alone while a crossing runs: capture swallows the motion, and
         // what comes after the return, as a flick back against the edge
         // during cleanup, can still cross once it is fresh. Otherwise taken
@@ -336,6 +339,25 @@ impl Observer {
             None
         };
         self.tick_with(links.controller(), motion, links);
+    }
+
+    fn refresh_edge_guards(&self, links: &Links) {
+        let guards = if self.enabled && links.controller().is_none() {
+            self.layout
+                .as_ref()
+                .zip(macos::desktop_geometry().ok().as_ref())
+                .map(|(layout, geometry)| {
+                    edge_guards(layout, geometry, |name| {
+                        links.states().any(|(peer, state)| {
+                            peer == name && matches!(state, macos::LinkState::Ready(_))
+                        })
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        macos::set_edge_guards(&guards);
     }
 
     /// `controller` is the peer controlling this Mac, if any, and `motion`
@@ -377,6 +399,7 @@ impl Observer {
         {
             tracing::warn!(error = %format!("{error:#}"), "edge observation failed; sharing disabled");
             self.enabled = false;
+            macos::set_edge_guards(&[]);
             self.approach.restart();
             self.notice = format!("Sharing stopped: {error:#}");
         }
@@ -562,6 +585,61 @@ impl Observer {
         });
         Ok(())
     }
+}
+
+/// Keep only configured, usable peer edges. Movement to this Mac's other
+/// displays stays native everywhere the desk does not put a peer.
+fn edge_guards(
+    layout: &Layout,
+    geometry: &Geometry,
+    ready: impl Fn(&str) -> bool,
+) -> Vec<macos::EdgeGuard> {
+    layout
+        .transitions()
+        .into_iter()
+        .filter_map(|transition| {
+            let source = &layout.monitors[transition.source];
+            let target = &layout.monitors[transition.target];
+            if source.peer.is_some() || !ready(target.peer.as_deref()?) {
+                return None;
+            }
+            let bounds = geometry
+                .for_monitor(source.display.as_ref().map(|d| d.id.as_str()))
+                .ok()?
+                .bounds()
+                .ok()?;
+            if source
+                .display
+                .as_ref()
+                .is_some_and(|display| display.bounds != bounds)
+            {
+                return None;
+            }
+            let (origin, span, edge) = match transition.edge {
+                Edge::Left => (bounds.y, bounds.height, 0),
+                Edge::Right => (bounds.y, bounds.height, 1),
+                Edge::Top => (bounds.x, bounds.width, 2),
+                Edge::Bottom => (bounds.x, bounds.width, 3),
+            };
+            // Match handoff's eight-point dead corners and half-open range.
+            let start = (transition.source_start * f64::from(span)).ceil().max(8.0);
+            let end = (transition.source_end * f64::from(span))
+                .ceil()
+                .min(f64::from(span) - 8.0);
+            (start < end).then_some(macos::EdgeGuard {
+                bounds: macos::DesktopRect {
+                    x: f64::from(bounds.x),
+                    y: f64::from(bounds.y),
+                    width: f64::from(bounds.width),
+                    height: f64::from(bounds.height),
+                },
+                start: f64::from(origin) + start,
+                end: f64::from(origin) + end,
+                edge,
+            })
+        })
+        .take(256)
+        .collect()
 }
 
 impl Drop for Observer {
@@ -937,6 +1015,42 @@ mod tests {
         };
         assert_eq!(handoff.unwrap().position, position(lower));
         assert_ne!(position(lower), position(edge));
+    }
+
+    #[test]
+    fn native_edge_guards_only_hold_configured_edges_with_ready_peers() {
+        let (mut layout, mut geometry) = edge();
+        let first = crate::desktop::Display {
+            id: "panel-a".into(),
+            name: "Panel A".into(),
+            bounds: geometry.monitors[0],
+            width_mm: 0,
+            height_mm: 0,
+            active: true,
+        };
+        let mut second = first.clone();
+        second.id = "panel-b".into();
+        second.bounds.x = 1920;
+        geometry.monitors.push(second.bounds);
+        geometry.displays = vec![first.clone(), second.clone()];
+        layout.monitors[0].display = Some(first);
+        let mut other = layout.monitors[0].clone();
+        other.id = "local/b".into();
+        other.display = Some(second);
+        other.x = -1920;
+        layout.monitors.push(other);
+        let guards = edge_guards(&layout, &geometry, |name| name == "linux");
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].edge, 1);
+        assert_eq!(guards[0].bounds.x, 0.0);
+        assert_eq!(guards[0].bounds.width, 1920.0);
+        assert_eq!((guards[0].start, guards[0].end), (8.0, 540.0));
+        assert!(edge_guards(&layout, &geometry, |_| false).is_empty());
+        layout.monitors[0].display.as_mut().unwrap().bounds.width = 1000;
+        assert!(
+            edge_guards(&layout, &geometry, |_| true).is_empty(),
+            "a resized display must wait for current layout metadata"
+        );
     }
 
     #[test]

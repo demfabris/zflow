@@ -81,7 +81,7 @@ struct ComputersView: View {
       if let layout = snapshot.layout {
         Arrangement(model: model, snapshot: snapshot, layout: layout, shelf: .bottom)
           .frame(height: snapshot.unplaced.isEmpty ? 300 : 400)
-        Text("Arrange individual monitors. Use exposed edges to switch computers; system display settings control movement between local monitors.")
+        Text("Arrange individual monitors with touching edges to switch computers. Other movement between this Mac’s monitors follows system display settings.")
           .font(.callout).foregroundStyle(.secondary)
       }
     }

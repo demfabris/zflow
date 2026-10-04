@@ -384,9 +384,10 @@ static CFMachPortRef fake_tap(CGEventTapLocation location,
                              CGEventTapOptions options, CGEventMask mask,
                              CGEventTapCallBack callback, void *context) {
   if (callback == motion_callback) {
-    assert(location == kCGSessionEventTap && placement == kCGTailAppendEventTap);
-    assert(options == kCGEventTapOptionListenOnly && context == NULL);
-    assert(mask == CGEventMaskBit(kCGEventMouseMoved));
+    assert(location == kCGHIDEventTap && placement == kCGTailAppendEventTap);
+    assert(options == kCGEventTapOptionDefault && context == NULL);
+    assert(mask == (CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDragged) |
+                    CGEventMaskBit(kCGEventRightMouseDragged) | CGEventMaskBit(kCGEventOtherMouseDragged)));
     motion_taps++;
     return tap_available ? CFMachPortCreate(NULL, idle_port, NULL, NULL) : NULL;
   }
@@ -888,6 +889,80 @@ static void wait_for_motion_watch_to_end(void) {
   assert(g_motion_tap == NULL);
 }
 
+static void edge_guard_tests(void) {
+  reset();
+  ZFlowMacEdgeGuard guard = {{0, 0, 1920, 1080}, 8, 1072, 1};
+  cursor_position = CGPointMake(1800, 400);
+  g_motion_position_valid = false;
+  zflow_mac_edge_guards(&guard, 1);
+  // A fast diagonal jump onto the adjacent local monitor stops at the
+  // intersection, before the move is delivered to an app on that monitor.
+  CGEventRef move = move_by(400, 200);
+  cursor_position = CGPointMake(2200, 600);
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == NULL);
+  assert(warped_position.x == 1919 && warped_position.y == 459.5);
+  // Reversing into the original monitor stays local.
+  cursor_position = CGPointMake(1800, 450);
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  // A drag or modifier is not trapped at a configured edge.
+  held_button = 0;
+  cursor_position = CGPointMake(2200, 600);
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  held_button = -1;
+  // Drag locations are tracked too: releasing on the adjacent display
+  // must not use a stale position from before the drag and jump backward.
+  g_motion_position = (ZFlowMacPosition){1800, 400};
+  assert(motion_callback(NULL, kCGEventLeftMouseDragged, move, NULL) == move);
+  cursor_position = CGPointMake(2210, 600);
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  g_motion_position = (ZFlowMacPosition){1800, 400};
+  CGEventSetIntegerValueField(move, kCGEventSourceUserData, ZFLOW_POSTED_MARK);
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  CGEventSetIntegerValueField(move, kCGEventSourceUserData, 0);
+  g_motion_position = (ZFlowMacPosition){1800, 400};
+  fail_call = 'W';
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  fail_call = 0;
+  g_motion_position = (ZFlowMacPosition){1800, 400};
+  held_flags = kCGEventFlagMaskCommand;
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  held_flags = 0;
+  g_motion_position = (ZFlowMacPosition){1800, 400};
+  secure_input = true;
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  secure_input = false;
+  // No stale barrier survives a stopped worker or a display reconfiguration.
+  g_motion_position = (ZFlowMacPosition){1800, 400};
+  g_edge_guard_until = 0;
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  zflow_mac_edge_guards(&guard, 1);
+  g_motion_position = (ZFlowMacPosition){1800, 400};
+  atomic_fetch_add(&g_display_generation, 1);
+  assert(motion_callback(NULL, kCGEventMouseMoved, move, NULL) == move);
+  // Each orientation and partial edge range uses the full motion segment.
+  ZFlowMacPosition held;
+  for (uint32_t edge = 0; edge < 4; edge++) {
+    guard = (ZFlowMacEdgeGuard){{0, 0, 100, 100}, 25, 75, edge};
+    zflow_mac_edge_guards(&guard, 1);
+    ZFlowMacPosition to[] = {{-50, 50}, {150, 50}, {50, -50}, {50, 150}};
+    assert(guarded_move((ZFlowMacPosition){50, 50}, to[edge], &held));
+    assert((edge < 2 ? held.y : held.x) == 50);
+    assert((edge < 2 ? held.x : held.y) == (edge % 2 ? 99 : 0));
+    assert(!guarded_move(to[edge], (ZFlowMacPosition){50, 50}, &held));
+  }
+  guard = (ZFlowMacEdgeGuard){{0, 0, 100, 100}, 25, 75, 1};
+  zflow_mac_edge_guards(&guard, 1);
+  assert(!guarded_move((ZFlowMacPosition){50, 5}, (ZFlowMacPosition){150, 5}, &held));
+  assert(guarded_move((ZFlowMacPosition){99, 40}, (ZFlowMacPosition){120, 55}, &held));
+  assert(held.x == 99 && held.y == 55);
+  assert(!guarded_move((ZFlowMacPosition){99, 55}, (ZFlowMacPosition){120, 80}, &held));
+  zflow_mac_edge_guards(NULL, 0);
+  assert(!guarded_move((ZFlowMacPosition){50, 50}, (ZFlowMacPosition){150, 50}, &held));
+  CFRelease(move);
+  ZFlowMacMotion motion;
+  zflow_mac_motion_take(&motion);
+}
+
 static void motion_tests(void) {
   ZFlowMacMotion motion;
   assert(!zflow_mac_motion_take(&motion) && !zflow_mac_motion_take(NULL));
@@ -918,7 +993,7 @@ static void motion_tests(void) {
   CFRelease(right);
   CFRelease(unmarked);
 
-  // One listen-only tap on its own thread; a refusal starts nothing.
+  // One motion tap on its own thread; a refusal starts nothing.
   tap_available = false;
   assert(zflow_mac_motion_watch() == -1 && !atomic_load(&g_motion_watching));
   assert(motion_taps == 1 && g_motion_tap == NULL);
@@ -947,6 +1022,7 @@ int main(void) {
   touch_tests();
   event_tests();
   iso_key_tests();
+  edge_guard_tests();
   reset();
   tap_available = false;
   int taps = tap_calls;

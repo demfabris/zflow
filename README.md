@@ -12,9 +12,9 @@ and computer. Drag individual monitors to match your desk. Sizes use physical
 dimensions when available, otherwise OS coordinate dimensions. Existing
 computer tiles split automatically; disconnected monitors keep their saved
 positions and return when reconnected. Mirrored displays share one cursor
-surface. Movement between a computer's own monitors follows its system display
-settings; zflow connects only exposed portions of monitor edges to other
-computers. A monitor connected to two computers appears once for each active
+surface. A touching monitor on another computer takes priority at that edge,
+even when the OS places a local monitor across it. Other movement between local
+monitors follows system display settings. A monitor connected to two computers appears once for each active
 connection: choosing its visible input and automatic input switching are not
 part of this version.
 

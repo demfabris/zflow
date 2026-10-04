@@ -104,7 +104,7 @@ impl Geometry {
 }
 
 /// Maps positions between the saved local edge and the receiver crossing range.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReturnMapping {
     pub geometry: Geometry,
     pub edge: Edge,

@@ -1,7 +1,7 @@
 use crate::{
     capture::{CaptureFrame, CaptureTransition, KeyState},
     core::{HidUsage, KeyRemap, KeyboardMode, MotionDelta, PointerButton, ReceiverEffect},
-    desktop::{Display, Geometry, Point, Rect},
+    desktop::{Display, Edge, FRACTION_MAX, Geometry, Point, Rect},
 };
 use anyhow::{Result, bail, ensure};
 use std::{
@@ -18,6 +18,7 @@ unsafe extern "C" {
     fn zflow_input_is_remote() -> i32;
     fn zflow_input_grab() -> i32;
     fn zflow_input_pulse();
+    fn zflow_input_boundaries(items: *const Boundary, count: i32);
     fn zflow_input_stop(thread: u32);
     fn zflow_input_clean() -> i32;
     fn zflow_desktop_available() -> i32;
@@ -44,6 +45,7 @@ pub enum Event {
     Frame(CaptureFrame),
     Escape,
     Activate,
+    EdgeHit(Point, Edge),
     Stopped,
 }
 static EVENTS: OnceLock<mpsc::Sender<Event>> = OnceLock::new();
@@ -95,6 +97,16 @@ extern "C" fn event(kind: i32, code: i32, value: i32, extra: i32) -> i32 {
         }
         5 => Event::Escape,
         6 => Event::Activate,
+        7 => Event::EdgeHit(
+            Point { x: code, y: value },
+            match extra {
+                0 => Edge::Left,
+                1 => Edge::Right,
+                2 => Edge::Top,
+                3 => Edge::Bottom,
+                _ => return 1,
+            },
+        ),
         _ => return 1,
     };
     i32::from(EVENTS.get().is_some_and(|tx| tx.try_send(event).is_ok()))
@@ -159,6 +171,188 @@ pub fn grab() -> Result<()> {
 pub fn pulse() {
     unsafe {
         zflow_input_pulse();
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Boundary {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    edge: i32,
+    start: i32,
+    end: i32,
+    returning: i32,
+}
+impl Boundary {
+    pub fn new(bounds: Rect, edge: Edge, start: u32, end: u32, returning: bool) -> Option<Self> {
+        if start >= end || end > FRACTION_MAX {
+            return None;
+        }
+        let (origin, span) = match edge {
+            Edge::Left | Edge::Right => (bounds.y, bounds.height),
+            _ => (bounds.x, bounds.width),
+        };
+        let start = (u64::from(start) * u64::from(span)).div_ceil(u64::from(FRACTION_MAX)) as i32;
+        let end = if returning {
+            (u64::from(end) * u64::from(span) / u64::from(FRACTION_MAX)) as i32 + 1
+        } else {
+            (u64::from(end) * u64::from(span)).div_ceil(u64::from(FRACTION_MAX)) as i32
+        };
+        let margin = if returning { 0 } else { 8 };
+        let start = start.max(margin);
+        let end = end.min(span as i32 - margin);
+        (start < end).then_some(Self {
+            left: bounds.x,
+            top: bounds.y,
+            right: bounds.x + bounds.width as i32,
+            bottom: bounds.y + bounds.height as i32,
+            edge: match edge {
+                Edge::Left => 0,
+                Edge::Right => 1,
+                Edge::Top => 2,
+                Edge::Bottom => 3,
+            },
+            start: origin + start,
+            end: origin + end,
+            returning: i32::from(returning),
+        })
+    }
+}
+pub fn boundaries(items: &[Boundary]) {
+    // SAFETY: C copies these bounded descriptors before returning.
+    unsafe {
+        zflow_input_boundaries(items.as_ptr(), items.len() as i32);
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    unsafe extern "C" {
+        fn zflow_boundary_hit(
+            boundary: *const Boundary,
+            x: i32,
+            y: i32,
+            nx: i32,
+            ny: i32,
+            hx: *mut i32,
+            hy: *mut i32,
+        ) -> i32;
+    }
+    fn hit(b: &Boundary, from: (i32, i32), to: (i32, i32)) -> Option<(i32, i32)> {
+        let (mut x, mut y) = (0, 0);
+        (unsafe { zflow_boundary_hit(b, from.0, from.1, to.0, to.1, &mut x, &mut y) } != 0)
+            .then_some((x, y))
+    }
+    #[test]
+    fn native_guard_catches_fast_internal_crossing_and_leaves_other_motion_alone() {
+        let b = Boundary::new(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 3840,
+                height: 2160,
+            },
+            Edge::Right,
+            250_000,
+            750_000,
+            false,
+        )
+        .unwrap();
+        assert_eq!(hit(&b, (3800, 1000), (4100, 1300)), Some((3839, 1039)));
+        assert_eq!(
+            hit(&b, (3839, 1000), (3920, 1100)),
+            Some((3839, 1100)),
+            "a held edge still allows sliding"
+        );
+        assert_eq!(
+            hit(&b, (3839, 1000), (3810, 1000)),
+            None,
+            "reversing stays local"
+        );
+        assert_eq!(
+            hit(&b, (3800, 200), (4100, 200)),
+            None,
+            "outside the configured edge remains native"
+        );
+        assert_eq!(
+            hit(&b, (4100, 1000), (4200, 1000)),
+            None,
+            "other monitor cannot trigger this edge"
+        );
+        let full = Boundary::new(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 3840,
+                height: 2160,
+            },
+            Edge::Right,
+            0,
+            FRACTION_MAX,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            hit(&full, (3830, 4), (4000, 4)),
+            None,
+            "dead corner stays local"
+        );
+    }
+    #[test]
+    fn native_guards_cover_all_directions_and_negative_origins() {
+        let rect = Rect {
+            x: -1920,
+            y: -1080,
+            width: 1920,
+            height: 1080,
+        };
+        for (edge, from, to, expected) in [
+            (Edge::Left, (-1800, -540), (-2100, -540), (-1920, -540)),
+            (Edge::Right, (-100, -540), (200, -540), (-1, -540)),
+            (Edge::Top, (-960, -1000), (-960, -1300), (-960, -1080)),
+            (Edge::Bottom, (-960, -100), (-960, 200), (-960, -1)),
+        ] {
+            let b = Boundary::new(rect, edge, 0, FRACTION_MAX, false).unwrap();
+            assert_eq!(hit(&b, from, to), Some(expected));
+        }
+    }
+    #[test]
+    fn incoming_guard_stops_at_selected_monitor_including_partial_range_end() {
+        let b = Boundary::new(
+            Rect {
+                x: 3840,
+                y: 0,
+                width: 3840,
+                height: 2160,
+            },
+            Edge::Left,
+            250_000,
+            750_000,
+            true,
+        )
+        .unwrap();
+        assert_eq!(hit(&b, (3900, 1620), (3700, 1620)), Some((3840, 1620)));
+        assert_eq!(hit(&b, (3900, 1621), (3700, 1621)), None);
+        assert_eq!(hit(&b, (3900, 539), (3700, 539)), None);
+        assert!(
+            Boundary::new(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080
+                },
+                Edge::Left,
+                800_000,
+                500_000,
+                false
+            )
+            .is_none()
+        );
     }
 }
 pub fn clean() -> bool {

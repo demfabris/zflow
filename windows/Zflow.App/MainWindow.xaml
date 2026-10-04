@@ -61,7 +61,7 @@
               <StackPanel Spacing="12">
                 <StackPanel Spacing="4">
                   <TextBlock Text="Screen arrangement" Style="{StaticResource SectionHeading}" />
-                  <TextBlock Text="Arrange individual monitors. Use exposed edges to switch computers; system display settings control movement between local monitors." Style="{StaticResource SecondaryText}" />
+                  <TextBlock Text="Arrange individual monitors. Drag their edges together to switch computers." Style="{StaticResource SecondaryText}" />
                 </StackPanel>
                 <Border Background="{ThemeResource ControlAltFillColorSecondaryBrush}" CornerRadius="8"
                         BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1">

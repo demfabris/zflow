@@ -29,6 +29,18 @@ impl Lease {
     pub fn returned(&self) -> bool {
         self.returned.is_some()
     }
+    pub fn boundary(&self) -> Option<input::Boundary> {
+        if self.expired() || self.returned() {
+            return None;
+        }
+        input::Boundary::new(
+            self.selected.bounds().ok()?,
+            self.edge,
+            self.start,
+            self.end,
+            true,
+        )
+    }
     pub fn sample(&mut self) -> Result<()> {
         if Instant::now() >= self.next_geometry {
             ensure!(

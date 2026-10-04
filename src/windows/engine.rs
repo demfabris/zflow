@@ -111,6 +111,8 @@ struct Engine {
     outbound: Option<Outbound>,
     arming: Option<(String, u64)>,
     geometry: Geometry,
+    desktop_available: bool,
+    boundaries: Vec<input::Boundary>,
     previous: crate::desktop::Point,
     next_geometry: Instant,
     next_discovery: Instant,
@@ -187,6 +189,8 @@ pub async fn run(path: PathBuf) -> Result<()> {
         outbound: None,
         arming: None,
         geometry,
+        desktop_available: input::available(),
+        boundaries: Vec::new(),
         previous: input::cursor()?,
         next_geometry: Instant::now(),
         next_discovery: Instant::now(),
@@ -225,11 +229,13 @@ pub async fn run(path: PathBuf) -> Result<()> {
                 },
                 Some(input::Event::Frame(frame))=>if let Some(out)=&engine.outbound
                     && let Some(link)=engine.links.get(&out.peer) && link.handle.capture(crate::capture::CapturedDeviceFrame{device_path:"windows".into(),frame,captured_at:Instant::now()}).is_err(){engine.local();},
+                Some(input::Event::EdgeHit(point, edge))=>if let Err(error)=engine.edge_hit(point, edge){engine.local();engine.notice=Some(format!("{error:#}"));},
                 Some(input::Event::Stopped)|None=>{engine.local();bail!("Windows input capture stopped");},
                 _=>{},
             },
             _=tick.tick()=>{if let Err(error)=engine.tick(){engine.local();engine.notice=Some(format!("{error:#}"));}},
         }
+        engine.refresh_boundaries();
     }
     engine.local();
     engine.endpoint.close(0u32.into(), b"Windows app stopped");
@@ -980,6 +986,8 @@ impl Engine {
         Ok(())
     }
     fn local(&mut self) {
+        input::boundaries(&[]);
+        self.boundaries.clear();
         input::remote(false);
         self.pending_activation = None;
         // Returning locally must also stop the remote sender. Releasing only
@@ -1128,9 +1136,10 @@ impl Engine {
                         },
                         |(p, s)| p == &peer && *s == session_id,
                     )
-                    && self.lease.as_ref().is_none_or(|l| {
-                        l.belongs(&peer, session_id) && !l.expired() && !l.returned()
-                    });
+                    && self
+                        .lease
+                        .as_ref()
+                        .is_none_or(|l| l.belongs(&peer, session_id) && !l.expired());
                 let owns = self.inbound.as_ref() == Some(&(peer.clone(), session_id));
                 let result = if allowed {
                     if effects
@@ -1144,7 +1153,15 @@ impl Engine {
                     let closed = effects
                         .iter()
                         .any(|e| matches!(e, ReceiverEffect::ActivationClosed { .. }));
-                    let result = self.injector.apply(effects).map_err(|e| format!("{e:#}"));
+                    // The sender learns about a return on its next Poll. Ignore
+                    // in-flight frames until then; rejecting them would close
+                    // the session before it receives the return coordinates.
+                    let result = if self.lease.as_ref().is_some_and(|l| l.returned()) {
+                        self.injector.release();
+                        Ok(())
+                    } else {
+                        self.injector.apply(effects).map_err(|e| format!("{e:#}"))
+                    };
                     if closed {
                         self.inbound = None;
                     }
@@ -1226,6 +1243,8 @@ impl Engine {
         }
         if matches!(request, DesktopRequest::Prepare { .. }) {
             ensure!(self.lease.is_none(), "A desktop handoff is already active");
+            input::boundaries(&[]);
+            self.boundaries.clear();
             let (lease, response) = desktop::prepare(peer.into(), session, request)?;
             self.lease = Some(lease);
             return Ok(response);
@@ -1246,7 +1265,8 @@ impl Engine {
     }
     fn tick(&mut self) -> Result<()> {
         let now = Instant::now();
-        if !input::available() {
+        self.desktop_available = input::available();
+        if !self.desktop_available {
             if self.outbound.is_some()
                 || self.inbound.is_some()
                 || self.lease.is_some()
@@ -1363,6 +1383,8 @@ impl Engine {
                 && let Some(h) =
                     handoff::on_edge(&layout, &self.geometry, held.return_mapping.edge, current)
                 && h.peer == held.peer
+                && h.monitor == held.monitor
+                && h.return_mapping == held.return_mapping
                 && input::clean()
             {
                 if now.duration_since(since) >= Duration::from_millis(250) {
@@ -1374,6 +1396,79 @@ impl Engine {
             self.previous = current;
         }
         Ok(())
+    }
+    fn edge_hit(&mut self, point: crate::desktop::Point, edge: crate::desktop::Edge) -> Result<()> {
+        if self.outbound.is_some()
+            || self.arming.is_some()
+            || self.inbound.is_some()
+            || self.lease.is_some()
+            || !self.config.daemon.sharing
+            || !input::clean()
+            || input::cursor()? != point
+        {
+            return Ok(());
+        }
+        if let Some(h) = handoff::on_edge(&self.local_layout(), &self.geometry, edge, point) {
+            if !self.config.switching.pause_at_edges {
+                self.arm(h.peer.clone(), Some(h));
+            } else if self.edge_since.as_ref().is_none_or(|(held, _)| {
+                held.peer != h.peer
+                    || held.monitor != h.monitor
+                    || held.return_mapping != h.return_mapping
+            }) {
+                self.edge_since = Some((h, Instant::now()));
+            }
+        }
+        Ok(())
+    }
+    fn refresh_boundaries(&mut self) {
+        let mut boundaries = Vec::new();
+        if self.desktop_available && self.config.daemon.sharing && self.outbound.is_none() {
+            if let Some(lease) = &self.lease {
+                boundaries.extend(lease.boundary());
+            } else if self.inbound.is_none() {
+                let layout = self.local_layout();
+                for t in layout.transitions() {
+                    let source = &layout.monitors[t.source];
+                    let Some(peer) = &layout.monitors[t.target].peer else {
+                        continue;
+                    };
+                    if source.peer.is_some()
+                        || !self.links.get(peer).is_some_and(|l| !l.handle.is_closed())
+                        || !self
+                            .config
+                            .peers
+                            .get(peer)
+                            .is_some_and(|p| p.permissions.connect && p.permissions.receive_normal)
+                    {
+                        continue;
+                    }
+                    let Ok(selected) = self
+                        .geometry
+                        .for_monitor(source.display.as_ref().map(|d| d.id.as_str()))
+                    else {
+                        continue;
+                    };
+                    let Ok(bounds) = selected.bounds() else {
+                        continue;
+                    };
+                    if source.display.as_ref().is_some_and(|d| d.bounds != bounds) {
+                        continue;
+                    }
+                    boundaries.extend(input::Boundary::new(
+                        bounds,
+                        t.edge,
+                        (t.source_start * f64::from(crate::desktop::FRACTION_MAX)).round() as u32,
+                        (t.source_end * f64::from(crate::desktop::FRACTION_MAX)).round() as u32,
+                        false,
+                    ));
+                }
+            }
+        }
+        if boundaries != self.boundaries {
+            input::boundaries(&boundaries);
+            self.boundaries = boundaries;
+        }
     }
     fn send_clip(&mut self, peer: &str) {
         if !self.config.clipboard.share {

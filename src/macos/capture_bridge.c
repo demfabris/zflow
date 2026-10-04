@@ -162,6 +162,63 @@ static pthread_mutex_t g_motion_watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic bool g_motion_watching;
 static CFMachPortRef g_motion_tap;
 
+// Short leases make these barriers fail open if the app worker stops ticking.
+#define ZFLOW_MAX_EDGE_GUARDS 256
+#define ZFLOW_EDGE_GUARD_NS 500000000ULL
+typedef struct {
+  ZFlowMacRect bounds;
+  double start, end;
+  uint32_t edge; // Left, Right, Top, Bottom.
+} ZFlowMacEdgeGuard;
+static ZFlowMacEdgeGuard g_edge_guards[ZFLOW_MAX_EDGE_GUARDS];
+static uint32_t g_edge_guard_count, g_edge_guard_generation;
+static uint64_t g_edge_guard_until;
+static ZFlowMacPosition g_motion_position;
+static bool g_motion_position_valid;
+
+void zflow_mac_edge_guards(const ZFlowMacEdgeGuard *guards, uint32_t count) {
+  ZFlowMacPosition cursor;
+  bool located = zflow_mac_cursor_position(&cursor) == 0;
+  pthread_mutex_lock(&g_motion_lock);
+  g_edge_guard_count = guards && count <= ZFLOW_MAX_EDGE_GUARDS ? count : 0;
+  if (g_edge_guard_count) memcpy(g_edge_guards, guards, count * sizeof(*guards));
+  g_edge_guard_until = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + ZFLOW_EDGE_GUARD_NS;
+  g_edge_guard_generation = zflow_mac_display_generation();
+  if (!g_motion_position_valid && located) {
+    g_motion_position = cursor;
+    g_motion_position_valid = true;
+  }
+  pthread_mutex_unlock(&g_motion_lock);
+}
+
+// Intersect the complete move, including one that skips the edge's pixels.
+// The first encountered configured edge wins; other local edges stay native.
+static bool guarded_move(ZFlowMacPosition from, ZFlowMacPosition to,
+                         ZFlowMacPosition *held) {
+  double first = 2.0;
+  for (uint32_t i = 0; i < g_edge_guard_count; i++) {
+    ZFlowMacEdgeGuard guard = g_edge_guards[i];
+    if (!rect_contains(guard.bounds, from)) continue;
+    bool vertical = guard.edge < 2;
+    bool negative = guard.edge == 0 || guard.edge == 2;
+    double line = vertical ? guard.bounds.x : guard.bounds.y;
+    if (!negative) line += (vertical ? guard.bounds.width : guard.bounds.height) - 1;
+    double before = vertical ? from.x : from.y, after = vertical ? to.x : to.y;
+    if (negative ? !(after < before && before >= line && after <= line)
+                 : !(after > before && before <= line && after >= line)) continue;
+    // Once held at the boundary, preserve movement along it. Using t=0
+    // would pin the pointer in place and trap it inside a partial segment.
+    double t = before == line ? 1.0 : (line - before) / (after - before);
+    double along = vertical ? from.y + t * (to.y - from.y) : from.x + t * (to.x - from.x);
+    if (t >= first || along < guard.start || along >= guard.end) continue;
+    first = t;
+    *held = vertical ? (ZFlowMacPosition){line, along} : (ZFlowMacPosition){along, line};
+  }
+  return first <= 1.0;
+}
+
+static void shorten_warp_freeze(void);
+
 // A move's deltas are the device's motion after acceleration, not the
 // cursor's: macOS reports them even while the cursor is held against a
 // screen edge, where its location stays put. Capture reads the same fields
@@ -171,22 +228,46 @@ static CGEventRef motion_callback(CGEventTapProxy proxy, CGEventType type,
   (void)proxy;
   (void)context;
   if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
-    // Listening holds nothing back, so it can always resume.
+    // Forget guards until the worker refreshes them after a disabled tap.
+    pthread_mutex_lock(&g_motion_lock);
+    g_edge_guard_count = 0;
+    g_motion_position_valid = false;
+    pthread_mutex_unlock(&g_motion_lock);
     if (g_motion_tap) CGEventTapEnable(g_motion_tap, true);
     return event;
   }
-  if (type != kCGEventMouseMoved ||
-      CGEventGetIntegerValueField(event, kCGEventSourceUserData) == ZFLOW_POSTED_MARK ||
-      CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) == getpid())
-    return event;
+  if (type != kCGEventMouseMoved && type != kCGEventLeftMouseDragged &&
+      type != kCGEventRightMouseDragged && type != kCGEventOtherMouseDragged) return event;
+  CGPoint location = CGEventGetLocation(event);
+  ZFlowMacPosition position = {location.x, location.y};
+  bool own = CGEventGetIntegerValueField(event, kCGEventSourceUserData) != ZFLOW_POSTED_MARK &&
+      CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) != getpid();
+  uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   pthread_mutex_lock(&g_motion_lock);
-  if (!g_motion_pending) g_motion.dx = g_motion.dy = 0;
-  g_motion.dx += CGEventGetDoubleValueField(event, kCGMouseEventDeltaX);
-  g_motion.dy += CGEventGetDoubleValueField(event, kCGMouseEventDeltaY);
-  g_motion_at = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-  g_motion_pending = true;
+  if (own) {
+    if (!g_motion_pending) g_motion.dx = g_motion.dy = 0;
+    g_motion.dx += CGEventGetDoubleValueField(event, kCGMouseEventDeltaX);
+    g_motion.dy += CGEventGetDoubleValueField(event, kCGMouseEventDeltaY);
+    g_motion_at = now;
+    g_motion_pending = true;
+  }
+  ZFlowMacPosition held;
+  bool blocked = own && type == kCGEventMouseMoved && g_edge_guard_count &&
+      g_motion_position_valid && now < g_edge_guard_until &&
+      g_edge_guard_generation == atomic_load(&g_display_generation) &&
+      zflow_mac_input_is_neutral() && !IsSecureEventInputEnabled() &&
+      guarded_move(g_motion_position, position, &held);
+  if (blocked) {
+    static pthread_once_t warp_freeze = PTHREAD_ONCE_INIT;
+    pthread_once(&warp_freeze, shorten_warp_freeze);
+    blocked = CGWarpMouseCursorPosition(CGPointMake(held.x, held.y)) == kCGErrorSuccess;
+    if (blocked) position = held;
+  }
+  g_motion_position = position;
+  g_motion_position_valid = isfinite(position.x) && isfinite(position.y);
   pthread_mutex_unlock(&g_motion_lock);
-  return event;
+  // The original jump must not reach the app on the adjacent local display.
+  return blocked ? NULL : event;
 }
 
 // Returns 1 and the motion since the last take, or 0 when there was none.
@@ -216,12 +297,16 @@ static void *motion_thread(void *context) {
   CFRelease(source);
   CFRelease(g_motion_tap);
   g_motion_tap = NULL;
+  pthread_mutex_lock(&g_motion_lock);
+  g_edge_guard_count = 0;
+  g_motion_position_valid = false;
+  pthread_mutex_unlock(&g_motion_lock);
   atomic_store(&g_motion_watching, false);
   return NULL;
 }
 
-// Watches the Mac's own pointer motion from a listen-only tap on its own
-// thread, unless one runs already. 0 when watching, -1 when macOS refused.
+// Watches motion and holds configured crossings on their source display until
+// the sharing worker captures input. 0 when watching, -1 when macOS refused.
 // A refused tap leaks a Mach port inside CoreGraphics, so callers must not
 // retry quickly.
 int zflow_mac_motion_watch(void) {
@@ -232,8 +317,10 @@ int zflow_mac_motion_watch(void) {
     return 0;
   }
   CFMachPortRef tap = CGEventTapCreate(
-      kCGSessionEventTap, kCGTailAppendEventTap, kCGEventTapOptionListenOnly,
-      CGEventMaskBit(kCGEventMouseMoved), motion_callback, NULL);
+      kCGHIDEventTap, kCGTailAppendEventTap, kCGEventTapOptionDefault,
+      CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDragged) |
+      CGEventMaskBit(kCGEventRightMouseDragged) | CGEventMaskBit(kCGEventOtherMouseDragged),
+      motion_callback, NULL);
   CFRunLoopSourceRef source = tap ? CFMachPortCreateRunLoopSource(NULL, tap, 0) : NULL;
   g_motion_tap = tap;
   // Set first: the thread clears it when it ends, which can be at once.
