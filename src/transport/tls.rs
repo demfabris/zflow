@@ -26,9 +26,9 @@ use crate::identity::Identity;
 
 use super::TransportError;
 
-pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/4";
+pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/5";
 /// Answered on the input port by computers that do not trust each other yet.
-pub const HELLO_ALPN_PROTOCOL: &[u8] = b"zflow-hello/4";
+pub const HELLO_ALPN_PROTOCOL: &[u8] = b"zflow-hello/5";
 const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 const INPUT_IDLE_TIMEOUT_MS: u32 = 15_000;
 /// A hello is two short messages, so a silent peer is dropped quickly.
@@ -491,6 +491,7 @@ mod tests {
         ("0.1.0", b"zflow/1", b"zflow-pair/1"),
         ("0.2.0", b"zflow/3", b"zflow-pair/4"),
         ("0.3.0", b"zflow/4", b"zflow-hello/4"),
+        ("0.4.0", b"zflow/5", b"zflow-hello/5"),
     ];
 
     #[test]

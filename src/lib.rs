@@ -2,6 +2,10 @@
 
 pub mod app;
 pub mod capture;
+#[cfg(not(windows))]
+pub mod cli;
+#[cfg(windows)]
+#[path = "windows/cli.rs"]
 pub mod cli;
 pub mod clipboard;
 pub mod config;
@@ -28,4 +32,6 @@ pub mod peer_view;
 pub mod runtime;
 pub mod session;
 pub mod transport;
+#[cfg(windows)]
+pub mod windows;
 pub mod wire;

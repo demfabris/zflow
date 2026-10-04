@@ -368,7 +368,7 @@ extension Unplaced {
     case .identifying: "Identifying…"
     case .differentVersion: "Different zflow version"
     case .duplicateName: "Same name as another"
-    case .ready: os.map { $0 == .macos ? "macOS" : "Linux" } ?? ""
+    case .ready: os.map { $0 == .macos ? "macOS" : $0 == .windows ? "Windows" : "Linux" } ?? ""
     }
   }
 }

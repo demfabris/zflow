@@ -165,9 +165,31 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows:
+    name: Build Windows WinUI app
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install Rust build toolchain
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+      - name: Package Windows
+        run: ./scripts/package-windows.ps1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-x86_64
+          path: target/windows-release/*
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish verified artifacts
-    needs: build
+    needs: [build, windows]
     # A manual publish only releases main; other branches can still build.
     if: startsWith(github.ref, 'refs/tags/v') || (inputs.publish && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
@@ -210,10 +232,11 @@ jobs:
             test -s "target/dist/zflow-$tag-$target.tar.gz"
           done
           test -s "target/dist/zflow-$tag-macos.dmg"
+          test -s "target/dist/zflow-$tag-windows-x86_64.zip"
           test -s "target/dist/zflow_${version}_amd64.deb"
           test -s "target/dist/zflow_${version}_arm64.deb"
           cp install.sh target/dist/install.sh
-          (cd target/dist && sha256sum ./*.tar.gz ./*.dmg ./*.deb install.sh | sed 's|  ./|  |' > SHA256SUMS)
+          (cd target/dist && sha256sum ./*.tar.gz ./*.dmg ./*.deb ./*.zip install.sh | sed 's|  ./|  |' > SHA256SUMS)
           prerelease=()
           if [[ "$version" == *-* ]]; then prerelease=(--prerelease); fi
           gh release create "$tag" target/dist/* --target "$GITHUB_SHA" --draft \

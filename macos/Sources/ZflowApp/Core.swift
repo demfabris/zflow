@@ -33,7 +33,7 @@ struct Unplaced: Decodable, Identifiable, Equatable, Sendable {
   /// Only a computer whose key is known, on this version, can be placed.
   var placeable: Bool { state == .ready || state == .duplicateName }
 }
-enum Os: String, Decodable, Sendable { case linux, macos }
+enum Os: String, Decodable, Sendable { case linux, macos, windows }
 /// src/pairing_window.rs View: the ten minutes in which a fresh install
 /// lets the one new computer around join by itself.
 struct PairingWindow: Decodable, Equatable, Sendable {

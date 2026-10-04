@@ -1,4 +1,13 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/windows/input.c");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        cc::Build::new()
+            .file("src/windows/input.c")
+            .warnings(true)
+            .compile("zflow_windows_input");
+        println!("cargo:rustc-link-lib=user32");
+        println!("cargo:rustc-link-lib=wtsapi32");
+    }
     println!("cargo:rerun-if-changed=src/macos/capture_bridge.c");
     println!("cargo:rerun-if-changed=src/macos/awdl_client.c");
     println!("cargo:rerun-if-changed=src/macos/inject.c");

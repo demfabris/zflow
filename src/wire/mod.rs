@@ -126,6 +126,8 @@ pub struct Hello {
 pub enum Os {
     Linux,
     Macos,
+    // Append only: postcard encodes the existing variants by ordinal.
+    Windows,
 }
 
 pub fn encode(message: &WireMessage) -> Result<Vec<u8>, WireError> {

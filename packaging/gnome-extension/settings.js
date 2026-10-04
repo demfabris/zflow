@@ -24,7 +24,7 @@ const SHELF_GAP = 8;
 // src/daemon.rs) until that computer sends its own.
 const NEW_TILE = [1920, 1080];
 const PLACEABLE = new Set(['ready', 'duplicate_name']);
-const OS_NAMES = {linux: 'Linux', macos: 'macOS'};
+const OS_NAMES = {linux: 'Linux', macos: 'macOS', windows: 'Windows'};
 // A key's mark is six hex digits; each of the first four picks one of these
 // by its low three bits, as the Mac app does, so a key looks the same on
 // every computer.

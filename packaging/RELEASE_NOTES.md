@@ -1,4 +1,4 @@
-Prebuilt zflow for Linux x86-64/ARM64 and one universal macOS app for Apple silicon and Intel.
+Prebuilt zflow for Windows x64, Linux x86-64/ARM64, and one universal macOS app for Apple silicon and Intel.
 On a Mac, open `zflow-VERSION-macos.dmg` and drag zflow to Applications, or use the command below.
 This is a prototype release; the live qualification checklist is in TESTPLAN.md.
 
@@ -6,7 +6,25 @@ This is a prototype release; the live qualification checklist is in TESTPLAN.md.
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash
 ```
 
-## New in 0.3.0: arrange to pair
+## New in 0.4.0: Windows preview
+
+- Native WinUI 3 app with a draggable computer arrangement, explicit pairing,
+  Tailscale address entry, per-computer keyboard and scroll settings, clipboard
+  sharing, and a notification-area menu.
+- A per-user Rust engine captures physical keys and relative pointer motion,
+  injects input on the unlocked Windows desktop, and releases input on lock,
+  disconnect, pause, or shutdown. Ctrl+Win+Backspace returns input locally.
+- Download `zflow-v0.4.0-windows-x86_64.zip`, extract the entire folder, and open
+  `Zflow.App.exe`. The included PowerShell installer adds a Start menu shortcut.
+  Windows 10 version 2004+ and Windows 11 x64 are supported; runtimes are bundled.
+- Update every computer to 0.4.0 before pairing. The Windows OS label requires
+  a protocol revision; 0.3.0 peers are incompatible. Existing pairing keys stay
+  valid after all peers update. Windows requires explicit trust on each side.
+- This preview still needs the hardware matrix in `windows/README.md` and
+  `TESTPLAN.md`. Windows secure desktops, elevated apps, and raw multitouch are
+  outside its support boundary.
+
+## Previous release: arrange to pair (0.3.0)
 
 - Setup codes are gone. zflow computers on the same network show up in the
   zflow window under Found on your network. Drag one into place next to this
@@ -38,7 +56,7 @@ Mac apps include Developer ID signatures and Apple's notarization ticket.
 You can install the optional AWDL helper from the app with administrator approval.
 
 Updates preserve configuration and the computers you added. Computers on
-0.3.0 cannot connect to ones on 0.2.0 or v0.1.0, so update every computer;
+0.4.0 cannot connect to ones on 0.3.0, 0.2.0 or v0.1.0, so update every computer;
 until then they show each other as a different zflow version. An updated
 computer never adds another by itself: only a fresh install does.
 Restarting the Linux service interrupts active sharing. Reboot Linux

@@ -1,6 +1,12 @@
 # zflow
 
 zflow shares keyboard, pointer, and trackpad input over authenticated QUIC.
+Windows now has a native WinUI 3 preview with keyboard and pointer sharing,
+screen arrangement, clipboard sharing and a notification-area app. See
+[Windows setup and build instructions](windows/README.md). This source version
+is 0.4.0; update all participating computers together. It cannot connect to
+released 0.3.0 installations.
+
 Linux runs a system service with a GNOME panel indicator and native
 GTK4/libadwaita settings. macOS runs a native SwiftUI menu-bar app with a small
 settings window. Input goes both ways: the Mac sends to Linux, and a paired

@@ -81,6 +81,11 @@ fn ensure_private_directory(path: &Path) -> Result<(), IdentityError> {
         path: path.to_owned(),
         source,
     })?;
+    #[cfg(windows)]
+    crate::windows::security::protect(path, true).map_err(|source| IdentityError::Write {
+        path: path.to_owned(),
+        source: std::io::Error::other(source),
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -95,13 +100,21 @@ fn ensure_private_directory(path: &Path) -> Result<(), IdentityError> {
 }
 
 fn ensure_private_file(path: &Path) -> Result<(), IdentityError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| IdentityError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(IdentityError::InsecurePermissions(path.to_owned()));
+    }
+    #[cfg(windows)]
+    crate::windows::security::protect(path, false).map_err(|source| IdentityError::Write {
+        path: path.to_owned(),
+        source: std::io::Error::other(source),
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let metadata = fs::symlink_metadata(path).map_err(|source| IdentityError::Read {
-            path: path.to_owned(),
-            source,
-        })?;
         if !metadata.file_type().is_file() || metadata.mode() & 0o077 != 0 {
             return Err(IdentityError::InsecurePermissions(path.to_owned()));
         }

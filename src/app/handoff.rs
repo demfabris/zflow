@@ -110,7 +110,7 @@ pub(crate) fn validate(layout: &Layout, geometry: &Geometry) -> Result<()> {
 
 /// The crossing for a push against `edge` at `position`, a fraction of this
 /// desktop along that edge, as a GNOME barrier reports it.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub(crate) fn from_edge(
     layout: &Layout,
     geometry: &Geometry,

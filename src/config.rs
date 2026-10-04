@@ -317,7 +317,6 @@ pub(crate) fn save_text(path: &Path, text: &str) -> Result<(), ConfigError> {
         source: std::io::Error::other(error),
     })?;
     let temporary = parent.join(format!(".{file_name}.tmp-{}", encode_hex(&suffix)));
-    #[cfg(unix)]
     let existing_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
         Ok(_) => return Err(ConfigError::UnsafeTarget(path.to_owned())),
@@ -329,6 +328,8 @@ pub(crate) fn save_text(path: &Path, text: &str) -> Result<(), ConfigError> {
             });
         }
     };
+    #[cfg(not(unix))]
+    let _ = existing_metadata;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

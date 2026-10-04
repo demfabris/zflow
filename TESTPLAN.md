@@ -4,6 +4,27 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Windows preview (0.4.0)
+
+Build on Windows with `scripts/build-windows.ps1`, then run the checks and
+hardware matrix in `windows/README.md`. Use the same 0.4.0 source on all peers.
+The optional desktop smoke test uses an isolated configuration and a local
+QUIC peer; it never activates input capture or injects input:
+
+```powershell
+cargo test --locked --test windows_desktop -- --ignored --nocapture
+```
+
+Qualify Windows ↔ macOS and Windows ↔ GNOME over both LAN and Tailscale.
+Compare marks and explicitly trust both sides, arrange touching screens, then
+test crossing/return, typing and held keys, mouse drag, both wheel axes,
+keyboard modes, and opt-in Unicode/PNG clipboard sharing. Check emergency
+pause, disconnect with held input, lock/unlock, sleep/wake, display/DPI changes,
+tray close/reopen/quit, restart, start at login, and reinstall preserving keys.
+Verify a secure/elevated desktop is unavailable and does not leave held keys.
+Record actual OS versions, hardware, and results; passing simulated protocol
+tests does not qualify the native capture path.
+
 ## Arrange to pair sitting (0.3.0)
 
 One sitting with the Mac and the Ubuntu box, both on 0.3.0 from main. A third

@@ -88,6 +88,8 @@ pub fn make_hello(
 pub fn this_os() -> Os {
     if cfg!(target_os = "macos") {
         Os::Macos
+    } else if cfg!(windows) {
+        Os::Windows
     } else {
         Os::Linux
     }
@@ -227,6 +229,7 @@ pub fn local_name() -> String {
 
 /// The OS host name, cut to the label bound. GUI apps and services do not
 /// inherit the shell's `$HOSTNAME`, so this asks the OS.
+#[cfg(unix)]
 pub(crate) fn local_device_label() -> Option<String> {
     let mut buffer = [0_u8; 256];
     // SAFETY: the pointer and length describe `buffer`, which outlives the call.
@@ -241,6 +244,20 @@ pub(crate) fn local_device_label() -> Option<String> {
     truncate(&mut name, MAX_LABEL_BYTES);
     let label = name.trim();
     (!label.is_empty() && !label.chars().any(char::is_control)).then(|| label.to_owned())
+}
+
+#[cfg(windows)]
+pub(crate) fn local_device_label() -> Option<String> {
+    use windows_sys::Win32::System::WindowsProgramming::GetComputerNameW;
+    let mut buffer = [0_u16; 256];
+    let mut length = buffer.len() as u32;
+    // SAFETY: the buffer and its length remain valid for the call.
+    if unsafe { GetComputerNameW(buffer.as_mut_ptr(), &mut length) } == 0 {
+        return None;
+    }
+    let mut name = String::from_utf16_lossy(&buffer[..length as usize]);
+    truncate(&mut name, MAX_LABEL_BYTES);
+    Some(name)
 }
 
 /// This computer's addresses on its input port. Sent in a hello, they let

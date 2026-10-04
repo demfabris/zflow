@@ -1431,6 +1431,7 @@ fn nearby_line(computer: &crate::neighbors::Unplaced) -> String {
     let os = match computer.os {
         Some(crate::wire::Os::Linux) => "Linux",
         Some(crate::wire::Os::Macos) => "macOS",
+        Some(crate::wire::Os::Windows) => "Windows",
         None => "-",
     };
     format!(
