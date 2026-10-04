@@ -214,3 +214,18 @@ private func temporary() -> URL {
   #expect(tiles.first?.computer.display?.name == "Samsung")
   #expect(tiles.first?.mark == "abcdef")
 }
+
+@Test func smallMonitorTilesPreserveProportionsAndTouchingEdges() {
+  let landscape = Computer(
+    id: "local/a", label: "Landscape", x: -2800, y: -400, width: 2800, height: 1600)
+  let portrait = Computer(
+    id: "local/b", label: "Portrait", x: 0, y: -400, width: 1400, height: 2400)
+  let origin = CGPoint(x: 400, y: 200)
+  let first = ComputerLayout.frame(for: landscape, scale: 0.02, origin: origin)
+  let second = ComputerLayout.frame(for: portrait, scale: 0.02, origin: origin)
+  #expect(first.size == CGSize(width: 56, height: 32))
+  #expect(second.size == CGSize(width: 28, height: 48))
+  #expect(first.maxX == second.minX)
+  #expect(first.minY == second.minY)
+  #expect(first.minX == 344 && first.minY == 192)
+}

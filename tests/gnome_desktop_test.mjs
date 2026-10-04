@@ -6,7 +6,7 @@ import vm from 'node:vm';
 const source = fs.readFileSync(new URL('../packaging/gnome-extension/extension.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '').replace('export default class ', 'class ') + '\nglobalThis.TestExtension = ZflowExtension;';
 
-function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
+function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}], monitorData = {}) {
     let pointer = {x: monitors[0].x + 100, y: monitors[0].y + 100};
     let now = 1;
     const barriers = [];
@@ -68,10 +68,18 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
         },
         Gio: {Cancellable: class {cancel() {}}, DBusCallFlags: {NONE: 0}, DBus: {session: {
             emit_signal(...args) {emitted.push(args);},
-            call(_dest,_path,_iface,_method,_args,_type,_flags,_timeout,_cancel,done) {done(this, {});},
-            call_finish() {return {deep_unpack: () => [1,
-                monitors.map((m,i) => [[String(i),'vendor','panel','serial'],[],{'display-name': 'Display '+i}]),
-                monitors.map((m,i) => [m.x,m.y,1,0,i===0,[[String(i),'vendor','panel','serial']],{}]),{}]};}
+            call(_dest,_path,_iface,method,_args,_type,_flags,_timeout,_cancel,done) {done(this, {method});},
+            call_finish({method}) {
+                if (method === 'GetResources') {
+                    if (monitorData.resourcesError) throw new Error('Unavailable');
+                    return {deep_unpack: () => [monitorData.resourceSerial ?? 1, [],
+                        monitors.map((m,i) => [i,0,i,[],String(i),[],[],
+                            {vendor:'vendor',product:'panel',serial:'serial',...monitorData.resources}])]};
+                }
+                return {deep_unpack: () => [1,
+                    monitors.map((m,i) => [[String(i),'vendor','panel','serial'],[],{'display-name': 'Display '+i,...monitorData.current}]),
+                    monitors.map((m,i) => [m.x,m.y,1,monitorData.transform ?? 0,i===0,[[String(i),'vendor','panel','serial']],{}]),{}]};
+            }
         }}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},
             BusNameOwnerFlags: {NONE: 0}, bus_own_name_on_connection: () => 1, bus_unown_name() {},
             // The desktop agent is already running as :1.7.
@@ -107,6 +115,33 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
 }
 
 const prepare = (edge = 'left', extra = {}) => ({command: 'prepare', token: 7, edge, start: 0, end: 1000000, position: 500000, ...extra});
+
+{
+    const d = desktop(undefined, {resources: {'width-mm': 530, 'height-mm': 300}});
+    const screen = (await d.extension._request({command: 'snapshot'})).geometry.displays[0];
+    assert.equal(screen.width_mm, 530, 'Mutter GetResources supplies dimensions absent from GetCurrentState');
+    assert.equal(screen.height_mm, 300);
+    d.extension.disable();
+}
+{
+    const d = desktop(undefined, {resources: {'width-mm': 530, 'height-mm': 300}, transform: 1});
+    const screen = (await d.extension._request({command: 'snapshot'})).geometry.displays[0];
+    assert.equal(screen.width_mm, 300, 'rotated monitor dimensions follow its orientation');
+    assert.equal(screen.height_mm, 530);
+    d.extension.disable();
+}
+for (const monitorData of [{resources: {serial: 'replaced', 'width-mm': 530, 'height-mm': 300}}, {resourcesError: true}]) {
+    const d = desktop(undefined, monitorData);
+    const screen = (await d.extension._request({command: 'snapshot'})).geometry.displays[0];
+    assert.equal(screen.width_mm, 0, 'missing or different connector identity never supplies dimensions');
+    assert.equal(screen.height_mm, 0);
+    d.extension.disable();
+}
+{
+    const d = desktop(undefined, {resourceSerial: 2, resources: {'width-mm': 530, 'height-mm': 300}});
+    await assert.rejects(d.extension._request({command: 'snapshot'}), /Waiting for GNOME monitor information/);
+    d.extension.disable();
+}
 
 {
     // An exposed monitor edge can lie inside the whole desktop's bounding box.

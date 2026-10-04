@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// One computer on the arrangement canvas. The canvas draws only placed
+/// One display on the arrangement canvas. The canvas draws only placed
 /// tiles, at the spot the layout gives them.
 struct LayoutTile: Identifiable, Equatable {
   var computer: Computer
@@ -217,17 +217,22 @@ struct ComputerLayout: View {
     return (Int(x.rounded()), Int(y.rounded()))
   }
 
+  /// Every display uses the same transform so touching edges stay touching.
+  nonisolated static func frame(for computer: Computer, scale: CGFloat, origin: CGPoint) -> CGRect {
+    CGRect(
+      x: origin.x + CGFloat(computer.x) * scale,
+      y: origin.y + CGFloat(computer.y) * scale,
+      width: CGFloat(computer.width) * scale,
+      height: CGFloat(computer.height) * scale)
+  }
+
   private func positionedTile(_ tile: LayoutTile, scale: CGFloat, origin: CGPoint) -> some View {
     let computer = tile.computer
     let active: Bool = dragging == computer.id
     let offset: CGSize = active ? translation : .zero
-    let midpointX: CGFloat = CGFloat(computer.x) + CGFloat(computer.width) / 2
-    let midpointY: CGFloat = CGFloat(computer.y) + CGFloat(computer.height) / 2
-    let center = CGPoint(
-      x: origin.x + midpointX * scale + offset.width,
-      y: origin.y + midpointY * scale + offset.height)
-    return tileView(tile, scale: scale, active: active)
-      .position(center)
+    let frame = Self.frame(for: computer, scale: scale, origin: origin)
+    return tileView(tile, size: frame.size, active: active)
+      .position(x: frame.midX + offset.width, y: frame.midY + offset.height)
       .zIndex(active ? 1 : 0)
   }
 
@@ -272,37 +277,44 @@ struct ComputerLayout: View {
 
   /// This Mac has an accent outline. A paired computer that is not
   /// connected is drawn faded, with a dashed outline.
-  private func tileView(_ tile: LayoutTile, scale: CGFloat, active: Bool) -> some View {
+  private func tileView(_ tile: LayoutTile, size: CGSize, active: Bool) -> some View {
     let computer = tile.computer
     let local = computer.peer == nil
     let away = !local && [nil, .paired, .unreachable].contains(tile.state)
+    let detailed = size.width >= 110 && size.height >= 76
     let shape = RoundedRectangle(cornerRadius: 10)
     return VStack(alignment: .leading, spacing: 2) {
-      HStack(alignment: .top) {
-        Image(systemName: local ? "laptopcomputer" : "desktopcomputer")
-          .font(.title3)
-          .foregroundStyle(local ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+      if detailed {
+        HStack(alignment: .top) {
+          Image(systemName: local ? "laptopcomputer" : "desktopcomputer")
+            .font(.title3)
+            .foregroundStyle(local ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+          Spacer(minLength: 4)
+          if let mark = tile.mark { KeyMark(mark: mark).opacity(away ? 0.6 : 1) }
+        }
         Spacer(minLength: 4)
-        if let mark = tile.mark { KeyMark(mark: mark).opacity(away ? 0.6 : 1) }
       }
-      Spacer(minLength: 4)
-      Text(computer.display?.name ?? computer.label).font(.callout.weight(.semibold)).lineLimit(1)
-      if let state = tile.state {
+      Text(computer.display?.name ?? computer.label)
+        .font(detailed ? .callout.weight(.semibold) : .caption2.weight(.semibold))
+        .lineLimit(1)
+      if detailed, let state = tile.state {
         HStack(spacing: 5) {
           StateDot(state: state)
           Text(computer.display == nil ? state.label : "\(computer.peer ?? "This Mac") · \(state.label)").lineLimit(1)
         }
         .font(.caption).foregroundStyle(.secondary)
-      } else if local && computer.label != "This Mac" {
-        Text("This Mac").font(.caption).foregroundStyle(.secondary)
+      } else if size.height >= 40 && computer.display != nil {
+        Text(computer.peer ?? "This Mac")
+          .font(detailed ? .caption : .caption2).foregroundStyle(.secondary).lineLimit(1)
       }
     }
-    .padding(10)
+    .padding(detailed ? 10 : 4)
     .frame(
-      width: max(110, CGFloat(computer.width) * scale),
-      height: max(76, CGFloat(computer.height) * scale),
-      alignment: .topLeading
+      width: size.width,
+      height: size.height,
+      alignment: detailed ? .topLeading : .center
     )
+    .clipShape(shape)
     .background(Color(nsColor: .controlBackgroundColor).opacity(away ? 0.55 : 1), in: shape)
     .overlay {
       if active || local {
@@ -317,6 +329,7 @@ struct ComputerLayout: View {
     .shadow(
       color: .black.opacity(active ? 0.13 : 0.05), radius: active ? 8 : 3, y: active ? 4 : 1
     )
+    .help(computer.label)
   }
 
   private var layoutBounds: CGRect {

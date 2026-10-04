@@ -249,21 +249,27 @@ export default class ZflowExtension extends Extension {
         this._displayCall = cancellable;
         // This service runs inside Shell too. An asynchronous call avoids
         // blocking the compositor while it answers its own display query.
-        Gio.DBus.session.call('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+        const readCurrentState = resources => Gio.DBus.session.call('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
             'org.gnome.Mutter.DisplayConfig', 'GetCurrentState', null, null,
             Gio.DBusCallFlags.NONE, 2000, cancellable, (connection, result) => {
                 if (generation !== this._displayGeneration) return;
                 this._displayCall = null;
                 try {
-                    const [, physical, logical] = connection.call_finish(result).deep_unpack();
+                    const [serial, physical, logical] = connection.call_finish(result).deep_unpack();
+                    if (resources && resources[0] !== serial) return;
                     const unpack = value => value?.deep_unpack ? value.deep_unpack() : value;
                     this._displayInfo = logical.map(([x, y, , transform, , specs]) => {
                         // Mirrors are one logical surface. Pick a stable member.
                         const spec = [...specs].sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))[0];
                         const properties = physical.find(([candidate]) => JSON.stringify(candidate) === JSON.stringify(spec))?.[2] ?? {};
                         const index = global.backend.get_monitor_manager?.().get_monitor_for_connector(spec[0]);
-                        let width = unpack(properties['width-mm']) ?? 0;
-                        let height = unpack(properties['height-mm']) ?? 0;
+                        // GetCurrentState omits physical dimensions on some Mutter
+                        // versions. GetResources exposes the same connector's EDID
+                        // dimensions; match its complete identity before using them.
+                        const output = resources?.[2].find(o => o[4] === spec[0]
+                            && ['vendor', 'product', 'serial'].every((key, i) => unpack(o[7][key]) === spec[i + 1]));
+                        let width = unpack(properties['width-mm']) ?? unpack(output?.[7]['width-mm']) ?? 0;
+                        let height = unpack(properties['height-mm']) ?? unpack(output?.[7]['height-mm']) ?? 0;
                         if (transform % 2) [width, height] = [height, width];
                         if (width < 10 || height < 10 || width > 4000 || height > 4000) width = height = 0;
                         return {x, y, index, id: GLib.compute_checksum_for_string(GLib.ChecksumType.SHA256, JSON.stringify(spec), -1),
@@ -272,6 +278,15 @@ export default class ZflowExtension extends Extension {
                     });
                     this._placeEdges();
                 } catch { this._displayInfo = null; }
+            });
+        Gio.DBus.session.call('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+            'org.gnome.Mutter.DisplayConfig', 'GetResources', null, null,
+            Gio.DBusCallFlags.NONE, 2000, cancellable, (connection, result) => {
+                if (generation !== this._displayGeneration) return;
+                let resources = null;
+                try { resources = connection.call_finish(result).deep_unpack(); }
+                catch { /* Logical geometry still works when EDID data is unavailable. */ }
+                readCurrentState(resources);
             });
     }
 

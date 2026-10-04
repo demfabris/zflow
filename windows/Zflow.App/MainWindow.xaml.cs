@@ -105,11 +105,13 @@ public sealed partial class MainWindow : Window
         {
             if (node is not JsonObject m) continue;
             bool local = m["peer"] is null;
+            double tileWidth = Number(m["width"]) * scale, tileHeight = Number(m["height"]) * scale;
             var stack = new StackPanel { Spacing = 6, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-            if (Number(m["height"]) * scale >= 80) stack.Children.Add(new FontIcon { Glyph = local ? "\uE7F8" : "\uE7F4", FontSize = 22 });
-            stack.Children.Add(new TextBlock { Text = Text(m["display"]?["name"], Text(m["label"])), FontSize = 13, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = Math.Max(10, Number(m["width"]) * scale - 20) });
-            if (m["display"] is not null && Number(m["height"]) * scale >= 66) stack.Children.Add(new TextBlock { Text = local ? "This PC" : Text(m["peer"]), FontSize = 12, Foreground = Brush("TextFillColorSecondaryBrush"), HorizontalAlignment = HorizontalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = Math.Max(10, Number(m["width"]) * scale - 20) });
-            var tile = new Border { Width = Number(m["width"]) * scale, Height = Number(m["height"]) * scale, MinHeight = 44, CornerRadius = new CornerRadius(7), BorderThickness = new Thickness(local ? 2 : 1), BorderBrush = Brush(local ? "AccentFillColorDefaultBrush" : "CardStrokeColorDefaultBrush"), Background = Brush("CardBackgroundFillColorDefaultBrush"), Child = stack };
+            if (tileHeight >= 80 && tileWidth >= 44) stack.Children.Add(new FontIcon { Glyph = local ? "\uE7F8" : "\uE7F4", FontSize = 22 });
+            if (tileHeight >= 24 && tileWidth >= 30) stack.Children.Add(new TextBlock { Text = Text(m["display"]?["name"], Text(m["label"])), FontSize = 13, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = tileWidth - 20 });
+            if (m["display"] is not null && tileHeight >= 66 && tileWidth >= 30) stack.Children.Add(new TextBlock { Text = local ? "This PC" : Text(m["peer"]), FontSize = 12, Foreground = Brush("TextFillColorSecondaryBrush"), HorizontalAlignment = HorizontalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, MaxWidth = tileWidth - 20 });
+            // Preserve physical proportions and touching edges even when a screen is too small for labels.
+            var tile = new Border { Width = tileWidth, Height = tileHeight, CornerRadius = new CornerRadius(7), BorderThickness = new Thickness(local ? 2 : 1), BorderBrush = Brush(local ? "AccentFillColorDefaultBrush" : "CardStrokeColorDefaultBrush"), Background = Brush("CardBackgroundFillColorDefaultBrush"), Child = stack };
             Canvas.SetLeft(tile, ox + (Number(m["x"]) - left) * scale); Canvas.SetTop(tile, oy + (Number(m["y"]) - top) * scale);
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(tile, $"{Text(m["label"])} screen. Drag to arrange.");
             ToolTipService.SetToolTip(tile, Text(m["label"]));
