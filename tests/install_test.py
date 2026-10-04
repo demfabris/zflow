@@ -422,10 +422,13 @@ class PackagingTest(unittest.TestCase):
         for path in ("/usr/local/share/applications/io.zflow.zflow.desktop",
                      "/usr/local/share/dbus-1/services/io.zflow.Desktop.service",
                      "/etc/xdg/autostart/io.zflow.desktop-agent.desktop",
+                     "/usr/local/share/icons/hicolor/scalable/apps/io.zflow.zflow.svg",
+                     "/usr/local/share/icons/hicolor/symbolic/apps/io.zflow.zflow-symbolic.svg",
                      "firewall.sh"):
             with self.subTest(path=path):
                 self.assertIn(path.rsplit("/", 1)[-1], install)
                 self.assertIn(path.rsplit("/", 1)[-1], uninstall)
+        self.assertIn("Icon=io.zflow.zflow\n", self.read("packaging/linux/io.zflow.zflow.desktop"))
         entry = self.read("packaging/linux/io.zflow.desktop-agent.desktop")
         self.assertIn("OnlyShowIn=GNOME;", entry)
         # A removed-but-not-purged package leaves this conffile behind.

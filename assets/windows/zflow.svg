@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="48" height="48" viewBox="0 0 48 48">
+  <title>zflow</title>
+  <defs>
+    <path id="cursor" d="M766 212C780 208 792 220 788 234L680 640C676 655 655 657 648 643L590 530L414 706C402 718 382 718 370 706L318 654C306 642 306 622 318 610L494 434L381 376C367 369 369 348 384 344Z"/>
+    <path id="motion" d="M188 474L274 388C283 379 297 379 306 388L324 406C333 415 333 429 324 438L238 524C229 533 215 533 206 524L188 506C179 497 179 483 188 474ZM204 670L234 640C243 631 257 631 266 640L284 658C293 667 293 681 284 690L254 720C245 729 231 729 222 720L204 702C195 693 195 679 204 670Z"/>
+    <linearGradient id="blue" gradientUnits="userSpaceOnUse" x1="350" y1="240" x2="720" y2="700">
+      <stop stop-color="#55b4f7"/>
+      <stop offset="1" stop-color="#0869c8"/>
+    </linearGradient>
+    <linearGradient id="orange" gradientUnits="userSpaceOnUse" x1="180" y1="380" x2="330" y2="730">
+      <stop stop-color="#ffba7b"/>
+      <stop offset="1" stop-color="#e8753a"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(-6 -4.35) scale(.0625)">
+    <use xlink:href="#cursor" fill="#1455a2"/>
+    <use xlink:href="#motion" fill="#b64e29"/>
+  </g>
+  <g transform="translate(-6 -5) scale(.0625)">
+    <use xlink:href="#cursor" fill="url(#blue)"/>
+    <use xlink:href="#motion" fill="url(#orange)"/>
+    <path fill="#ffffff" opacity=".14" d="M766 212C780 208 792 220 788 234L590 530L494 434L381 376C367 369 369 348 384 344Z"/>
+  </g>
+</svg>

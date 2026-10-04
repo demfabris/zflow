@@ -6,7 +6,10 @@ This is a prototype release; the live qualification checklist is in TESTPLAN.md.
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash
 ```
 
-## New in 0.4.0: Windows preview
+## New in 0.4.0: Windows preview and native icons
+
+- Cursor Flow artwork across all three desktops: Icon Composer appearances on
+  macOS, full-color and symbolic GNOME icons, and Windows app and tray icons.
 
 - Native WinUI 3 app with a draggable computer arrangement, explicit pairing,
   Tailscale address entry, per-computer keyboard and scroll settings, clipboard

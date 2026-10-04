@@ -13,11 +13,14 @@ internal sealed class NativeWindow : IDisposable
     public event Action? QuitRequested;
     private const uint TrayMessage = 0x8001;
     private readonly uint taskbarCreated = RegisterWindowMessage("TaskbarCreated");
-    public NativeWindow(Window window)
+    public NativeWindow(Window window, string iconPath)
     {
         this.window = window; hwnd = WinRT.Interop.WindowNative.GetWindowHandle(window); callback = Procedure;
-        icon = new NotifyIconData { cbSize = (uint)Marshal.SizeOf<NotifyIconData>(), hWnd = hwnd, uID = 1, uFlags = 1 | 2 | 4, uCallbackMessage = TrayMessage, hIcon = LoadIcon(0, 32512), szTip = "zflow · Open to manage input sharing", szInfo = "", szInfoTitle = "" };
-        if (!SetWindowSubclass(hwnd, callback, 1, 0)) throw new InvalidOperationException("Could not attach the zflow tray menu.");
+        // Keep the owned icon until disposal so Explorer restarts can reuse it.
+        nint trayIcon = LoadImage(0, iconPath, 1, GetSystemMetrics(49), GetSystemMetrics(50), 0x10);
+        if (trayIcon == 0) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "Could not load the zflow tray icon.");
+        icon = new NotifyIconData { cbSize = (uint)Marshal.SizeOf<NotifyIconData>(), hWnd = hwnd, uID = 1, uFlags = 1 | 2 | 4, uCallbackMessage = TrayMessage, hIcon = trayIcon, szTip = "zflow · Open to manage input sharing", szInfo = "", szInfoTitle = "" };
+        if (!SetWindowSubclass(hwnd, callback, 1, 0)) { DestroyIcon(trayIcon); throw new InvalidOperationException("Could not attach the zflow tray menu."); }
         Shell_NotifyIcon(0, ref icon);
     }
     private nint Procedure(nint h, uint message, nuint w, nint l, nuint id, nuint data)
@@ -39,7 +42,12 @@ internal sealed class NativeWindow : IDisposable
         }
         return DefSubclassProc(h, message, w, l);
     }
-    public void Dispose() { Shell_NotifyIcon(2, ref icon); RemoveWindowSubclass(hwnd, callback, 1); }
+    public void Dispose()
+    {
+        if (icon.hIcon == 0) return;
+        Shell_NotifyIcon(2, ref icon); RemoveWindowSubclass(hwnd, callback, 1);
+        DestroyIcon(icon.hIcon); icon.hIcon = 0;
+    }
     public static void ShowExisting() { nint h = FindWindow(null, "zflow"); if (h != 0) { ShowWindow(h, 9); SetForegroundWindow(h); } }
     public static void QuitExisting() { nint h = FindWindow(null, "zflow"); if (h != 0) PostMessage(h, 0x8002, 0, 0); }
     private delegate nint SubclassProc(nint hwnd, uint message, nuint w, nint l, nuint id, nuint data);
@@ -49,7 +57,9 @@ internal sealed class NativeWindow : IDisposable
     [DllImport("comctl32")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetWindowSubclass(nint hwnd, SubclassProc callback, nuint id, nuint data);
     [DllImport("comctl32")] private static extern bool RemoveWindowSubclass(nint hwnd, SubclassProc callback, nuint id);
     [DllImport("comctl32")] private static extern nint DefSubclassProc(nint hwnd, uint message, nuint w, nint l);
-    [DllImport("user32", CharSet = CharSet.Unicode)] private static extern nint LoadIcon(nint instance, nint icon);
+    [DllImport("user32", CharSet = CharSet.Unicode, SetLastError = true)] private static extern nint LoadImage(nint instance, string name, uint type, int width, int height, uint flags);
+    [DllImport("user32")] private static extern int GetSystemMetrics(int index);
+    [DllImport("user32")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool DestroyIcon(nint icon);
     [DllImport("user32", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessage(string name);
     [DllImport("user32", CharSet = CharSet.Unicode)] private static extern nint FindWindow(string? cls, string title);
     [DllImport("user32")] private static extern bool ShowWindow(nint hwnd, int command);

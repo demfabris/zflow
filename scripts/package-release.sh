@@ -13,12 +13,13 @@ trap 'rm -rf -- "$stage"' EXIT
 mkdir "$stage/$name"
 case "$target" in
     x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
-        install -d "$stage/$name/bin" "$stage/$name/scripts" "$stage/$name/packaging"
+        install -d "$stage/$name/bin" "$stage/$name/scripts" "$stage/$name/packaging" "$stage/$name/assets"
         install -m 0755 "$binary_dir/zflow" "$binary_dir/zflowd" "$stage/$name/bin/"
         install -m 0755 "$root/scripts/install.sh" "$root/scripts/uninstall.sh" "$stage/$name/scripts/"
         for directory in config linux modules-load.d system-sleep systemd udev; do
             cp -R "$root/packaging/$directory" "$stage/$name/packaging/"
         done
+        cp -R "$root/assets/linux" "$stage/$name/assets/"
         ;;
     universal-apple-darwin)
         for executable in "$binary_dir/zflow.app/Contents/MacOS/"*; do

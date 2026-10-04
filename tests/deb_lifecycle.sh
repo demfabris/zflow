@@ -36,6 +36,9 @@ test -x /usr/bin/zflow
 # The extension is exactly what scripts/pack-extension.sh uploads.
 test "$(ls /usr/share/gnome-shell/extensions/zflow@demfabris | tr '\n' ' ')" = 'client.js extension.js indicator.js metadata.json prefs.js settings.js '
 test -f /usr/share/applications/io.zflow.zflow.desktop
+grep -qx 'Icon=io.zflow.zflow' /usr/share/applications/io.zflow.zflow.desktop
+test -f /usr/share/icons/hicolor/scalable/apps/io.zflow.zflow.svg
+test -f /usr/share/icons/hicolor/symbolic/apps/io.zflow.zflow-symbolic.svg
 # Every GNOME user starts the agent at login and can activate it over D-Bus.
 grep -qx 'Exec=/usr/bin/zflow desktop-agent' /etc/xdg/autostart/io.zflow.desktop-agent.desktop
 grep -qx 'Exec=/usr/bin/zflow desktop-agent' /usr/share/dbus-1/services/io.zflow.Desktop.service
@@ -68,6 +71,8 @@ printf '[Unit]\nBefore=display-manager.service\n' > /etc/systemd/system/zflowd.s
 dpkg --remove zflow
 test -f /etc/systemd/system/zflowd.service.d/prelogin.conf
 test ! -e /usr/bin/zflow
+test ! -e /usr/share/icons/hicolor/scalable/apps/io.zflow.zflow.svg
+test ! -e /usr/share/icons/hicolor/symbolic/apps/io.zflow.zflow-symbolic.svg
 test ! -e /usr/share/dbus-1/services/io.zflow.Desktop.service
 # dpkg keeps the autostart conffile until purge; TryExec keeps it from running.
 grep -qx 'TryExec=/usr/bin/zflow' /etc/xdg/autostart/io.zflow.desktop-agent.desktop

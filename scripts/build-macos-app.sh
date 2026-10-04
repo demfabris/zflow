@@ -42,6 +42,7 @@ done
 
 [[ "$(uname -s)" == Darwin ]] || die 'macOS is required'
 command -v cargo >/dev/null 2>&1 || die 'cargo is required'
+xcrun --find actool >/dev/null 2>&1 || die 'Xcode 26 or later with actool is required to build the app icon'
 if [[ "$explicit_sign" == true ]]; then
     command -v codesign >/dev/null 2>&1 || die 'codesign is required for --sign'
 elif development_identity="$(security find-identity -v -p codesigning 2>/dev/null |
@@ -91,7 +92,7 @@ readonly bundle="$output_dir/zflow.app"
 temporary_dir="$(mktemp -d "$output_dir/.zflow-app.XXXXXXXX")"
 trap 'rm -rf -- "$temporary_dir"' EXIT
 app="$temporary_dir/zflow.app"
-install -d -m 0755 "$app/Contents/MacOS" "$app/Contents/Library/LaunchDaemons"
+install -d -m 0755 "$app/Contents/MacOS" "$app/Contents/Library/LaunchDaemons" "$app/Contents/Resources"
 install -m 0755 "$binary" "$app/Contents/MacOS/zflow-app"
 install -m 0755 "$swift_output/zflow-awdl-daemon" "$app/Contents/MacOS/zflow-awdl-daemon"
 if [[ "$universal" == true ]]; then
@@ -103,6 +104,14 @@ if [[ "$universal" == true ]]; then
 fi
 install -m 0644 "$REPO_ROOT/packaging/macOS/io.zflow.awdl.plist" "$app/Contents/Library/LaunchDaemons/io.zflow.awdl.plist"
 install -m 0644 "$REPO_ROOT/packaging/macOS/Info.plist" "$app/Contents/Info.plist"
+# Keep the layered light, dark and tinted Icon Composer appearances in the app.
+xcrun actool "$REPO_ROOT/assets/zflow.icon" \
+    --compile "$app/Contents/Resources" \
+    --output-format human-readable-text --notices --warnings \
+    --output-partial-info-plist "$temporary_dir/icon-info.plist" \
+    --app-icon zflow --target-device mac \
+    --minimum-deployment-target 26.0 --platform macosx
+/usr/libexec/PlistBuddy -c "Merge '$temporary_dir/icon-info.plist'" "$app/Contents/Info.plist"
 version="$(cargo metadata --no-deps --format-version 1 --manifest-path "$REPO_ROOT/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"

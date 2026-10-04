@@ -19,6 +19,8 @@ override_dh_auto_install:
 	install -D -m 0755 packaging/linux/host-setup.sh debian/zflow/usr/lib/zflow/host-setup.sh
 	install -D -m 0755 packaging/linux/firewall.sh debian/zflow/usr/lib/zflow/firewall.sh
 	install -D -m 0644 packaging/linux/io.zflow.zflow.desktop debian/zflow/usr/share/applications/io.zflow.zflow.desktop
+	install -D -m 0644 assets/linux/io.zflow.zflow.svg debian/zflow/usr/share/icons/hicolor/scalable/apps/io.zflow.zflow.svg
+	install -D -m 0644 assets/linux/io.zflow.zflow-symbolic.svg debian/zflow/usr/share/icons/hicolor/symbolic/apps/io.zflow.zflow-symbolic.svg
 	install -D -m 0644 packaging/linux/io.zflow.Desktop.service debian/zflow/usr/share/dbus-1/services/io.zflow.Desktop.service
 	install -D -m 0644 packaging/linux/io.zflow.desktop-agent.desktop debian/zflow/etc/xdg/autostart/io.zflow.desktop-agent.desktop
 	# The same files scripts/pack-extension.sh uploads to extensions.gnome.org.

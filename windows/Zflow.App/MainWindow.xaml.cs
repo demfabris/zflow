@@ -24,7 +24,9 @@ public sealed partial class MainWindow : Window
         SystemBackdrop = new MicaBackdrop();
         ExtendsContentIntoTitleBar = true; SetTitleBar(TitleArea);
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1180, 880));
-        native = new NativeWindow(this);
+        string iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "zflow.ico");
+        AppWindow.SetIcon(iconPath);
+        native = new NativeWindow(this, iconPath);
         native.QuitRequested += async () => await QuitAsync();
         AppWindow.Closing += (_, args) => { if (!quitting) { args.Cancel = true; AppWindow.Hide(); } };
         timer.Tick += async (_, _) => await RefreshAsync();

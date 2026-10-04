@@ -82,7 +82,7 @@ export class Settings {
         this._scrolls = new Map();
         // Rows are rebuilt when a computer connects, so remember which are open.
         this._expanded = new Set();
-        this.page = new Adw.PreferencesPage({title: 'zflow', icon_name: 'input-mouse-symbolic'});
+        this.page = new Adw.PreferencesPage({title: 'zflow', icon_name: 'io.zflow.zflow-symbolic'});
         const sharing = new Adw.PreferencesGroup();
         this._status = new Adw.ActionRow({title: 'Starting zflow…', subtitle: 'Share your keyboard, pointer, and trackpad.', subtitle_lines: 3, use_markup: false});
         this._statusIcon = new Gtk.Image({icon_name: 'input-mouse-symbolic'});

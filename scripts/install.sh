@@ -24,6 +24,9 @@ readonly FIREWALL_SCRIPT="$LIB_DIR/firewall.sh"
 readonly LAUNCHER_FILE="/usr/local/share/applications/io.zflow.zflow.desktop"
 readonly DBUS_SERVICE_FILE="/usr/local/share/dbus-1/services/io.zflow.Desktop.service"
 readonly AUTOSTART_FILE="/etc/xdg/autostart/io.zflow.desktop-agent.desktop"
+readonly ICON_THEME_DIR="/usr/local/share/icons/hicolor"
+readonly APP_ICON_FILE="$ICON_THEME_DIR/scalable/apps/io.zflow.zflow.svg"
+readonly SYMBOLIC_ICON_FILE="$ICON_THEME_DIR/symbolic/apps/io.zflow.zflow-symbolic.svg"
 install_built=false
 
 die() {
@@ -78,6 +81,8 @@ for source in \
     "$REPO_ROOT/packaging/linux/io.zflow.zflow.desktop" \
     "$REPO_ROOT/packaging/linux/io.zflow.Desktop.service" \
     "$REPO_ROOT/packaging/linux/io.zflow.desktop-agent.desktop" \
+    "$REPO_ROOT/assets/linux/io.zflow.zflow.svg" \
+    "$REPO_ROOT/assets/linux/io.zflow.zflow-symbolic.svg" \
     "$REPO_ROOT/packaging/config/zflow.toml" \
     "$REPO_ROOT/packaging/modules-load.d/zflow.conf" \
     "$REPO_ROOT/packaging/system-sleep/zflow" \
@@ -134,6 +139,14 @@ rm -f -- "$BIN_DIR/zflow-gui"
 install_session_file "$REPO_ROOT/packaging/linux/io.zflow.zflow.desktop" "$LAUNCHER_FILE"
 install_session_file "$REPO_ROOT/packaging/linux/io.zflow.Desktop.service" "$DBUS_SERVICE_FILE"
 install_session_file "$REPO_ROOT/packaging/linux/io.zflow.desktop-agent.desktop" "$AUTOSTART_FILE"
+refuse_symlink "$APP_ICON_FILE"
+refuse_symlink "$SYMBOLIC_ICON_FILE"
+install -d -o root -g root -m 0755 "${APP_ICON_FILE%/*}" "${SYMBOLIC_ICON_FILE%/*}"
+install -o root -g root -m 0644 "$REPO_ROOT/assets/linux/io.zflow.zflow.svg" "$APP_ICON_FILE"
+install -o root -g root -m 0644 "$REPO_ROOT/assets/linux/io.zflow.zflow-symbolic.svg" "$SYMBOLIC_ICON_FILE"
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache --quiet --force --ignore-theme-index "$ICON_THEME_DIR"
+fi
 # Keep the pre-login ordering only when the configuration enables pre-login input.
 if ! grep -Eqs '^[[:space:]]*allow_prelogin_input[[:space:]]*=[[:space:]]*true([[:space:]#]|$)' "$CONFIG_FILE"; then
     rm -f -- "$PRELOGIN_DROPIN"

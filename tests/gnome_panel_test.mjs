@@ -64,6 +64,7 @@ await new Promise(setImmediate);
 assert.equal(calls[0].flags, 1, 'panel reads must not override disabled login startup');
 assert.equal(panel._status.label.text, 'Controlled by Mac');
 assert.equal(panel._sharing.state, true);
+assert.equal(panel._icon.icon_name, 'io.zflow.zflow-symbolic');
 // After a reboot the panel can start before the agent, then meet one from
 // another API level, and then a working one. Showing any of that is not a
 // request, so sharing stays as it was.

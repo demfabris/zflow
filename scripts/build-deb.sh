@@ -10,6 +10,8 @@ work=$(mktemp -d "$output/.deb.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 mkdir "$work/source"
 cp -R "$root/debian" "$root/packaging" "$work/source/"
+mkdir "$work/source/assets"
+cp -R "$root/assets/linux" "$work/source/assets/"
 cat > "$work/source/debian/changelog" <<EOF
 zflow (${version/-/~}) unstable; urgency=medium
 

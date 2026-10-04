@@ -7,6 +7,7 @@
     <AssemblyName>Zflow.App</AssemblyName>
     <Version>0.4.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\assets\windows\zflow.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <UseWinUI>true</UseWinUI>
@@ -23,6 +24,8 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260921001" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="..\..\assets\windows\zflow.ico" Link="Assets\zflow.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\windows\zflow.png" Link="Assets\zflow.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="..\..\target\release\zflow.exe" Link="zflow.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\..\target\release\zflow.exe')" />
   </ItemGroup>
 </Project>

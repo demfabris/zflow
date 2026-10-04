@@ -7,7 +7,7 @@ import {Client, compatible, needsAttention, statusText} from './client.js';
 export class Indicator {
     constructor() {
         this._button = new PanelMenu.Button(0.0, 'zflow');
-        this._icon = new St.Icon({icon_name: 'input-mouse-symbolic', style_class: 'system-status-icon'});
+        this._icon = new St.Icon({icon_name: 'io.zflow.zflow-symbolic', style_class: 'system-status-icon'});
         this._button.add_child(this._icon);
         this._status = new PopupMenu.PopupMenuItem('Starting zflow…', {reactive: false});
         this._button.menu.addMenuItem(this._status);
@@ -45,7 +45,7 @@ export class Indicator {
         this._updating = false;
         this._sharing.setSensitive(sharing !== null && !this._busy);
         this._icon.icon_name = needsAttention(snapshot) ? 'dialog-warning-symbolic'
-            : sharing ? 'input-mouse-symbolic' : 'media-playback-pause-symbolic';
+            : sharing ? 'io.zflow.zflow-symbolic' : 'media-playback-pause-symbolic';
     }
 
     async _run(request) {

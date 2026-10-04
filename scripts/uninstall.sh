@@ -25,6 +25,9 @@ readonly DESKTOP_FILE="/usr/local/share/applications/io.zflow.zflow.desktop"
 readonly DBUS_SERVICE_DIR="/usr/local/share/dbus-1/services"
 readonly DBUS_SERVICE_FILE="$DBUS_SERVICE_DIR/io.zflow.Desktop.service"
 readonly AUTOSTART_FILE="/etc/xdg/autostart/io.zflow.desktop-agent.desktop"
+readonly ICON_THEME_DIR="/usr/local/share/icons/hicolor"
+readonly APP_ICON_FILE="$ICON_THEME_DIR/scalable/apps/io.zflow.zflow.svg"
+readonly SYMBOLIC_ICON_FILE="$ICON_THEME_DIR/symbolic/apps/io.zflow.zflow-symbolic.svg"
 
 purge=false
 
@@ -86,7 +89,12 @@ rm -f -- \
     "$ZFLOW_GUI_BIN" \
     "$DESKTOP_FILE" \
     "$DBUS_SERVICE_FILE" \
-    "$AUTOSTART_FILE"
+    "$AUTOSTART_FILE" \
+    "$APP_ICON_FILE" \
+    "$SYMBOLIC_ICON_FILE"
+if [[ -d "$ICON_THEME_DIR" ]] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache --quiet --force --ignore-theme-index "$ICON_THEME_DIR"
+fi
 rmdir -- "$LIB_DIR" "$DROPIN_DIR" 2>/dev/null || true
 rmdir -- "$DBUS_SERVICE_DIR" "${DBUS_SERVICE_DIR%/*}" 2>/dev/null || true
 

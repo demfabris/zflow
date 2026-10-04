@@ -5,7 +5,7 @@ import {Setup} from './setup.js';
 const app = new Adw.Application({application_id: 'io.zflow.zflow'});
 app.connect('activate', () => {
     if (app.active_window) { app.active_window.present(); return; }
-    const window = new Adw.ApplicationWindow({application: app, title: 'zflow', default_width: 520, default_height: 640});
+    const window = new Adw.ApplicationWindow({application: app, title: 'zflow', icon_name: 'io.zflow.zflow', default_width: 520, default_height: 640});
     const toolbar = new Adw.ToolbarView();
     toolbar.add_top_bar(new Adw.HeaderBar());
     const settings = new Settings(window);
