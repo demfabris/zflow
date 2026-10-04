@@ -5,7 +5,7 @@ const BUS = 'io.zflow.Desktop';
 const PATH = '/io/zflow/Desktop';
 // src/app/gnome.rs mirrors this. The extension comes from extensions.gnome.org
 // and the agent from the zflow package, so they can be updated at different times.
-export const API = 3;
+export const API = 4;
 
 // Agents older than API 1 did not report it and speak API 1.
 export function compatible(snapshot) {

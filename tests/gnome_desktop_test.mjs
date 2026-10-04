@@ -4,7 +4,7 @@ import vm from 'node:vm';
 
 // Execute the shipped extension with deterministic compositor operations.
 const source = fs.readFileSync(new URL('../packaging/gnome-extension/extension.js', import.meta.url), 'utf8')
-    .replace(/^import .*;\n/gm, '').replace('export default class ', 'class ') + '\nglobalThis.TestExtension = ZflowExtension;';
+    .replace(/^import .*;\r?\n/gm, '').replace('export default class ', 'class ') + '\nglobalThis.TestExtension = ZflowExtension;';
 
 function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     let pointer = {x: monitors[0].x + 100, y: monitors[0].y + 100};
@@ -41,7 +41,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
     };
     // GNOME 51 reaches the backend only through the stage context.
     const context = {
-        API: 3,
+        API: 4,
         Extension: class {},
         Indicator: class { destroy() {} },
         TextDecoder,
@@ -56,6 +56,8 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
             timeout_add(_priority, interval, fn) {const id = next++; timers.set(id, {fn, interval, due: now + interval * 1000}); return id;},
             idle_add(_priority, fn) {queueMicrotask(fn); return next++;},
             Source: {remove(id) {timers.delete(id);}},
+            ChecksumType: {SHA256: 1},
+            compute_checksum_for_string(_kind, text) {return Buffer.from(text).toString('hex').slice(0,64);},
             Variant: class { constructor(_type, value) {this.value = value;} },
             Bytes: class {
                 constructor(data) {this.data = Uint8Array.from(data);}
@@ -64,7 +66,13 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
                 toArray() {assert.ok(this.data, 'bytes used after St freed them'); return this.data;}
             },
         },
-        Gio: {DBus: {session: {emit_signal(...args) {emitted.push(args);}}}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},
+        Gio: {Cancellable: class {cancel() {}}, DBusCallFlags: {NONE: 0}, DBus: {session: {
+            emit_signal(...args) {emitted.push(args);},
+            call(_dest,_path,_iface,_method,_args,_type,_flags,_timeout,_cancel,done) {done(this, {});},
+            call_finish() {return {deep_unpack: () => [1,
+                monitors.map((m,i) => [[String(i),'vendor','panel','serial'],[],{'display-name': 'Display '+i}]),
+                monitors.map((m,i) => [m.x,m.y,1,0,i===0,[[String(i),'vendor','panel','serial']],{}]),{}]};}
+        }}, DBusExportedObject: {wrapJSObject() {return {export() {}, unexport() {}};}},
             BusNameOwnerFlags: {NONE: 0}, bus_own_name_on_connection: () => 1, bus_unown_name() {},
             // The desktop agent is already running as :1.7.
             BusNameWatcherFlags: {NONE: 0}, bus_unwatch_name(id) {watch.removed = id;},
@@ -99,6 +107,32 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}]) {
 }
 
 const prepare = (edge = 'left', extra = {}) => ({command: 'prepare', token: 7, edge, start: 0, end: 1000000, position: 500000, ...extra});
+
+{
+    // An exposed monitor edge can lie inside the whole desktop's bounding box.
+    const d = desktop([{x: -1920, y: 0, width: 1920, height: 1080}, {x: 0, y: 0, width: 2560, height: 1440}]);
+    const snapshot = await d.extension._request({command: 'snapshot'});
+    assert.equal(snapshot.geometry.displays.length, 2);
+    const monitor = snapshot.geometry.displays[0].id;
+    const result = await d.extension._request(prepare('bottom', {monitor}));
+    assert.deepEqual({...result.position}, {x: -960, y: 1076});
+    const barrier = d.barriers.find(b => !b.destroyed);
+    assert.equal(barrier.properties.y1, 1080, 'selected monitor bottom');
+    barrier.hit(barrier, {x: -480, y: 1080});
+    assert.equal((await d.extension._request({command: 'poll', token: 7})).position, 750000);
+    await d.extension._request({command: 'finish', token: 7});
+    await assert.rejects(d.extension._request(prepare('bottom', {monitor: 'disconnected'})), /disconnected/);
+    assert.equal(d.extension._lease, null, 'unknown monitors never acquire input');
+    await d.extension._request({command: 'edges', edges: [{monitor, edge: 'bottom', start: 0, end: 1000000}]});
+    const outbound = d.barriers.findLast(b => !b.destroyed);
+    outbound.hit(outbound, {x: -960, y: 1080, event_id: 10});
+    const hit = d.emitted.findLast(args => args[3] === 'EdgeHit')[4].value;
+    assert.deepEqual(Array.from(hit), [monitor, 'bottom', 500000]);
+    d.context.Main.layoutManager.monitors.splice(0,1);
+    d.handlers.get('monitors-changed')();
+    assert.ok(outbound.destroyed, 'unplugging removes the old barrier');
+    d.extension.disable();
+}
 
 for (const [edge, expectedY, direction] of [['top', 3, 4], ['bottom', 1076, 8]]) {
     const d = desktop();
@@ -324,7 +358,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     await call(':1.99', {command: 'snapshot'});
     assert.equal(d.extension._lease, null);
     assert.equal(d.barriers.length, 0);
-    await call(':1.7', {command: 'snapshot', api: 3});
+    await call(':1.7', {command: 'snapshot', api: 4});
     d.watch.vanished();
     await call(':1.7', {command: 'snapshot'});
     const denied = 'org.freedesktop.DBus.Error.AccessDenied';
@@ -356,7 +390,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.context.Main.layoutManager.monitors.length = 0;
     assert.deepEqual({...await d.extension._request({command: 'focus'})}, {status: 'focus', terminal: true}, 'focus needs no monitors');
     const replies = [];
-    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus', api: 3})], {
+    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus', api: 4})], {
         get_sender: () => sender,
         return_dbus_error: name => replies.push(name),
         return_value: variant => replies.push(JSON.parse(variant.value[0]).terminal),
@@ -381,10 +415,10 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
         get_sender: () => ':1.7',
         return_value: variant => replies.push(JSON.parse(variant.value[0])),
     });
-    await call({command: 'snapshot', api: 4});
+    await call({command: 'snapshot', api: 5});
     await call({command: 'snapshot', api: 1});
     await call({command: 'snapshot'});
-    await call({command: 'snapshot', api: 3});
+    await call({command: 'snapshot', api: 4});
     assert.match(replies[0].reason, /^Update zflow: its GNOME extension is older/);
     assert.match(replies[1].reason, /^Update zflow: the app is older/);
     assert.match(replies[2].reason, /^Update zflow: the app is older/, 'agents from before API levels speak API 1');
@@ -421,9 +455,9 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     const hits = () => d.emitted.filter(args => args[3] === 'EdgeHit').map(args => [args[0], ...args[4].value]);
     barrier.hit(barrier, {x: 3200, y: 540, event_id: 1});
     barrier.hit(barrier, {x: 3200, y: 541, event_id: 1});
-    assert.deepEqual(hits(), [[':1.7', 'right', 500000]], 'one report per push, to the agent only');
+    assert.deepEqual(hits(), [[':1.7', '', 'right', 500000]], 'one report per push, to the agent only');
     barrier.hit(barrier, {x: 3200, y: 0, event_id: 2});
-    assert.deepEqual(hits().at(-1), [':1.7', 'right', 0]);
+    assert.deepEqual(hits().at(-1), [':1.7', '', 'right', 0]);
     // While another computer controls this one, its return barrier answers.
     await d.extension._request(prepare('right'));
     barrier.hit(barrier, {x: 3200, y: 100, event_id: 3});
@@ -466,7 +500,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     barrier.hit(barrier, {x: 0, y: 540, event_id: 1});
     assert.deepEqual(hits(), [], 'still resting');
     d.advance(50);
-    assert.deepEqual(hits(), [['left', 500000]], 'crosses where the pointer rests after the pause');
+    assert.deepEqual(hits(), [['', 'left', 500000]], 'crosses where the pointer rests after the pause');
     barrier.hit(barrier, {x: 0, y: 100, event_id: 2});
     barrier.left();
     d.advance(300);
@@ -600,7 +634,7 @@ function clipboardCalls(d) {
     assert.deepEqual(d.notices, [['zflow', notice], ['zflow', 'x'.repeat(256)]]);
     for (const message of [undefined, '', 7]) await assert.rejects(d.extension._request({command: 'notify', message}), /Invalid notice/);
     const replies = [];
-    await d.extension.CallAsync([JSON.stringify({command: 'notify', message: 'hi', api: 3})], {
+    await d.extension.CallAsync([JSON.stringify({command: 'notify', message: 'hi', api: 4})], {
         get_sender: () => ':1.99',
         return_dbus_error: name => replies.push(name),
     });

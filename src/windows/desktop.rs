@@ -11,6 +11,7 @@ pub struct Lease {
     pub session: u64,
     token: u64,
     geometry: Geometry,
+    selected: Geometry,
     edge: Edge,
     start: u32,
     end: u32,
@@ -39,7 +40,7 @@ impl Lease {
         if input::clean() {
             self.returned = self.returned.or_else(|| {
                 at_edge(
-                    &self.geometry,
+                    &self.selected,
                     self.edge,
                     self.start,
                     self.end,
@@ -75,6 +76,7 @@ pub fn prepare(
 ) -> Result<(Lease, DesktopResponse)> {
     request.validate()?;
     let DesktopRequest::Prepare {
+        monitor,
         token,
         edge,
         start,
@@ -85,7 +87,8 @@ pub fn prepare(
         anyhow::bail!("Expected Prepare");
     };
     let geometry = input::geometry()?;
-    let p = entry(&geometry, edge, start, end, position)?;
+    let selected = geometry.for_monitor(monitor.as_deref())?;
+    let p = entry(&selected, edge, start, end, position)?;
     input::move_to(p)?;
     let actual = input::cursor()?;
     ensure!(
@@ -97,6 +100,7 @@ pub fn prepare(
         session,
         token,
         geometry: geometry.clone(),
+        selected,
         edge,
         start,
         end,
@@ -146,6 +150,7 @@ mod tests {
     #[test]
     fn negative_origin_and_partial_edge_return() {
         let g = Geometry {
+            displays: Vec::new(),
             monitors: vec![
                 Rect {
                     x: -1920,

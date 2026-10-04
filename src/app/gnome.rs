@@ -13,7 +13,7 @@ pub const BUS: &str = "io.zflow.Desktop";
 const PATH: &str = "/io/zflow/Desktop";
 /// packaging/gnome-extension/client.js mirrors this. Raise both when the agent
 /// and the extension stop understanding each other.
-pub(super) const API: u32 = 3;
+pub(super) const API: u32 = 4;
 const AUTOSTART: &str = "autostart/io.zflow.desktop-agent.desktop";
 /// Where the package keeps the service's settings.
 const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";
@@ -714,6 +714,7 @@ mod tests {
         // The settings window arranges the layout the service keeps.
         let layout = crate::app::layout_model::Layout {
             monitors: vec![crate::app::layout_model::Monitor {
+                display: None,
                 id: "local".into(),
                 label: "This computer".into(),
                 peer: None,

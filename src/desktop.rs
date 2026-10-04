@@ -3,13 +3,16 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+mod monitors;
+pub use monitors::Display;
+
 pub const FRACTION_MAX: u32 = 1_000_000;
 pub const MAX_TOKEN: u64 = 9_007_199_254_740_991;
 pub const LEASE_MS: u64 = 2_000;
 // packaging/gnome-extension/extension.js mirrors this hold duration.
 pub const POLL_HOLD_MS: u64 = 200;
 pub const REQUEST_TIMEOUT_MS: u64 = 1_000;
-pub const MAX_MESSAGE_BYTES: usize = 4_096;
+pub const MAX_MESSAGE_BYTES: usize = 32_768;
 pub const EXTENSION_ID: &str = "zflow@demfabris";
 pub const BUS_NAME: &str = "org.gnome.Shell.Extensions.Zflow";
 pub const OBJECT_PATH: &str = "/org/gnome/Shell/Extensions/Zflow";
@@ -52,6 +55,9 @@ impl Rect {
 #[serde(deny_unknown_fields)]
 pub struct Geometry {
     pub monitors: Vec<Rect>,
+    /// Active logical displays. Empty only in layouts made before monitor discovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub displays: Vec<Display>,
 }
 
 impl Geometry {
@@ -69,6 +75,7 @@ impl Geometry {
                 "Invalid desktop monitor geometry"
             );
         }
+        self.validate_displays()?;
         Ok(())
     }
     pub fn bounds(&self) -> Result<Rect> {
@@ -183,11 +190,11 @@ fn edge_point(bounds: Rect, edge: Edge, along: f64) -> Point {
     let inset_y = 3.min((bounds.height.saturating_sub(1) / 2) as i32);
     let x = bounds.x
         + (along * f64::from(bounds.width))
-            .floor()
+            .round()
             .clamp(0.0, f64::from(bounds.width - 1)) as i32;
     let y = bounds.y
         + (along * f64::from(bounds.height))
-            .floor()
+            .round()
             .clamp(0.0, f64::from(bounds.height - 1)) as i32;
     match edge {
         Edge::Left => Point {
@@ -214,6 +221,8 @@ fn edge_point(bounds: Rect, edge: Edge, along: f64) -> Point {
 pub enum DesktopRequest {
     Snapshot,
     Prepare {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        monitor: Option<String>,
         token: u64,
         edge: Edge,
         start: u32,
@@ -244,12 +253,17 @@ impl DesktopRequest {
             "Desktop handoff token must be a positive safe JSON integer"
         );
         if let Self::Prepare {
+            monitor,
             start,
             end,
             position,
             ..
         } = self
         {
+            ensure!(
+                monitor.as_ref().is_none_or(|id| monitors::valid_id(id)),
+                "Invalid target monitor"
+            );
             ensure!(
                 start < end && *end <= FRACTION_MAX && position >= start && position <= end,
                 "Invalid desktop edge range or position"
@@ -298,9 +312,9 @@ impl DesktopResponse {
     }
 }
 
-/// At most this many computers share a layout, which keeps it inside one
+/// At most this many active or remembered monitors share a layout, keeping it inside one
 /// desktop message.
-pub const MAX_SHARED_TILES: usize = 16;
+pub const MAX_SHARED_TILES: usize = 32;
 
 /// The arrangement every paired computer keeps. Tiles are keyed by key
 /// fingerprint, because each computer names the others differently.
@@ -320,6 +334,8 @@ pub struct SharedLayout {
 pub struct Tile {
     /// The computer's key fingerprint.
     pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<Display>,
     pub x: i32,
     pub y: i32,
     pub width: u32,
@@ -341,14 +357,18 @@ impl SharedLayout {
         ensure!(self.version <= MAX_TOKEN, "Invalid layout version");
         ensure!(
             self.tiles.len() <= MAX_SHARED_TILES,
-            "A shared layout holds at most {MAX_SHARED_TILES} computers"
+            "A shared layout holds at most {MAX_SHARED_TILES} monitors"
         );
         let mut keys = std::collections::BTreeSet::new();
         for tile in &self.tiles {
             ensure!(
-                fingerprint(&tile.key) && keys.insert(&tile.key),
+                fingerprint(&tile.key)
+                    && keys.insert((&tile.key, tile.display.as_ref().map(|d| &d.id))),
                 "Invalid or repeated layout tile"
             );
+            if let Some(display) = &tile.display {
+                display.validate()?;
+            }
             ensure!(
                 (-MAX_COORDINATE..=MAX_COORDINATE).contains(&tile.x)
                     && (-MAX_COORDINATE..=MAX_COORDINATE).contains(&tile.y)
@@ -378,7 +398,21 @@ impl SharedLayout {
     /// for that, it goes beside a tile it touched, else beside any tile. Of
     /// the ways that work, the one that moves the fewest tiles wins.
     pub fn with_own_size(&self, key: &str, width: u32, height: u32) -> Option<Self> {
-        let Some(index) = self.tiles.iter().position(|tile| tile.key == key) else {
+        self.with_display_size(key, None, width, height)
+    }
+
+    fn with_display_size(
+        &self,
+        key: &str,
+        id: Option<&str>,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        let Some(index) = self
+            .tiles
+            .iter()
+            .position(|tile| tile.key == key && tile.display.as_ref().map(|d| d.id.as_str()) == id)
+        else {
             if self.tiles.len() >= MAX_SHARED_TILES {
                 return None;
             }
@@ -562,7 +596,12 @@ impl SharedLayout {
             return None;
         }
         let mut next = self.clone();
-        next.tiles.iter_mut().find(|tile| tile.key == old)?.key = new.to_owned();
+        if !next.tiles.iter().any(|tile| tile.key == old) {
+            return None;
+        }
+        for tile in next.tiles.iter_mut().filter(|tile| tile.key == old) {
+            tile.key = new.to_owned();
+        }
         next.version = self.version.checked_add(1)?;
         next.editor = own.to_owned();
         next.validate().ok().map(|()| next)
@@ -579,6 +618,7 @@ fn free_spot(
     (width, height): (u32, u32),
 ) -> Option<Tile> {
     let new = Tile {
+        display: None,
         key: key.to_owned(),
         x: 0,
         y: 0,
@@ -701,6 +741,7 @@ mod tests {
     fn a_computer_paired_later_gets_a_tile_beside_this_one() {
         let key = |n: usize| format!("{n:064x}");
         let tile = |n, x, y, width, height| Tile {
+            display: None,
             key: key(n),
             x,
             y,
@@ -769,6 +810,7 @@ mod tests {
     fn a_reinstalled_computer_keeps_its_tile() {
         let key = |n: usize| format!("{n:064x}");
         let tile = |n, x| Tile {
+            display: None,
             key: key(n),
             x,
             y: 0,
@@ -800,6 +842,7 @@ mod tests {
         use crate::app::layout_model::{Layout, MAX_COORDINATE, MAX_DIMENSION};
         let key = |n: usize| format!("{n:064x}");
         let tile = |n, x, y, width, height| Tile {
+            display: None,
             key: key(n),
             x,
             y,
@@ -929,6 +972,7 @@ mod tests {
     fn a_full_shared_layout_fits_one_desktop_message_and_orders_versions() {
         let key = |n: usize| format!("{n:064x}");
         let tile = |n| Tile {
+            display: None,
             key: key(n),
             x: -crate::app::layout_model::MAX_COORDINATE,
             y: -crate::app::layout_model::MAX_COORDINATE,
@@ -965,6 +1009,7 @@ mod tests {
             editor: key(9),
             tiles: vec![
                 Tile {
+                    display: None,
                     key: key(1),
                     x: 0,
                     y: 0,
@@ -972,6 +1017,7 @@ mod tests {
                     height: 800,
                 },
                 Tile {
+                    display: None,
                     key: key(2),
                     x: 1000,
                     y: 0,
@@ -1002,6 +1048,7 @@ mod tests {
         // grows into, and keeps touching both.
         let mut middle = small.clone();
         middle.tiles.push(Tile {
+            display: None,
             key: key(3),
             x: -300,
             y: 0,
@@ -1050,6 +1097,7 @@ mod tests {
         assert!(DesktopRequest::Poll { token: 0 }.validate().is_err());
         assert!(
             DesktopRequest::Prepare {
+                monitor: None,
                 token: 1,
                 edge: Edge::Left,
                 start: 100,
@@ -1061,6 +1109,7 @@ mod tests {
         );
         assert!(
             DesktopRequest::Prepare {
+                monitor: None,
                 token: 1,
                 edge: Edge::Left,
                 start: 0,
@@ -1079,6 +1128,7 @@ mod tests {
             {
                 let mapping = ReturnMapping {
                     geometry: Geometry {
+                        displays: Vec::new(),
                         monitors: vec![Rect {
                             x: -1000,
                             y: -200,
@@ -1121,6 +1171,7 @@ mod tests {
         }
         let mapping = ReturnMapping {
             geometry: Geometry {
+                displays: Vec::new(),
                 monitors: vec![Rect {
                     x: -1000,
                     y: -200,
@@ -1143,6 +1194,7 @@ mod tests {
     fn fraction_and_position_reject_invalid_mapping() {
         let mut mapping = ReturnMapping {
             geometry: Geometry {
+                displays: Vec::new(),
                 monitors: vec![Rect {
                     x: 0,
                     y: 0,
@@ -1167,6 +1219,7 @@ mod tests {
     #[test]
     fn desktop_position_must_be_on_a_monitor() {
         let geometry = Geometry {
+            displays: Vec::new(),
             monitors: vec![
                 Rect {
                     x: -100,

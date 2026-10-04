@@ -20,6 +20,15 @@ static CGEventRef posted[4];
 static size_t posted_count;
 static bool posted_on_main;
 
+static void found_display(int32_t x, int32_t y, int32_t width, int32_t height,
+    const char *id, const char *name, uint32_t width_mm, uint32_t height_mm, void *context) {
+  (void)x; (void)y;
+  assert(width > 0 && height > 0 && id && *id && name && *name);
+  assert((width_mm == 0) == (height_mm == 0));
+  ++*(unsigned int *)context;
+  printf("Display: %s, %dx%d, %ux%u mm\n", name, width, height, width_mm, height_mm);
+}
+
 static void fake_post(CGEventTapLocation tap, CGEventRef event) {
   assert(tap == kCGHIDEventTap);
   assert(posted_count < sizeof(posted) / sizeof(posted[0]));
@@ -31,6 +40,10 @@ static void fake_post(CGEventTapLocation tap, CGEventRef event) {
 static void *post_from_a_thread(void *unused) {
   (void)unused;
   assert(!pthread_main_np());
+  unsigned int count = 0;
+  // Discovery is also called on the core worker. Main Thread Checker checks
+  // the real AppKit calls; this only reads hardware and never changes it.
+  if (zflow_mac_displays(found_display, &count)) assert(count > 0);
   assert(zflow_mac_post_media_key(NX_KEYTYPE_SOUND_UP, 1, MARK) == 0);
   assert(zflow_mac_post_media_key(NX_KEYTYPE_PLAY, 0, MARK) == 0);
   return NULL;

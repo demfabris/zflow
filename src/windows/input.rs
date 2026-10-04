@@ -1,7 +1,7 @@
 use crate::{
     capture::{CaptureFrame, CaptureTransition, KeyState},
     core::{HidUsage, KeyRemap, KeyboardMode, MotionDelta, PointerButton, ReceiverEffect},
-    desktop::{Geometry, Point, Rect},
+    desktop::{Display, Geometry, Point, Rect},
 };
 use anyhow::{Result, bail, ensure};
 use std::{
@@ -23,7 +23,17 @@ unsafe extern "C" {
     fn zflow_desktop_available() -> i32;
     fn zflow_input_post(kind: i32, code: i32, value: i32, extra: i32) -> i32;
     fn zflow_monitors(
-        callback: extern "C" fn(i32, i32, i32, i32, *mut c_void),
+        callback: extern "C" fn(
+            i32,
+            i32,
+            i32,
+            i32,
+            *const std::ffi::c_char,
+            *const std::ffi::c_char,
+            u32,
+            u32,
+            *mut c_void,
+        ),
         context: *mut c_void,
     ) -> i32;
     fn zflow_cursor(x: *mut i32, y: *mut i32, move_to: i32) -> i32;
@@ -158,21 +168,60 @@ pub fn available() -> bool {
     unsafe { zflow_desktop_available() != 0 }
 }
 pub fn geometry() -> Result<Geometry> {
-    extern "C" fn monitor(x: i32, y: i32, width: i32, height: i32, context: *mut c_void) {
-        // SAFETY: zflow_monitors calls synchronously with the live Vec below.
-        unsafe { &mut *context.cast::<Vec<Rect>>() }.push(Rect {
+    extern "C" fn monitor(
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        id: *const std::ffi::c_char,
+        name: *const std::ffi::c_char,
+        width_mm: u32,
+        height_mm: u32,
+        context: *mut c_void,
+    ) {
+        use sha2::{Digest, Sha256};
+        use std::ffi::CStr;
+        // SAFETY: the bridge calls synchronously with live, terminated strings.
+        let geometry = unsafe { &mut *context.cast::<Geometry>() };
+        let bounds = Rect {
             x,
             y,
             width: width as u32,
             height: height as u32,
+        };
+        if geometry.monitors.contains(&bounds) {
+            return;
+        } // Mirrored surfaces share one cursor.
+        geometry.monitors.push(bounds);
+        geometry.displays.push(Display {
+            id: format!(
+                "{:x}",
+                Sha256::digest(unsafe { CStr::from_ptr(id) }.to_bytes())
+            ),
+            name: unsafe { CStr::from_ptr(name) }
+                .to_string_lossy()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(32)
+                .collect(),
+            bounds,
+            width_mm,
+            height_mm,
+            active: true,
         });
     }
-    let mut monitors: Vec<Rect> = Vec::new();
+    let mut geometry = Geometry {
+        monitors: Vec::new(),
+        displays: Vec::new(),
+    };
     ensure!(
-        unsafe { zflow_monitors(monitor, (&mut monitors as *mut Vec<Rect>).cast()) } != 0,
+        unsafe { zflow_monitors(monitor, (&mut geometry as *mut Geometry).cast()) } != 0,
         "Could not enumerate Windows monitors"
     );
-    let geometry = Geometry { monitors };
+    geometry
+        .monitors
+        .sort_by_key(|r| (r.x, r.y, r.width, r.height));
+    geometry.displays.sort_by(|a, b| a.id.cmp(&b.id));
     geometry.validate()?;
     Ok(geometry)
 }

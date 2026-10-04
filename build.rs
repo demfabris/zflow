@@ -7,6 +7,7 @@ fn main() {
             .compile("zflow_windows_input");
         println!("cargo:rustc-link-lib=user32");
         println!("cargo:rustc-link-lib=wtsapi32");
+        println!("cargo:rustc-link-lib=advapi32");
     }
     println!("cargo:rerun-if-changed=src/macos/capture_bridge.c");
     println!("cargo:rerun-if-changed=src/macos/awdl_client.c");

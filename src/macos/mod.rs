@@ -191,17 +191,56 @@ pub fn desktop_geometry() -> Result<Geometry> {
     {
         return Ok(geometry.clone());
     }
-    let geometry = Geometry {
-        monitors: active_desktop_rectangles()?
-            .into_iter()
-            .map(|r| Rect {
-                x: r.x.round() as i32,
-                y: r.y.round() as i32,
-                width: r.width.round() as u32,
-                height: r.height.round() as u32,
-            })
-            .collect(),
+    extern "C" fn found(
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        id: *const std::ffi::c_char,
+        name: *const std::ffi::c_char,
+        width_mm: u32,
+        height_mm: u32,
+        context: *mut std::ffi::c_void,
+    ) {
+        use std::ffi::CStr;
+        // SAFETY: the bridge calls synchronously with live UTF-8 strings.
+        let geometry = unsafe { &mut *context.cast::<Geometry>() };
+        let bounds = Rect {
+            x,
+            y,
+            width: width as u32,
+            height: height as u32,
+        };
+        if geometry.monitors.contains(&bounds) {
+            return;
+        }
+        geometry.monitors.push(bounds);
+        geometry.displays.push(crate::desktop::Display {
+            id: unsafe { CStr::from_ptr(id) }.to_string_lossy().into_owned(),
+            name: unsafe { CStr::from_ptr(name) }
+                .to_string_lossy()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(32)
+                .collect(),
+            bounds,
+            width_mm,
+            height_mm,
+            active: true,
+        });
+    }
+    let mut geometry = Geometry {
+        monitors: Vec::new(),
+        displays: Vec::new(),
     };
+    ensure!(
+        unsafe { zflow_mac_displays(found, (&mut geometry as *mut Geometry).cast()) } != 0,
+        "Could not enumerate Mac displays"
+    );
+    geometry
+        .monitors
+        .sort_by_key(|r| (r.x, r.y, r.width, r.height));
+    geometry.displays.sort_by(|a, b| a.id.cmp(&b.id));
     geometry.validate()?;
     *cache = Some((generation, geometry.clone()));
     Ok(geometry)
@@ -920,6 +959,20 @@ unsafe extern "C" {
     fn zflow_mac_accessibility_authorized(prompt: i32) -> i32;
     fn zflow_mac_event_tap_allowed() -> i32;
     fn zflow_mac_cursor_position(position: *mut CursorPosition) -> i32;
+    fn zflow_mac_displays(
+        callback: extern "C" fn(
+            i32,
+            i32,
+            i32,
+            i32,
+            *const std::ffi::c_char,
+            *const std::ffi::c_char,
+            u32,
+            u32,
+            *mut std::ffi::c_void,
+        ),
+        context: *mut std::ffi::c_void,
+    ) -> i32;
     fn zflow_mac_desktop_rectangles(rectangles: *mut DesktopRect, capacity: u32) -> i32;
     fn zflow_mac_display_generation() -> u32;
     fn zflow_mac_input_is_neutral() -> i32;

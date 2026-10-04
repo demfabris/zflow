@@ -13,7 +13,7 @@ struct LayoutTile: Identifiable, Equatable {
 
   /// The layout's computers, each paired one with its state and mark.
   static func tiles(_ layout: Layout, peers: [Peer], ownMark: String? = nil) -> [LayoutTile] {
-    layout.monitors.map { computer in
+    layout.monitors.filter { $0.display?.active != false }.map { computer in
       guard let name = computer.peer else {
         return LayoutTile(computer: computer, state: nil, mark: ownMark)
       }
@@ -286,11 +286,11 @@ struct ComputerLayout: View {
         if let mark = tile.mark { KeyMark(mark: mark).opacity(away ? 0.6 : 1) }
       }
       Spacer(minLength: 4)
-      Text(computer.label).font(.callout.weight(.semibold)).lineLimit(1)
+      Text(computer.display?.name ?? computer.label).font(.callout.weight(.semibold)).lineLimit(1)
       if let state = tile.state {
         HStack(spacing: 5) {
           StateDot(state: state)
-          Text(state.label).lineLimit(1)
+          Text(computer.display == nil ? state.label : "\(computer.peer ?? "This Mac") · \(state.label)").lineLimit(1)
         }
         .font(.caption).foregroundStyle(.secondary)
       } else if local && computer.label != "This Mac" {

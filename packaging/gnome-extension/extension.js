@@ -20,7 +20,7 @@ const WARP_US = 100000;
 const POLL_HOLD_MS = 200;
 // ReadClipboard answers one kind: "text", "png", "empty", or
 // "too_large:<bytes>" for a clip over MAX_CLIP_BYTES, whose data stays here.
-const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method><method name="ReadClipboard"><arg name="kind" type="s" direction="out"/><arg name="data" type="ay" direction="out"/></method><method name="WriteClipboard"><arg name="kind" type="s" direction="in"/><arg name="data" type="ay" direction="in"/></method><signal name="FocusChanged"><arg type="b"/></signal><signal name="EdgeHit"><arg type="s"/><arg type="u"/></signal></interface></node>`;
+const XML = `<node><interface name="${BUS}"><method name="Call"><arg type="s" direction="in"/><arg type="s" direction="out"/></method><method name="ReadClipboard"><arg name="kind" type="s" direction="out"/><arg name="data" type="ay" direction="out"/></method><method name="WriteClipboard"><arg name="kind" type="s" direction="in"/><arg name="data" type="ay" direction="in"/></method><signal name="FocusChanged"><arg type="b"/></signal><signal name="EdgeHit"><arg type="s"/><arg type="s"/><arg type="u"/></signal></interface></node>`;
 // src/clipboard.rs mirrors this limit.
 const MAX_CLIP_BYTES = 3 * 1024 * 1024;
 // The app that copied hands the clipboard over, and a stuck one never does.
@@ -69,6 +69,9 @@ function validRange(start, end) {
 
 export default class ZflowExtension extends Extension {
     enable() {
+        this._displayInfo = null;
+        this._displayGeneration = 0;
+        this._displayCall = null;
         this._indicator = new Indicator();
         this._lease = null;
         this._barriers = [];
@@ -113,11 +116,16 @@ export default class ZflowExtension extends Extension {
         });
         this._monitorsId = Main.layoutManager.connect('monitors-changed', () => {
             this._clear();
-            this._placeEdges();
+            this._refreshDisplays();
         });
+        this._refreshDisplays();
     }
 
     disable() {
+        ++this._displayGeneration;
+        this._displayCall?.cancel();
+        this._displayCall = null;
+        this._displayInfo = null;
         this._indicator?.destroy();
         this._indicator = null;
         this._edges = [];
@@ -157,11 +165,14 @@ export default class ZflowExtension extends Extension {
         this._waits.clear();
         const ms = Main.layoutManager.monitors;
         // While another computer controls this one, it has no edges of its own.
-        if (this._lease || !this._edges.length || !ms.length
+        if (this._lease || !this._edges.length || !ms.length || !this._displayInfo
             || (global.backend.capabilities & Meta.BackendCapabilities.BARRIERS) === 0)
             return;
-        for (const {edge, start, end} of this._edges) {
-            const g = edgeGeometry(ms, edge, start, end);
+        for (const {monitor, edge, start, end} of this._edges) {
+            let selected;
+            try { selected = this._selected(this._snapshot().geometry, monitor); }
+            catch { continue; } // A disconnected monitor has no barrier.
+            const g = edgeGeometry(selected, edge, start, end);
             const [low, high] = g.vertical ? [g.top, g.bottom] : [g.left, g.right];
             const segments = g.segments.map(s => ({...s,
                 start: s.start === low ? s.start + DEAD_CORNER : s.start,
@@ -176,7 +187,7 @@ export default class ZflowExtension extends Extension {
                 let waiting = 0;
                 const report = position => {
                     if (!this._lease && this._agent)
-                        Gio.DBus.session.emit_signal(this._agent, PATH, BUS, 'EdgeHit', new GLib.Variant('(su)', [edge, position]));
+                        Gio.DBus.session.emit_signal(this._agent, PATH, BUS, 'EdgeHit', new GLib.Variant('(ssu)', [monitor ?? '', edge, position]));
                 };
                 barrier.connect('hit', (_barrier, event) => {
                     if (this._lease || !this._agent) return;
@@ -229,13 +240,65 @@ export default class ZflowExtension extends Extension {
             Gio.DBus.session.emit_signal(this._agent, PATH, BUS, 'FocusChanged', new GLib.Variant('(b)', [this._terminal]));
     }
 
+    _refreshDisplays() {
+        this._displayCall?.cancel();
+        const generation = ++this._displayGeneration;
+        this._displayInfo = null;
+        this._placeEdges();
+        const cancellable = new Gio.Cancellable();
+        this._displayCall = cancellable;
+        // This service runs inside Shell too. An asynchronous call avoids
+        // blocking the compositor while it answers its own display query.
+        Gio.DBus.session.call('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+            'org.gnome.Mutter.DisplayConfig', 'GetCurrentState', null, null,
+            Gio.DBusCallFlags.NONE, 2000, cancellable, (connection, result) => {
+                if (generation !== this._displayGeneration) return;
+                this._displayCall = null;
+                try {
+                    const [, physical, logical] = connection.call_finish(result).deep_unpack();
+                    const unpack = value => value?.deep_unpack ? value.deep_unpack() : value;
+                    this._displayInfo = logical.map(([x, y, , transform, , specs]) => {
+                        // Mirrors are one logical surface. Pick a stable member.
+                        const spec = [...specs].sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))[0];
+                        const properties = physical.find(([candidate]) => JSON.stringify(candidate) === JSON.stringify(spec))?.[2] ?? {};
+                        const index = global.backend.get_monitor_manager?.().get_monitor_for_connector(spec[0]);
+                        let width = unpack(properties['width-mm']) ?? 0;
+                        let height = unpack(properties['height-mm']) ?? 0;
+                        if (transform % 2) [width, height] = [height, width];
+                        if (width < 10 || height < 10 || width > 4000 || height > 4000) width = height = 0;
+                        return {x, y, index, id: GLib.compute_checksum_for_string(GLib.ChecksumType.SHA256, JSON.stringify(spec), -1),
+                            name: String(unpack(properties['display-name']) ?? spec[0]).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 32),
+                            width_mm: width, height_mm: height, active: true};
+                    });
+                    this._placeEdges();
+                } catch { this._displayInfo = null; }
+            });
+    }
+
+    _selected(geometry, id) {
+        if (id === undefined || id === null) return geometry.monitors;
+        const display = geometry.displays.find(d => d.id === id);
+        if (!display) throw new Error('The selected monitor is disconnected; refresh the screen arrangement');
+        return [display.bounds];
+    }
+
     _snapshot() {
         // Shell disables this extension while locked, so only the monitors need checking.
         if (!Main.layoutManager.monitors.length) throw new Error('GNOME has no active monitors');
         const monitors = Main.layoutManager.monitors.map(m => ({x: m.x, y: m.y, width: m.width, height: m.height}));
         if (monitors.length > 16) throw new Error('At most 16 monitors are supported');
+        if (!this._displayInfo) {
+            if (!this._displayCall) this._refreshDisplays();
+            throw new Error('Waiting for GNOME monitor information');
+        }
+        const displays = monitors.map((bounds, index) => {
+            const info = this._displayInfo.find(d => d.index === undefined ? d.x === bounds.x && d.y === bounds.y : d.index === index);
+            if (!info) throw new Error('GNOME monitors changed; waiting for an updated screen arrangement');
+            const {x: _x, y: _y, index: _index, ...metadata} = info;
+            return {...metadata, bounds};
+        });
         const [x, y] = global.get_pointer();
-        return {geometry: {monitors}, position: {x, y}};
+        return {geometry: {monitors, displays}, position: {x, y}};
     }
 
     // Only the desktop agent may call in.
@@ -314,7 +377,7 @@ export default class ZflowExtension extends Extension {
         if (!this._fromAgent(invocation)) return;
         let response;
         try {
-            if (json.length > 4096) throw new Error('Desktop request exceeds limit');
+            if (json.length > 32768) throw new Error('Desktop request exceeds limit');
             const request = JSON.parse(json);
             // Agents older than API 1 did not send it and speak API 1.
             const api = request.api ?? 1;
@@ -339,10 +402,11 @@ export default class ZflowExtension extends Extension {
         if (r.command === 'edges') {
             const pauseMs = r.pause_ms ?? 0;
             if (!Array.isArray(r.edges) || r.edges.length > 64
-                || !r.edges.every(e => EDGES.includes(e?.edge) && validRange(e.start, e.end))
+                || !r.edges.every(e => EDGES.includes(e?.edge) && validRange(e.start, e.end)
+                    && (e.monitor === undefined || (typeof e.monitor === 'string' && e.monitor.length > 0 && e.monitor.length <= 128)))
                 || !Number.isSafeInteger(pauseMs) || pauseMs < 0 || pauseMs > 2000)
                 throw new Error('Invalid outbound edges');
-            const edges = r.edges.map(({edge, start, end}) => ({edge, start, end}));
+            const edges = r.edges.map(({monitor, edge, start, end}) => ({monitor, edge, start, end}));
             // Rebuilding would forget the push in progress, so a pointer still
             // resting on the barrier after a return would cross again.
             if (JSON.stringify(edges) !== JSON.stringify(this._edges) || pauseMs !== this._pauseMs) {
@@ -404,7 +468,7 @@ export default class ZflowExtension extends Extension {
         if (!EDGES.includes(r.edge)) throw new Error('Invalid edge');
         if ((global.backend.capabilities & Meta.BackendCapabilities.BARRIERS) === 0)
             throw new Error('This GNOME session does not provide pointer barriers');
-        const g = edgeGeometry(snapshot.geometry.monitors, r.edge, r.start, r.end);
+        const g = edgeGeometry(this._selected(snapshot.geometry, r.monitor), r.edge, r.start, r.end);
         const {left, top, right, bottom, vertical, origin, span, segments} = g;
         // The Mac tile is this desktop's bounding box, so the entry can fall where no
         // monitor touches the edge, or a rounding pixel outside the range. Enter at

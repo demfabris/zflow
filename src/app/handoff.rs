@@ -14,6 +14,8 @@ use super::layout_model::{Layout, Transition};
 #[derive(Clone, Debug)]
 pub(crate) struct Handoff {
     pub peer: String,
+    pub monitor: Option<String>,
+    pub source_geometry: Geometry,
     pub edge: Edge,
     pub start: u32,
     pub end: u32,
@@ -29,12 +31,13 @@ pub(crate) struct Handoff {
 impl Handoff {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn matches_geometry(&self, geometry: &Geometry) -> bool {
-        self.return_mapping.geometry == *geometry
+        self.source_geometry == *geometry
     }
 
     /// Asks the other computer to put its cursor at the entry point.
     pub fn prepare(&self, token: u64) -> DesktopRequest {
         DesktopRequest::Prepare {
+            monitor: self.monitor.clone(),
             token,
             edge: self.edge,
             start: self.start,
@@ -49,7 +52,7 @@ impl Handoff {
         response.validate()?;
         match response {
             DesktopResponse::Prepared { geometry, .. } => {
-                let bounds = geometry.bounds()?;
+                let bounds = geometry.for_monitor(self.monitor.as_deref())?.bounds()?;
                 ensure!(
                     bounds.width == self.expected_width && bounds.height == self.expected_height,
                     "the other computer's desktop changed size; refresh and save the computer layout before sharing"
@@ -90,14 +93,22 @@ pub(crate) fn validate(layout: &Layout, geometry: &Geometry) -> Result<()> {
     let locals: Vec<_> = layout
         .monitors
         .iter()
-        .filter(|m| m.peer.is_none())
+        .filter(|m| m.peer.is_none() && m.active())
         .collect();
-    ensure!(locals.len() == 1, "The layout needs one local computer");
-    let bounds = geometry.bounds()?;
-    ensure!(
-        locals[0].width == bounds.width && locals[0].height == bounds.height,
-        "This computer's desktop changed. Waiting for its updated layout"
-    );
+    ensure!(!locals.is_empty(), "The layout needs a local monitor");
+    for local in locals {
+        let actual = geometry
+            .for_monitor(local.display.as_ref().map(|d| d.id.as_str()))?
+            .bounds()?;
+        let expected = local.display.as_ref().map(|d| d.bounds);
+        ensure!(
+            expected.map_or(
+                actual.width == local.width && actual.height == local.height,
+                |r| r == actual
+            ),
+            "This computer's monitors changed. Waiting for its updated layout"
+        );
+    }
     ensure!(
         layout
             .transitions()
@@ -114,10 +125,11 @@ pub(crate) fn validate(layout: &Layout, geometry: &Geometry) -> Result<()> {
 pub(crate) fn from_edge(
     layout: &Layout,
     geometry: &Geometry,
+    monitor: Option<&str>,
     edge: Edge,
     position: u32,
 ) -> Option<Handoff> {
-    let bounds = geometry.bounds().ok()?;
+    let bounds = geometry.for_monitor(monitor).ok()?.bounds().ok()?;
     let along = f64::from(position.min(FRACTION_MAX)) / f64::from(FRACTION_MAX);
     let offset = |span: u32| (along * f64::from(span)).floor().min(f64::from(span - 1)) as i32;
     let current = match edge {
@@ -142,6 +154,13 @@ pub(crate) fn from_edge(
         .transitions()
         .iter()
         .filter(|t| layout.monitors[t.source].peer.is_none() && t.edge == edge)
+        .filter(|t| {
+            layout.monitors[t.source]
+                .display
+                .as_ref()
+                .map(|d| d.id.as_str())
+                == monitor
+        })
         .find(|t| (t.source_start..=t.source_end).contains(&along))
         .and_then(|transition| handoff_at(layout, geometry, transition, current))
 }
@@ -160,12 +179,11 @@ pub(crate) fn crossing(
     previous: Point,
     current: Point,
 ) -> Option<Handoff> {
-    let bounds = geometry.bounds().ok()?;
     if !contains(geometry, previous) {
         return None;
     }
-    reaching(layout, geometry, current, |edge| {
-        !touches(&bounds, edge, previous)
+    reaching(layout, geometry, current, |bounds, edge| {
+        bounds.contains(previous) && !touches(bounds, edge, previous)
     })
 }
 
@@ -180,7 +198,7 @@ pub(crate) fn pushed(
     dx: f64,
     dy: f64,
 ) -> Option<Handoff> {
-    reaching(layout, geometry, current, |edge| match edge {
+    reaching(layout, geometry, current, |_, edge| match edge {
         Edge::Left => dx < 0.0,
         Edge::Right => dx > 0.0,
         Edge::Top => dy < 0.0,
@@ -196,16 +214,16 @@ pub(crate) fn on_edge(
     edge: Edge,
     current: Point,
 ) -> Option<Handoff> {
-    reaching(layout, geometry, current, |wanted| wanted == edge)
+    reaching(layout, geometry, current, |_, wanted| wanted == edge)
 }
 
 /// Whether `point` is on any of this desktop's outer edges.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn on_any_edge(geometry: &Geometry, point: Point) -> bool {
-    geometry.bounds().is_ok_and(|bounds| {
+    geometry.monitors.iter().any(|bounds| {
         [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
             .into_iter()
-            .any(|edge| touches(&bounds, edge, point))
+            .any(|edge| bounds.contains(point) && touches(bounds, edge, point))
     })
 }
 
@@ -216,18 +234,23 @@ fn reaching(
     layout: &Layout,
     geometry: &Geometry,
     current: Point,
-    wanted: impl Fn(Edge) -> bool,
+    wanted: impl Fn(&Rect, Edge) -> bool,
 ) -> Option<Handoff> {
-    let bounds = geometry.bounds().ok()?;
     if !contains(geometry, current) {
         return None;
     }
     for transition in layout.transitions() {
         let edge = transition.edge;
-        if layout.monitors[transition.source].peer.is_some()
-            || !wanted(edge)
-            || !touches(&bounds, edge, current)
-        {
+        let source = &layout.monitors[transition.source];
+        if source.peer.is_some() {
+            continue;
+        }
+        let Ok(selected) = geometry.for_monitor(source.display.as_ref().map(|d| d.id.as_str()))
+        else {
+            continue;
+        };
+        let bounds = selected.bounds().ok()?;
+        if !bounds.contains(current) || !wanted(&bounds, edge) || !touches(&bounds, edge, current) {
             continue;
         }
         let (offset, span) = match edge {
@@ -266,24 +289,37 @@ fn handoff_at(
     current: Point,
 ) -> Option<Handoff> {
     let peer = layout.monitors[transition.target].peer.as_ref()?;
+    let source = &layout.monitors[transition.source];
+    let target = &layout.monitors[transition.target];
+    let selected = geometry
+        .for_monitor(source.display.as_ref().map(|d| d.id.as_str()))
+        .ok()?;
     let return_mapping = ReturnMapping {
         edge: transition.edge,
         local_start: transition.source_start,
         local_end: transition.source_end,
         remote_start: transition.target_start,
         remote_end: transition.target_end,
-        geometry: geometry.clone(),
+        geometry: selected.clone(),
     };
     Some(Handoff {
         peer: peer.clone(),
+        monitor: target.display.as_ref().map(|d| d.id.clone()),
+        source_geometry: geometry.clone(),
         edge: opposite(transition.edge),
         start: fraction(transition.target_start),
         end: fraction(transition.target_end),
         position: return_mapping.fraction(current).ok()?,
-        expected_width: layout.monitors[transition.target].width,
-        expected_height: layout.monitors[transition.target].height,
+        expected_width: target
+            .display
+            .as_ref()
+            .map_or(target.width, |d| d.bounds.width),
+        expected_height: target
+            .display
+            .as_ref()
+            .map_or(target.height, |d| d.bounds.height),
         entry_region: entry_region(
-            geometry,
+            &selected,
             transition.edge,
             transition.source_start,
             transition.source_end,
@@ -383,11 +419,222 @@ mod tests {
     use super::super::layout_model::Monitor;
     use super::*;
 
+    fn named(id: &str, bounds: Rect) -> crate::desktop::Display {
+        crate::desktop::Display {
+            id: id.into(),
+            name: id.into(),
+            bounds,
+            width_mm: 0,
+            height_mm: 0,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn each_monitor_maps_its_own_partial_edge_across_different_scaling() {
+        let left = named(
+            "left",
+            Rect {
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
+        let right = named(
+            "right",
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            },
+        );
+        let mac = named(
+            "mac-panel",
+            Rect {
+                x: 4000,
+                y: -800,
+                width: 3008,
+                height: 1692,
+            },
+        );
+        let tile =
+            |display: crate::desktop::Display, peer: Option<&str>, x, y, width, height| Monitor {
+                id: display.id.clone(),
+                label: display.name.clone(),
+                peer: peer.map(str::to_owned),
+                display: Some(display),
+                x,
+                y,
+                width,
+                height,
+            };
+        let layout = Layout {
+            monitors: vec![
+                tile(left.clone(), None, 0, 0, 2400, 1360),
+                tile(right.clone(), None, 2400, 0, 2800, 1560),
+                tile(mac.clone(), Some("mac"), -600, 1360, 3000, 1600),
+            ],
+        };
+        let geometry = Geometry {
+            monitors: vec![left.bounds, right.bounds],
+            displays: vec![left, right],
+        };
+        validate(&layout, &geometry).unwrap();
+        let h = crossing(
+            &layout,
+            &geometry,
+            Point { x: -960, y: 1070 },
+            Point { x: -960, y: 1079 },
+        )
+        .unwrap();
+        assert_eq!(h.monitor.as_deref(), Some("mac-panel"));
+        assert_eq!((h.start, h.end, h.position), (200000, 1000000, 600000));
+        assert_eq!((h.expected_width, h.expected_height), (3008, 1692));
+        assert_eq!(
+            h.return_mapping.position(600000).unwrap(),
+            Point { x: -960, y: 1076 }
+        );
+        assert!(h.matches_geometry(&geometry));
+        assert_eq!(
+            from_edge(&layout, &geometry, Some("left"), Edge::Bottom, 500000)
+                .unwrap()
+                .position,
+            h.position
+        );
+        assert!(from_edge(&layout, &geometry, Some("right"), Edge::Bottom, 500000).is_none());
+        let prepared = Geometry {
+            monitors: vec![
+                mac.bounds,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ],
+            displays: vec![
+                mac.clone(),
+                named(
+                    "other",
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    },
+                ),
+            ],
+        };
+        h.check_prepared(DesktopResponse::Prepared {
+            geometry: prepared.clone(),
+            position: Point { x: 5804, y: -797 },
+        })
+        .unwrap();
+        let mut removed = prepared;
+        removed.monitors.remove(0);
+        removed.displays.remove(0);
+        assert!(
+            h.check_prepared(DesktopResponse::Prepared {
+                geometry: removed,
+                position: Point { x: 3, y: 500 }
+            })
+            .is_err()
+        );
+        h.prepare(1).validate().unwrap();
+    }
+
+    #[test]
+    fn local_monitor_boundaries_are_excluded_but_exposed_remainders_can_cross() {
+        let left = named(
+            "left",
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
+        let mut right = named(
+            "right",
+            Rect {
+                x: 1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
+        let mut layout = Layout {
+            monitors: vec![
+                Monitor {
+                    id: "left".into(),
+                    label: "left".into(),
+                    peer: None,
+                    display: Some(left.clone()),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                Monitor {
+                    id: "right".into(),
+                    label: "right".into(),
+                    peer: None,
+                    display: Some(right.clone()),
+                    x: 8000,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                Monitor {
+                    id: "mac".into(),
+                    label: "mac".into(),
+                    peer: Some("mac".into()),
+                    display: None,
+                    x: 1920,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ],
+        };
+        assert!(
+            layout.transitions().is_empty(),
+            "do not hijack movement onto another local monitor"
+        );
+        right.bounds.height = 540;
+        layout.monitors[1].display = Some(right.clone());
+        let geometry = Geometry {
+            monitors: vec![left.bounds, right.bounds],
+            displays: vec![left, right],
+        };
+        assert!(
+            crossing(
+                &layout,
+                &geometry,
+                Point { x: 1910, y: 200 },
+                Point { x: 1919, y: 200 }
+            )
+            .is_none()
+        );
+        let h = crossing(
+            &layout,
+            &geometry,
+            Point { x: 1910, y: 800 },
+            Point { x: 1919, y: 800 },
+        )
+        .unwrap();
+        assert_eq!(h.start, 500000);
+        assert_eq!(h.end, 1000000);
+    }
+
     fn setup() -> (Layout, Geometry) {
         (
             Layout {
                 monitors: vec![
                     Monitor {
+                        display: None,
                         id: "mac".into(),
                         label: "Mac".into(),
                         peer: None,
@@ -397,6 +644,7 @@ mod tests {
                         height: 1000,
                     },
                     Monitor {
+                        display: None,
                         id: "ubuntu".into(),
                         label: "Ubuntu".into(),
                         peer: Some("ubuntu".into()),
@@ -408,6 +656,7 @@ mod tests {
                 ],
             },
             Geometry {
+                displays: Vec::new(),
                 monitors: vec![Rect {
                     x: -1000,
                     y: -200,
@@ -462,9 +711,10 @@ mod tests {
     #[test]
     fn only_a_prepared_desktop_of_the_expected_size_and_a_finish_pass() {
         let (layout, geometry) = setup();
-        let handoff = from_edge(&layout, &geometry, Edge::Right, 750_000).unwrap();
+        let handoff = from_edge(&layout, &geometry, None, Edge::Right, 750_000).unwrap();
         let prepared = |width, height| DesktopResponse::Prepared {
             geometry: Geometry {
+                displays: Vec::new(),
                 monitors: vec![Rect {
                     x: 0,
                     y: 0,
@@ -506,7 +756,7 @@ mod tests {
         )
         .unwrap();
         // Ubuntu touches the lower half of the right edge; y 550 is 75% down.
-        let pushed = from_edge(&layout, &geometry, Edge::Right, 750_000).unwrap();
+        let pushed = from_edge(&layout, &geometry, None, Edge::Right, 750_000).unwrap();
         assert_eq!(pushed.peer, watched.peer);
         assert_eq!(
             (pushed.edge, pushed.start, pushed.end, pushed.position),
@@ -517,13 +767,14 @@ mod tests {
             Point { x: 996, y: 550 }
         );
         assert!(
-            from_edge(&layout, &geometry, Edge::Right, 100_000).is_none(),
+            from_edge(&layout, &geometry, None, Edge::Right, 100_000).is_none(),
             "no computer there"
         );
-        assert!(from_edge(&layout, &geometry, Edge::Left, 750_000).is_none());
+        assert!(from_edge(&layout, &geometry, None, Edge::Left, 750_000).is_none());
 
         let prepared = |width, height| DesktopResponse::Prepared {
             geometry: Geometry {
+                displays: Vec::new(),
                 monitors: vec![Rect {
                     x: 0,
                     y: 0,
@@ -589,6 +840,7 @@ mod tests {
         let mut layout = layout;
         layout.monitors[0].width = 1000;
         let geometry = Geometry {
+            displays: Vec::new(),
             monitors: vec![Rect {
                 x: -200,
                 y: -300,
@@ -704,6 +956,7 @@ mod tests {
             layout.monitors[1].x = x;
             layout.monitors[1].y = y;
             let geometry = Geometry {
+                displays: Vec::new(),
                 monitors: vec![Rect {
                     x: -200,
                     y: -300,

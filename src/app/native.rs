@@ -814,6 +814,7 @@ impl NativeApp {
         let (width, height) = PEER_TILE_SIZE;
         let mut next = self.layout.draft.clone();
         next.monitors.push(Monitor {
+            display: None,
             id: format!("peer:{name}"),
             label: name.to_owned(),
             peer: Some(name.to_owned()),
@@ -931,30 +932,22 @@ impl NativeApp {
         if self.layout_error.is_some() {
             return Ok(());
         }
-        let Ok(local) = macos::desktop_geometry().and_then(|geometry| geometry.bounds()) else {
+        let Ok(geometry) = macos::desktop_geometry() else {
             return Ok(());
         };
+        let local = geometry.bounds()?;
         if !fits(local.width, local.height) {
             return Ok(());
         }
         let size = (local.width, local.height);
-        let connected = self.links.states().any(|(_, state)| {
-            matches!(
-                state,
-                LinkState::Ready(_) | LinkState::Connected | LinkState::Refused(_)
-            )
-        });
         if self.shared.draft.layout.is_none() {
             self.arrange(size)?;
-            if !connected {
-                return Ok(());
-            }
         }
         let Some(own) = self.own_key() else {
             return Ok(());
         };
         let next = match &self.shared.draft.layout {
-            Some(kept) => kept.with_own_size(&own, size.0, size.1),
+            Some(kept) => kept.with_geometry(&own, &geometry),
             None => next_version(None).and_then(|version| {
                 let keys = peer_keys(self.document.saved());
                 let first = self.layout.draft.to_shared(version, &own, &keys);
@@ -962,6 +955,7 @@ impl NativeApp {
                 let first = first
                     .with_tiles_for(&own, keys.values().map(String::as_str), PEER_TILE_SIZE)
                     .unwrap_or(first);
+                let first = first.with_geometry(&own, &geometry).unwrap_or(first);
                 first.validate().is_ok().then_some(first)
             }),
         };
@@ -1027,6 +1021,7 @@ impl NativeApp {
                 .max()
                 .unwrap_or(0);
             let mut monitor = Monitor {
+                display: None,
                 id: old
                     .map(|m| m.id.clone())
                     .unwrap_or_else(|| owner.map_or("local".into(), |name| format!("peer:{name}"))),
@@ -1578,6 +1573,7 @@ mod tests {
             editor: theirs.clone(),
             tiles: vec![
                 Tile {
+                    display: None,
                     key: own.clone(),
                     x: 0,
                     y: 0,
@@ -1585,6 +1581,7 @@ mod tests {
                     height: 1692,
                 },
                 Tile {
+                    display: None,
                     key: theirs.clone(),
                     x: desk_x,
                     y: 0,
@@ -1638,6 +1635,7 @@ mod tests {
         let mut app = NativeApp::open(path.clone()).unwrap();
         let (own, theirs) = (app.own_key().unwrap(), desk.fingerprint_hex());
         let tile = |key: &str, x| Tile {
+            display: None,
             key: key.into(),
             x,
             y: 0,
@@ -1825,6 +1823,7 @@ mod tests {
         .unwrap();
         let (own, old) = (app.own_key().unwrap(), desk.fingerprint_hex());
         let tile = |key: &str, x| Tile {
+            display: None,
             key: key.into(),
             x,
             y: 0,
@@ -2026,6 +2025,7 @@ mod tests {
         }
         let ready = || {
             LinkState::Ready(crate::desktop::Geometry {
+                displays: Vec::new(),
                 monitors: vec![crate::desktop::Rect {
                     x: 0,
                     y: 0,

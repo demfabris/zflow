@@ -14,19 +14,22 @@ is needed. Quit zflow from the notification-area menu before an update.
 Windows may ask to allow `zflow.exe` through its firewall. Allow it on the
 networks you use for sharing. Input and introductions use UDP port 43119;
 local discovery uses mDNS. Tailscale names and addresses work through
-**Add by address**, even when multicast discovery does not cross the VPN.
+**Add computer**, even when multicast discovery does not cross the VPN.
 
-Version 0.4.0 introduces the Windows OS label in the hello message and uses
-`zflow/5` and `zflow-hello/5`. **Update the Mac and Linux computers to the same
-source version before pairing.** Released 0.3.0 installations cannot connect.
+Version 0.5.0 adds individual monitor discovery and uses `zflow/6` for input
+and `zflow-hello/5` for introductions. **Update the Mac and Linux computers
+to the same source version, including the GNOME extension.** Older input
+protocols cannot connect; pairing keys are preserved.
 
 1. Open zflow on each computer.
-2. Use **Add by address** with a hostname (such as `macbook` or `xps`), an IP,
+2. Use **Add computer** with a hostname (such as `macbook` or `xps`), an IP,
    or `host:port`. Bracket IPv6 when including a port.
 3. Compare the six-character marks on both computers. Add each computer on
    the other one too; discovery alone never grants input access.
-4. Drag the added screen tiles until their edges touch, in the same order as
-   the screens on your desk. The arrangement propagates to connected peers.
+4. Drag individual monitor tiles, including this PC's, until their exposed
+   edges touch. The arrangement propagates to connected peers. Local monitor
+   boundaries remain controlled by Windows Display Settings. Disabled monitors
+   leave the canvas and retain their saved positions for reconnection.
 5. Leave all keys and buttons released, then move across a touching edge.
    **Pause at edges** adds a 250 ms dwell before crossing.
 
@@ -36,14 +39,16 @@ computer also has a **Control** button. Closing the window keeps the app in
 the notification area; **Quit zflow** releases input and stops the engine.
 
 Settings include start at login, clipboard sharing, edge dwell, keyboard modes
-and per-computer reverse scrolling. Clipboard sharing supports Unicode text
+and per-computer reverse scrolling. Expand a computer's card for its keyboard,
+scrolling, and removal options. **About zflow** has the installed version,
+license, documentation, and feedback links. Clipboard sharing supports Unicode text
 and the registered PNG clipboard format, up to 3 MB. Files, DIB-only images,
 and content marked `ExcludeClipboardContentFromMonitorProcessing` stay local.
 
 Configuration is `%LOCALAPPDATA%\zflow\zflow.toml`; keys and arrangement are
 in its `state` subdirectory. App edits preserve TOML comments and refuse to
-overwrite external edits. After editing the file manually, use **Restart
-engine**. The engine's local named pipe permits only this Windows account
+overwrite external edits. After editing the file manually, use **Restart** in
+**Settings → Connection and troubleshooting**. The engine's local named pipe permits only this Windows account
 and rejects remote clients.
 
 ## Build

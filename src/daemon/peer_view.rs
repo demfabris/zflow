@@ -75,9 +75,14 @@ async fn desktop_command(
         shared.desktop.focus(&shared.runtime, terminal).await;
         return Ok(DesktopReply::Ack);
     }
-    if let Request::EdgeHit { edge, position } = request {
+    if let Request::EdgeHit {
+        monitor,
+        edge,
+        position,
+    } = request
+    {
         authorize_peer(stream, daemon_uid, shared.active_uid())?;
-        shared.edge_hit(edge, position);
+        shared.edge_hit(monitor, edge, position);
         return Ok(DesktopReply::Ack);
     }
     if let Request::Retry {} = request {

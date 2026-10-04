@@ -144,12 +144,21 @@ impl Hub {
     }
 
     /// The computer whose edge the pointer pushed against, if any.
-    pub(super) fn edge_peer(&self, edge: Edge, position: u32) -> Option<String> {
+    pub(super) fn edge_peer(
+        &self,
+        monitor: Option<&str>,
+        edge: Edge,
+        position: u32,
+    ) -> Option<String> {
         self.local
             .borrow()
             .edges
             .iter()
-            .find(|(range, _)| range.edge == edge && (range.start..=range.end).contains(&position))
+            .find(|(range, _)| {
+                range.monitor.as_deref() == monitor
+                    && range.edge == edge
+                    && (range.start..=range.end).contains(&position)
+            })
             .map(|(_, peer)| peer.clone())
     }
 
@@ -292,6 +301,10 @@ pub(super) fn outbound_edges(layout: &Layout) -> Vec<(OutboundEdge, String)> {
         .filter_map(|transition| {
             let peer = layout.monitors[transition.target].peer.clone()?;
             let range = OutboundEdge {
+                monitor: layout.monitors[transition.source]
+                    .display
+                    .as_ref()
+                    .map(|d| d.id.clone()),
                 edge: transition.edge,
                 start: fraction(transition.source_start),
                 end: fraction(transition.source_end),
@@ -328,7 +341,7 @@ pub(super) fn start_local_sync(shared: Arc<Shared>) {
             let (edges, pause_ms, active) = {
                 let state = changes.borrow_and_update();
                 (
-                    state.edges.iter().map(|(range, _)| *range).collect(),
+                    state.edges.iter().map(|(range, _)| range.clone()).collect(),
                     if state.pause { PAUSE_MS } else { 0 },
                     state.sending,
                 )
@@ -494,8 +507,22 @@ pub(super) async fn serve(
     tokio::spawn({
         let shared = shared.clone();
         async move {
-            if let DesktopResponse::Snapshot { geometry, .. } = shared.desktop.snapshot().await {
-                shared.fit_own_tile(&geometry).await;
+            loop {
+                if shared
+                    .desktop
+                    .broker
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_none_or(|(current, _)| *current != id)
+                {
+                    break;
+                }
+                if let DesktopResponse::Snapshot { geometry, .. } = shared.desktop.snapshot().await
+                {
+                    shared.fit_own_tile(&geometry).await;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     });
@@ -701,6 +728,7 @@ impl Hub {
                 let response = match job.request {
                     AgentRequest::Handoff(DesktopRequest::Snapshot) => DesktopResponse::Snapshot {
                         geometry: crate::desktop::Geometry {
+                            displays: Vec::new(),
                             monitors: vec![crate::desktop::Rect {
                                 x: 0,
                                 y: 0,
@@ -938,6 +966,7 @@ mod tests {
     fn only_the_local_tiles_touching_edges_become_barriers() {
         use crate::app::layout_model::Monitor;
         let tile = |id: &str, x, y, width, height| Monitor {
+            display: None,
             id: id.into(),
             label: id.into(),
             peer: (id != "local").then(|| id.into()),
@@ -960,6 +989,7 @@ mod tests {
             edges,
             [(
                 OutboundEdge {
+                    monitor: None,
                     edge: Edge::Right,
                     start: FRACTION_MAX / 2,
                     end: FRACTION_MAX,
@@ -969,9 +999,12 @@ mod tests {
         );
         let hub = Hub::default();
         hub.local.send_modify(|state| state.edges = edges);
-        assert_eq!(hub.edge_peer(Edge::Right, 750_000).as_deref(), Some("mac"));
-        assert_eq!(hub.edge_peer(Edge::Right, 100_000), None);
-        assert_eq!(hub.edge_peer(Edge::Left, 750_000), None);
+        assert_eq!(
+            hub.edge_peer(None, Edge::Right, 750_000).as_deref(),
+            Some("mac")
+        );
+        assert_eq!(hub.edge_peer(None, Edge::Right, 100_000), None);
+        assert_eq!(hub.edge_peer(None, Edge::Left, 750_000), None);
     }
 
     #[test]

@@ -591,6 +591,7 @@ mod tests {
         let (status, events) = mpsc::unbounded_channel();
         let (stop, stopped) = watch::channel(false);
         let geometry = Geometry {
+            displays: Vec::new(),
             monitors: vec![Rect {
                 x: 0,
                 y: 0,
@@ -605,6 +606,8 @@ mod tests {
             },
             handoff: Handoff {
                 peer: "linux".into(),
+                monitor: None,
+                source_geometry: geometry.clone(),
                 edge: Edge::Left,
                 start: 0,
                 end: crate::desktop::FRACTION_MAX,
@@ -874,6 +877,7 @@ mod tests {
     fn edge() -> (Layout, Geometry) {
         let monitor =
             |id: &str, peer: Option<&str>, x, y, height| super::super::layout_model::Monitor {
+                display: None,
                 id: id.into(),
                 label: id.into(),
                 peer: peer.map(Into::into),
@@ -890,6 +894,7 @@ mod tests {
             ],
         };
         let geometry = Geometry {
+            displays: Vec::new(),
             monitors: vec![Rect {
                 x: 0,
                 y: 0,

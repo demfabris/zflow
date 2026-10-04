@@ -7,9 +7,9 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::model::{Contents, Document};
-use crate::desktop::{Edge, MAX_SHARED_TILES, SharedLayout, Tile};
+use crate::desktop::{Display, Edge, MAX_SHARED_TILES, SharedLayout, Tile};
 
-pub const MAX_MONITORS: usize = 32;
+pub const MAX_MONITORS: usize = MAX_SHARED_TILES;
 pub const MAX_COORDINATE: i32 = 100_000;
 pub const MAX_DIMENSION: u32 = 16_384;
 
@@ -26,6 +26,8 @@ pub struct Monitor {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<Display>,
     pub x: i32,
     pub y: i32,
     pub width: u32,
@@ -44,6 +46,10 @@ pub struct Transition {
 }
 
 impl Monitor {
+    pub fn active(&self) -> bool {
+        self.display.as_ref().is_none_or(|d| d.active)
+    }
+
     fn bounds(&self) -> (i64, i64, i64, i64) {
         let (x, y) = (i64::from(self.x), i64::from(self.y));
         (x, y, x + i64::from(self.width), y + i64::from(self.height))
@@ -77,19 +83,22 @@ impl Layout {
             {
                 ensure!(
                     !value.trim().is_empty()
-                        && value.len() <= 128
+                        && value.len() <= 256
                         && !value.chars().any(char::is_control),
-                    "Monitor IDs, labels, and peer names must contain 1 to 128 bytes without control characters."
+                    "Monitor IDs, labels, and peer names must contain 1 to 256 bytes without control characters."
                 );
             }
             ensure!(ids.insert(&monitor.id), "Monitor IDs must be unique.");
+            if let Some(display) = &monitor.display {
+                display.validate()?;
+            }
             ensure!(
                 monitor.valid_geometry(),
                 "Monitor coordinates must be within ±{MAX_COORDINATE}; dimensions must be between 1 and {MAX_DIMENSION}."
             );
             for other in &self.monitors[..index] {
                 ensure!(
-                    !monitor.overlaps(other),
+                    !monitor.active() || !other.active() || !monitor.overlaps(other),
                     "Monitors {} and {} overlap.",
                     monitor.label,
                     other.label
@@ -117,14 +126,15 @@ impl Layout {
                     None => own.to_owned(),
                     Some(name) => keys.get(name)?.clone(),
                 };
-                // One tile per computer.
-                seen.insert(key.clone()).then_some(Tile {
-                    key,
-                    x: monitor.x,
-                    y: monitor.y,
-                    width: monitor.width,
-                    height: monitor.height,
-                })
+                seen.insert((key.clone(), monitor.display.as_ref().map(|d| d.id.clone())))
+                    .then_some(Tile {
+                        key,
+                        display: monitor.display.clone(),
+                        x: monitor.x,
+                        y: monitor.y,
+                        width: monitor.width,
+                        height: monitor.height,
+                    })
             })
             .take(MAX_SHARED_TILES)
             .collect();
@@ -163,9 +173,16 @@ impl Layout {
                     )
                 };
                 Some(Monitor {
-                    id,
-                    label,
+                    id: tile
+                        .display
+                        .as_ref()
+                        .map_or(id.clone(), |d| format!("{id}/{}", d.id)),
+                    label: tile
+                        .display
+                        .as_ref()
+                        .map_or(label.clone(), |d| format!("{} · {label}", d.name)),
                     peer,
+                    display: tile.display.clone(),
                     x: tile.x,
                     y: tile.y,
                     width: tile.width,
@@ -183,7 +200,7 @@ impl Layout {
         let mut transitions = Vec::new();
         for (source, a) in self.monitors.iter().enumerate() {
             for (target, b) in self.monitors.iter().enumerate() {
-                if source == target || a.peer == b.peer {
+                if source == target || a.peer == b.peer || !a.active() || !b.active() {
                     continue;
                 }
                 let (al, at, ar, ab) = a.bounds();
@@ -207,19 +224,86 @@ impl Layout {
                 let start = a_start.max(b_start);
                 let end = a_end.min(b_end);
                 if start < end {
-                    transitions.push(Transition {
-                        source,
-                        target,
-                        edge,
-                        source_start: (start - a_start) as f64 / (a_end - a_start) as f64,
-                        source_end: (end - a_start) as f64 / (a_end - a_start) as f64,
-                        target_start: (start - b_start) as f64 / (b_end - b_start) as f64,
-                        target_end: (end - b_start) as f64 / (b_end - b_start) as f64,
-                    });
+                    let opposite = match edge {
+                        Edge::Left => Edge::Right,
+                        Edge::Right => Edge::Left,
+                        Edge::Top => Edge::Bottom,
+                        Edge::Bottom => Edge::Top,
+                    };
+                    // Keep OS navigation between a computer's own displays. Only
+                    // exposed portions of both monitor edges can be shared.
+                    for (s0, s1) in self.exposed(a, edge) {
+                        for (t0, t1) in self.exposed(b, opposite) {
+                            let low = (start as f64)
+                                .max(a_start as f64 + s0 * (a_end - a_start) as f64)
+                                .max(b_start as f64 + t0 * (b_end - b_start) as f64);
+                            let high = (end as f64)
+                                .min(a_start as f64 + s1 * (a_end - a_start) as f64)
+                                .min(b_start as f64 + t1 * (b_end - b_start) as f64);
+                            if low >= high {
+                                continue;
+                            }
+                            transitions.push(Transition {
+                                source,
+                                target,
+                                edge,
+                                source_start: (low - a_start as f64) / (a_end - a_start) as f64,
+                                source_end: (high - a_start as f64) / (a_end - a_start) as f64,
+                                target_start: (low - b_start as f64) / (b_end - b_start) as f64,
+                                target_end: (high - b_start as f64) / (b_end - b_start) as f64,
+                            });
+                        }
+                    }
                 }
             }
         }
         transitions
+    }
+
+    fn exposed(&self, monitor: &Monitor, edge: Edge) -> Vec<(f64, f64)> {
+        let Some(display) = &monitor.display else {
+            return vec![(0.0, 1.0)];
+        };
+        let r = display.bounds;
+        let vertical = matches!(edge, Edge::Left | Edge::Right);
+        let (origin, span) = if vertical {
+            (r.y, r.height)
+        } else {
+            (r.x, r.width)
+        };
+        let outside = match edge {
+            Edge::Left => r.x - 1,
+            Edge::Right => r.x + r.width as i32,
+            Edge::Top => r.y - 1,
+            Edge::Bottom => r.y + r.height as i32,
+        };
+        let mut ranges = vec![(0.0_f64, 1.0_f64)];
+        for other in self
+            .monitors
+            .iter()
+            .filter(|m| m.peer == monitor.peer && m.active())
+        {
+            let Some(d) = &other.display else {
+                continue;
+            };
+            let b = d.bounds;
+            let (across, extent, along, length) = if vertical {
+                (b.x, b.width, b.y, b.height)
+            } else {
+                (b.y, b.height, b.x, b.width)
+            };
+            if outside < across || outside >= across + extent as i32 {
+                continue;
+            }
+            let low = f64::from(along - origin) / f64::from(span);
+            let high = (f64::from(along - origin) + f64::from(length)) / f64::from(span);
+            ranges = ranges
+                .into_iter()
+                .flat_map(|(a, b)| [(a, b.min(low)), (a.max(high), b)])
+                .filter(|(a, b)| a < b)
+                .collect();
+        }
+        ranges
     }
 
     /// Snap to a nearby shared edge, or keep a valid free position. Reject overlap.
@@ -228,23 +312,25 @@ impl Layout {
         if !(0..=MAX_COORDINATE).contains(&tolerance) {
             return None;
         }
-        let fits = |x: i64, y: i64| {
-            let mut candidate = moving.clone();
-            candidate.x = i32::try_from(x).ok()?;
-            candidate.y = i32::try_from(y).ok()?;
-            (candidate.valid_geometry()
-                && self
-                    .monitors
-                    .iter()
-                    .enumerate()
-                    .all(|(i, other)| i == index || !candidate.overlaps(other)))
-            .then_some((candidate.x, candidate.y))
-        };
+        if !moving.active() {
+            return None;
+        }
+        let fits =
+            |x: i64, y: i64| {
+                let mut candidate = moving.clone();
+                candidate.x = i32::try_from(x).ok()?;
+                candidate.y = i32::try_from(y).ok()?;
+                (candidate.valid_geometry()
+                    && self.monitors.iter().enumerate().all(|(i, other)| {
+                        i == index || !other.active() || !candidate.overlaps(other)
+                    }))
+                .then_some((candidate.x, candidate.y))
+            };
         let (x, y, tolerance) = (i64::from(x), i64::from(y), i64::from(tolerance));
         let (width, height) = (i64::from(moving.width), i64::from(moving.height));
         let mut best: Option<(i64, (i32, i32))> = None;
         for (other_index, other) in self.monitors.iter().enumerate() {
-            if other_index == index {
+            if other_index == index || !other.active() {
                 continue;
             }
             let (left, top, right, bottom) = other.bounds();
@@ -312,6 +398,7 @@ mod tests {
 
     fn monitor(id: &str, x: i32, y: i32, width: u32, height: u32) -> Monitor {
         Monitor {
+            display: None,
             id: id.into(),
             label: id.into(),
             peer: (id != "local").then(|| id.into()),
@@ -376,6 +463,7 @@ mod tests {
         // A peer placed a computer this one has only found on its shelf.
         let [own, desk, found] = [1, 2, 3].map(|n| format!("{n:064x}"));
         let tile = |key: &String, x| Tile {
+            display: None,
             key: key.clone(),
             x,
             y: 0,

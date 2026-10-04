@@ -5,6 +5,7 @@
 #include <wtsapi32.h>
 #include <stdint.h>
 #include <wchar.h>
+#include <stdlib.h>
 
 typedef int (*event_fn)(int kind, int code, int value, int extra);
 static event_fn emit;
@@ -197,12 +198,68 @@ int zflow_input_post(int kind, int code, int value, int extra) {
     return SendInput(1, &input, sizeof(input)) == 1;
 }
 
-typedef void (*monitor_fn)(int x, int y, int width, int height, void *context);
+typedef void (*monitor_fn)(int x, int y, int width, int height, const char *id,
+    const char *name, unsigned int width_mm, unsigned int height_mm, void *context);
 typedef struct { monitor_fn callback; void *context; } monitor_context;
+
+// EDID physical dimensions follow the panel through resolution and DPI changes.
+static void monitor_size(const WCHAR *device_path, UINT *width, UINT *height) {
+    WCHAR key[512] = L"SYSTEM\\CurrentControlSet\\Enum\\";
+    const WCHAR *start = device_path;
+    if (wcsncmp(start, L"\\\\?\\", 4) != 0) return;
+    start += 4;
+    size_t at = wcslen(key);
+    for (; *start && *start != L'{'; ++start) {
+        if (at + 32 >= 512) return;
+        key[at++] = *start == L'#' ? L'\\' : *start;
+    }
+    key[at] = 0;
+    if (!*start) return;
+    wcscat_s(key, 512, L"Device Parameters");
+    BYTE edid[4096]; DWORD size = sizeof(edid);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"EDID", RRF_RT_REG_BINARY, NULL, edid, &size) == ERROR_SUCCESS
+        && size >= 128 && edid[0] == 0 && edid[1] == 255 && edid[21] && edid[22]) {
+        *width = edid[21] * 10; *height = edid[22] * 10;
+    }
+}
+
 static BOOL CALLBACK monitor(HMONITOR m, HDC dc, LPRECT r, LPARAM p) {
-    (void)m; (void)dc;
+    (void)dc;
     monitor_context *ctx = (monitor_context *)p;
-    ctx->callback(r->left, r->top, r->right-r->left, r->bottom-r->top, ctx->context);
+    MONITORINFOEXW info = {0}; info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(m, (MONITORINFO *)&info)) return FALSE;
+    WCHAR id[512], name[128];
+    wcscpy_s(id, 512, info.szDevice); wcscpy_s(name, 128, info.szDevice);
+    UINT width_mm = 0, height_mm = 0;
+    UINT32 paths_count = 0, modes_count = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths_count, &modes_count) == ERROR_SUCCESS) {
+        DISPLAYCONFIG_PATH_INFO *paths = calloc(paths_count, sizeof(*paths));
+        DISPLAYCONFIG_MODE_INFO *modes = calloc(modes_count, sizeof(*modes));
+        if (paths && modes && QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths_count, paths, &modes_count, modes, NULL) == ERROR_SUCCESS) {
+            for (UINT32 i = 0; i < paths_count; ++i) {
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME source = {0};
+                source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                source.header.size = sizeof(source); source.header.adapterId = paths[i].sourceInfo.adapterId; source.header.id = paths[i].sourceInfo.id;
+                if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || wcscmp(source.viewGdiDeviceName, info.szDevice)) continue;
+                DISPLAYCONFIG_TARGET_DEVICE_NAME target = {0};
+                target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+                target.header.size = sizeof(target); target.header.adapterId = paths[i].targetInfo.adapterId; target.header.id = paths[i].targetInfo.id;
+                if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) continue;
+                if (*target.monitorDevicePath) wcscpy_s(id, 512, target.monitorDevicePath);
+                if (*target.monitorFriendlyDeviceName) wcscpy_s(name, 128, target.monitorFriendlyDeviceName);
+                monitor_size(id, &width_mm, &height_mm);
+                if (paths[i].targetInfo.rotation == DISPLAYCONFIG_ROTATION_ROTATE90 || paths[i].targetInfo.rotation == DISPLAYCONFIG_ROTATION_ROTATE270) {
+                    UINT swap = width_mm; width_mm = height_mm; height_mm = swap;
+                }
+                break;
+            }
+        }
+        free(paths); free(modes);
+    }
+    char utf8_id[1536] = {0}, utf8_name[384] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, id, -1, utf8_id, sizeof(utf8_id), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8_name, sizeof(utf8_name), NULL, NULL);
+    ctx->callback(r->left, r->top, r->right-r->left, r->bottom-r->top, utf8_id, utf8_name, width_mm, height_mm, ctx->context);
     return TRUE;
 }
 int zflow_monitors(monitor_fn callback, void *context) {

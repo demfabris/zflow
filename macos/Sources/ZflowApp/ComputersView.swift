@@ -81,7 +81,7 @@ struct ComputersView: View {
       if let layout = snapshot.layout {
         Arrangement(model: model, snapshot: snapshot, layout: layout, shelf: .bottom)
           .frame(height: snapshot.unplaced.isEmpty ? 300 : 400)
-        Text("Drag computers to match your desk. The pointer crosses where two edges touch.")
+        Text("Arrange individual monitors. Use exposed edges to switch computers; system display settings control movement between local monitors.")
           .font(.callout).foregroundStyle(.secondary)
       }
     }

@@ -760,9 +760,9 @@ impl Shared {
             return;
         };
         let current = self.layout.lock().await.clone();
-        let Some(resized) = current.and_then(|layout| {
-            layout.with_own_size(&self.identity_fingerprint, bounds.width, bounds.height)
-        }) else {
+        let Some(resized) =
+            current.and_then(|layout| layout.with_geometry(&self.identity_fingerprint, geometry))
+        else {
             return;
         };
         let version = resized.version;
@@ -808,6 +808,9 @@ impl Shared {
         )?;
         // Keep it, so later requests do not ask GNOME again. Version 0 gives
         // way to any layout a peer arranged.
+        let initial = initial
+            .with_geometry(&self.identity_fingerprint, &geometry)
+            .unwrap_or(initial);
         self.keep_layout(initial, None).await;
         self.layout
             .lock()
@@ -854,13 +857,18 @@ impl Shared {
 
     /// Starts a crossing toward the computer behind the edge the pointer
     /// pushed against. The usual activation checks apply.
-    fn edge_hit(self: &Arc<Self>, edge: crate::desktop::Edge, position: u32) {
-        let Some(peer) = self.desktop.edge_peer(edge, position) else {
+    fn edge_hit(
+        self: &Arc<Self>,
+        monitor: Option<String>,
+        edge: crate::desktop::Edge,
+        position: u32,
+    ) {
+        let Some(peer) = self.desktop.edge_peer(monitor.as_deref(), edge, position) else {
             return;
         };
         let shared = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = shared.cross(edge, position).await {
+            if let Err(error) = shared.cross(monitor.as_deref(), edge, position).await {
                 tracing::info!(error = %format_args!("{error:#}"), %peer, "edge crossing ended");
             }
         });
@@ -1847,6 +1855,7 @@ fn initial_layout(
         .take(crate::desktop::MAX_SHARED_TILES)
         .map(|(key, (width, height))| {
             let tile = crate::desktop::Tile {
+                display: None,
                 key: key.to_owned(),
                 x,
                 y: 0,
@@ -3153,6 +3162,7 @@ mod tests {
         layout.version = 7;
         layout.editor = fingerprint(9);
         layout.tiles.push(crate::desktop::Tile {
+            display: None,
             key: fingerprint(5),
             x: 0,
             y: 5000,

@@ -158,6 +158,7 @@ pub async fn run(path: PathBuf) -> Result<()> {
             version: 1,
             editor: key.clone(),
             tiles: vec![Tile {
+                display: None,
                 key,
                 x: 0,
                 y: 0,
@@ -438,8 +439,11 @@ impl Engine {
                     );
                     layout.validate()?;
                     ensure!(
-                        layout.monitors.iter().filter(|m| m.peer.is_none()).count() == 1,
-                        "Arrangement needs exactly one local computer"
+                        layout
+                            .monitors
+                            .iter()
+                            .any(|m| m.peer.is_none() && m.active()),
+                        "Arrangement needs an active local monitor"
                     );
                     ensure!(
                         layout.monitors.iter().all(|m| m
@@ -877,9 +881,8 @@ impl Engine {
                 }
                 if token == 0 {
                     if let Ok(DesktopResponse::Snapshot { geometry, .. }) = result {
-                        let b = geometry.bounds()?;
                         let key = self.config.peers[&peer].fingerprint_hex()?;
-                        if let Some(layout) = self.layout.with_own_size(&key, b.width, b.height) {
+                        if let Some(layout) = self.layout.with_geometry(&key, &geometry) {
                             self.layout = layout;
                             self.save_layout()?;
                         }
@@ -1046,6 +1049,7 @@ impl Engine {
         self.arming = Some((peer.clone(), session));
         let request = handoff.as_ref().map_or(
             DesktopRequest::Prepare {
+                monitor: None,
                 token,
                 edge: crate::desktop::Edge::Left,
                 start: 0,
@@ -1284,10 +1288,10 @@ impl Engine {
                 self.local();
                 self.geometry = geometry;
             }
-            let b = self.geometry.bounds()?;
-            if let Some(layout) =
-                self.layout
-                    .with_own_size(&self.identity.fingerprint_hex(), b.width, b.height)
+
+            if let Some(layout) = self
+                .layout
+                .with_geometry(&self.identity.fingerprint_hex(), &self.geometry)
             {
                 self.layout = layout;
                 self.save_layout()?;

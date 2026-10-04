@@ -19,7 +19,12 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 impl Shared {
     /// Runs one crossing toward the computer behind `edge`. Only one runs at
     /// a time; a push during a crossing is ignored.
-    pub(super) async fn cross(self: &Arc<Self>, edge: Edge, position: u32) -> Result<()> {
+    pub(super) async fn cross(
+        self: &Arc<Self>,
+        monitor: Option<&str>,
+        edge: Edge,
+        position: u32,
+    ) -> Result<()> {
         let Ok(_crossing) = self.crossing.try_lock() else {
             return Ok(());
         };
@@ -38,7 +43,7 @@ impl Shared {
             .local_layout()
             .await
             .context("no layout places another computer here")?;
-        let handoff = handoff::from_edge(&layout, &geometry, edge, position)
+        let handoff = handoff::from_edge(&layout, &geometry, monitor, edge, position)
             .context("the layout has no computer at that point of the edge")?;
         let record = self
             .config

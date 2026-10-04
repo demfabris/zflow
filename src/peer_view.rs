@@ -65,6 +65,8 @@ pub enum Request {
     /// `position` is a fraction of the desktop along that edge, out of
     /// [`FRACTION_MAX`].
     EdgeHit {
+        #[serde(default)]
+        monitor: Option<String>,
         edge: Edge,
         position: u32,
     },
@@ -135,9 +137,11 @@ pub enum LocalRequest {
 
 /// A range of one outer edge of this desktop, as fractions of its length
 /// out of [`FRACTION_MAX`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboundEdge {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
     pub edge: Edge,
     pub start: u32,
     pub end: u32,
@@ -558,6 +562,7 @@ mod tests {
         let edges = |start, end| {
             AgentRequest::Local(LocalRequest::Edges {
                 edges: vec![OutboundEdge {
+                    monitor: None,
                     edge: Edge::Right,
                     start,
                     end,
@@ -635,6 +640,7 @@ mod tests {
     fn handoff_replies_read_the_same_and_a_clip_is_never_one() {
         use crate::desktop::{Geometry, Rect};
         let geometry = Geometry {
+            displays: Vec::new(),
             monitors: vec![Rect {
                 x: 0,
                 y: 0,

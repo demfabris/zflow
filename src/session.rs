@@ -1780,6 +1780,7 @@ mod tests {
             version: 3,
             editor: format!("{:064x}", 1),
             tiles: vec![Tile {
+                display: None,
                 key: format!("{:064x}", 1),
                 x: 0,
                 y: 0,
@@ -1912,6 +1913,7 @@ mod tests {
         let prepare = tokio::spawn(async move {
             source
                 .desktop_request(DesktopRequest::Prepare {
+                    monitor: None,
                     token: 7,
                     edge: Edge::Left,
                     start: 0,
@@ -1924,10 +1926,18 @@ mod tests {
         let SessionEventKind::Desktop { request, reply } = event.kind else {
             panic!("expected prepare");
         };
-        assert!(matches!(request, DesktopRequest::Prepare { token: 7, .. }));
+        assert!(matches!(
+            request,
+            DesktopRequest::Prepare {
+                monitor: None,
+                token: 7,
+                ..
+            }
+        ));
         reply
             .send(DesktopResponse::Prepared {
                 geometry: Geometry {
+                    displays: Vec::new(),
                     monitors: vec![Rect {
                         x: 0,
                         y: 0,
@@ -2023,6 +2033,7 @@ mod tests {
         let prepare = tokio::spawn(async move {
             source
                 .desktop_request(DesktopRequest::Prepare {
+                    monitor: None,
                     token: 1,
                     edge: Edge::Left,
                     start: 0,

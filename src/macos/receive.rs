@@ -357,7 +357,10 @@ impl Screen for inject::FakeBackend {
                 height: display.height as u32,
             })
             .collect();
-        Ok(Geometry { monitors })
+        Ok(Geometry {
+            monitors,
+            displays: Vec::new(),
+        })
     }
 
     fn generation(&self) -> u32 {

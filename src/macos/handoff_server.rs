@@ -338,6 +338,7 @@ impl<D: Desk> HandoffServer<D> {
         request: DesktopRequest,
     ) -> DesktopResponse {
         let DesktopRequest::Prepare {
+            monitor,
             token,
             edge,
             start,
@@ -351,7 +352,8 @@ impl<D: Desk> HandoffServer<D> {
         // against the displays the entry was placed in.
         let generation = self.desk.generation();
         let planned = self.desk.geometry().and_then(|geometry| {
-            let armed = ArmedEdge::new(&geometry, edge, start, end)?;
+            let selected = geometry.for_monitor(monitor.as_deref())?;
+            let armed = ArmedEdge::new(&selected, edge, start, end)?;
             Ok((geometry, armed))
         });
         let (geometry, armed) = match planned {
@@ -601,6 +603,7 @@ mod tests {
 
     fn desktop(monitors: &[(i32, i32, u32, u32)]) -> Geometry {
         Geometry {
+            displays: Vec::new(),
             monitors: monitors
                 .iter()
                 .map(|&(x, y, width, height)| Rect {
@@ -788,6 +791,7 @@ mod tests {
 
     fn prepare(token: u64) -> DesktopRequest {
         DesktopRequest::Prepare {
+            monitor: None,
             token,
             edge: Edge::Left,
             start: 0,
@@ -805,6 +809,60 @@ mod tests {
         let mut fake = desk.state();
         fake.geometry = Some(geometry);
         fake.generation += 1;
+    }
+
+    #[tokio::test]
+    async fn a_named_monitor_enters_and_returns_on_its_own_edge() {
+        let mut geometry = desktop(&[(-1920, 0, 1920, 1080), (0, 0, 2560, 1440)]);
+        geometry.displays = geometry
+            .monitors
+            .iter()
+            .enumerate()
+            .map(|(i, bounds)| crate::desktop::Display {
+                id: format!("panel-{i}"),
+                name: format!("Display {i}"),
+                bounds: *bounds,
+                width_mm: 0,
+                height_mm: 0,
+                active: true,
+            })
+            .collect();
+        let (server, desk, ownership) = setup(geometry.clone());
+        let prepare = |monitor: &str| DesktopRequest::Prepare {
+            monitor: Some(monitor.into()),
+            token: 7,
+            edge: Edge::Bottom,
+            start: 0,
+            end: MAX,
+            position: 500000,
+        };
+        assert!(matches!(
+            server.request("linux", 1, prepare("missing")).await,
+            DesktopResponse::Unavailable { .. }
+        ));
+        assert!(desk.state().moves.is_empty());
+        assert_eq!(ownership.controller(), None);
+        assert_eq!(
+            server.request("linux", 1, prepare("panel-0")).await,
+            DesktopResponse::Prepared {
+                geometry,
+                position: Point { x: -960, y: 1076 }
+            }
+        );
+        desk.state().cursor = Some(at(-480.0, 1079.0));
+        assert_eq!(
+            server
+                .request("linux", 1, DesktopRequest::Poll { token: 7 })
+                .await,
+            DesktopResponse::Returned { position: 750000 }
+        );
+        assert_eq!(
+            server
+                .request("linux", 1, DesktopRequest::Finish { token: 7 })
+                .await,
+            DesktopResponse::Finished
+        );
+        assert_eq!(ownership.controller(), None);
     }
 
     #[tokio::test]
@@ -909,6 +967,7 @@ mod tests {
         let (server, _desk, ownership) =
             setup(desktop(&[(-200, -100, 200, 100), (-200, 100, 200, 100)]));
         let gap = DesktopRequest::Prepare {
+            monitor: None,
             token: 7,
             edge: Edge::Left,
             start: 366_667,

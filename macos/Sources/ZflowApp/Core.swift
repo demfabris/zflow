@@ -5,10 +5,16 @@ struct Computer: Codable, Identifiable, Equatable, Sendable {
   var id: String
   var label: String
   var peer: String?
+  var display: DisplayInfo?
   var x: Int
   var y: Int
   var width: Int
   var height: Int
+}
+struct DisplayInfo: Codable, Equatable, Sendable {
+  var id: String
+  var name: String
+  var active: Bool
 }
 struct Layout: Decodable, Equatable, Sendable { var monitors: [Computer] }
 /// src/neighbors.rs Unplaced: a computer found around this Mac that is not

@@ -6,7 +6,7 @@ const timers = new Map();
 const calls = [];
 // While true, the desktop agent is not running yet, as right after login.
 let agentDown = false;
-let snapshot = {api: 3, status: {state: 'controlled', peer: 'Mac', title: 'Controlled by Mac'}, sharing: true, health: []};
+let snapshot = {api: 4, status: {state: 'controlled', peer: 'Mac', title: 'Controlled by Mac'}, sharing: true, health: []};
 const context = {
     GLib: {
         Variant: class { constructor(_type, value) { this.value = value; } },
@@ -56,7 +56,7 @@ const context = {
 };
 for (const file of ['client', 'indicator']) {
     const source = fs.readFileSync(new URL(`../packaging/gnome-extension/${file}.js`, import.meta.url), 'utf8')
-        .replace(/^import .*;\n/gm, '').replace(/^export /gm, '');
+        .replace(/^import .*;\r?\n/gm, '').replace(/^export /gm, '');
     vm.runInNewContext(source + (file === 'client' ? '\nglobalThis.TestClient = Client;' : '\nglobalThis.TestIndicator = Indicator;'), context);
 }
 const panel = new context.TestIndicator();
@@ -77,10 +77,10 @@ assert.equal(panel._sharing.state, false);
 agentDown = false;
 snapshot.sharing = null;
 await panel._client.refresh();
-snapshot.api = 4;
+snapshot.api = 5;
 await panel._client.refresh();
 assert.equal(panel._status.label.text, 'Update zflow');
-snapshot.api = 3;
+snapshot.api = 4;
 snapshot.sharing = true;
 await panel._client.refresh();
 assert.equal(panel._sharing.state, true);
@@ -93,11 +93,11 @@ assert.equal(panel._status.label.text, 'Paused');
 assert.equal(panel._sharing.state, false);
 assert.equal(panel._icon.icon_name, 'media-playback-pause-symbolic');
 // An agent from another API level gets "Update zflow" instead of a broken menu.
-snapshot.api = 4;
+snapshot.api = 5;
 await panel._client.refresh();
 assert.equal(panel._status.label.text, 'Update zflow');
 assert.equal(panel._icon.icon_name, 'dialog-warning-symbolic');
-snapshot.api = 3;
+snapshot.api = 4;
 await panel._client.refresh();
 assert.equal(panel._status.label.text, 'Paused');
 // A failing check warns even while the menu has nothing else to say.

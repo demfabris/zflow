@@ -156,6 +156,7 @@ async fn native_engine_pairs_persists_reconnects_and_stops() {
                                 } => {
                                     let _ = reply.send(DesktopResponse::Snapshot {
                                         geometry: Geometry {
+                                            displays: Vec::new(),
                                             monitors: vec![Rect {
                                                 x: 0,
                                                 y: 0,
@@ -205,14 +206,21 @@ async fn native_engine_pairs_persists_reconnects_and_stops() {
     assert!(matches!(snapshot, DesktopResponse::Snapshot { .. }));
 
     let mut layout = state["layout"].clone();
-    let local_width = layout["monitors"][0]["width"].as_i64().unwrap();
+    let local_right = layout["monitors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["peer"].is_null())
+        .map(|m| m["x"].as_i64().unwrap() + m["width"].as_i64().unwrap())
+        .max()
+        .unwrap();
     // Leave a gap so real physical pointer motion cannot cross during this test.
     let monitors = layout["monitors"].as_array_mut().unwrap();
     let tile = monitors
         .iter_mut()
         .find(|m| m["peer"] == "smoke-peer")
         .unwrap();
-    tile["x"] = json!(local_width + 128);
+    tile["x"] = json!(local_right + 128);
     let arrange = json!({"command":"arrange","layout":layout,"version":state["layout_version"]});
     let arranged = request(&path, arrange.clone()).await;
     assert!(arranged["error"].is_null(), "{arranged}");

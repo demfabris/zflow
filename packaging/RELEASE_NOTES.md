@@ -6,7 +6,21 @@ This is a prototype release; the live qualification checklist is in TESTPLAN.md.
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash
 ```
 
-## New in 0.4.0: Windows preview and native icons
+## New in 0.5.0: individual monitors
+
+- Windows, macOS, and GNOME discover active logical monitors with persistent
+  platform identities, display names, and physical dimensions where available.
+- Arrange each monitor independently. Handoffs and returns address the selected
+  monitor, including negative desktop coordinates and mixed scaling. Local
+  monitor boundaries continue to follow system display settings.
+- Existing computer tiles split automatically. Disabled or unplugged monitors
+  leave the canvas but retain their positions. Mirrors are one cursor surface.
+- Update every computer to 0.5.0, including GNOME extension API 4. Pairing keys
+  stay valid; the new input protocol does not connect to 0.4.0 or older peers.
+- Shared physical monitor input selection, automatic DDC switching, manual
+  size calibration, and rearranging OS-internal crossings remain future work.
+
+## Previous release: Windows preview and native icons (0.4.0)
 
 - Cursor Flow artwork across all three desktops: Icon Composer appearances on
   macOS, full-color and symbolic GNOME icons, and Windows app and tray icons.

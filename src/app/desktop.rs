@@ -404,9 +404,10 @@ async fn forward_signals(
             }
             message = next_message(&mut hits) => {
                 let message = message.context("The session bus closed")??;
-                let (edge, position): (String, u32) = message.body().deserialize()?;
+                let (monitor, edge, position): (String, String, u32) = message.body().deserialize()?;
+                let monitor = (!monitor.is_empty()).then_some(monitor);
                 match serde_json::from_value(edge.into()) {
-                    Ok(edge) => report(Request::EdgeHit { edge, position }).await,
+                    Ok(edge) => report(Request::EdgeHit { monitor, edge, position }).await,
                     Err(error) => tracing::debug!(%error, "unknown edge from GNOME"),
                 }
                 None
@@ -1062,7 +1063,7 @@ mod tests {
                         crate::peer_view::Request::Focus { terminal } => {
                             sent.send(terminal).unwrap()
                         }
-                        crate::peer_view::Request::EdgeHit { edge, position } => {
+                        crate::peer_view::Request::EdgeHit { edge, position, .. } => {
                             hit.send((edge, position)).unwrap()
                         }
                         other => panic!("unexpected report {other:?}"),
@@ -1102,7 +1103,7 @@ mod tests {
                 OBJECT_PATH,
                 BUS_NAME,
                 "EdgeHit",
-                &(edge, position),
+                &("", edge, position),
             )
             .await
             .unwrap();

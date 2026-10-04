@@ -4,10 +4,30 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
-## Windows preview (0.4.0)
+## Individual monitors (0.5.0)
+
+Use the same 0.5.0 source on every computer, including GNOME extension API 4.
+Existing layouts must migrate without losing paired computers or keys.
+
+- Verify one named tile per active logical monitor, independently draggable on
+  Windows, macOS, and GNOME. Mirrored outputs are one logical surface.
+- Check mixed DPI, portrait rotation, negative origins, and partial edge
+  overlap. Cross an exposed edge of each monitor and return to that monitor.
+- Keep moving across native boundaries between local monitors: zflow must not
+  intercept these, even if another computer touches that edge in its canvas.
+- Disable a monitor (including BetterDisplay disconnect), unplug it, and change
+  resolution while receiving or sending. Input must release safely, the tile
+  must disappear, and reconnecting must restore its position when still free.
+- Rearrange on one computer and verify the others retain every monitor and
+  dormant placement through edits and restart. Detection must not rewrite a
+  stable layout at each poll.
+- OS-active outputs need not be visible on a shared monitor's selected input;
+  verify the intended physical input manually. This version does not switch it.
+
+## Windows preview
 
 Build on Windows with `scripts/build-windows.ps1`, then run the checks and
-hardware matrix in `windows/README.md`. Use the same 0.4.0 source on all peers.
+hardware matrix in `windows/README.md`. Use matching source on all peers.
 The optional desktop smoke test uses an isolated configuration and a local
 QUIC peer; it never activates input capture or injects input:
 

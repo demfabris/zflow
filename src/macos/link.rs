@@ -1488,6 +1488,7 @@ mod tests {
 
     fn geometry() -> Geometry {
         Geometry {
+            displays: Vec::new(),
             monitors: vec![Rect {
                 x: 0,
                 y: 0,
@@ -1719,6 +1720,7 @@ mod tests {
         for token in 1..=2 {
             // A crossing's steps on the link's session, without native capture.
             let prepare = DesktopRequest::Prepare {
+                monitor: None,
                 token,
                 edge: Edge::Left,
                 start: 0,
@@ -1816,6 +1818,8 @@ mod tests {
 
     fn handoff(peer: &str) -> Handoff {
         Handoff {
+            monitor: None,
+            source_geometry: geometry(),
             peer: peer.into(),
             entry_region: Rect {
                 x: 0,
@@ -2027,6 +2031,7 @@ mod tests {
         );
         let token = 7;
         let prepare = DesktopRequest::Prepare {
+            monitor: None,
             token,
             edge: Edge::Left,
             start: 0,
@@ -2247,6 +2252,7 @@ mod tests {
         linux.capture(key(KeyState::Pressed)).unwrap();
         posted(&fake, "key 0 down", Duration::from_millis(800));
         let smaller = Geometry {
+            displays: Vec::new(),
             monitors: vec![Rect {
                 x: 0,
                 y: 0,
@@ -2425,6 +2431,7 @@ mod tests {
             version,
             editor: key.clone(),
             tiles: vec![crate::desktop::Tile {
+                display: None,
                 key: key.clone(),
                 x: 0,
                 y: 0,

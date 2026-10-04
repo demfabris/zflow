@@ -598,6 +598,7 @@ mod tests {
         let message = WireMessage::Desktop(DesktopMessage::Request {
             id: 1,
             request: DesktopRequest::Prepare {
+                monitor: None,
                 token: MAX_TOKEN,
                 edge: Edge::Right,
                 start: 0,

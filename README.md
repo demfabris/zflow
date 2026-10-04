@@ -4,8 +4,19 @@ zflow shares keyboard, pointer, and trackpad input over authenticated QUIC.
 Windows now has a native WinUI 3 preview with keyboard and pointer sharing,
 screen arrangement, clipboard sharing and a notification-area app. See
 [Windows setup and build instructions](windows/README.md). This source version
-is 0.4.0; update all participating computers together. It cannot connect to
-released 0.3.0 installations.
+is 0.5.0; update all participating computers together. Its monitor-aware
+input protocol cannot connect to 0.4.0 or older installations.
+
+The arrangement shows each active monitor separately, with its display name
+and computer. Drag individual monitors to match your desk. Sizes use physical
+dimensions when available, otherwise OS coordinate dimensions. Existing
+computer tiles split automatically; disconnected monitors keep their saved
+positions and return when reconnected. Mirrored displays share one cursor
+surface. Movement between a computer's own monitors follows its system display
+settings; zflow connects only exposed portions of monitor edges to other
+computers. A monitor connected to two computers appears once for each active
+connection: choosing its visible input and automatic input switching are not
+part of this version.
 
 Linux runs a system service with a GNOME panel indicator and native
 GTK4/libadwaita settings. macOS runs a native SwiftUI menu-bar app with a small

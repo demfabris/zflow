@@ -200,3 +200,17 @@ private func temporary() -> URL {
   #expect(tiles.map(\.mark) == ["fedcba", "0123ab", "0123ab"])
   #expect(tiles.allSatisfy { $0.placed })
 }
+
+@Test func monitorTilesKeepTheirIdentityAndHideDisconnectedDisplays() throws {
+  let json = """
+    {"monitors":[
+      {"id":"local/panel-a","label":"Samsung · This Mac","display":{"id":"panel-a","name":"Samsung","active":true},"x":0,"y":0,"width":2800,"height":1560},
+      {"id":"local/panel-b","label":"Dell · This Mac","display":{"id":"panel-b","name":"Dell","active":false},"x":2800,"y":0,"width":2400,"height":1360}
+    ]}
+    """
+  let layout = try JSONDecoder().decode(Layout.self, from: Data(json.utf8))
+  let tiles = LayoutTile.tiles(layout, peers: [], ownMark: "abcdef")
+  #expect(tiles.map(\.id) == ["local/panel-a"])
+  #expect(tiles.first?.computer.display?.name == "Samsung")
+  #expect(tiles.first?.mark == "abcdef")
+}
