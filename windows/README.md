@@ -30,6 +30,11 @@ protocols cannot connect; pairing keys are preserved.
    The arrangement propagates to connected peers. A remote monitor at an edge
    takes priority over a Windows monitor across that boundary. Disabled monitors
    leave the canvas and retain their saved positions for reconnection.
+   If one physical panel is connected to two computers, it can appear twice:
+   each tile belongs to that computer's active output. Place the Mac tile
+   directly against the Dell tile to switch from the Dell to the Mac, and move
+   the Windows copy elsewhere on the canvas. zflow does not switch the panel's
+   hardware input or disable the other computer's output.
 5. Leave all keys and buttons released, then move across a touching edge.
    **Pause at edges** adds a 250 ms dwell before crossing.
 
@@ -96,7 +101,14 @@ and vertical wheel input are supported. Raw multitouch forwarding is not.
 
 The engine refuses input outside an active, unlocked desktop. Windows sign-in,
 UAC secure desktops and elevated applications are outside a normal user's
-injection rights. It does not install a service, driver, or UIAccess bypass.
+injection rights. To control an administrator PowerShell or Terminal window,
+choose **Settings → Restart as administrator** and approve the Windows prompt
+locally. This restarts both the settings app and input engine; cancelling the
+prompt keeps the existing app running. Elevation lasts for this run only;
+**Run at startup** still starts normally. Windows sign-in and UAC prompts always
+require local input. It does not install a service, driver, or UIAccess bypass.
+If Windows rejects an input release after a focus change, zflow retains it and
+retries until Windows permits it, before accepting another activation.
 Remote keys and buttons release on disconnect, lease expiry, pause, and
 shutdown. A native watchdog returns physical input if the engine stalls.
 

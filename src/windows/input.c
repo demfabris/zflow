@@ -238,6 +238,15 @@ int zflow_input_clean(void) {
     return 1;
 }
 
+int zflow_input_elevated(void) {
+    HANDLE token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return 0;
+    TOKEN_ELEVATION elevation = {0}; DWORD size = 0;
+    BOOL ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size);
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated;
+}
+
 // kind: 1 scan key, 2 virtual key, 3 button, 4 relative motion, 5 wheel.
 int zflow_input_post(int kind, int code, int value, int extra) {
     INPUT input = {0};

@@ -78,6 +78,10 @@ public sealed partial class MainWindow : Window
         try
         {
             SharingSwitch.IsEnabled = true; SharingSwitch.IsOn = Flag(next["sharing"]);
+            bool elevated = Flag(next["elevated"]);
+            ElevationCard.Header = elevated ? "Running as administrator" : "Running as user";
+            ElevationCard.Description = elevated ? "Administrator windows can receive input. Windows sign-in and UAC prompts still require local input." : "Administrator windows need zflow to run as administrator too. Startup runs normally.";
+            ElevateButton.Visibility = elevated ? Visibility.Collapsed : Visibility.Visible;
             ClipboardSwitch.IsOn = Flag(next["clipboard"]); PauseEdgesSwitch.IsOn = Flag(next["pause_at_edges"]);
             LocalName.Text = Text(next["name"], "This computer"); LocalMark.Text = "Mark  " + Text(next["mark"]);
             string sending = Text(next["sending"]), receiving = Text(next["receiving"]);
@@ -245,9 +249,36 @@ public sealed partial class MainWindow : Window
         catch (Exception error) { ShowError(error); }
     }
     private void OpenConfig_Click(object sender, RoutedEventArgs e) { try { var start = new ProcessStartInfo("notepad.exe") { UseShellExecute = false }; start.ArgumentList.Add(EngineClient.ConfigPath); Process.Start(start); } catch (Exception error) { ShowError(error); } }
-    private async void Restart_Click(object sender, RoutedEventArgs e) { try { await engine.SendAsync(new { command = "quit" }, 1500); } catch { } await Task.Delay(500); await StartAsync(); }
+    private async void Restart_Click(object sender, RoutedEventArgs e)
+    {
+        if (applying || quitting) return;
+        applying = true;
+        try
+        {
+            try { await engine.StopAsync(); }
+            catch (Exception error) when (error is IOException or OperationCanceledException or TimeoutException) { } // Start also recovers an exited engine.
+            await StartAsync();
+        }
+        catch (Exception error) { ShowError(error); }
+        finally { applying = false; }
+    }
+    private async void Elevate_Click(object sender, RoutedEventArgs e)
+    {
+        if (applying || quitting) return;
+        applying = true;
+        try
+        {
+            if (!await Elevation.RequestRestartAsync()) return;
+            // The replacement waits for this process, including the old engine,
+            // before acquiring the single-instance mutex or launching input hooks.
+            await engine.StopAsync();
+            await QuitAsync(engineStopped: true);
+        }
+        catch (Exception error) { ShowError(error); }
+        finally { applying = false; }
+    }
     private async void Quit_Click(object sender, RoutedEventArgs e) => await QuitAsync();
-    private async Task QuitAsync() { if (quitting) return; quitting = true; timer.Stop(); try { await engine.SendAsync(new { command = "quit" }, 2000); } catch { } native.Dispose(); Close(); Application.Current.Exit(); }
+    private async Task QuitAsync(bool engineStopped = false) { if (quitting) return; quitting = true; timer.Stop(); if (!engineStopped) { try { await engine.StopAsync(); } catch { } } native.Dispose(); Close(); Application.Current.Exit(); }
     private async Task CapturePreviewAsync(string path)
     {
         try

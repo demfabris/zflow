@@ -35,8 +35,15 @@ internal sealed class EngineClient
 
     public async Task<JsonObject> StartAsync()
     {
-        try { return await SendAsync(new { command = "status" }, 300); }
+        JsonObject? existing = null;
+        try { existing = await SendAsync(new { command = "status" }, 300); }
         catch (Exception e) when (e is IOException or OperationCanceledException or TimeoutException) { }
+        if (existing is not null)
+        {
+            if (!Elevation.IsElevated || existing["elevated"]?.GetValue<bool>() == true) return existing;
+            // An elevated settings window must not silently reuse a normal engine.
+            await StopAsync();
+        }
         string executable = Path.Combine(AppContext.BaseDirectory, "zflow.exe");
         if (!File.Exists(executable)) throw new FileNotFoundException("The Windows input engine is missing. Build or reinstall the complete zflow app.", executable);
         Directory.CreateDirectory(DataDirectory);
@@ -52,5 +59,36 @@ internal sealed class EngineClient
             catch (Exception e) when (e is IOException or OperationCanceledException or TimeoutException) { await Task.Delay(100); }
         }
         throw new IOException("The input engine did not start. Check that UDP port 43119 is available.");
+    }
+
+    public async Task StopAsync()
+    {
+        var state = await SendAsync(new { command = "status" }, 1500);
+        Process? running = null;
+        if (state["pid"] is JsonValue pid)
+        {
+            try { running = Process.GetProcessById(pid.GetValue<int>()); _ = running.Handle; }
+            catch (ArgumentException) { return; }
+        }
+        using (running)
+        {
+            await SendAsync(new { command = "quit" }, 2000);
+            if (running is not null)
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+                await running.WaitForExitAsync(timeout.Token);
+            }
+            else
+            {
+                // Compatibility with engines that predate the process ID in status.
+                for (int attempt = 0; attempt < 30; ++attempt)
+                {
+                    await Task.Delay(100);
+                    try { await SendAsync(new { command = "status" }, 300); }
+                    catch (Exception e) when (e is IOException or OperationCanceledException or TimeoutException) { return; }
+                }
+                throw new IOException("The input engine did not stop. Quit zflow and try again.");
+            }
+        }
     }
 }

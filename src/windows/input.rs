@@ -21,6 +21,7 @@ unsafe extern "C" {
     fn zflow_input_boundaries(items: *const Boundary, count: i32);
     fn zflow_input_stop(thread: u32);
     fn zflow_input_clean() -> i32;
+    fn zflow_input_elevated() -> i32;
     fn zflow_desktop_available() -> i32;
     fn zflow_input_post(kind: i32, code: i32, value: i32, extra: i32) -> i32;
     fn zflow_monitors(
@@ -361,6 +362,9 @@ pub fn clean() -> bool {
 pub fn available() -> bool {
     unsafe { zflow_desktop_available() != 0 }
 }
+pub fn elevated() -> bool {
+    unsafe { zflow_input_elevated() != 0 }
+}
 pub fn geometry() -> Result<Geometry> {
     extern "C" fn monitor(
         x: i32,
@@ -438,7 +442,7 @@ pub fn move_to(mut p: Point) -> Result<()> {
 fn post(kind: i32, code: i32, value: i32, extra: i32) -> Result<()> {
     ensure!(
         unsafe { zflow_input_post(kind, code, value, extra) } != 0,
-        "Windows rejected input. Elevated apps require zflow at the same integrity level; secure desktops cannot be controlled"
+        "Windows blocked remote input. To control administrator windows, open zflow Settings and choose Restart as administrator. Windows sign-in and UAC prompts require local input."
     );
     Ok(())
 }
@@ -452,6 +456,7 @@ pub struct Injector {
     repeat_delay: Duration,
     repeat_interval: Duration,
     reverse_scroll: bool,
+    releasing: bool,
 }
 impl Injector {
     pub fn new() -> Self {
@@ -474,6 +479,7 @@ impl Injector {
                 1.0 / (2.5 + 27.5 * f64::from(speed.min(31)) / 31.0),
             ),
             reverse_scroll: false,
+            releasing: false,
         }
     }
     pub fn configure(&mut self, keyboard: KeyboardMode, reverse_scroll: bool) {
@@ -502,6 +508,13 @@ impl Injector {
         Ok(())
     }
     pub fn apply(&mut self, effects: Vec<ReceiverEffect>) -> Result<()> {
+        if self.releasing {
+            self.release();
+            ensure!(
+                !self.releasing,
+                "Windows has not released the previous input. Focus a normal window locally, or restart zflow as administrator in Settings."
+            );
+        }
         let result = (|| {
             for effect in effects {
                 match effect {
@@ -564,6 +577,12 @@ impl Injector {
         result
     }
     pub fn tick(&mut self) -> Result<()> {
+        if self.releasing {
+            // UIPI can reject the mouse-up immediately after a click focuses an
+            // elevated window. Keep retrying even after that session closes.
+            self.release();
+            return Ok(());
+        }
         if let Some((key, at)) = self.repeat
             && Instant::now() >= at
         {
@@ -589,6 +608,7 @@ impl Injector {
             }
         }
         self.remap.reset(self.remap.mode());
+        self.releasing = !self.keys.is_empty() || !self.buttons.is_empty();
     }
 }
 impl Drop for Injector {
@@ -653,8 +673,35 @@ mod tests {
         i.release();
         assert!(i.keys.contains(&HidUsage::keyboard(4)));
         FAIL.set(false);
-        i.release();
+        i.tick().unwrap();
         assert!(i.keys.is_empty());
+    }
+    #[test]
+    fn blocked_click_cancels_repeat_retries_mouse_up_and_blocks_new_activation() {
+        let mut i = fake();
+        let button = |pressed| ReceiverEffect::Button {
+            button: PointerButton(1),
+            pressed,
+            synthetic: false,
+        };
+        i.apply(vec![key(4, true), button(true)]).unwrap();
+        FAIL.set(true);
+        assert!(i.apply(vec![button(false)]).is_err());
+        assert!(i.repeat.is_none());
+        assert!(i.releasing);
+        assert!(i.apply(vec![key(5, true)]).is_err());
+        i.tick().unwrap();
+        assert!(i.releasing);
+        FAIL.set(false);
+        i.tick().unwrap();
+        assert!(!i.releasing);
+        assert!(i.keys.is_empty() && i.buttons.is_empty());
+        POSTS.with_borrow(|p| {
+            assert!(p.contains(&(1, 0x1e, 0, 0)));
+            assert!(p.contains(&(3, 1, 0, 0)));
+            assert!(!p.contains(&(1, 0x30, 1, 0)));
+        });
+        i.apply(vec![key(5, true), key(5, false)]).unwrap();
     }
     #[test]
     fn arrow_repeat_and_pc_modifier_positions() {

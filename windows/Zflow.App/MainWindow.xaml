@@ -97,6 +97,10 @@
                   <controls:SettingsCard.HeaderIcon><FontIcon Glyph="&#xE7B8;" /></controls:SettingsCard.HeaderIcon>
                   <ToggleSwitch x:Name="StartupSwitch" AutomationProperties.Name="Run at startup" Toggled="Startup_Toggled" />
                 </controls:SettingsCard>
+                <controls:SettingsCard x:Name="ElevationCard" Header="Running as user" Description="Administrator windows need zflow to run as administrator too.">
+                  <controls:SettingsCard.HeaderIcon><FontIcon Glyph="&#xEA18;" /></controls:SettingsCard.HeaderIcon>
+                  <Button x:Name="ElevateButton" Content="Restart as administrator" Click="Elevate_Click" />
+                </controls:SettingsCard>
               </StackPanel>
               <StackPanel Spacing="4">
                 <TextBlock Text="Input and clipboard" Style="{StaticResource SectionHeading}" />

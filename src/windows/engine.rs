@@ -277,6 +277,7 @@ impl Engine {
         let peers:Vec<_>=self.config.peers.iter().map(|(name,p)|json!({"name":name,"key":p.fingerprint_hex().ok(),"mark":p.spki_der().ok().map(|s|crate::neighbors::mark(&s)),
             "connected":self.links.get(name).is_some_and(|l|!l.handle.is_closed()),"status":self.failures.get(name).map(|(_,_,reason)|reason),"keyboard":p.keyboard,"reverse_scroll":p.reverse_scroll,"addresses":p.addresses})).collect();
         json!({"name":crate::hello::local_name(),"key":self.identity.fingerprint_hex(),"mark":crate::neighbors::mark(self.identity.spki()),
+            "pid":std::process::id(),"elevated":input::elevated(),
             "sharing":self.config.daemon.sharing,"clipboard":self.config.clipboard.share,"available":input::available(),"peers":peers,
             "nearby":self.neighbors.unplaced(&self.config),"layout":self.local_layout(),"sending":self.outbound.as_ref().map(|o|&o.peer),"receiving":self.inbound.as_ref().map(|(p,_)|p),
             "notice":self.notice,"layout_version":self.layout.version,"pause_at_edges":self.config.switching.pause_at_edges,"listen":self.config.transport.listen,"addresses":crate::discovery::this_host_addresses()})
@@ -1173,6 +1174,9 @@ impl Engine {
                     }
                     Err("Windows is paused, locked, or already sharing input".into())
                 };
+                if let Err(error) = &result {
+                    self.notice = Some(error.clone());
+                }
                 let _ = applied.send(result);
             }
             SessionEventKind::Desktop { request, reply } => {
