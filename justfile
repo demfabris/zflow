@@ -1,7 +1,21 @@
-set shell := ["bash", "-euo", "pipefail", "-c"]
-set positional-arguments
+import 'just/common.just'
+
+# Capture app or daemon diagnostics.
+mod debug 'just/debug.just'
+# Apply or check Rust formatting.
+mod fmt 'just/fmt.just'
+# Install a native service.
+mod install 'just/install.just'
+# Package distributable artifacts.
+mod package 'just/package.just'
+# Check or publish a GitHub release.
+mod release 'just/release.just'
+# Run a test suite.
+mod test 'just/test.just'
 
 # List development commands.
+[default]
+[private]
 default:
     @just --list
 
@@ -18,37 +32,6 @@ run platform *args: (_platform platform)
         cargo run --locked --bin zflow -- settings "$@"
     fi
 
-# Install/update the Linux service (requires sudo).
-install-linux:
-    ./scripts/install.sh
-
-# Run with diagnostics and save terminal output under target/logs.
-debug platform *args: (_platform platform)
-    #!/usr/bin/env bash
-    set -euo pipefail
-    umask 077
-    platform="$1"
-    shift
-    mkdir -p target/logs
-    logfile="target/logs/zflow-$platform-$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
-    printf 'Saving diagnostics to %s/%s\n' "$PWD" "$logfile"
-    if [[ "$platform" == mac ]]; then
-        ./scripts/build-macos-app.sh --debug
-        RUST_LOG=warn,zflow=debug target/debug/zflow.app/Contents/MacOS/zflow-app "$@" 2>&1 | tee "$logfile"
-    else
-        RUST_LOG=warn,zflow=debug cargo run --locked --bin zflow -- desktop-agent "$@" 2>&1 | tee "$logfile"
-    fi
-
-# Enable Linux daemon diagnostics until reboot; requires sudo and restarts the service.
-debug-daemon: (_platform "linux")
-    #!/usr/bin/env bash
-    set -euo pipefail
-    sudo install -d -m 0755 /run/systemd/system/zflowd.service.d
-    printf '[Service]\nEnvironment="RUST_LOG=warn,zflow=debug"\n' | sudo tee /run/systemd/system/zflowd.service.d/debug.conf >/dev/null
-    sudo systemctl daemon-reload
-    sudo systemctl restart zflowd.service
-    printf 'Daemon debug logging enabled until reboot. Read with: journalctl -u zflowd -f -o short-iso-precise\n'
-
 # Package the Mac app or build the Linux service and native app launcher.
 build platform *args: (_platform platform)
     #!/usr/bin/env bash
@@ -61,70 +44,9 @@ build platform *args: (_platform platform)
         cargo build --locked --bin zflow --bin zflowd "$@"
     fi
 
-# Pack the Mac app into target/release/zflow.dmg, signed like the app but not notarized.
-dmg *args: (_platform "mac")
-    ./scripts/build-macos-app.sh --dmg "$@"
-
-# Run Rust tests.
-test *args:
-    cargo test --locked --all-targets "$@"
-
-# Run Swift/Rust bridge tests with an isolated temporary configuration.
-test-native: (_platform "mac")
-    MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --locked --lib
-    swift test --package-path macos
-
-# Exercise the shipped GNOME extension with a simulated compositor (requires Node.js).
-test-desktop:
-    node tests/gnome_desktop_test.mjs
-    node tests/gnome_panel_test.mjs
-
-# Exercise native GTK controls through D-Bus on the current display.
-test-gtk: (_platform "linux")
-    dbus-run-session -- cargo test --locked --lib app:: -- --ignored --skip native_desktop_geometry
-    GTK_A11Y=none GIO_USE_VFS=local dbus-run-session -- gjs -m tests/gnome_settings_test.js
-    GSETTINGS_BACKEND=memory GTK_A11Y=none GIO_USE_VFS=local dbus-run-session -- gjs -m tests/gnome_setup_test.js
-
-# Exercise installation and recovery without changing the host (requires Python 3).
-test-install:
-    python3 tests/install_test.py
-
-# Exercise a built Debian package in a disposable Ubuntu container.
-test-package:
-    ./tests/deb_lifecycle.sh
-
-# Pack the GNOME extension for extensions.gnome.org under target/dist.
-pack-extension: (_platform "linux")
-    ./scripts/pack-extension.sh
-
-# Format Rust code.
-fmt:
-    cargo fmt --all
-
-# Check formatting without changing files.
-fmt-check:
-    cargo fmt --all --check
-
 # Lint Rust code.
 lint:
     cargo clippy --locked --all-targets -- -D warnings
 
 # Check formatting, lint, and run tests.
-check: fmt-check lint test test-desktop test-install
-
-[private]
-_platform platform:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    host=$(uname -s)
-    case "$1:$host" in
-        mac:Darwin|linux:Linux) ;;
-        mac:*|linux:*)
-            printf 'Platform %s does not match this host (%s). Run on the matching machine; these commands do not cross-compile or SSH.\n' "$1" "$host" >&2
-            exit 1
-            ;;
-        *)
-            printf 'Unknown platform: %s. Use mac or linux.\n' "$1" >&2
-            exit 1
-            ;;
-    esac
+check: fmt::check lint test::rust test::desktop test::install test::release

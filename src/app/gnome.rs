@@ -504,6 +504,10 @@ pub(super) fn write_assets(path: &std::path::Path) -> Result<()> {
             "app.js",
             include_str!("../../packaging/gnome-extension/app.js"),
         ),
+        (
+            "updates.js",
+            include_str!("../../packaging/gnome-extension/updates.js"),
+        ),
     ] {
         std::fs::write(path.join(name), contents)?;
     }
@@ -583,6 +587,7 @@ pub fn settings() -> Result<()> {
         "Open settings as your desktop user, without sudo"
     );
     let path = xdg("XDG_CACHE_HOME", ".cache")?.join("zflow/desktop");
+    super::desktop::refresh_extension()?;
     write_assets(&path)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -590,6 +595,8 @@ pub fn settings() -> Result<()> {
     runtime.block_on(async { start_agent(&zbus::Connection::session().await?, false).await })?;
     drop(runtime);
     Err(std::process::Command::new("gjs")
+        .env("ZFLOW_EXECUTABLE", std::env::current_exe()?)
+        .env("ZFLOW_VERSION", env!("CARGO_PKG_VERSION"))
         .arg("-m")
         .arg(path.join("app.js"))
         .exec())

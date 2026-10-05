@@ -27,14 +27,19 @@ the two-way sitting there has not run yet.
 
 ## Install
 
+Install a published release on each computer. No repository checkout or build
+tools are needed. Once installed, use the app's update controls below.
+
 Run as your normal user on Linux or macOS:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/demfabris/zflow/releases/latest/download/install.sh | bash
 ```
 
 The installer downloads prebuilt GitHub release artifacts and verifies their
-SHA-256 checksums. It needs no Rust, Swift, Xcode, or C compiler. Linux binaries
+SHA-256 checksums. The command downloads the installer from the latest published
+release. The installer resolves the latest tag once before downloading its files.
+It needs no Rust, Swift, Xcode, or C compiler. Linux binaries
 support x86-64 and ARM64 with glibc 2.39+ and systemd 254+. Native Mac apps support
 Intel and Apple Silicon on macOS 26+.
 
@@ -68,6 +73,30 @@ v0.1.0 was built before that: its Mac apps are ad-hoc signed. Input sharing work
 but they can't install the optional AWDL helper. Releases built by the signing
 workflow can install it from the app with administrator approval.
 
+On Windows, run the [Windows installer](https://github.com/demfabris/zflow/releases/latest/download/zflow-windows-x86_64-Setup.exe).
+It installs for your account and adds a Start menu shortcut. See
+[Windows instructions](windows/README.md) for portable copies and migration
+from the earlier ZIP installation.
+
+Installed releases can check for updates from their native settings:
+
+- **macOS:** choose **Check for Updates…** from the zflow menu. Settings controls
+  automatic checks and downloads. Sparkle verifies the signed update and
+  handles installation and relaunch.
+- **GNOME:** the **Updates** group checks when you open the window and every
+  six hours while it stays open. **Install…** asks before interrupting sharing,
+  then uses the system administrator prompt. Debian installations stay under
+  apt; archive installations stay under `/usr/local`. Copies owned by other
+  package managers direct you to that manager.
+- **Windows:** **About zflow → Updates** checks, downloads, and offers
+  **Restart and update**. **Settings → App updates** controls automatic checks.
+  Portable copies link to the installer.
+
+The first release with these controls must be installed through the command,
+disk image, or Windows installer above. Later updates preserve settings and
+paired computers. A restart interrupts input sharing, so update each computer
+when you have local control of it.
+
 Repeat the command to update. It keeps your configuration and the computers
 you added; updating the Linux service interrupts an active connection.
 Computers on 0.3.0 and on 0.2.0 or older cannot connect, so update every
@@ -81,7 +110,7 @@ the zflow window shows a banner with the step that is left: **Install**,
 Pass options after `bash -s --`:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash -s -- --version v0.3.0 --no-launch
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/demfabris/zflow/releases/latest/download/install.sh | bash -s -- --version v0.3.0 --no-launch
 ```
 
 Omit `--version` for the latest release. `--headless` skips GNOME integration.
@@ -514,24 +543,47 @@ the problem to capture or playout behavior.
 
 ## Develop
 
+These commands are for developing and publishing zflow. Installing or updating
+it on another computer uses the published downloads and app controls above.
+
+Use just 1.45 or newer. Grouped commands follow `just <action> <target> [args]`.
+Run `just` to list actions, `just test` to list test targets, or
+`just --list --list-submodules` to see all commands. Opening a group lists its
+commands without running them.
+
 ```sh
-just run mac                 # Build and open the native debug app
 just build mac               # Package the native release app
-just dmg                     # Pack it into a local disk image (--universal for both CPUs)
-just install-linux           # Install/update the Linux service
+just build linux             # Build the service and native app launcher
+just run mac                 # Build and open the native debug app
 just run linux               # Open native GNOME settings
 just debug mac               # Native app diagnostics under target/logs
 just debug linux             # Desktop-agent diagnostics
-just debug-daemon            # Linux daemon diagnostics until reboot
-just test                    # Rust tests
-just test-native             # Swift bridge tests (macOS)
-just test-desktop            # GNOME extension tests (Node.js)
-just test-gtk                # Native GTK controls and D-Bus tests (Linux display)
-just pack-extension          # Zip for extensions.gnome.org (Linux with GNOME Shell)
-just test-install            # Binary installer and recovery tests (Python 3)
-just test-package            # Debian lifecycle tests in Docker (build a .deb first)
-just check                   # Formatting, Clippy, Rust, GNOME, installer tests
+just debug daemon            # Linux daemon diagnostics until reboot
+just install linux           # Install/update the Linux service
+just package dmg             # Local Mac disk image (--universal for both CPUs)
+just package extension       # Zip for extensions.gnome.org (Linux with GNOME Shell)
+just test rust               # Rust tests
+just test native             # Swift bridge tests (macOS)
+just test desktop            # GNOME extension tests (Node.js)
+just test gtk                # Native GTK controls and D-Bus tests (Linux display)
+just test install            # Binary installer and recovery tests (Python 3)
+just test package            # Debian lifecycle tests in Docker (build a .deb first)
+just test release            # Release command and macOS updater packaging tests
+just fmt apply               # Format Rust code
+just fmt check               # Check Rust formatting
+just lint                    # Clippy with warnings denied
+just check                   # Formatting, Clippy, Rust, GNOME, installer, release tests
+just release check           # Validate the committed version and GitHub state
+just release publish         # Push main, require CI, tag, and wait for publication
 ```
+
+Before the first update-enabled release, run `just release setup` on a Mac
+with GitHub repository administration access to configure Sparkle signing.
+For each release, update `Cargo.toml`, `Cargo.lock`, the protocol version table
+when needed, and `packaging/RELEASE_NOTES.md`; commit on `main`, then run
+`just release publish`. The command releases the committed Cargo version and
+requires a clean checkout. See [release setup](packaging/README.md) for keys,
+native validation and recovering a failed workflow.
 
 CI (`.github/workflows/ci.yml`) runs these checks plus ShellCheck on Linux, and
 Clippy, Rust tests, the C harnesses, and Swift bridge tests on macOS, for every
@@ -553,8 +605,9 @@ used. Native system controls follow the current macOS appearance.
 
 For an isolated configuration, launch the bundle executable with
 `--config /absolute/path/zflow.toml`. `RUST_LOG` controls Rust diagnostics.
-`just debug` captures logs with private file permissions. Read Linux daemon logs
-with `journalctl -u zflowd -o short-iso-precise --since "10 minutes ago"`.
+`just debug mac` and `just debug linux` capture logs with private file permissions.
+Read Linux daemon logs with
+`journalctl -u zflowd -o short-iso-precise --since "10 minutes ago"`.
 
 ```sh
 cargo test --locked --all-targets

@@ -4,9 +4,44 @@
 
 Thresholds named "frozen" must be written down, with their measurement method, before the matrix that uses them runs.
 
+## Installation and updates without a checkout
+
+A release fails this gate if installing or updating on a supported computer
+requires cloning the repository, compiling zflow, or installing development
+tools. Run this matrix with downloaded artifacts on computers without a zflow
+checkout, Rust, Xcode, or a .NET SDK. System runtime packages and native
+permission dialogs are expected.
+
+1. Install through the published Linux installer, Mac disk image, or Windows
+   Setup. Launch from the desktop and complete permission prompts. Confirm the
+   app, input engine, and optional installed helpers come from the package.
+2. Pair computers and save a layout, settings, and login preference. Publish a
+   newer test version through the release workflow. For pre-publication checks,
+   use downloaded CI packages and isolated test feeds with the same packaging
+   and signing; do not rebuild on the test computers.
+3. Use the installed app to check, download, install, and restart. Verify the
+   expected version, preserved identity/pairing/layout/settings, and resumed
+   sharing. Repeat after logout and reboot. Test each supported CPU family.
+4. On Linux, cover both Debian and archive installations. Confirm the daemon,
+   desktop agent, and settings app use the new version; check the bundled or
+   independently managed GNOME extension and any required logout. On Mac,
+   verify the installed Wi-Fi helper after replacement. On Windows, verify
+   the bundled engine and the Start menu and login launchers.
+5. Cancel at each prompt the platform offers, including administrator approval
+   and restart. Repeat while offline and with an interrupted download. The
+   installed version must remain usable, and retry must work through the app
+   without source or build tools.
+6. Upgrade an existing installation without update controls using only a
+   published installer or disk image. Its next upgrade must use the app.
+
+Record the artifact versions, OS/CPU, install type, and result. Passing unit or
+installer fixture tests does not satisfy this matrix. The `just release`
+commands and signing-key setup belong on the publisher's development machine;
+GitHub Actions builds all platforms.
+
 ## Individual monitors (0.5.0)
 
-Use the same 0.5.0 source on every computer, including GNOME extension API 4.
+Install the same 0.5.0 release on every computer, including GNOME extension API 4.
 Existing layouts must migrate without losing paired computers or keys.
 
 - Verify one named tile per active logical monitor, independently draggable on
@@ -29,10 +64,10 @@ Existing layouts must migrate without losing paired computers or keys.
 
 ## Windows preview
 
-Build on Windows with `scripts/build-windows.ps1`, then run the checks and
-hardware matrix in `windows/README.md`. Use matching source on all peers.
-The optional desktop smoke test uses an isolated configuration and a local
-QUIC peer; it never activates input capture or injects input:
+Install the Windows release or a downloaded CI package, then run the hardware
+matrix in `windows/README.md`. Use matching versions on all peers.
+Developers can also run this optional test from a checkout. It uses an isolated
+configuration and a local QUIC peer without capture or input injection:
 
 ```powershell
 cargo test --locked --test windows_desktop -- --ignored --nocapture
@@ -59,7 +94,7 @@ pairing window.
 To make a computer fresh without losing its setup:
 
 - Ubuntu: `sudo systemctl stop zflowd`, move `/etc/zflow/zflow.toml` and
-  `/var/lib/zflow` aside, then `sudo just install-linux`. Setup writes
+  `/var/lib/zflow` aside, then `sudo just install linux`. Setup writes
   `eligible` to `/var/lib/zflow/pairing-window`. Log in at the desktop. To
   restore, stop the service and move both back.
 - Mac: quit zflow, then open it on a new configuration, which gets its own key
@@ -92,7 +127,7 @@ Checks:
    the shelf. Restarting `zflowd` or the Mac app while the window is open
    closes it too.
 6. **No window without a fresh install.** An upgrade over 0.2.0 (`sudo just
-   install-linux` with the configuration in place), an install over ssh with
+   install linux` with the configuration in place), an install over ssh with
    nobody logged in at the desktop, and a computer that already trusts one
    never add a computer by themselves.
 7. **Layouts add no trust.** On a computer that has not placed the VM, a
@@ -174,7 +209,7 @@ One sitting with the Mac and the Ubuntu box, both from main. Both ends speak
 
 Setup on Ubuntu:
 
-1. `sudo just install-linux`. It installs `zflow` and `zflowd`, reloads udev, so
+1. `sudo just install linux`. It installs `zflow` and `zflowd`, reloads udev, so
    every keyboard and pointer is readable by the `zflow` account, and restarts
    the service.
 2. Empty `capture_devices` in `/etc/zflow/zflow.toml`, then run `sudo zflow doctor`.
@@ -234,7 +269,7 @@ Setup on the Mac:
    `mkdir -p target/logs; log=target/logs/zflow-mac-$(date -u +%Y%m%dT%H%M%SZ).log`, then
    `open -n --stderr "$PWD/$log" --stdout "$PWD/$log" --env RUST_LOG=warn,zflow=debug target/debug/zflow.app`.
    Running the binary from a shell makes the terminal the responsible process.
-3. On Ubuntu, `just debug-daemon`.
+3. On Ubuntu, `just debug daemon`.
 
 Checks:
 
@@ -358,14 +393,14 @@ Mac is affected.
 
 ## Binary releases and Debian packaging, September 16
 
-Run `just test-install` (also included in `just check`). The tests use local
+Run `just test install` (also included in `just check`). The tests use local
 release fixtures with real SHA-256 verification and archive extraction. They
 cover platform/architecture selection, a pinned latest release, rejected
 checksums, failed downloads, runtime dependency selection, GUI/terminal
 authentication, GNOME setup, and macOS update recovery. Build tools fail the
 test if the installer tries to invoke them.
 
-Build a native `.deb` with `scripts/build-deb.sh`, then run `just test-package`.
+Build a native `.deb` with `scripts/build-deb.sh`, then run `just test package`.
 This installs the actual package in a disposable Ubuntu 24.04 container,
 checks paths and permissions, edits configuration/device selections, and checks
 update, removal, reinstallation, purge, and rejection of a source installation.
@@ -400,7 +435,7 @@ panel indicator. The native GTK4/libadwaita app and extension preferences share
 one settings view. A session D-Bus service in the desktop agent forwards a
 limited set of requests to the credential-checked daemon API.
 
-Run `just check` and `just test-gtk`. The GTK check requires a Linux display
+Run `just check` and `just test gtk`. The GTK check requires a Linux display
 and runs on a private D-Bus session. It exercises actual widgets and D-Bus
 messages against a fake service: pause/resume, rejected-write rollback, login,
 pairing confirmation/cancellation, forgetting, loss of service, and cleanup.
@@ -410,6 +445,7 @@ pre-login boundary, plus daemon pairing acknowledgements and cancellation.
 Implementation checks on GNOME Shell 50.1, GTK 4.22.4 and libadwaita 1.9.1:
 `just check` passed (236 library tests, eight QUIC tests, both Node suites).
 `just test-gtk` passed the isolated Rust session-service test and GTK controls.
+Use `just test gtk` for that check in the current checkout.
 The extension loaded in a separate headless GNOME Shell and returned desktop
 geometry through its existing API. Native GTK rendering was inspected for the
 settings window and pairing dialog. The live system daemon was not replaced;
@@ -444,7 +480,7 @@ Automated checks:
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
-just test-native
+just test native
 node tests/gnome_desktop_test.mjs
 ./scripts/build-macos-app.sh --debug --sign "SIGNING IDENTITY"
 ```
@@ -628,7 +664,7 @@ existing `ubuntu` known-host entry and connected as `demfabris` using
 Ubuntu ran a September 10 installed daemon alongside the September 14 GUI;
 its journal rejected edge handoff with `unknown message family 7`. GNOME 50.1
 had the extension files but had not loaded the new extension. The installer
-now restarts an existing daemon after replacement, and `just install-linux`
+now restarts an existing daemon after replacement, and `just install linux`
 builds and installs both binaries. The user completed installation and
 logout/login; SSH confirmed the updated daemon and an ACTIVE GNOME extension.
 The user reported a successful round trip followed by a failed reconnect.
@@ -648,7 +684,7 @@ the Mac reported cursor movement during connection preparation, and a later
 Finish request timed out. This workflow remains unqualified. `just debug mac`
 and `just debug linux` now save timestamped logs grouped by crossing and include
 stage durations, cancellation displacement, capture-loop gaps and stop reasons.
-`just debug-daemon` enables receiver request, seat-check and compositor timings
+`just debug daemon` enables receiver request, seat-check and compositor timings
 until reboot. Request diagnostics distinguish cancellation, timeout, closed
 response channels and unavailable queues. Successful active polls below 350 ms
 stay at trace level. Focused Mac/receiver tests and Clippy passed; the debug
@@ -696,7 +732,7 @@ acquisition and 25 ms for release with the switch on; measure the updated build
 before claiming a reduction. The under-60-ms rearm target remains unverified.
 
 Complete this live checklist with matching Mac, Linux desktop-agent, daemon and extension
-builds. Use `just debug mac`, `just debug linux` and `just debug-daemon`:
+builds. Use `just debug mac`, `just debug linux` and `just debug daemon`:
 
 - Cross five times each way, including one 60-second stay on Ubuntu. Record
   `elapsed_ms` on `edge observer saw capture start` and request-ID growth;

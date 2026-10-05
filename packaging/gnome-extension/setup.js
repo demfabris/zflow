@@ -16,8 +16,10 @@ const STEPS = {
     install: {title: 'Install the zflow GNOME extension to finish setup', button: 'Install'},
     enable: {title: 'The zflow GNOME extension is turned off', button: 'Turn On'},
     logout: {title: 'Log out and back in to finish setting up zflow', button: 'Log Out'},
+    update: {title: 'Log out and back in to load the updated zflow GNOME extension', button: 'Log Out'},
     error: {title: 'The zflow GNOME extension stopped. Log out and back in to restart it', button: 'Log Out'},
     outdated: {title: 'The zflow GNOME extension does not support this GNOME version. Update zflow', button: null},
+    ego_outdated: {title: 'Update the zflow extension through GNOME Extensions or Extension Manager', button: null},
 };
 
 function call(bus, path, iface, method, parameters, cancellable) {
@@ -65,10 +67,16 @@ export class Setup {
         let step = null;
         try {
             const [info] = await shellCall('GetExtensionInfo', this._cancel);
+            const metadata = this._metadata();
+            const fromEgo = '_generated' in info || (metadata && '_generated' in metadata);
+            const olderExtension = this._client.snapshot?.health?.some(row =>
+                row.id === 'desktop' && row.detail.includes('GNOME extension is older than the app'));
             if (info.state === undefined) step = this._installed() ? 'logout' : 'install';
+            else if (fromEgo && (info.state === OUT_OF_DATE || olderExtension)) step = 'ego_outdated';
+            else if (info.state === OUT_OF_DATE) step = 'outdated';
+            else if (this._pendingUpdate(info, metadata)) step = 'update';
             else if (info.state === INACTIVE || info.state === INITIALIZED) step = 'enable';
             else if (info.state === ERROR) step = 'error';
-            else if (info.state === OUT_OF_DATE) step = 'outdated';
         } catch {
             // Without GNOME Shell there is nothing to set up here.
         }
@@ -82,6 +90,25 @@ export class Setup {
     _installed() {
         return [GLib.get_user_data_dir(), ...GLib.get_system_data_dirs()].some(dir => GLib.file_test(
             GLib.build_filenamev([dir, 'gnome-shell', 'extensions', UUID, 'metadata.json']), GLib.FileTest.EXISTS));
+    }
+
+    _metadata() {
+        for (const dir of [GLib.get_user_data_dir(), ...GLib.get_system_data_dirs()]) {
+            try {
+                const [, bytes] = GLib.file_get_contents(GLib.build_filenamev([
+                    dir, 'gnome-shell', 'extensions', UUID, 'metadata.json',
+                ]));
+                return JSON.parse(new TextDecoder().decode(bytes));
+            } catch { /* Try the next extension location. */ }
+        }
+        return null;
+    }
+
+    _pendingUpdate(info, metadata) {
+        // Shell reports its loaded metadata, which stays old until a new login.
+        // Copies from extensions.gnome.org follow GNOME's own update lifecycle.
+        return metadata && !('_generated' in metadata) && !('_generated' in info) &&
+            metadata['version-name'] && metadata['version-name'] !== info['version-name'];
     }
 
     _show() {
@@ -102,8 +129,8 @@ export class Setup {
             } else if (step === 'enable') {
                 const [enabled] = await shellCall('EnableExtension', this._cancel);
                 if (!enabled) throw new Error('GNOME could not turn on the zflow extension');
-            } else if (step === 'logout' || step === 'error') {
-                enableAtLogin();
+            } else if (step === 'logout' || step === 'error' || step === 'update') {
+                if (step !== 'update') enableAtLogin();
                 // GNOME shows its own confirmation first.
                 await call('org.gnome.SessionManager', '/org/gnome/SessionManager', 'org.gnome.SessionManager',
                     'Logout', new GLib.Variant('(u)', [0]), this._cancel);

@@ -19,14 +19,17 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <PublishReadyToRun>false</PublishReadyToRun>
     <PublishTrimmed>false</PublishTrimmed>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <ZflowEnginePath Condition="'$(ZflowEnginePath)' == ''">$(MSBuildThisFileDirectory)..\..\target\x86_64-pc-windows-msvc\release\zflow.exe</ZflowEnginePath>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260921001" />
     <PackageReference Include="CommunityToolkit.WinUI.Controls.SettingsControls" Version="8.2.251219" />
+    <PackageReference Include="Velopack" Version="1.2.161" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="..\..\assets\windows\zflow.ico" Link="Assets\zflow.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="..\..\assets\windows\zflow.png" Link="Assets\zflow.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-    <Content Include="..\..\target\release\zflow.exe" Link="zflow.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\..\target\release\zflow.exe')" />
+    <Content Include="$(ZflowEnginePath)" Link="zflow.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

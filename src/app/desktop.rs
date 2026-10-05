@@ -618,31 +618,61 @@ async fn extension_state(connection: &zbus::Connection) -> zbus::Result<Option<f
         .and_then(|state| f64::try_from(state).ok()))
 }
 
-/// Makes this version's extension the one GNOME finds at login, unless the
-/// copy came from extensions.gnome.org, which GNOME keeps updated itself.
-fn write_extension() -> anyhow::Result<()> {
+fn extension_paths() -> anyhow::Result<(std::path::PathBuf, bool)> {
     let path = std::path::Path::new("gnome-shell/extensions").join(crate::desktop::EXTENSION_ID);
     let user = super::gnome::xdg("XDG_DATA_HOME", ".local/share")?.join(&path);
-    // extensions.gnome.org marks the metadata of every copy it serves.
-    if std::fs::read_to_string(user.join("metadata.json"))
-        .is_ok_and(|text| text.contains("\"_generated\""))
-    {
-        return Ok(());
-    }
     let packaged = super::gnome::xdg_dirs("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
         .iter()
         .any(|dir| dir.join(&path).join("metadata.json").is_file());
+    Ok((user, packaged))
+}
+
+/// Makes this version's extension the one GNOME finds at login, unless the
+/// copy came from extensions.gnome.org, which GNOME keeps updated itself.
+fn write_extension() -> anyhow::Result<()> {
+    let (user, packaged) = extension_paths()?;
+    write_extension_at(&user, packaged, true)
+}
+
+/// Refresh an existing bundled copy without installing, enabling, or fetching
+/// an extension. GNOME keeps copies from extensions.gnome.org up to date.
+pub(super) fn refresh_extension() -> anyhow::Result<()> {
+    let (user, packaged) = extension_paths()?;
+    write_extension_at(&user, packaged, false)
+}
+
+fn write_extension_at(user: &std::path::Path, packaged: bool, create: bool) -> anyhow::Result<()> {
+    let metadata = std::fs::read_to_string(user.join("metadata.json")).ok();
+    // extensions.gnome.org marks the metadata of every copy it serves.
+    if metadata
+        .as_ref()
+        .is_some_and(|text| text.contains("\"_generated\""))
+    {
+        return Ok(());
+    }
     if packaged {
         // Older versions copied the extension here too, which would shadow
         // the package's copy.
-        if std::fs::symlink_metadata(&user).is_ok_and(|metadata| metadata.is_dir()) {
-            std::fs::remove_dir_all(&user)?;
+        if std::fs::symlink_metadata(user).is_ok_and(|metadata| metadata.is_dir()) {
+            std::fs::remove_dir_all(user)?;
         }
         return Ok(());
     }
-    std::fs::create_dir_all(&user)?;
+    if !create && metadata.is_none() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(user)?;
     for (name, contents) in EXTENSION_FILES {
-        std::fs::write(user.join(name), contents)?;
+        let contents = if name == "metadata.json" {
+            let mut metadata: serde_json::Value = serde_json::from_str(contents)?;
+            metadata["version-name"] = env!("CARGO_PKG_VERSION").into();
+            serde_json::to_string_pretty(&metadata)? + "\n"
+        } else {
+            contents.into()
+        };
+        if std::fs::read_to_string(user.join(name)).ok().as_deref() != Some(&contents) {
+            std::fs::write(user.join(name), contents)?;
+        }
     }
     Ok(())
 }
@@ -719,6 +749,67 @@ fn format_strv(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_refresh_only_updates_existing_bundled_files() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("extension");
+        write_extension_at(&user, false, false).unwrap();
+        assert!(
+            !user.exists(),
+            "ordinary startup must not install an extension"
+        );
+
+        write_extension_at(&user, false, true).unwrap();
+        std::fs::write(user.join("metadata.json"), r#"{"version-name":"0.0.1"}"#).unwrap();
+        std::fs::write(user.join("extension.js"), "older release").unwrap();
+        write_extension_at(&user, false, false).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(user.join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(metadata["version-name"], env!("CARGO_PKG_VERSION"));
+        for (name, contents) in EXTENSION_FILES {
+            if name != "metadata.json" {
+                assert_eq!(std::fs::read_to_string(user.join(name)).unwrap(), contents);
+            }
+        }
+    }
+
+    #[test]
+    fn extension_refresh_preserves_ego_owned_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path();
+        let metadata = r#"{"_generated":"EGO","version":7}"#;
+        std::fs::write(user.join("metadata.json"), metadata).unwrap();
+        std::fs::write(user.join("extension.js"), "EGO owns this").unwrap();
+        for packaged in [false, true] {
+            for create in [false, true] {
+                write_extension_at(user, packaged, create).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(user.join("metadata.json")).unwrap(),
+                    metadata
+                );
+                assert_eq!(
+                    std::fs::read_to_string(user.join("extension.js")).unwrap(),
+                    "EGO owns this"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extension_refresh_uses_the_system_package_without_shadowing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("extension");
+        write_extension_at(&user, true, false).unwrap();
+        assert!(!user.exists());
+        write_extension_at(&user, false, true).unwrap();
+        assert!(user.exists());
+        write_extension_at(&user, true, false).unwrap();
+        assert!(
+            !user.exists(),
+            "the system package must take precedence over an old bundled copy"
+        );
+    }
 
     struct Shell(Arc<Mutex<Vec<(String, serde_json::Value)>>>);
 

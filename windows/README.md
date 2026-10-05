@@ -2,14 +2,41 @@
 
 The Windows preview uses a native WinUI 3 app and a Rust input engine. It runs
 in your signed-in session on Windows 10 version 2004 or later and Windows 11,
-x64. The portable folder includes .NET and the Windows App SDK runtimes.
+x64. Downloads include .NET and the Windows App SDK runtimes, and the Rust
+engine links the Visual C++ runtime statically.
 
 ## Run or install
 
-Open `Zflow.App.exe` in the extracted Windows archive. Keep the whole folder
-together. To add a Start menu shortcut and install into your account, run
-`./install-windows.ps1` from PowerShell in that folder. No administrator access
-is needed. Quit zflow from the notification-area menu before an update.
+Download and run the [Windows installer](https://github.com/demfabris/zflow/releases/latest/download/zflow-windows-x86_64-Setup.exe).
+It installs into `%LOCALAPPDATA%\Zflow.App` and adds a Start menu shortcut.
+No administrator access is needed. Configuration and paired computers remain
+in `%LOCALAPPDATA%\zflow`, outside the installation directory.
+
+The installed app checks for stable releases when it starts and every six
+hours. **About zflow → Updates** lets you check, download, and restart to
+install an update. Restarting pauses input sharing; the app asks first.
+**Settings → App updates** controls automatic checks. A failed check appears
+in the Updates card, and you can retry there.
+
+For a PowerShell installation, download and run the
+[installation script](https://github.com/demfabris/zflow/releases/latest/download/install-windows.ps1):
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://github.com/demfabris/zflow/releases/latest/download/install-windows.ps1 -OutFile "$env:TEMP\zflow-install.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\zflow-install.ps1"
+```
+
+It downloads the latest stable installer, checks its SHA-256 against that
+release, and installs it. Add `-NoLaunch` to leave the app closed. No checkout,
+SDK, or compiler is needed. The script waits for the previous app and engine
+to close. If an old copy runs as administrator, quit it locally
+before installing. The new app preserves your startup setting and uses the
+new launcher's stable path. You can remove the old
+`%LOCALAPPDATA%\Programs\zflow` folder after confirming the new app works.
+
+The ZIP remains available for portable use. Open `Zflow.App.exe` and keep the
+whole extracted folder together. Portable and development copies show a link
+to the installer; they do not install updates in place.
 
 Windows may ask to allow `zflow.exe` through its firewall. Allow it on the
 networks you use for sharing. Input and introductions use UDP port 43119;
@@ -18,7 +45,7 @@ local discovery uses mDNS. Tailscale names and addresses work through
 
 Version 0.5.0 adds individual monitor discovery and uses `zflow/6` for input
 and `zflow-hello/5` for introductions. **Update the Mac and Linux computers
-to the same source version, including the GNOME extension.** Older input
+to the same release, including the GNOME extension.** Older input
 protocols cannot connect; pairing keys are preserved.
 
 1. Open zflow on each computer.
@@ -65,9 +92,28 @@ Windows SDK, and the .NET 10 SDK. Then, from the repository root:
 ./scripts/build-windows.ps1 -Launch
 ```
 
-The result is `windows/dist/Zflow.App.exe`. `scripts/package-windows.ps1`
-builds a portable archive and SHA-256 sidecar under `target/windows-release`.
-`scripts/install-windows.ps1` installs an already-built app for the current user.
+The result is `windows/dist/Zflow.App.exe`. The build targets
+`x86_64-pc-windows-msvc`, uses the static CRT for the Rust engine, and checks
+the published engine's architecture and runtime imports with Visual Studio's
+`dumpbin`. `scripts/package-windows.ps1`
+builds the installer, update feed and full update package, plus a portable
+archive and SHA-256 sidecar under `target/windows-release`. The package and
+app versions come from `Cargo.toml`. Velopack and its packaging tool are pinned
+to `1.2.161`.
+
+To install a local release build, run
+`./scripts/install-windows.ps1 -SourceDirectory target/windows-release`.
+
+Publish `zflow-windows-x86_64-Setup.exe`, `releases.win-x64.json`, and the
+`.nupkg` referenced by that feed together in each stable GitHub release.
+The Windows updater ignores draft releases and prereleases. The release
+workflow also publishes the portable ZIP and `install-windows.ps1` and includes
+their checksums in `SHA256SUMS`.
+
+Windows artifacts are unsigned unless `scripts/package-windows.ps1
+-SignParameters '…'` supplies trusted `signtool` parameters. Velopack signs
+the application, updater and installer during packaging. Windows may show
+publisher or SmartScreen prompts for unsigned downloads.
 
 The build also detects a .NET SDK at `%LOCALAPPDATA%\zflow-dev\dotnet`.
 No SDK or compiler is needed to run a packaged app.
@@ -119,7 +165,16 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ./scripts/build-windows.ps1
+dotnet run --project windows/Zflow.UpdateTests
+pwsh -NoProfile -File windows/Zflow.UpdateTests/Install.Tests.ps1
+pwsh -NoProfile -File windows/Zflow.UpdateTests/Build.Tests.ps1
 ```
+
+The updater checks also run on Linux with the .NET 10 SDK. They cover failed
+downloads, concurrent checks, portable/development behavior, pending updates,
+and engine shutdown before installation. Installation, WinUI controls,
+elevation, file replacement and restart need native Windows qualification.
+Test an update between two packaged versions before publishing it.
 
 With sharing paused, `cargo test --lib native_return_guard_stops_injected_motion_at_an_internal_edge -- --ignored --nocapture`
 checks the real Windows hook at the current display scaling. It briefly moves

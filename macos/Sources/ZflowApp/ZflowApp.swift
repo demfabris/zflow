@@ -20,6 +20,10 @@ struct ZflowApp: App {
     .restorationBehavior(.disabled)
     .defaultLaunchBehavior(.suppressed)
     .commands {
+      CommandGroup(after: .appInfo) {
+        Button("Check for Updates…") { model.updates.check() }
+          .disabled(!model.updates.canCheck)
+      }
       // Settings is a page of the window, not a window of its own.
       CommandGroup(replacing: .appSettings) {
         Button("Settings…") { model.show(.settings) }.keyboardShortcut(",")
@@ -64,8 +68,12 @@ private struct MenuIcon: View {
   var delegate: AppDelegate
   @Environment(\.openWindow) private var openWindow
   var body: some View {
-    Image(systemName: model.healthy ? "computermouse" : "computermouse.fill")
-      .accessibilityLabel("zflow, \(model.title)")
+    Image(
+      systemName: model.updates.availableVersion != nil
+        ? "arrow.down.circle" : (model.healthy ? "computermouse" : "computermouse.fill")
+    )
+      .accessibilityLabel(
+        model.updates.availableVersion != nil ? "zflow, update available" : "zflow, \(model.title)")
       .task {
         delegate.model = model
         model.openWindow = openWindow

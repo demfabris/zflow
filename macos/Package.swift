@@ -14,14 +14,19 @@ let package = Package(
     .executable(name: "zflow-app", targets: ["ZflowApp"]),
     .executable(name: "zflow-awdl-daemon", targets: ["AWDLDaemon"]),
   ],
+  dependencies: [
+    .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0")
+  ],
   targets: [
     .testTarget(name: "ZflowAppTests", dependencies: ["ZflowApp"]),
     .target(name: "ZflowCore", publicHeadersPath: "include"),
     .target(name: "AWDLGuardian", publicHeadersPath: "include"),
     .executableTarget(
-      name: "ZflowApp", dependencies: ["ZflowCore"],
+      name: "ZflowApp",
+      dependencies: ["ZflowCore", .product(name: "Sparkle", package: "Sparkle")],
       linkerSettings: [
         .unsafeFlags(["-L", rustLibrary, "-lzflow"]),
+        .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
         .linkedFramework("AppKit"), .linkedFramework("ApplicationServices"),
         .linkedFramework("Carbon"), .linkedFramework("CoreFoundation"),
         .linkedFramework("ImageIO"), .linkedFramework("IOKit"), .linkedFramework("Security"),

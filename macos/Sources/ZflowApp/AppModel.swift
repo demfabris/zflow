@@ -30,6 +30,7 @@ final class AppModel {
   var pasteAccess = NSPasteboard.general.accessBehavior
   var busy = false
   let services = Services()
+  let updates = Updates()
   let configPath: String
   let showSettingsAtLaunch: Bool
   /// Set by the menu bar icon, which lives as long as the app.

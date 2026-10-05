@@ -15,6 +15,9 @@ pub fn run(install: bool) -> Result<()> {
                 .unwrap_or_else(|_| "warn,zflow=info".into()),
         )
         .try_init();
+    if let Err(error) = super::desktop::refresh_extension() {
+        tracing::warn!(%error, "could not refresh the bundled GNOME extension");
+    }
     let updated = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
         let state = Arc::new(Mutex::new(super::gnome::State::default()));
         let connection = super::gnome::connect(state.clone()).await?;

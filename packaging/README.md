@@ -18,6 +18,7 @@ installing, so no process running as the user can swap files mid-install.
 | Linux x86-64 | Ubuntu 24.04 | `zflow-vVERSION-x86_64-unknown-linux-gnu.tar.gz`, `zflow_VERSION_amd64.deb` |
 | Linux ARM64 | Ubuntu 24.04 ARM | `zflow-vVERSION-aarch64-unknown-linux-gnu.tar.gz`, `zflow_VERSION_arm64.deb` |
 | macOS Apple Silicon and Intel | macOS 26 | `zflow-vVERSION-macos.dmg`, `zflow-vVERSION-universal-apple-darwin.tar.gz` |
+| Windows x64 | Windows 2025 | `zflow-windows-x86_64-Setup.exe`, `Zflow.App-VERSION-win-x64-full.nupkg`, `releases.win-x64.json`, portable ZIP |
 
 Linux uses Ubuntu 24.04 to keep the glibc floor at 2.39. The Mac job builds the
 Rust library for both CPUs, merges the two with `lipo`, and builds the Swift
@@ -30,17 +31,43 @@ tagged commit, not again here. After all builds pass, the publish job combines
 the artifacts, computes `SHA256SUMS`, uploads a draft release, and publishes
 it. It refuses to replace a published release, and replaces a draft that an
 earlier failed run left behind.
-The release also contains `install.sh`. Checksums detect corrupt or mismatched
-downloads; they rely on the same GitHub/HTTPS trust as the artifacts.
+The release also contains `install.sh`, `install-windows.ps1`, and Sparkle's
+`appcast.xml`. `SHA256SUMS` covers all installation and updater artifacts.
+Checksums detect corrupt or mismatched downloads; they rely on the same
+GitHub/HTTPS trust as the artifacts.
+
+Installers and invitations use
+`https://github.com/demfabris/zflow/releases/latest/download/install.sh`, so
+they run published installation code. The installer resolves one concrete
+tag and fetches both the archive and its checksums from that tag.
+
+To publish a stable release, update Cargo.toml/Cargo.lock to the intended version,
+list it with its protocols in `VERSIONS` in `src/transport/tls.rs` when needed,
+update `packaging/RELEASE_NOTES.md`, and commit on `main`:
+
+```sh
+just release check
+just release publish
+```
+
+`check` verifies the clean checkout, repository, update-signing configuration,
+version, remote branch ancestry and tag availability without pushing or tagging.
+`publish` pushes the committed `main`, waits for CI on that exact commit, creates
+its annotated `vVERSION` tag, pushes it, and waits for the release workflow.
+`just release publish --no-wait` still waits for CI, then returns after pushing
+the tag. A failed CI run creates no tag. If packaging fails after the tag is
+pushed, fix the workflow failure and rerun that GitHub Actions run; the command
+refuses to move an existing tag. Changed source needs a new version and commit.
 
 To build without publishing, dispatch the **Release** workflow with `publish`
-left off. To publish, update Cargo.toml/Cargo.lock to the intended version,
-list it with its protocols in `VERSIONS` in `src/transport/tls.rs`,
-commit and push, then either push its matching `vVERSION` tag or dispatch from
-`main` with `publish=true`. A dispatch from another branch builds but never
-publishes. Manual publication creates the tag at the workflow's commit.
+left off. Manual publication from `main` with `publish=true` remains available,
+and requires successful CI on the workflow's commit. A dispatch from another
+branch builds but never publishes. Manual publication creates the tag at the
+workflow's commit. Release runs are serialized so publication cannot overlap.
 Prerelease version suffixes produce GitHub prereleases, which users select
 with `--version`; the default `latest` selects a normal published release.
+The normal release command accepts stable versions only. Stable publication
+explicitly marks the release as latest; prereleases never replace it.
 
 The release workflow signs the universal app with Developer ID, submits it to
 Apple, and staples the accepted notarization ticket. It then packs the stapled
@@ -63,6 +90,45 @@ Configure these GitHub Actions repository secrets before running the workflow:
 | `APPLE_ID` | Apple Account email address |
 | `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password generated for that account |
 | `APPLE_TEAM_ID` | Developer team ID matching the certificate |
+| `SPARKLE_PRIVATE_ED_KEY` | Sparkle EdDSA private key, installed by `just release setup` |
+
+Configure the Sparkle key once, on a trusted Mac with `gh` logged into an account
+that can manage this repository's secrets and variables:
+
+```sh
+just release setup
+```
+
+The helper resolves the pinned Sparkle package, creates or reuses the
+`io.zflow.zflow` key in your login Keychain, stores its private key in the GitHub
+secret, and stores the public key in the `SPARKLE_PUBLIC_ED_KEY` repository
+variable. Its temporary export is private and removed on exit. Back up the
+Keychain key securely. When configuring another Mac, import that same key;
+the helper refuses to replace a published signing identity with a different
+key. Key rotation requires Sparkle's documented migration process.
+
+Release builds use `--updates` and require that public key. Local builds without
+it still run, with updating disabled. Sparkle verifies the EdDSA signature before
+extracting an update. After the Mac disk image is signed, notarized and stapled,
+`scripts/macos-update-feed.sh` signs its final bytes and produces `appcast.xml`
+with a version-specific download URL. Apps read the feed at
+`https://github.com/demfabris/zflow/releases/latest/download/appcast.xml`.
+
+Windows uses pinned Velopack tooling for its per-user installer and update
+packages. Its package ID is `Zflow.App`; `%LOCALAPPDATA%\zflow` remains the
+configuration directory. Setup, the JSON feed and its full package must ship
+together. Signing Windows binaries requires a separate trusted certificate;
+see [Windows packaging](../windows/README.md#build).
+
+Before publishing the first updater release, validate an update between two
+packaged versions on macOS and Windows, including shutdown with held input,
+cancelled installation and relaunch. Use downloaded packages on computers
+without the repository or build tools, following the
+[installation and update gate](../TESTPLAN.md#installation-and-updates-without-a-checkout).
+Script fixtures and updater unit tests do
+not execute native app replacement. On Mac, an already-running AWDL helper may
+keep the previous binary until launchd restarts it; helper changes also need
+that lifecycle check.
 
 The Mac job builds and tests the app with an ad-hoc signature first, so no
 build script runs while the certificate is available. It then imports the
@@ -228,7 +294,7 @@ Use `--purge` only when you also want to delete those files and the account.
 `scripts/build-macos-app.sh [--debug] [--universal] [--dmg] [--sign IDENTITY]`
 builds the Rust static library and Swift package, then assembles
 `target/{debug,release}/zflow.app`. It builds for the current CPU unless
-`--universal` asks for Apple silicon and Intel in one app. `--dmg`, or `just dmg`,
+`--universal` asks for Apple silicon and Intel in one app. `--dmg`, or `just package dmg`,
 also packs `zflow.dmg` beside the app, signed with the app's identity unless that
 is ad hoc, and never notarized.
 The app requires macOS 26 and Swift 6.2 or newer. It uses SwiftUI Settings and
@@ -320,7 +386,7 @@ account.
 
 ## GNOME extension on extensions.gnome.org
 
-`scripts/pack-extension.sh` (or `just pack-extension`) runs
+`scripts/pack-extension.sh` (or `just package extension`) runs
 `gnome-extensions pack` and writes
 `target/dist/zflow@demfabris.shell-extension.zip`. It needs GNOME Shell's
 `gnome-extensions` tool. The zip holds exactly the files that

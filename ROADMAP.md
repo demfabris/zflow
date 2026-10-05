@@ -9,8 +9,8 @@ Tags: **exists**, **partial**, **missing**. "Guess" marks anything not proven by
 ## How to use this plan
 
 - Phases ship one at a time, in the order in [Order](#order). Each phase lists its acceptance checks.
-- **(Mac)** marks steps that need macOS to build or test: Swift, `src/macos/`, `just test-native`, the C harnesses. On the Ubuntu box, those files can be edited but not built. Leave them for the Mac, or note what is left.
-- Run the checks from README's Develop section: `just check` and `just test-gtk` on Linux; `just test-native` and the C harnesses on the Mac.
+- **(Mac)** marks steps that need macOS to build or test: Swift, `src/macos/`, `just test native`, the C harnesses. On the Ubuntu box, those files can be edited but not built. Leave them for the Mac, or note what is left.
+- Run the checks from README's Develop section: `just check` and `just test gtk` on Linux; `just test native` and the C harnesses on the Mac.
 - When a phase changes a rule written in SPEC.md, update SPEC.md in the same commit. Known ones:
   - `SPEC.md:161`: the capture set is watched while idle.
   - `SPEC.md:166`: grabs are all-or-none.

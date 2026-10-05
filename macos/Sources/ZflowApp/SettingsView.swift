@@ -66,6 +66,30 @@ struct SettingsView: View {
       } footer: {
         Text("Take back control from any computer with ⌃⌘⌫.")
       }
+      Section("Updates") {
+        if let reason = model.updates.unavailableReason {
+          Text(reason).foregroundStyle(.secondary)
+        } else {
+          Toggle(
+            "Check for updates automatically",
+            isOn: Binding(
+              get: { model.updates.automaticallyChecks },
+              set: { model.updates.setAutomaticChecks($0) })
+          )
+          Toggle(
+            "Download and install updates automatically",
+            isOn: Binding(
+              get: { model.updates.automaticallyDownloads },
+              set: { model.updates.setAutomaticDownloads($0) })
+          )
+          .disabled(!model.updates.automaticallyChecks)
+          Button("Check for Updates…") { model.updates.check() }
+            .disabled(!model.updates.canCheck)
+          if let version = model.updates.availableVersion {
+            Text("zflow \(version) is available.").foregroundStyle(.secondary)
+          }
+        }
+      }
     }
     .formStyle(.grouped)
     .navigationTitle("Settings")

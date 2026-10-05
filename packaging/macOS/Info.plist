@@ -20,6 +20,10 @@
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/demfabris/zflow/releases/latest/download/appcast.xml</string>
+    <key>SUVerifyUpdateBeforeExtraction</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>

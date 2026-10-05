@@ -11,6 +11,7 @@ sign_identity=-
 explicit_sign=false
 universal=false
 dmg=false
+updates=false
 
 die() {
     printf 'build-macos-app: %s\n' "$*" >&2
@@ -22,6 +23,7 @@ while [[ $# -gt 0 ]]; do
         --debug) profile=debug ;;
         --universal) universal=true ;;
         --dmg) dmg=true ;;
+        --updates) updates=true ;;
         --sign)
             [[ $# -ge 2 && -n "$2" ]] || die '--sign requires a signing identity'
             sign_identity="$2"
@@ -29,10 +31,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            printf 'usage: ./scripts/build-macos-app.sh [--debug] [--universal] [--dmg] [--sign IDENTITY]\n'
+            printf 'usage: ./scripts/build-macos-app.sh [--debug] [--universal] [--dmg] [--updates] [--sign IDENTITY]\n'
             printf 'Build target/release/zflow.app (target/debug with --debug).\n'
             printf 'Sign with the first Apple Development identity, else ad-hoc (--sign - forces ad-hoc).\n'
             printf '%s\n' '--universal builds for Apple silicon and Intel; --dmg also packs zflow.dmg beside the app.'
+            printf '%s\n' '--updates requires SPARKLE_PUBLIC_ED_KEY and enables signed updates in release builds.'
             exit 0
             ;;
         *) die "unknown argument: $1" ;;
@@ -41,6 +44,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$(uname -s)" == Darwin ]] || die 'macOS is required'
+if [[ "$updates" == true ]]; then
+    [[ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]] || die '--updates requires SPARKLE_PUBLIC_ED_KEY'
+fi
+if [[ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
+    python3 - <<'PY'
+import base64
+import os
+import sys
+
+try:
+    valid = len(base64.b64decode(os.environ["SPARKLE_PUBLIC_ED_KEY"], validate=True)) == 32
+except ValueError:
+    valid = False
+if not valid:
+    sys.exit("build-macos-app: SPARKLE_PUBLIC_ED_KEY must be a base64-encoded 32-byte public key")
+PY
+fi
 command -v cargo >/dev/null 2>&1 || die 'cargo is required'
 xcrun --find actool >/dev/null 2>&1 || die 'Xcode 26 or later with actool is required to build the app icon'
 if [[ "$explicit_sign" == true ]]; then
@@ -92,11 +112,18 @@ readonly bundle="$output_dir/zflow.app"
 temporary_dir="$(mktemp -d "$output_dir/.zflow-app.XXXXXXXX")"
 trap 'rm -rf -- "$temporary_dir"' EXIT
 app="$temporary_dir/zflow.app"
-install -d -m 0755 "$app/Contents/MacOS" "$app/Contents/Library/LaunchDaemons" "$app/Contents/Resources"
+install -d -m 0755 "$app/Contents/MacOS" "$app/Contents/Library/LaunchDaemons" \
+    "$app/Contents/Resources" "$app/Contents/Frameworks"
 install -m 0755 "$binary" "$app/Contents/MacOS/zflow-app"
 install -m 0755 "$swift_output/zflow-awdl-daemon" "$app/Contents/MacOS/zflow-awdl-daemon"
+# SwiftPM links binary dependencies, but this custom app bundle must embed them.
+sparkle="$REPO_ROOT/macos/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+[[ -d "$sparkle" ]] || die "missing Sparkle framework: $sparkle"
+ditto "$sparkle" "$app/Contents/Frameworks/Sparkle.framework"
+install -m 0644 "$REPO_ROOT/macos/.build/artifacts/sparkle/Sparkle/LICENSE" \
+    "$app/Contents/Resources/Sparkle-LICENSE"
 if [[ "$universal" == true ]]; then
-    for executable in "$app"/Contents/MacOS/*; do
+    for executable in "$app"/Contents/MacOS/* "$app/Contents/Frameworks/Sparkle.framework/Sparkle"; do
         for arch in arm64 x86_64; do
             lipo "$executable" -verify_arch "$arch" || die "${executable##*/} has no $arch code"
         done
@@ -115,6 +142,9 @@ xcrun actool "$REPO_ROOT/assets/zflow.icon" \
 version="$(cargo metadata --no-deps --format-version 1 --manifest-path "$REPO_ROOT/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"
+if [[ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$app/Contents/Info.plist"
+fi
 plutil -lint "$app/Contents/Info.plist"
 if command -v codesign >/dev/null 2>&1; then
     sign_args=("$sign_identity" "$app")

@@ -15,6 +15,8 @@ public sealed partial class MainWindow : Window
     private readonly EngineClient engine = new();
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly NativeWindow native;
+    private readonly AppUpdates updates = new();
+    private readonly DispatcherTimer updateTimer = new() { Interval = TimeSpan.FromHours(6) };
     private JsonObject? state;
     private bool refreshing, applying, dragging, quitting;
     private string previousView = "";
@@ -33,6 +35,7 @@ public sealed partial class MainWindow : Window
         native.QuitRequested += async () => await QuitAsync();
         AppWindow.Closing += (_, args) => { if (!quitting) { args.Cancel = true; AppWindow.Hide(); } };
         timer.Tick += async (_, _) => await RefreshAsync();
+        updateTimer.Tick += async (_, _) => { if (AutoUpdatesSwitch.IsOn) await CheckUpdatesAsync(); };
         Root.Loaded += async (_, _) =>
         {
             // AppWindow uses physical pixels; size the settings UI consistently at any DPI.
@@ -42,8 +45,12 @@ public sealed partial class MainWindow : Window
             AppWindow.MoveAndResize(new Windows.Graphics.RectInt32(area.X + (area.Width - width) / 2, area.Y + (area.Height - height) / 2, width, height));
             applying = true;
             using (var run = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run")) StartupSwitch.IsOn = run?.GetValue("zflow") is not null;
+            using (var preferences = Registry.CurrentUser.OpenSubKey(@"Software\zflow")) AutoUpdatesSwitch.IsOn = preferences?.GetValue("CheckForUpdates") is not int enabled || enabled != 0;
+            AutoUpdatesSwitch.IsEnabled = updates.IsEnabled;
             applying = false;
             await StartAsync(); timer.Start();
+            UpdateUpdateControls();
+            if (updates.IsEnabled) { updateTimer.Start(); if (AutoUpdatesSwitch.IsOn) _ = CheckUpdatesAsync(); }
             if (Environment.GetCommandLineArgs().Contains("--background")) AppWindow.Hide();
             var args = Environment.GetCommandLineArgs();
             int capture = Array.IndexOf(args, "--capture-preview");
@@ -245,7 +252,7 @@ public sealed partial class MainWindow : Window
     private void Startup_Toggled(object sender, RoutedEventArgs e)
     {
         if (applying) return;
-        try { using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"); if (StartupSwitch.IsOn) key.SetValue("zflow", $"\"{Environment.ProcessPath}\" --background"); else key.DeleteValue("zflow", false); }
+        try { using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"); if (StartupSwitch.IsOn) key.SetValue("zflow", $"\"{Installation.StartupExecutable}\" --background"); else key.DeleteValue("zflow", false); }
         catch (Exception error) { ShowError(error); }
     }
     private void OpenConfig_Click(object sender, RoutedEventArgs e) { try { var start = new ProcessStartInfo("notepad.exe") { UseShellExecute = false }; start.ArgumentList.Add(EngineClient.ConfigPath); Process.Start(start); } catch (Exception error) { ShowError(error); } }
@@ -278,7 +285,75 @@ public sealed partial class MainWindow : Window
         finally { applying = false; }
     }
     private async void Quit_Click(object sender, RoutedEventArgs e) => await QuitAsync();
-    private async Task QuitAsync(bool engineStopped = false) { if (quitting) return; quitting = true; timer.Stop(); if (!engineStopped) { try { await engine.StopAsync(); } catch { } } native.Dispose(); Close(); Application.Current.Exit(); }
+    private async Task QuitAsync(bool engineStopped = false) { if (quitting) return; quitting = true; timer.Stop(); updateTimer.Stop(); if (!engineStopped) { try { await engine.StopAsync(); } catch { } } native.Dispose(); Close(); Application.Current.Exit(); }
+    private void AutoUpdates_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (applying || !updates.IsEnabled) return;
+        try { using var preferences = Registry.CurrentUser.CreateSubKey(@"Software\zflow"); preferences.SetValue("CheckForUpdates", AutoUpdatesSwitch.IsOn ? 1 : 0); if (AutoUpdatesSwitch.IsOn) _ = CheckUpdatesAsync(); }
+        catch (Exception error) { ShowError(error); }
+    }
+    private void UpdateUpdateControls(string? message = null)
+    {
+        CheckUpdatesButton.IsEnabled = updates.IsEnabled && !updates.IsBusy;
+        InstallUpdateButton.IsEnabled = !updates.IsBusy;
+        InstallUpdateButton.Visibility = updates.CanDownload || updates.CanRestart ? Visibility.Visible : Visibility.Collapsed;
+        InstallUpdateButton.Content = updates.CanRestart ? "Restart and update" : "Download update";
+        AboutNav.InfoBadge = updates.CanDownload || updates.CanRestart ? new InfoBadge() : null;
+        GetInstallerLink.Visibility = updates.IsEnabled ? Visibility.Collapsed : Visibility.Visible;
+        UpdateStatus.Text = message ?? (!updates.IsEnabled ? "Install zflow with the Windows installer to receive updates. Portable and development copies update manually."
+            : updates.CanRestart ? $"zflow {updates.Version} is ready. Restart when you are ready to pause sharing."
+            : updates.CanDownload ? $"zflow {updates.Version} is available."
+            : "You can check for the latest stable release here.");
+    }
+    private async Task CheckUpdatesAsync()
+    {
+        if (!updates.IsEnabled || updates.IsBusy || quitting) return;
+        try
+        {
+            var check = updates.CheckAsync();
+            UpdateUpdateControls("Checking for updates…");
+            await check;
+            UpdateUpdateControls(updates.Version is null ? "You have the latest stable release." : null);
+        }
+        catch (Exception error) { UpdateUpdateControls("Could not check for updates. " + error.Message); }
+    }
+    private async void CheckUpdates_Click(object sender, RoutedEventArgs e) => await CheckUpdatesAsync();
+    private async void InstallUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        if (updates.IsBusy || quitting || applying) return;
+        if (updates.CanDownload)
+        {
+            try
+            {
+                UpdateProgress.Value = 0; UpdateProgress.Visibility = Visibility.Visible;
+                var download = updates.DownloadAsync(progress => DispatcherQueue.TryEnqueue(() => UpdateProgress.Value = progress));
+                UpdateUpdateControls("Downloading update…");
+                await download;
+                UpdateUpdateControls();
+            }
+            catch (Exception error) { UpdateUpdateControls("Could not download the update. " + error.Message); }
+            finally { UpdateProgress.Visibility = Visibility.Collapsed; }
+            return;
+        }
+        if (!updates.CanRestart) return;
+        var dialog = new ContentDialog { XamlRoot = Root.XamlRoot, Title = "Restart and update zflow?", Content = "Input sharing will stop while zflow updates and restarts. Your settings and paired computers will stay.", PrimaryButtonText = "Restart and update", CloseButtonText = "Later", DefaultButton = ContentDialogButton.Close };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary || quitting) return;
+        applying = true;
+        timer.Stop(); updateTimer.Stop();
+        try
+        {
+            await updates.PrepareRestartAsync(() => engine.StopAsync());
+            await QuitAsync(engineStopped: true);
+        }
+        catch (Exception error)
+        {
+            // If shutdown or updater launch fails, resume the existing input engine.
+            await StartAsync();
+            UpdateUpdateControls("Could not install the update. " + error.Message);
+            timer.Start(); updateTimer.Start();
+        }
+        finally { applying = false; }
+    }
     private async Task CapturePreviewAsync(string path)
     {
         try

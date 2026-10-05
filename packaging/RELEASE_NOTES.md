@@ -3,11 +3,19 @@ On a Mac, open `zflow-VERSION-macos.dmg` and drag zflow to Applications, or use 
 This is a prototype release; the live qualification checklist is in TESTPLAN.md.
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/demfabris/zflow/main/install.sh | bash
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/demfabris/zflow/releases/latest/download/install.sh | bash
 ```
 
 ## New in 0.5.0: individual monitors
 
+- Native update controls: signed Sparkle updates on macOS, package-aware GNOME
+  updates with system authorization, and a per-user Windows installer with
+  Velopack updates. Settings and paired computers survive updates. Install this
+  version once through the installer or disk image to receive future updates
+  from inside the app.
+- Install commands now fetch the installer from the latest published release.
+  Windows users can run `zflow-windows-x86_64-Setup.exe`; the ZIP stays available
+  for portable use.
 - Windows, macOS, and GNOME discover active logical monitors with persistent
   platform identities, display names, and physical dimensions where available.
 - Arrange each monitor independently. Handoffs and returns address the selected

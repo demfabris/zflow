@@ -41,6 +41,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Check for or install a published Linux release.
+    #[cfg(target_os = "linux")]
+    Update {
+        #[command(subcommand)]
+        command: UpdateCommand,
+    },
     /// Open native GNOME settings. Closing the window leaves sharing running.
     Settings,
     /// Run the GNOME session integration without a window.
@@ -97,6 +103,22 @@ enum Command {
         maximum_delay_ms: Option<u64>,
         #[arg(long)]
         percentile: Option<f64>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum UpdateCommand {
+    /// Check the latest stable release and print JSON. Does not install anything.
+    Check,
+    /// Install a newer stable release with administrator authorization.
+    Install {
+        /// Exact release tag returned by update check.
+        #[arg(long)]
+        version: String,
+        /// Require the desktop's graphical authentication agent.
+        #[arg(long)]
+        gui: bool,
     },
 }
 
@@ -172,6 +194,11 @@ const PRELOGIN_ORDERING: &str = include_str!("../packaging/systemd/zflowd-prelog
 pub fn run(cli: Cli) -> Result<()> {
     let path = cli.config;
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Command::Update { command } => match command {
+            UpdateCommand::Check => crate::app::updates::check(),
+            UpdateCommand::Install { version, gui } => crate::app::updates::install(&version, gui),
+        },
         Command::Settings => {
             #[cfg(target_os = "linux")]
             {

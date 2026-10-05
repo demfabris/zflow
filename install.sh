@@ -9,6 +9,8 @@ Usage: bash install.sh [options]
   --version VERSION     Install a release tag (default: latest)
   --headless            Linux: install the service without GNOME integration
   --no-launch           Do not open the app after installation
+  --update FROM_VERSION Linux: update this installed version without desktop setup
+  --gui                 Linux update: require graphical administrator approval
   --yes                 Accepted for older command lines; changes nothing
   -h, --help            Show this help
 
@@ -33,7 +35,10 @@ version_at_least() {
 }
 
 as_root() {
-    if [[ "$platform" == Linux && -n "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v pkexec >/dev/null 2>&1; then
+    if [[ "${gui:-false}" == true ]]; then
+        require pkexec
+        pkexec --disable-internal-agent "$@" </dev/null
+    elif [[ "$platform" == Linux && -n "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v pkexec >/dev/null 2>&1; then
         pkexec --disable-internal-agent "$@" </dev/null
     else
         require sudo
@@ -71,16 +76,16 @@ cleanup() {
 linux_dependencies() {
     if command -v apt-get >/dev/null 2>&1; then
         manager=apt-get
-        packages=(kmod udev passwd util-linux)
-        if [[ "$desktop" == true ]]; then packages+=(gjs gir1.2-gtk-4.0 gir1.2-adw-1); fi
+        packages=(kmod udev passwd util-linux curl)
+        if [[ "$desktop" == true ]]; then packages+=(gjs gir1.2-gtk-4.0 gir1.2-adw-1 pkexec); fi
     elif command -v dnf >/dev/null 2>&1; then
         manager=dnf
-        packages=(kmod systemd-udev shadow-utils util-linux)
-        if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita); fi
+        packages=(kmod systemd-udev shadow-utils util-linux curl)
+        if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita polkit); fi
     elif command -v pacman >/dev/null 2>&1; then
         manager=pacman
-        packages=(kmod systemd shadow util-linux)
-        if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita); fi
+        packages=(kmod systemd shadow util-linux curl)
+        if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita polkit); fi
     else
         die 'Automatic dependency installation supports apt, dnf, and pacman. Install the runtime dependencies and use the installation script inside the release archive.'
     fi
@@ -89,13 +94,24 @@ linux_dependencies() {
 # Every Linux system change, run as root in a shell of its own (see install_linux).
 # It works on a root-owned copy of the download and checks the checksum again, so
 # a process running as the user cannot swap files while the password prompt is open.
-# Arguments: DOWNLOAD SHA256, then apt options for a .deb, or the package manager
-# and runtime packages for an archive.
+# Arguments: DOWNLOAD SHA256 FROM_VERSION INSTALLED_CLI, then apt options for a
+# .deb, or the package manager and runtime packages for an archive.
 root_install() {
-    local source=$1 checksum=$2 asset=${1##*/} manager
-    shift 2
+    local source=$1 checksum=$2 previous=$3 installed_cli=$4 asset=${1##*/} manager
+    shift 4
+    update_lock=false
+    if [[ -n "$previous" ]]; then
+        # Serialize updates across login sessions. Recheck after a download or
+        # password prompt so an older request cannot replace a newer install.
+        umask 077
+        exec 9>/run/zflow-update.lock
+        flock --exclusive 9
+        update_lock=true
+        [[ "$("$installed_cli" --version)" == "zflow $previous" ]] \
+            || die 'zflow changed while this update was downloading. Check for updates again.'
+    fi
     root_stage=$(mktemp -d /tmp/zflow-install.XXXXXXXX)
-    trap 'rm -rf -- "$root_stage"' EXIT
+    trap 'rm -rf -- "$root_stage"; if [[ "$update_lock" == true ]]; then flock --unlock 9; fi' EXIT
     cp -- "$source" "$root_stage/$asset"
     [[ "$(sha256_of "$root_stage/$asset")" == "$checksum" ]] || die "Checksum mismatch for $asset; nothing was installed."
     if [[ "$asset" == *.deb ]]; then
@@ -126,13 +142,11 @@ check_linux() {
     require udevadm
     udevadm --help | grep 'verify' >/dev/null || die 'udevadm verify is required (systemd 254 or newer).'
     if [[ "$desktop" == true ]]; then
-        require gjs
-        require gnome-extensions
         local versions gtk_version adw_version
         # Missing libraries are installed with zflow; only reject ones that are too old.
         # These template expressions belong to JavaScript.
         # shellcheck disable=SC2016
-        if versions=$(gjs -c 'imports.gi.versions.Gtk="4.0"; imports.gi.versions.Adw="1"; const {Gtk,Adw}=imports.gi; print(`${Gtk.get_major_version()}.${Gtk.get_minor_version()} ${Adw.get_major_version()}.${Adw.get_minor_version()}`);' 2>/dev/null); then
+        if command -v gjs >/dev/null 2>&1 && versions=$(gjs -c 'imports.gi.versions.Gtk="4.0"; imports.gi.versions.Adw="1"; const {Gtk,Adw}=imports.gi; print(`${Gtk.get_major_version()}.${Gtk.get_minor_version()} ${Adw.get_major_version()}.${Adw.get_minor_version()}`);' 2>/dev/null); then
             IFS=' ' read -r gtk_version adw_version <<< "$versions"
             if ! version_at_least "$gtk_version" 4.12 || ! version_at_least "$adw_version" 1.5; then
                 die 'GNOME settings require GTK 4.12+ and libadwaita 1.5+. Upgrade the distribution or use --headless.'
@@ -227,19 +241,21 @@ describe_linux() {
 
 install_linux() {
     say 'Installing the service. An existing zflow connection will disconnect during its restart.'
-    local root_args=("$work_dir/$asset" "$checksum")
+    if [[ "$use_deb" == true ]]; then installed_cli=/usr/bin/zflow; else installed_cli=/usr/local/bin/zflow; fi
+    local root_args=("$work_dir/$asset" "$checksum" "${update_from:-}" "$installed_cli")
     if [[ "$use_deb" == true ]]; then
-        if [[ "$desktop" == false ]]; then root_args+=(--no-install-recommends); fi
-        installed_cli=/usr/bin/zflow
+        if [[ "$desktop" == true ]]; then root_args+=(--install-recommends); else root_args+=(--no-install-recommends); fi
     else
         linux_dependencies
         root_args+=("$manager" "${packages[@]}")
-        installed_cli=/usr/local/bin/zflow
     fi
     # One elevated shell makes every system change: one password prompt, and
     # cancelling it leaves nothing half installed.
     as_root bash -c "set -euo pipefail; $(declare -f die sha256_of root_install); root_install \"\$@\"" \
         zflow-install "${root_args[@]}"
+    # The running desktop agent detects its replaced executable and restarts.
+    # Keep the GTK caller alive so it can show the result and reopen settings.
+    if [[ "${update:-false}" == true ]]; then return; fi
     if [[ "$desktop" == false ]]; then
         say 'The Linux service is installed. Run zflow desktop-agent --install from a GNOME session to add the desktop app.'
         return
@@ -293,6 +309,9 @@ main() {
     version=latest
     launch=true
     desktop=false
+    update=false
+    update_from=''
+    gui=false
     work_dir=''
     mac_stage=''
     mac_destination=/Applications/zflow.app
@@ -302,6 +321,10 @@ main() {
             --yes) ;;
             --headless) headless=true ;;
             --no-launch) launch=false ;;
+            --update)
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die '--update requires the installed version'
+                update=true; update_from="$2"; shift ;;
+            --gui) gui=true ;;
             --version)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die '--version requires a release version'
                 version="$2"; shift ;;
@@ -314,12 +337,19 @@ main() {
     [[ "$(id -u)" != 0 ]] || die 'Run this installer as your normal user, without sudo. It requests administrator access when needed.'
     [[ -n "${HOME:-}" && "$HOME" == /* ]] || die 'HOME must be an absolute path.'
     [[ "$platform" == Linux || "$headless" == false ]] || die '--headless is only available on Linux.'
+    [[ "$platform" == Linux || "$update" == false && "$gui" == false ]] || die '--update and --gui are only available on Linux.'
+    if [[ "$gui" == true ]]; then
+        [[ "$update" == true ]] || die '--gui requires --update.'
+        [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || die 'Open updates from your desktop session.'
+        require pkexec
+    fi
     for command in curl tar awk mktemp; do require "$command"; done
     if ! command -v sha256sum >/dev/null 2>&1; then require shasum; fi
     if [[ "$version" == latest ]]; then version=$(latest_version); fi
     case "$version" in v*) ;; *) version="v$version";; esac
     [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die 'Invalid release version.'
     if [[ "$platform" == Linux ]]; then
+        if [[ "$update" == true ]]; then require flock; fi
         require systemctl
         [[ -n "$(systemctl show --property=Version --value 2>/dev/null)" ]] || die 'Linux installation requires a running systemd system manager.'
         if [[ "$headless" == false && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then

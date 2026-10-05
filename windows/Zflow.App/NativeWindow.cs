@@ -50,6 +50,7 @@ internal sealed class NativeWindow : IDisposable
     }
     public static void ShowExisting() { nint h = FindWindow(null, "zflow"); if (h != 0) { ShowWindow(h, 9); SetForegroundWindow(h); } }
     public static void QuitExisting() { nint h = FindWindow(null, "zflow"); if (h != 0) PostMessage(h, 0x8002, 0, 0); }
+    public static void ShowStartupError(string message) => MessageBox(0, message, "zflow", 0x10);
     private delegate nint SubclassProc(nint hwnd, uint message, nuint w, nint l, nuint id, nuint data);
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] private struct NotifyIconData { public uint cbSize; public nint hWnd; public uint uID, uFlags, uCallbackMessage; public nint hIcon; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string szTip; public uint dwState, dwStateMask; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string szInfo; public uint uTimeout; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string szInfoTitle; public uint dwInfoFlags; public Guid guidItem; public nint hBalloonIcon; }
     [StructLayout(LayoutKind.Sequential)] private struct Point { public int X, Y; }
@@ -70,4 +71,5 @@ internal sealed class NativeWindow : IDisposable
     [DllImport("user32")] private static extern uint TrackPopupMenu(nint menu, uint flags, int x, int y, int reserved, nint owner, nint rectangle);
     [DllImport("user32")] private static extern bool DestroyMenu(nint menu);
     [DllImport("user32")] private static extern bool GetCursorPos(out Point point);
+    [DllImport("user32", CharSet = CharSet.Unicode, EntryPoint = "MessageBoxW")] private static extern int MessageBox(nint owner, string text, string caption, uint type);
 }

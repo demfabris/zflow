@@ -1,4 +1,4 @@
-// Run on a private bus: dbus-run-session -- gjs -m tests/gnome_settings_test.js
+// Run on a private bus: dbus-run-session --config-file=tests/gtk-session.conf -- gjs -m tests/gnome_settings_test.js
 import Adw from 'gi://Adw?version=1';
 import Gdk from 'gi://Gdk?version=4.0';
 import Gio from 'gi://Gio';

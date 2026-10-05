@@ -1,10 +1,12 @@
 """Test release selection and verification without installing on the host."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -22,6 +24,7 @@ command() {
     if [[ "$1" == -v ]]; then
         case "$2" in
             apt-get|dnf|pacman) [[ "$2" == "$MANAGER" ]]; return ;;
+            gjs|gnome-extensions) [[ -z "${GNOME_TOOLS_MISSING:-}" ]]; return ;;
             # Debian keeps these in /usr/sbin, outside a normal user's PATH.
             getent|groupadd|useradd|runuser|modprobe|systemd-analyze) return 1 ;;
         esac
@@ -30,7 +33,13 @@ command() {
 }
 # The single elevated step really runs as bash -c CODE NAME ARGS, without root.
 as_root() {
-    if [[ "$1 $2" == "bash -c" ]]; then record "root bash -c ${*:4}"; "$@"; else record "root $*"; fi
+    if [[ "$1 $2" == "bash -c" ]]; then
+        record "root bash -c ${*:4}"
+        # Keep the transaction lock and version probe inside the fixture too.
+        local code=${3//\/run\/zflow-update.lock/$TEST_ROOT\/root\/update.lock}
+        code="$(declare -f /usr/local/bin/zflow /usr/bin/zflow)"$'\n'"$code"
+        bash -c "$code" "${@:4}"
+    else record "root $*"; fi
 }
 fetch() { record "fetch $1"; cp "$RELEASE/${1##*/}" "$2"; }
 curl() { record latest; echo "${LATEST_URL:-https://github.com/demfabris/zflow/releases/tag/v0.1.0}"; }
@@ -42,15 +51,20 @@ systemctl() { echo "${SYSTEMD_VERSION-259}"; }
 udevadm() { echo verify; }
 gjs() { [[ -z "${GTK_MISSING:-}" ]] || return 1; echo "${GTK_VERSIONS:-4.12 1.5}"; }
 gnome-extensions() { record "extension $*"; }
+pkexec() { record "unexpected pkexec"; return 99; }
 for tool in cargo rustup rustc swift xcrun xcode-select cc make; do
     eval "$tool() { record forbidden-toolchain; return 99; }"
 done
 function /usr/local/bin/zflow() {
+    if [[ "$1" == --version ]]; then echo "zflow ${INSTALLED_VERSION:-0.0.9}"; return; fi
     record "user installed-zflow $*"
     echo "${DESKTOP_OUTPUT:-Desktop installed}"
     return "${DESKTOP_STATUS:-0}"
 }
-function /usr/bin/zflow() { record "user deb-zflow $*"; }
+function /usr/bin/zflow() {
+    if [[ "$1" == --version ]]; then echo "zflow ${INSTALLED_VERSION:-0.0.9}"; return; fi
+    record "user deb-zflow $*"
+}
 sw_vers() { echo "${MACOS_VERSION:-26.0}"; }
 sysctl() { echo "${ROSETTA:-0}"; }
 codesign() { record "codesign $*"; return "${SIGNATURE_STATUS:-0}"; }
@@ -94,7 +108,7 @@ class InstallerTest(unittest.TestCase):
         # Commands the elevated shell runs; it cannot see this shell's functions.
         tools = self.root / "bin"
         tools.mkdir()
-        for name in ("apt-get", "dnf", "pacman"):
+        for name in ("apt-get", "dnf", "pacman", "flock"):
             (tools / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "$LOG"\n')
         # The root step stages under /tmp; keep that inside the test directory.
         (tools / "mktemp").write_text(
@@ -140,7 +154,7 @@ class InstallerTest(unittest.TestCase):
 
     def assert_temporary_files_removed(self):
         self.assertEqual(list((self.root / "tmp").iterdir()), [])
-        self.assertEqual(list((self.root / "root").iterdir()), [])
+        self.assertEqual([path for path in (self.root / "root").iterdir() if path.name != "update.lock"], [])
 
     def test_linux_archive_install_never_builds(self):
         self.run_shell("main --yes --no-launch")
@@ -172,7 +186,7 @@ class InstallerTest(unittest.TestCase):
     def test_debian_uses_package_manager_then_sets_up_the_desktop_user(self):
         self.run_shell("main --no-launch", env={"LEGACY": "false"})
         self.assertEqual(len(self.elevations()), 1)
-        self.assertIn(f"apt-get install -y {self.root}/root/zflow-install.", self.calls())
+        self.assertIn(f"apt-get install -y --install-recommends {self.root}/root/zflow-install.", self.calls())
         self.assertIn("/zflow_0.1.0_amd64.deb", self.calls())
         # The package ships the launcher, autostart and D-Bus files; the user step
         # adds the extension and starts the agent in this session.
@@ -180,6 +194,51 @@ class InstallerTest(unittest.TestCase):
         self.assertNotIn("extension ", self.calls())
         self.assertNotIn("setup ", self.calls())
         self.assert_temporary_files_removed()
+
+    def test_gui_update_preserves_install_type_and_skips_desktop_setup(self):
+        for legacy, asset in (("true", "unknown-linux-gnu.tar.gz"), ("false", "amd64.deb")):
+            with self.subTest(legacy=legacy):
+                self.log.write_text("")
+                self.run_shell("main --update 0.0.9 --gui --no-launch --version v0.1.0", env={"LEGACY": legacy})
+                self.assertIn(asset, self.calls())
+                self.assertEqual(len(self.elevations()), 1)
+                self.assertNotIn("desktop-agent", self.calls())
+                self.assertNotIn("settings", self.calls())
+                self.assertNotIn("latest", self.calls())
+                self.assert_temporary_files_removed()
+
+    def test_gui_authorization_cancellation_keeps_the_installation(self):
+        self.run_shell("main --update 0.0.9 --gui --no-launch --version v0.1.0",
+                       before='as_root() { record "cancelled approval"; return 126; }', ok=False)
+        self.assertIn("cancelled approval", self.calls())
+        self.assertNotIn("apt-get", self.calls())
+        self.assertNotIn("setup ", self.calls())
+        self.assertNotIn("desktop-agent", self.calls())
+        self.assert_temporary_files_removed()
+
+    def test_gui_update_requires_graphical_authorization_without_sudo_fallback(self):
+        code = r'''
+command() {
+    if [[ "$1 $2" == '-v pkexec' ]]; then return 1; fi
+    builtin command "$@"
+}
+'''
+        output = self.run_shell("main --update 0.0.9 --gui --version v0.1.0", before=code, ok=False)
+        self.assertIn("pkexec", output)
+        self.assertEqual(self.calls(), "")
+        self.run_shell("main --gui --version v0.1.0", ok=False)
+        self.run_shell("main --update 0.0.9 --gui --version v0.1.0", env={"DBUS_SESSION_BUS_ADDRESS": ""}, ok=False)
+        self.assertEqual(self.calls(), "")
+
+    def test_update_cannot_replace_a_version_installed_during_the_download(self):
+        for legacy in ("true", "false"):
+            with self.subTest(legacy=legacy):
+                self.log.write_text("")
+                output = self.run_shell("main --update 0.0.9 --gui --no-launch --version v0.1.0",
+                                        env={"LEGACY": legacy, "INSTALLED_VERSION": "0.2.0"}, ok=False)
+                self.assertIn("changed while this update", output)
+                self.assertNotIn("\napt-get", self.calls())
+                self.assertNotIn("setup ", self.calls())
 
     def test_root_step_rejects_a_download_swapped_after_verification(self):
         # Simulate a process running as the user replacing the file during the password prompt.
@@ -208,6 +267,18 @@ class InstallerTest(unittest.TestCase):
         self.assertNotIn("root ", self.calls())
         self.run_shell("main --yes --no-launch", env={"LEGACY": "false", "GTK_MISSING": "1"})
         self.assertIn("deb-zflow desktop-agent --install", self.calls())
+
+    def test_missing_gnome_tools_are_installed_before_desktop_setup(self):
+        for legacy in ("false", "true"):
+            with self.subTest(legacy=legacy):
+                self.log.write_text("")
+                self.run_shell("main --no-launch", env={"LEGACY": legacy, "GNOME_TOOLS_MISSING": "1"})
+                calls = self.calls()
+                self.assertLess(calls.index("apt-get install"), calls.index("desktop-agent --install"))
+                if legacy == "false":
+                    self.assertIn("--install-recommends", calls)
+                else:
+                    self.assertIn("gjs gir1.2-gtk-4.0 gir1.2-adw-1 pkexec", calls)
 
     def test_headless_debian_skips_desktop_recommendations(self):
         self.run_shell("main --yes --headless", env={"LEGACY": "false"})
@@ -405,6 +476,64 @@ class PackagingTest(unittest.TestCase):
     def read(self, path):
         return (self.ROOT / path).read_text()
 
+    @unittest.skipIf(os.geteuid() == 0, "tests the normal user's archive entry point")
+    def test_archive_installer_defaults_to_prebuilt_binaries(self):
+        with tempfile.TemporaryDirectory(prefix="zflow-archive-test-") as temp:
+            root = Path(temp)
+            for path in ("scripts", "packaging", "assets/linux"):
+                shutil.copytree(self.ROOT / path, root / path)
+            (root / "bin").mkdir()
+            for name in ("zflow", "zflowd"):
+                binary = root / "bin" / name
+                binary.write_text("#!/bin/sh\nexit 0\n")
+                binary.chmod(0o755)
+            tools = root / "tools"
+            tools.mkdir()
+            log = root / "calls"
+            for name, body in (
+                ("uname", "echo Linux"),
+                ("sudo", 'printf "sudo %s\\n" "$*" >> "$LOG"'),
+                ("cargo", 'echo forbidden-cargo >> "$LOG"; exit 99'),
+            ):
+                tool = tools / name
+                tool.write_text(f"#!/bin/sh\n{body}\n")
+                tool.chmod(0o755)
+            result = subprocess.run([BASH, str(root / "scripts/install.sh")],
+                                    env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "LOG": str(log)},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(log.read_text(), f"sudo -- {root}/scripts/install.sh --install-built\n")
+            self.assertFalse((root / "Cargo.toml").exists(), "release users do not need a source checkout")
+
+    @unittest.skipUnless(os.uname().sysname == "Linux", "the Debian packaging script runs on Linux")
+    def test_debian_build_stamps_only_the_staged_extension_metadata(self):
+        with tempfile.TemporaryDirectory(prefix="zflow-deb-test-") as temp:
+            root = Path(temp)
+            for path in ("debian", "packaging", "assets/linux"):
+                shutil.copytree(self.ROOT / path, root / path)
+            (root / "scripts").mkdir()
+            shutil.copy(self.ROOT / "scripts/build-deb.sh", root / "scripts")
+            (root / "Cargo.toml").write_text('[package]\nversion = "0.7.3"\n')
+            (root / "bin").mkdir()
+            tools = root / "tools"
+            tools.mkdir()
+            metadata = root / "packaged-metadata.json"
+            for name, body in (
+                ("dpkg", "echo amd64"),
+                ("dpkg-buildpackage", 'cp packaging/gnome-extension/metadata.json "$TEST_METADATA"; touch ../zflow_0.7.3_amd64.deb'),
+            ):
+                tool = tools / name
+                tool.write_text(f"#!/bin/sh\n{body}\n")
+                tool.chmod(0o755)
+            original = (root / "packaging/gnome-extension/metadata.json").read_text()
+            result = subprocess.run([BASH, str(root / "scripts/build-deb.sh"), str(root / "bin")],
+                                    env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "TEST_METADATA": str(metadata)},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(metadata.read_text())["version-name"], "0.7.3")
+            self.assertEqual((root / "packaging/gnome-extension/metadata.json").read_text(), original)
+            self.assertTrue((root / "target/dist/zflow_0.7.3_amd64.deb").exists())
+
     def test_every_install_path_ships_the_extension_files_desktop_rs_writes(self):
         rust = self.read("src/app/desktop.rs")
         block = rust[rust.index("const EXTENSION_FILES"):]
@@ -416,6 +545,7 @@ class PackagingTest(unittest.TestCase):
         # The setup banner installs extensions, which extensions.gnome.org reviewers reject.
         self.assertNotIn("setup.js", written)
         self.assertNotIn("app.js", written)
+        self.assertNotIn("updates.js", written)
 
     def test_archive_install_and_uninstall_cover_the_same_session_files(self):
         install, uninstall = self.read("scripts/install.sh"), self.read("scripts/uninstall.sh")

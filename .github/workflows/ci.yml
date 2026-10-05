@@ -42,6 +42,13 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build self-contained WinUI app
         run: ./scripts/build-windows.ps1
+      - name: Windows update lifecycle
+        run: |
+          dotnet run --project windows/Zflow.UpdateTests
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File windows/Zflow.UpdateTests/Install.Tests.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File windows/Zflow.UpdateTests/Build.Tests.ps1
       - name: Upload Windows preview
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -70,8 +77,20 @@ jobs:
         run: |
           node tests/gnome_desktop_test.mjs
           node tests/gnome_panel_test.mjs
+      - name: Native GTK controls
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gjs gir1.2-gtk-4.0 gir1.2-adw-1 gnome-shell-common xvfb xauth
+          for test in gnome_settings_test gnome_setup_test gnome_updates_test; do
+            GSETTINGS_BACKEND=memory GTK_A11Y=none GIO_USE_VFS=local GDK_BACKEND=x11 \
+              xvfb-run --auto-servernum dbus-run-session --config-file=tests/gtk-session.conf -- gjs -m "tests/$test.js"
+          done
       - name: Installer
         run: python3 tests/install_test.py
+      - name: Release commands
+        run: |
+          python3 tests/release_test.py
+          python3 tests/macos_updates_test.py
       - name: Shell scripts
         run: |
           shellcheck -x install.sh scripts/*.sh packaging/linux/*.sh packaging/system-sleep/zflow \
@@ -143,3 +162,5 @@ jobs:
         run: python3 tests/install_test.py
       - name: Notarization script
         run: python3 tests/macos_notarization_test.py
+      - name: Update packaging
+        run: python3 tests/macos_updates_test.py

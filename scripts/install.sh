@@ -73,6 +73,8 @@ for argument in "$@"; do
     esac
 done
 [[ "$(uname -s)" == "Linux" ]] || die "Linux is required"
+# Release archives carry ready-to-run binaries. Only a source checkout builds.
+if [[ -d "$REPO_ROOT/bin" ]]; then install_built=true; fi
 
 for source in \
     "$SCRIPT_DIR/uninstall.sh" \
@@ -93,10 +95,11 @@ for source in \
 done
 
 if [[ "$EUID" -ne 0 ]]; then
-    [[ "$install_built" == false ]] || die "--install-built requires root"
-    require_command cargo
     require_command sudo
-    build_binaries
+    if [[ "$install_built" == false ]]; then
+        require_command cargo
+        build_binaries
+    fi
     exec sudo -- "$SCRIPT_DIR/install.sh" --install-built
 fi
 

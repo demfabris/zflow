@@ -2126,6 +2126,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "sd-notify",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

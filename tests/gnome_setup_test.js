@@ -1,5 +1,5 @@
 // Run on a private bus with in-memory settings:
-// GSETTINGS_BACKEND=memory dbus-run-session -- gjs -m tests/gnome_setup_test.js
+// GSETTINGS_BACKEND=memory dbus-run-session --config-file=tests/gtk-session.conf -- gjs -m tests/gnome_setup_test.js
 import Adw from 'gi://Adw?version=1';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -21,7 +21,7 @@ function waitFor(predicate) {
 // The Log Out step writes GNOME settings; never let that reach the real account.
 assert(GLib.getenv('GSETTINGS_BACKEND') === 'memory', 'run with GSETTINGS_BACKEND=memory');
 
-const shell = {state: undefined, calls: []};
+const shell = {state: undefined, calls: [], version: null, generated: false};
 const agentCalls = [];
 let installError = null;
 const bus = Gio.DBus.session;
@@ -39,7 +39,10 @@ const shellOwned = serve('org.gnome.Shell', '/org/gnome/Shell',
     </interface></node>`, {
         GetExtensionInfo(uuid) {
             assert(uuid === 'zflow@demfabris', 'the banner asks about zflow');
-            return shell.state === undefined ? {} : {state: new GLib.Variant('d', shell.state)};
+            const info = shell.state === undefined ? {} : {state: new GLib.Variant('d', shell.state)};
+            if (shell.version) info['version-name'] = new GLib.Variant('s', shell.version);
+            if (shell.generated) info._generated = new GLib.Variant('s', 'EGO');
+            return info;
         },
         EnableExtension(uuid) {
             shell.calls.push(`enable ${uuid}`);
@@ -71,7 +74,9 @@ app.connect('activate', () => {
     const setup = new Setup(client);
     // Whether the extension's files are on disk, without reading this account's folders.
     let files = false;
+    let metadata = null;
     setup._installed = () => files;
+    setup._metadata = () => metadata;
     toolbar.add_top_bar(setup.banner);
     window.content = toolbar;
     window.present();
@@ -115,7 +120,44 @@ app.connect('activate', () => {
         shell.state = 1;
         await setup.refresh();
         assert(!banner.revealed, 'a running extension hides the banner');
-        print('GTK setup banner: install, turn on, log out, unsupported GNOME, errors and hiding passed');
+
+        metadata = {'version-name': '0.2.0'};
+        for (const loaded of [null, '0.1.0']) {
+            shell.version = loaded;
+            await setup.refresh();
+            assert(banner.revealed && banner.title.includes('updated'), 'old loaded metadata needs a new login even when extension files are current');
+        }
+        settings.set_strv('enabled-extensions', []);
+        settings.set_strv('disabled-extensions', ['zflow@demfabris']);
+        const logoutCount = shell.calls.filter(call => call === 'logout 0').length;
+        banner.emit('button-clicked');
+        await waitFor(() => shell.calls.filter(call => call === 'logout 0').length > logoutCount);
+        assert(!settings.get_strv('enabled-extensions').includes('zflow@demfabris'), 'an update does not enable an opted-out extension');
+        assert(settings.get_strv('disabled-extensions').includes('zflow@demfabris'), 'an update preserves the disabled list');
+
+        shell.version = '0.2.0';
+        await setup.refresh();
+        assert(!banner.revealed, 'the banner clears after Shell loads the current version');
+        shell.version = '0.1.0';
+        shell.state = 4;
+        await setup.refresh();
+        assert(!banner.button_label && banner.title.includes('does not support'), 'an unsupported GNOME version keeps compatibility guidance before logout');
+        shell.state = 1;
+        metadata._generated = 'EGO';
+        await setup.refresh();
+        assert(!banner.revealed, 'GNOME manages a downloaded extension update');
+        delete metadata._generated;
+        shell.generated = true;
+        await setup.refresh();
+        assert(!banner.revealed, 'a loaded EGO copy keeps its own update lifecycle');
+        shell.state = 4;
+        await setup.refresh();
+        assert(banner.title.includes('Extension Manager'), 'an incompatible EGO copy directs updates to its owner');
+        shell.state = 1;
+        client.snapshot = {health: [{id: 'desktop', detail: 'Update zflow: its GNOME extension is older than the app'}]};
+        await setup.refresh();
+        assert(banner.title.includes('Extension Manager'), 'an older EGO API directs updates to its owner');
+        print('GTK setup banner: install, enable, logout, updates, EGO ownership and errors passed');
     })().catch(error => { failure = error; printerr(error.stack); }).finally(() => {
         setup.destroy();
         client.destroy();

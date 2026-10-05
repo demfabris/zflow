@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
@@ -22,8 +22,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  preflight:
+    name: Check release prerequisites
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check update signing configuration
+        env:
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          : "${SPARKLE_PUBLIC_ED_KEY:?Run just release setup on a Mac to configure Sparkle}"
+          : "${SPARKLE_PRIVATE_ED_KEY:?Run just release setup on a Mac to configure Sparkle}"
+      - name: Require successful CI before publishing
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          conclusion=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --branch main \
+            --event push --limit 1 --json conclusion --jq '.[0].conclusion // empty')
+          if [[ "$conclusion" != success ]]; then
+            echo 'The release commit must pass CI on main before publication.' >&2
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -64,11 +92,13 @@ jobs:
           ./tests/deb_lifecycle.sh
       - name: Native macOS app
         if: runner.os == 'macOS'
+        env:
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
         # Build with an ad-hoc signature before the signing keychain exists, so
         # no build script in this job can sign with the Developer ID.
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          ./scripts/build-macos-app.sh --universal
+          ./scripts/build-macos-app.sh --universal --updates
       - name: Import macOS signing certificate
         if: runner.os == 'macOS'
         env:
@@ -121,6 +151,13 @@ jobs:
           dmg="target/dist/zflow-v$version-macos.dmg"
           ./scripts/build-macos-dmg.sh target/release/zflow.app "$dmg" --sign "$MACOS_SIGNING_IDENTITY"
           ./scripts/notarize-macos-app.sh zflow-ci "$RUNNER_TEMP/zflow-signing.keychain-db" "$dmg"
+      - name: Sign macOS update feed
+        if: runner.os == 'macOS'
+        env:
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          ./scripts/macos-update-feed.sh "target/dist/zflow-v$version-macos.dmg" "$version"
       - name: Remove macOS signing credentials
         if: always() && runner.os == 'macOS'
         run: |
@@ -167,6 +204,7 @@ jobs:
 
   windows:
     name: Build Windows WinUI app
+    needs: preflight
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
@@ -211,6 +249,21 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           tag="v$version"
+          # Recheck here: a direct tag push or rerun can bypass the local command,
+          # and a newer release may have appeared while its CI was running.
+          if [[ "$version" != *-* ]]; then
+            latest=$(gh release view --json tagName --jq .tagName)
+            python3 - "$version" "$latest" <<'PY'
+          import re
+          import sys
+
+          version, latest = sys.argv[1:]
+          if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", latest):
+              sys.exit("Cannot compare the latest published version: " + latest)
+          if tuple(map(int, version.split('.'))) <= tuple(map(int, latest[1:].split('.'))):
+              sys.exit("Refusing to replace latest with an older or equal release: " + latest)
+          PY
+          fi
           # Never overwrite a published release. A draft is what a run that
           # failed before publishing left behind, so this run replaces it.
           if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
@@ -232,13 +285,23 @@ jobs:
             test -s "target/dist/zflow-$tag-$target.tar.gz"
           done
           test -s "target/dist/zflow-$tag-macos.dmg"
+          test -s target/dist/appcast.xml
           test -s "target/dist/zflow-$tag-windows-x86_64.zip"
+          test -s target/dist/zflow-windows-x86_64-Setup.exe
+          test -s target/dist/install-windows.ps1
+          test -s target/dist/releases.win-x64.json
+          test -s "target/dist/Zflow.App-$version-win-x64-full.nupkg"
           test -s "target/dist/zflow_${version}_amd64.deb"
           test -s "target/dist/zflow_${version}_arm64.deb"
           cp install.sh target/dist/install.sh
-          (cd target/dist && sha256sum ./*.tar.gz ./*.dmg ./*.deb ./*.zip install.sh | sed 's|  ./|  |' > SHA256SUMS)
+          (cd target/dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum | sed 's|  ./|  |') > target/SHA256SUMS
+          mv target/SHA256SUMS target/dist/SHA256SUMS
           prerelease=()
           if [[ "$version" == *-* ]]; then prerelease=(--prerelease); fi
           gh release create "$tag" target/dist/* --target "$GITHUB_SHA" --draft \
             --title "zflow $tag" --notes-file packaging/RELEASE_NOTES.md "${prerelease[@]}"
-          gh release edit "$tag" --draft=false
+          if [[ "$version" == *-* ]]; then
+            gh release edit "$tag" --draft=false --latest=false
+          else
+            gh release edit "$tag" --draft=false --latest
+          fi

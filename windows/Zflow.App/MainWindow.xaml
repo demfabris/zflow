@@ -40,7 +40,7 @@
         </NavigationViewItem>
       </NavigationView.MenuItems>
       <NavigationView.FooterMenuItems>
-        <NavigationViewItem Content="About zflow" Tag="about">
+        <NavigationViewItem x:Name="AboutNav" Content="About zflow" Tag="about">
           <NavigationViewItem.Icon><FontIcon Glyph="&#xE946;" /></NavigationViewItem.Icon>
         </NavigationViewItem>
       </NavigationView.FooterMenuItems>
@@ -101,6 +101,10 @@
                   <controls:SettingsCard.HeaderIcon><FontIcon Glyph="&#xEA18;" /></controls:SettingsCard.HeaderIcon>
                   <Button x:Name="ElevateButton" Content="Restart as administrator" Click="Elevate_Click" />
                 </controls:SettingsCard>
+                <controls:SettingsCard Header="App updates" Description="Check for new releases automatically. You choose when to download and restart.">
+                  <controls:SettingsCard.HeaderIcon><FontIcon Glyph="&#xE777;" /></controls:SettingsCard.HeaderIcon>
+                  <ToggleSwitch x:Name="AutoUpdatesSwitch" AutomationProperties.Name="Check for updates automatically" Toggled="AutoUpdates_Toggled" />
+                </controls:SettingsCard>
               </StackPanel>
               <StackPanel Spacing="4">
                 <TextBlock Text="Input and clipboard" Style="{StaticResource SectionHeading}" />
@@ -150,7 +154,19 @@
                   <controls:SettingsCard.HeaderIcon><FontIcon Glyph="&#xE946;" /></controls:SettingsCard.HeaderIcon>
                   <StackPanel Orientation="Horizontal" Spacing="16">
                     <TextBlock x:Name="VersionText" VerticalAlignment="Center" />
-                    <HyperlinkButton Content="Release notes" NavigateUri="https://github.com/demfabris/zflow/blob/main/packaging/RELEASE_NOTES.md" />
+                    <HyperlinkButton Content="Release notes" NavigateUri="https://github.com/demfabris/zflow/releases/latest" />
+                  </StackPanel>
+                </controls:SettingsCard>
+                <controls:SettingsCard Header="Updates" ContentAlignment="Vertical" HorizontalContentAlignment="Stretch">
+                  <controls:SettingsCard.HeaderIcon><FontIcon Glyph="&#xE777;" /></controls:SettingsCard.HeaderIcon>
+                  <StackPanel Spacing="12">
+                    <TextBlock x:Name="UpdateStatus" Text="Checking installation…" Style="{StaticResource SecondaryText}" />
+                    <ProgressBar x:Name="UpdateProgress" Visibility="Collapsed" Minimum="0" Maximum="100" />
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                      <Button x:Name="CheckUpdatesButton" Content="Check for updates" Click="CheckUpdates_Click" />
+                      <Button x:Name="InstallUpdateButton" Content="Download update" Click="InstallUpdate_Click" Visibility="Collapsed" />
+                      <HyperlinkButton x:Name="GetInstallerLink" Content="Get installer" NavigateUri="https://github.com/demfabris/zflow/releases/latest/download/zflow-windows-x86_64-Setup.exe" Visibility="Collapsed" />
+                    </StackPanel>
                   </StackPanel>
                 </controls:SettingsCard>
                 <controls:SettingsCard Header="Open source" Description="GNU General Public License v3.0 or later">

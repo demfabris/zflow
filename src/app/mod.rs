@@ -13,6 +13,8 @@ pub mod layout_model;
 pub mod model;
 #[cfg(target_os = "macos")]
 mod native;
+#[cfg(target_os = "linux")]
+pub mod updates;
 // On Linux the service finds computers itself.
 #[cfg(target_os = "macos")]
 mod nearby;

@@ -58,6 +58,14 @@ struct MenuBarView: View {
         Text("⌘,")
       }
       .keyboardShortcut(",")
+      MenuRow(
+        title: model.updates.availableVersion.map { "Update to \($0)…" } ?? "Check for Updates…"
+      ) {
+        model.updates.check()
+      } trailing: {
+        if model.updates.availableVersion != nil { Image(systemName: "arrow.down.circle") }
+      }
+      .disabled(!model.updates.canCheck)
       MenuRow(title: "Quit zflow") {
         model.quit()
       } trailing: {
