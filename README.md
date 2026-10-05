@@ -577,8 +577,9 @@ just release check           # Validate the committed version and GitHub state
 just release publish         # Push main, require CI, tag, and wait for publication
 ```
 
-Before the first update-enabled release, run `just release setup` on a Mac
-with GitHub repository administration access to configure Sparkle signing.
+Before the first update-enabled release, run `just release setup` on Linux or
+macOS with GitHub repository administration access to configure Sparkle signing.
+Linux maintainers need Python 3 with `cryptography`; macOS uses Swift and Keychain.
 For each release, update `Cargo.toml`, `Cargo.lock`, the protocol version table
 when needed, and `packaging/RELEASE_NOTES.md`; commit on `main`, then run
 `just release publish`. The command releases the committed Cargo version and

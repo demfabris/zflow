@@ -34,8 +34,8 @@ jobs:
           SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
           SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
         run: |
-          : "${SPARKLE_PUBLIC_ED_KEY:?Run just release setup on a Mac to configure Sparkle}"
-          : "${SPARKLE_PRIVATE_ED_KEY:?Run just release setup on a Mac to configure Sparkle}"
+          : "${SPARKLE_PUBLIC_ED_KEY:?Run just release setup on Linux or macOS to configure Sparkle}"
+          : "${SPARKLE_PRIVATE_ED_KEY:?Run just release setup on Linux or macOS to configure Sparkle}"
       - name: Require successful CI before publishing
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         env:

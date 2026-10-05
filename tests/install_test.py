@@ -479,7 +479,7 @@ class PackagingTest(unittest.TestCase):
     @unittest.skipIf(os.geteuid() == 0, "tests the normal user's archive entry point")
     def test_archive_installer_defaults_to_prebuilt_binaries(self):
         with tempfile.TemporaryDirectory(prefix="zflow-archive-test-") as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             for path in ("scripts", "packaging", "assets/linux"):
                 shutil.copytree(self.ROOT / path, root / path)
             (root / "bin").mkdir()

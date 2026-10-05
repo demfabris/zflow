@@ -92,20 +92,39 @@ Configure these GitHub Actions repository secrets before running the workflow:
 | `APPLE_TEAM_ID` | Developer team ID matching the certificate |
 | `SPARKLE_PRIVATE_ED_KEY` | Sparkle EdDSA private key, installed by `just release setup` |
 
-Configure the Sparkle key once, on a trusted Mac with `gh` logged into an account
-that can manage this repository's secrets and variables:
+Configure the Sparkle key once, on a trusted Linux or macOS maintainer computer
+with `gh` logged into an account that can manage this repository's secrets and
+variables:
 
 ```sh
 just release setup
 ```
 
-The helper resolves the pinned Sparkle package, creates or reuses the
-`io.zflow.zflow` key in your login Keychain, stores its private key in the GitHub
-secret, and stores the public key in the `SPARKLE_PUBLIC_ED_KEY` repository
-variable. Its temporary export is private and removed on exit. Back up the
-Keychain key securely. When configuring another Mac, import that same key;
-the helper refuses to replace a published signing identity with a different
-key. Key rotation requires Sparkle's documented migration process.
+On Linux, maintainers need Python 3 with the `cryptography` package. The helper
+creates or reuses `$XDG_CONFIG_HOME/zflow-release/sparkle-private-key`, defaulting
+to `~/.config/zflow-release/sparkle-private-key`. The directory is mode `0700`
+and the key is mode `0600`; the helper refuses to store it inside the checkout.
+The file contains Sparkle's base64-encoded 32-byte Ed25519 seed. Back it up
+securely and restore the same file when moving to another release computer.
+
+On macOS, the helper resolves the pinned Sparkle package and creates or reuses
+the `io.zflow.zflow` key in your login Keychain. Its temporary export is private
+and removed on exit. Back up the Keychain key securely. To import a Linux key
+or a previous Sparkle export into Keychain before setup:
+
+```sh
+swift package --package-path macos resolve
+macos/.build/artifacts/sparkle/Sparkle/bin/generate_keys \
+  --account io.zflow.zflow -f /path/to/sparkle-private-key
+```
+
+Both routes send the private key to the `SPARKLE_PRIVATE_ED_KEY` GitHub secret
+through standard input and set the `SPARKLE_PUBLIC_ED_KEY` repository variable.
+Repeating setup reuses the local key, including after a failed GitHub upload.
+The helper refuses to replace a published signing identity with a different key.
+Key rotation requires Sparkle's documented migration process. These tools and
+dependencies are only for release maintainers; installation and updates use
+published binaries.
 
 Release builds use `--updates` and require that public key. Local builds without
 it still run, with updating disabled. Sparkle verifies the EdDSA signature before

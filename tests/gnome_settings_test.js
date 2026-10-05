@@ -368,7 +368,8 @@ app.connect('activate', () => {
         assert(settings._status.title === 'Paused', 'pause reaches daemon and refreshes status');
         failSharing = true;
         settings._sharing.active = true;
-        await waitFor(() => !settings._busy && settings._errorGroup.visible);
+        // The rejected call finishes before its follow-up snapshot restores the control.
+        await waitFor(() => !settings._busy && settings._sharing.sensitive && settings._errorGroup.visible);
         assert(!settings._sharing.active, 'rejected toggle rolls back');
         assert(settings._error.subtitle === 'Test: service refused the change', 'service errors hide the D-Bus error name');
         failSharing = false;

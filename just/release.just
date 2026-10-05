@@ -7,9 +7,9 @@ set working-directory := ".."
 default:
     @just --list release
 
-# Configure Sparkle update signing in the Mac Keychain and GitHub repository.
-setup: (_platform "mac")
-    ./scripts/setup-macos-updates.sh
+# Configure Sparkle update signing from a macOS or Linux maintainer computer.
+setup:
+    ./scripts/setup-updates.sh
 
 # Check the committed version and GitHub state without pushing or tagging.
 check:

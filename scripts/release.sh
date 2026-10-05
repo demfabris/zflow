@@ -41,11 +41,11 @@ case "$remote_url" in
 esac
 public_key=$(gh variable list --repo "$repo" --json name,value \
     --jq '.[] | select(.name == "SPARKLE_PUBLIC_ED_KEY") | .value') \
-    || die 'Run just release setup on a Mac before publishing updates.'
-[[ -n "$public_key" ]] || die 'SPARKLE_PUBLIC_ED_KEY is empty; run just release setup on a Mac.'
+    || die 'Run just release setup on Linux or macOS before publishing updates.'
+[[ -n "$public_key" ]] || die 'SPARKLE_PUBLIC_ED_KEY is empty; run just release setup on Linux or macOS.'
 secret_names=$(gh secret list --repo "$repo" --json name --jq '.[].name')
 printf '%s\n' "$secret_names" | grep -qx SPARKLE_PRIVATE_ED_KEY \
-    || die 'SPARKLE_PRIVATE_ED_KEY is missing; run just release setup on a Mac.'
+    || die 'SPARKLE_PRIVATE_ED_KEY is missing; run just release setup on Linux or macOS.'
 
 # Read the remote without changing local tracking refs, including during --dry-run.
 remote_refs=$(git ls-remote origin refs/heads/main "refs/tags/$tag")
