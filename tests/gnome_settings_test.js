@@ -44,7 +44,7 @@ function waitFor(predicate) {
         let attempts = 0;
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, 20, () => {
             if (predicate()) { resolve(); return GLib.SOURCE_REMOVE; }
-            if (++attempts > 350) { reject(new Error('Timed out waiting for GTK state')); return GLib.SOURCE_REMOVE; }
+            if (++attempts > 350) { reject(new Error(`Timed out waiting for GTK state: ${predicate}`)); return GLib.SOURCE_REMOVE; }
             return GLib.SOURCE_CONTINUE;
         });
     });
@@ -155,6 +155,13 @@ app.connect('activate', () => {
     const settings = new Settings(window);
     window.content = settings.page;
     window.present();
+    const idle = () => !settings._busy && !settings.client._polling;
+    // Timer polls can overlap a fixture change. Wait for the previous reply before
+    // asking for the new state: refresh() skips requests while a poll is running.
+    const refresh = async () => {
+        await waitFor(idle);
+        await settings.client.refresh();
+    };
     (async () => {
         await waitFor(() => owned && settings._sharing.sensitive);
         assert(settings._status.title === 'Ready', 'ready status');
@@ -162,12 +169,12 @@ app.connect('activate', () => {
         assert(settings._shortcutRows[0].title === 'Return input to this computer', 'shortcuts are listed');
         assert(settings._help.description.includes('/etc/zflow/zflow.toml'), 'the advanced settings file is named');
         const firstRow = settings._peerRows[0];
-        await settings.client.refresh();
+        await refresh();
         assert(settings._peerRows[0] === firstRow, 'refresh must preserve keyboard focus');
         // The layout: tiles for both computers, with this one marked.
         assert(settings._layout.visible && settings._computers.description.startsWith('Arrange individual'), 'a layout replaces the hint about the other computer');
         layout.monitors.push({id: 'local/disabled', label: 'Disabled Dell', display: {active: false}, x: 0, y: 0, width: 1920, height: 1080});
-        await settings.client.refresh();
+        await refresh();
         assert(!settings._tiles.has('local/disabled'), 'inactive displays stay off the canvas');
         layout.monitors.pop();
         const mac = settings._tiles.get('peer:MacBook').button;
@@ -178,12 +185,12 @@ app.connect('activate', () => {
         assert(markColors('a1b2c3').join() === '2,1,3,2' && markColors('zz').length === 0, 'marks read the seed');
         assert(drawnMark(settings._tiles.get('local').mark) === markColors('a1b2c3').join(), 'this computer shows its own mark');
         assert(drawnMark(settings._tiles.get('peer:MacBook').mark) === markColors('3d4f00').join(), 'a peer shows its mark');
-        await settings.client.refresh();
+        await refresh();
         assert(settings._tiles.get('peer:MacBook').button === mac, 'an unchanged snapshot keeps the tiles');
         // An arrow key moves the focused tile 100 units and snaps within 150, as on the Mac.
         mac.grab_focus();
         assert(controller(mac, Gtk.EventControllerKey).emit('key-pressed', Gdk.KEY_Right, 0, 0), 'the tile takes arrow keys');
-        await waitFor(() => moves.length === 1 && !settings._busy);
+        await waitFor(() => moves.length === 1 && idle());
         assert(JSON.stringify(moves[0]) === JSON.stringify({command: 'move_tile', id: 'peer:MacBook', x: 2660, y: 0, tolerance: 150}), `the key sends one move: ${JSON.stringify(moves)}`);
         await waitFor(() => settings._tiles.get('peer:MacBook').monitor.x === 2660);
         assert(settings._tiles.get('peer:MacBook').button === mac && window.get_focus() === mac, 'a moved tile keeps focus');
@@ -205,7 +212,7 @@ app.connect('activate', () => {
         press();
         drag.emit('drag-update', -30, 12);
         drag.emit('drag-end', -30, 12);
-        await waitFor(() => moves.length >= 2 && !settings._busy);
+        await waitFor(() => moves.length >= 2 && idle());
         const dropped = {command: 'move_tile', id: 'peer:MacBook', x: 2660 + Math.round(-30 / scale), y: Math.round(12 / scale), tolerance: Math.round(14 / scale)};
         assert(moves.length === 2 && JSON.stringify(moves[1]) === JSON.stringify(dropped), `a drag sends one move: ${JSON.stringify(moves)}`);
         // A refused move puts the tile back. Times out if it stays where it was dropped.
@@ -219,7 +226,7 @@ app.connect('activate', () => {
         drag.emit('drag-update', -40, 0);
         assert(shown() !== home, 'the tile follows the drag');
         drag.emit('drag-end', -40, 0);
-        await waitFor(() => moves.length === 3 && !settings._busy && shown() === home);
+        await waitFor(() => moves.length === 3 && idle() && shown() === home);
         assert(settings._error.subtitle === 'Computers cannot overlap' && tile.monitor.x === dropped.x, 'the refusal is shown and the layout stays');
         failMove = false;
         const keyboard = settings._keyboards.get('MacBook');
@@ -228,9 +235,9 @@ app.connect('activate', () => {
         keyboard.selected = 2;
         assert(!keyboard.sensitive, 'a request in flight locks the dropdown instead of dropping a choice');
         // Times out if the dropdown stays locked after the request.
-        await waitFor(() => find('MacBook').keyboard === 'mac' && !settings._busy && keyboard.sensitive);
+        await waitFor(() => find('MacBook').keyboard === 'mac' && idle() && keyboard.sensitive);
         keyboard.selected = 0;
-        await waitFor(() => find('MacBook').keyboard === 'standard' && !settings._busy);
+        await waitFor(() => find('MacBook').keyboard === 'standard' && idle());
         assert(keyboardCalls === 2, 'each choice sends set_peer once');
         find('MacBook').keyboard = 'pc_positions';
         await waitFor(() => keyboard.selected === 1);
@@ -240,14 +247,14 @@ app.connect('activate', () => {
         assert(control.active, 'a paired computer can control this one');
         control.active = false;
         assert(!control.sensitive, 'a request in flight locks the switch');
-        await waitFor(() => !find('MacBook').allow_control && !settings._busy && control.sensitive);
+        await waitFor(() => !find('MacBook').allow_control && idle() && control.sensitive);
         find('MacBook').allow_control = true;
         await waitFor(() => control.active);
         assert(controlCalls === 1, 'a snapshot moves the switch without sending a request');
         assert(settings._peerRows[0] === firstRow, 'a permission change keeps the row');
         assert(!settings._pause.active && settings._pause.sensitive, 'crossings do not pause by default');
         settings._pause.active = true;
-        await waitFor(() => snapshot.pause_at_edges && !settings._busy && settings._pause.sensitive);
+        await waitFor(() => snapshot.pause_at_edges && idle() && settings._pause.sensitive);
         // Share Clipboard comes after the shortcuts and before Start at Login.
         const order = groups(settings.page);
         const at = widget => order.indexOf(widget instanceof Adw.PreferencesGroup ? widget : widget.get_ancestor(Adw.PreferencesGroup.$gtype));
@@ -256,17 +263,17 @@ app.connect('activate', () => {
         assert(!settings._clipboard.active && settings._clipboard.sensitive, 'the clipboard stays here until turned on');
         settings._clipboard.active = true;
         assert(!settings._clipboard.sensitive, 'a request in flight locks the switch');
-        await waitFor(() => snapshot.share_clipboard && !settings._busy && settings._clipboard.sensitive);
+        await waitFor(() => snapshot.share_clipboard && idle() && settings._clipboard.sensitive);
         assert(clipboardCalls === 1, 'turning it on sends set_clipboard once');
         snapshot.share_clipboard = false;
         await waitFor(() => !settings._clipboard.active);
         assert(clipboardCalls === 1, 'a snapshot moves the switch without sending a request');
         settings._logs.emit('clicked');
-        await waitFor(() => logsOpened === 1 && !settings._busy);
+        await waitFor(() => logsOpened === 1 && idle());
         const scroll = settings._scrolls.get('MacBook');
         assert(!scroll.active, 'scrolling starts the right way round');
         scroll.active = true;
-        await waitFor(() => find('MacBook').reverse_scroll && !settings._busy && scroll.sensitive);
+        await waitFor(() => find('MacBook').reverse_scroll && idle() && scroll.sensitive);
         assert(scrollCalls === 1 && settings._peerRows[0] === firstRow, 'reversing scroll sends set_peer once and keeps the row');
         firstRow.expanded = true;
         Object.assign(find('MacBook'), {state: 'controlled_from_here', detail: 'Controlled from here'});
@@ -282,7 +289,7 @@ app.connect('activate', () => {
             found('key:bb', 'laptop', 'duplicate_name', {os: 'macos', mark: 'ffffff'}),
             found('instance:zf-old', 'old', 'different_version'),
         ];
-        await settings.client.refresh();
+        await refresh();
         await waitFor(() => settings._found.size === 3 && settings._shelf.visible);
         const fedora = settings._found.get('key:aa');
         assert(fedora.name.label === 'fedora' && fedora.detail.label === 'Linux', `a found tile says what it is: ${fedora.detail.label}`);
@@ -299,7 +306,7 @@ app.connect('activate', () => {
         drag.emit('drag-begin', fedora.x + 5, fedora.y + 5);
         drag.emit('drag-update', 20, 4);
         drag.emit('drag-end', 20, 4);
-        await waitFor(() => !settings._busy);
+        await waitFor(idle);
         assert(places.length === 0, `only a drop on the board places: ${JSON.stringify(places)}`);
         // Dropped on the board, it is placed where its middle landed.
         const middle = [100, 100];
@@ -309,7 +316,7 @@ app.connect('activate', () => {
         const {left: originX, top: originY, offsetX, offsetY} = settings._origin;
         const unit = settings._scale;
         drag.emit('drag-end', dx, dy);
-        await waitFor(() => places.length === 1 && !settings._busy);
+        await waitFor(() => places.length === 1 && idle());
         const landed = [originX + (middle[0] - offsetX) / unit - 960, originY + (middle[1] - offsetY) / unit - 540].map(Math.round);
         const placed = {command: 'place', id: 'key:aa', x: landed[0], y: landed[1], tolerance: Math.round(14 / unit)};
         assert(JSON.stringify(places[0]) === JSON.stringify(placed), `a drop sends one place: ${JSON.stringify(places)}`);
@@ -318,63 +325,65 @@ app.connect('activate', () => {
         // With the keyboard, Enter puts one beside this computer.
         const laptop = settings._found.get('key:bb');
         assert(controller(laptop.button, Gtk.EventControllerKey).emit('key-pressed', Gdk.KEY_Return, 0, 0), 'a found tile takes Enter');
-        await waitFor(() => places.length === 2 && !settings._busy);
+        await waitFor(() => places.length === 2 && idle());
         assert(JSON.stringify(places[1]) === JSON.stringify({command: 'place', id: 'key:bb', x: 2560, y: 0, tolerance: 150}), `Enter places it beside this computer: ${JSON.stringify(places[1])}`);
         await waitFor(() => settings._found.size === 1);
 
         // A computer that joined by itself can be forgotten from here.
         snapshot.notices = [{id: 1, kind: 'joined', name: 'fedora', mark: '1abc9e'}];
-        await settings.client.refresh();
+        await refresh();
         await waitFor(() => settings._joinedRow.visible);
         assert(settings._joinedRow.title === 'fedora joined', 'the notice names the computer');
         assert(drawnMark(settings._joinedMark) === markColors('1abc9e').join() && settings._joinedMark.tooltip_text === 'Mark 1abc9e', 'the notice shows its mark');
         descendant(settings._joinedRow, widget => widget instanceof Gtk.Button && widget.label === 'Forget').emit('clicked');
-        await waitFor(() => forgotten.includes('fedora') && !settings._busy);
+        await waitFor(() => forgotten.includes('fedora') && idle());
         assert(!settings._joinedRow.visible && !find('fedora'), 'forgetting takes it out of the arrangement');
         snapshot.notices.push({id: 2, kind: 'joined', name: 'laptop', mark: 'ffffff'});
-        await settings.client.refresh();
+        await refresh();
         await waitFor(() => settings._joinedRow.visible && settings._joinedRow.title === 'laptop joined');
         settings._dismissJoined();
-        await settings.client.refresh();
+        await refresh();
         assert(!settings._joinedRow.visible, 'a dismissed notice stays away');
         // Forgetting asks nothing: the computer goes back on the shelf.
         descendant(settings._computers, widget => widget instanceof Gtk.Button && widget.tooltip_text === 'Forget laptop').emit('clicked');
-        await waitFor(() => forgotten.includes('laptop') && !settings._busy);
+        await waitFor(() => forgotten.includes('laptop') && idle());
         assert(!find('laptop'), 'forget needs no confirmation');
 
         // A fresh install's window shows how long it takes a computer by itself.
         snapshot.pairing_window = {state: 'open', seconds_left: 530, holding: null, reason: null};
-        await settings.client.refresh();
+        await refresh();
         await waitFor(() => settings._windowRow.visible);
         assert(settings._windowRow.title === 'This computer is new' && settings._windowRow.subtitle.includes('9 minutes'), `the window counts down: ${settings._windowRow.subtitle}`);
         snapshot.pairing_window = {state: 'open', seconds_left: 520, holding: {name: 'fedora', mark: '1abc9e', ms_left: 2400}, reason: null};
-        await settings.client.refresh();
+        await refresh();
         await waitFor(() => settings._windowRow.title === 'Adding fedora');
         assert(settings._windowRow.subtitle.startsWith('In 3 s') && drawnMark(settings._windowMark) === markColors('1abc9e').join(), 'the computer about to join is named and marked');
         snapshot.pairing_window = {state: 'closed', seconds_left: null, holding: null, reason: 'accepted'};
-        await settings.client.refresh();
+        await refresh();
         await waitFor(() => !settings._windowRow.visible);
 
         // An address mDNS cannot reach gets a hello, and what answers shows up on the shelf.
         settings._openAddAddress();
         settings._addDialog.entry.text = ' 100.64.0.7 ';
-        settings._addDialog.dialog.emit('response', 'look_up');
-        await waitFor(() => added.length === 1 && !settings._busy);
+        const lookUp = descendant(settings._addDialog.dialog, widget => widget instanceof Gtk.Button && widget.label === 'Look Up');
+        await waitFor(() => lookUp.get_mapped());
+        assert(lookUp.activate(), 'the native Look Up button activates');
+        await waitFor(() => added.length === 1 && idle());
         assert(added[0] === '100.64.0.7', 'the typed address is sent');
-        settings._addDialog.dialog.force_close();
+        await waitFor(() => !window.visible_dialog);
 
         settings._sharing.active = false;
-        await waitFor(() => !snapshot.sharing && !settings._busy);
+        await waitFor(() => !snapshot.sharing && idle());
         assert(settings._status.title === 'Paused', 'pause reaches daemon and refreshes status');
         failSharing = true;
         settings._sharing.active = true;
         // The rejected call finishes before its follow-up snapshot restores the control.
-        await waitFor(() => !settings._busy && settings._sharing.sensitive && settings._errorGroup.visible);
+        await waitFor(() => idle() && settings._sharing.sensitive && settings._errorGroup.visible);
         assert(!settings._sharing.active, 'rejected toggle rolls back');
         assert(settings._error.subtitle === 'Test: service refused the change', 'service errors hide the D-Bus error name');
         failSharing = false;
         settings._login.active = false;
-        await waitFor(() => !snapshot.autostart && !settings._busy);
+        await waitFor(() => !snapshot.autostart && idle());
         await settings._run({command: 'forget', name: 'MacBook'});
         assert(!find('MacBook'), 'forget uses daemon API');
         const freshWindow = new Adw.ApplicationWindow({application: app, default_width: 520, default_height: 640});
@@ -386,18 +395,35 @@ app.connect('activate', () => {
         assert(fresh._peerRows[0].title === 'No computers added yet', 'a fresh install starts with no computers');
         fresh.destroy();
         freshWindow.close();
+        // Hold an older reply while the fixture goes offline. An explicit refresh
+        // must wait for it, then fetch the new state before these assertions run.
+        await waitFor(idle);
+        const call = settings.client.call.bind(settings.client);
+        let releaseSnapshot;
+        settings.client.call = async (...args) => {
+            const reply = await call(...args);
+            settings.client.call = call;
+            await new Promise(resolve => { releaseSnapshot = resolve; });
+            return reply;
+        };
+        settings.client.refresh();
+        await waitFor(() => releaseSnapshot);
         Object.assign(snapshot, {
             sharing: null, status: {state: 'attention', peer: null, title: 'Needs attention'}, shortcuts: [], layout: null, share_clipboard: null,
             health: [{id: 'service', level: 'error', title: 'Background service', detail: 'Start the zflow system service', action: null}],
         });
-        await settings.client.refresh();
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 75, () => {
+            releaseSnapshot();
+            return GLib.SOURCE_REMOVE;
+        });
+        await refresh();
         assert(!settings._sharing.sensitive && !settings._addButton.sensitive && !settings._clipboard.sensitive, 'offline controls disabled');
         assert(!settings._layout.visible && settings._computers.description === 'Arrange computers in zflow on the other computer.', 'without a layout, the hint comes back');
         assert(statusText(snapshot) === 'Needs attention', 'offline status');
         assert(settings._healthRows[0].subtitle === 'Start the zflow system service', 'the check says what failed');
         assert(!settings._shortcuts.visible, 'no shortcuts without the service');
         snapshot.api = 1;
-        await settings.client.refresh();
+        await refresh();
         assert(settings._status.title === 'Update zflow' && settings._errorGroup.visible, 'an agent from another API level asks for an update');
         settings.destroy();
         await waitFor(() => !settings.client._polling);

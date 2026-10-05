@@ -2,6 +2,7 @@
 import Adw from 'gi://Adw?version=1';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Gtk from 'gi://Gtk?version=4.0';
 import {Updates} from '../packaging/gnome-extension/updates.js';
 
 function assert(value, message) { if (!value) throw new Error(message); }
@@ -10,10 +11,18 @@ function waitFor(predicate) {
         let attempts = 0;
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, 20, () => {
             if (predicate()) { resolve(); return GLib.SOURCE_REMOVE; }
-            if (++attempts > 250) { reject(new Error('Timed out waiting for updates')); return GLib.SOURCE_REMOVE; }
+            if (++attempts > 250) { reject(new Error(`Timed out waiting for updates: ${predicate}`)); return GLib.SOURCE_REMOVE; }
             return GLib.SOURCE_CONTINUE;
         });
     });
+}
+function responseButton(widget, label) {
+    if (widget instanceof Gtk.Button && widget.label === label) return widget;
+    for (let child = widget.get_first_child(); child; child = child.get_next_sibling()) {
+        const found = responseButton(child, label);
+        if (found) return found;
+    }
+    return null;
 }
 const directory = GLib.dir_make_tmp('zflow-update-test-XXXXXX');
 GLib.setenv('XDG_CONFIG_HOME', directory, true);
@@ -77,16 +86,19 @@ app.connect('activate', () => {
         await waitFor(() => window.visible_dialog);
         assert(window.visible_dialog instanceof Adw.AlertDialog, 'installation asks in a native dialog');
         assert(calls().every(call => call === 'update check'), 'opening confirmation never installs');
-        window.visible_dialog.emit('response', 'cancel');
-        window.visible_dialog?.force_close();
+        // Activate the actual response button so libadwaita owns response and closing.
+        const cancel = responseButton(window.visible_dialog, 'Cancel');
+        await waitFor(() => cancel.get_mapped());
+        assert(cancel.activate(), 'the native Cancel button activates');
         await waitFor(() => !window.visible_dialog);
         assert(!updates.installing && calls().every(call => call === 'update check'), 'Cancel leaves the system alone');
 
         setInstall('Error: Update cancelled. Nothing was installed.', 1);
         updates._button.emit('clicked');
         await waitFor(() => window.visible_dialog);
-        window.visible_dialog.emit('response', 'install');
-        window.visible_dialog?.force_close();
+        const install = responseButton(window.visible_dialog, 'Install and Restart');
+        await waitFor(() => install.get_mapped());
+        assert(install.activate(), 'the native install button activates');
         await waitFor(() => !updates.installing && calls().some(call => call.startsWith('update install')));
         assert(calls().includes('update install --version v0.6.0 --gui'), 'approval pins the displayed release and requires graphical authorization');
         assert(updates._row.subtitle.startsWith('Update cancelled.'), 'cancelled system authorization is shown');
