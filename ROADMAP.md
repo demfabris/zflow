@@ -471,7 +471,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - Live links (`src/daemon/links.rs`): the daemon keeps a session to each peer it may send to, with the Mac's retry schedule (`src/link.rs`), so the first crossing reuses it. A session the peer dialed counts. Since 0.3.0 it dials only where a hello found the peer's key, so it dials a Mac only while the Mac listens. GNOME shows each peer as Connected, Connecting or Unreachable with a reason, plus a "Paired computers" health row with Retry. The GNOME API level stayed 2 then: the snapshot kept its shape, and `connecting`, `unreachable` and health actions were already part of it. It is 3 since 0.3.0, which dropped the code pairing requests.
   - Left: the live checks in TESTPLAN.md, "Two-way input sitting".
   - Known limits:
-    - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
+    - Fixed in 0.6.0: a finger resting on a captured touchpad counted as held, so an edge push made with the touchpad gave up. Arming and hops now leave touch contact codes out; a clickpad press still counts.
     - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
     - Fixed in 0.6.0: an edit kept only the tiles of computers this one paired, so a computer that paired the others put them back beside itself. An edit now keeps the others where they were, unless it covers one.
 

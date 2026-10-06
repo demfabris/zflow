@@ -12,7 +12,9 @@ use thiserror::Error;
 
 use crate::capture::CapturedDeviceFrame;
 
-use super::{AggregateInputState, DeviceInfo, FrameAccumulator, MappingError, TouchAccumulator};
+use super::{
+    AggregateInputState, DeviceInfo, FrameAccumulator, MappingError, TouchAccumulator, is_contact,
+};
 
 #[derive(Debug)]
 struct CaptureNode {
@@ -281,7 +283,8 @@ impl CaptureSet {
     }
 
     /// Performs fresh EVIOCGKEY checks over every node. Unlike the tracked
-    /// state this closes the arming gap after startup or a dropped frame.
+    /// state this closes the arming gap after startup or a dropped frame. A
+    /// finger on a touchpad does not count, as in `nothing_pressed`.
     pub fn kernel_is_neutral(&self) -> Result<bool, CaptureSetError> {
         for node in &self.nodes {
             let held =
@@ -291,7 +294,7 @@ impl CaptureSet {
                         path: node.path.clone(),
                         source,
                     })?;
-            if held.iter().next().is_some() {
+            if !held.iter().all(is_contact) {
                 return Ok(false);
             }
         }
@@ -312,7 +315,7 @@ impl CaptureSet {
         if self.grabbed {
             return Ok(Vec::new());
         }
-        if !self.aggregate.is_neutral() || !self.aggregate.all_at_boundary() {
+        if !self.aggregate.nothing_pressed() || !self.aggregate.all_at_boundary() {
             return Err(CaptureSetError::NotNeutral);
         }
         if !self.kernel_is_neutral()? {
