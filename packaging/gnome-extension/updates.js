@@ -46,6 +46,12 @@ export class Updates {
             if (this._automatic.active) this.check(true);
             return GLib.SOURCE_CONTINUE;
         });
+        this.opened();
+    }
+
+    // Opening zflow checks, also when its window is already open, such as
+    // from the notification the desktop agent shows for a new release.
+    opened() {
         if (this._automatic.active) this.check(true);
     }
 

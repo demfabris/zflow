@@ -120,6 +120,16 @@ app.connect('activate', () => {
         const another = new Updates(window);
         assert(!another._automatic.active && !another._busy && calls().length === before, 'opening settings honors disabled checks');
         another.destroy();
+        updates.opened();
+        assert(!updates._busy && calls().length === before, 'opening zflow again honors disabled checks');
+        updates._automatic.active = true;
+        await waitFor(() => !updates._busy);
+        if (!Gio.NetworkMonitor.get_default().network_metered) {
+            const enabled = calls().length;
+            updates.opened();
+            await waitFor(() => !updates._busy);
+            assert(calls().length === enabled + 1, 'opening zflow again checks for updates');
+        }
 
         setResult({...release, current: '0.6.0', available: false});
         await updates.check();

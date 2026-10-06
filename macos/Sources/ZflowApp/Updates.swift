@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Observation
 import Sparkle
+import UserNotifications
 
 /// Sparkle owns the update schedule, preferences, download, installation and relaunch.
 @MainActor @Observable
@@ -11,6 +12,8 @@ final class Updates: NSObject, @preconcurrency SPUStandardUserDriverDelegate {
   private(set) var automaticallyDownloads = false
   private(set) var availableVersion: String?
   private(set) var unavailableReason: String?
+  /// Hears about an update that a background check left to the menu bar.
+  @ObservationIgnored var found: ((String) -> Void)?
   @ObservationIgnored private var controller: SPUStandardUpdaterController?
   @ObservationIgnored private var observations: [NSKeyValueObservation] = []
 
@@ -92,9 +95,14 @@ final class Updates: NSObject, @preconcurrency SPUStandardUserDriverDelegate {
     _ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem, state: SPUUserUpdateState
   ) {
     availableVersion = update.displayVersionString
+    // A menu bar icon is easy to miss, so a notification goes with it.
+    if !handleShowingUpdate { found?(update.displayVersionString) }
   }
 
   func standardUserDriverWillFinishUpdateSession() {
     availableVersion = nil
+    UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [
+      Notifier.update
+    ])
   }
 }

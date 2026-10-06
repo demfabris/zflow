@@ -1,12 +1,13 @@
 import UserNotifications
 
 /// Tells people when a computer joined, with a Forget button for one that
-/// is not theirs. macOS asks for permission the first time one joins, not
-/// at launch.
+/// is not theirs, and when an update is available. macOS asks for permission
+/// the first time there is something to tell, not at launch.
 @MainActor
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
   nonisolated static let category = "joined"
   nonisolated static let forget = "forget"
+  nonisolated static let update = "update"
   private weak var model: AppModel?
 
   /// Takes the clicks on notifications. Called before launch finishes, so
@@ -24,6 +25,14 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
   func attach(_ model: AppModel) {
     self.model = model
     model.joined = { [weak self] notice in self?.post(notice) }
+    model.updates.found = { [weak self] version in self?.post(update: version) }
+  }
+
+  private func post(update version: String) {
+    let content = UNMutableNotificationContent()
+    content.title = "zflow \(version) is available"
+    content.body = "Click to install it."
+    deliver(UNNotificationRequest(identifier: Self.update, content: content, trigger: nil))
   }
 
   private func post(_ notice: Notice) {
@@ -32,8 +41,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     content.body = "Its mark is \(notice.mark). It can share this Mac’s keyboard and mouse. Not yours?"
     content.categoryIdentifier = Self.category
     content.userInfo = ["name": notice.name]
-    let request = UNNotificationRequest(
-      identifier: "joined-\(notice.id)", content: content, trigger: nil)
+    deliver(
+      UNNotificationRequest(identifier: "joined-\(notice.id)", content: content, trigger: nil))
+  }
+
+  private func deliver(_ request: UNNotificationRequest) {
     Task {
       let center = UNUserNotificationCenter.current()
       guard (try? await center.requestAuthorization(options: [.alert, .sound])) == true else {
@@ -46,6 +58,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
   nonisolated func userNotificationCenter(
     _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
   ) async {
+    if response.notification.request.identifier == Self.update {
+      await MainActor.run { model?.updates.check() }
+      return
+    }
     guard let name = response.notification.request.content.userInfo["name"] as? String else {
       return
     }

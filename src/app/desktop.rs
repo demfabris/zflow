@@ -6,6 +6,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 struct State {
     ready: bool,
     message: String,
+    /// The last failure logged as a warning. The agent retries every two
+    /// seconds, and a stale GNOME extension fails the same way until the next
+    /// login, so only a new failure is worth a warning.
+    failure: String,
 }
 
 fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -39,21 +43,25 @@ impl DesktopReceiver {
         tracing::debug!("starting desktop agent");
         let connection = connection.clone();
         let state = self.state.clone();
-        *lock(&state) = State {
-            ready: false,
-            message: "Connecting to the local GNOME desktop…".into(),
-        };
+        {
+            let mut state = lock(&state);
+            state.ready = false;
+            state.message = "Connecting to the local GNOME desktop…".into();
+        }
         self.task = Some(tokio::spawn(async move {
             let result = run(&connection, &state).await;
-            if let Err(error) = &result {
-                tracing::warn!(error = %format_args!("{error:#}"), "desktop agent stopped");
-            }
-            *lock(&state) = State {
-                ready: false,
-                message: match result {
-                    Ok(()) => "Receiving stopped".into(),
-                    Err(error) => format!("{error:#}"),
-                },
+            let mut state = lock(&state);
+            state.ready = false;
+            state.message = match result {
+                Ok(()) => "Receiving stopped".into(),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if message != state.failure {
+                        tracing::warn!(error = %message, "desktop agent stopped");
+                        state.failure.clone_from(&message);
+                    }
+                    message
+                }
             };
         }));
     }
@@ -63,8 +71,8 @@ impl DesktopReceiver {
             task.abort();
         }
         *lock(&self.state) = State {
-            ready: false,
             message: "Receiving stopped".into(),
+            ..State::default()
         };
     }
 }
@@ -151,6 +159,7 @@ async fn run(connection: &zbus::Connection, state: &Mutex<State>) -> anyhow::Res
     *lock(state) = State {
         ready: true,
         message: "Ready to receive through the GNOME desktop".into(),
+        failure: String::new(),
     };
     tracing::info!("desktop agent ready");
 
@@ -432,7 +441,9 @@ async fn forward_signals(
 }
 
 #[cfg(target_os = "linux")]
-async fn next_message(stream: &mut zbus::MessageStream) -> Option<zbus::Result<zbus::Message>> {
+pub(super) async fn next_message(
+    stream: &mut zbus::MessageStream,
+) -> Option<zbus::Result<zbus::Message>> {
     use zbus::export::futures_core::Stream;
     std::future::poll_fn(|context| std::pin::Pin::new(&mut *stream).poll_next(context)).await
 }
@@ -461,6 +472,10 @@ async fn focus(proxy: &zbus::Proxy<'_>) -> bool {
         false
     })
 }
+
+/// The reason GNOME gave for the last refusal logged as a warning.
+#[cfg(target_os = "linux")]
+static REFUSED: Mutex<String> = Mutex::new(String::new());
 
 #[cfg(target_os = "linux")]
 async fn call(
@@ -511,8 +526,16 @@ async fn call(
                     "GNOME desktop RPC completed"
                 );
             }
-            if let crate::desktop::DesktopResponse::Unavailable { reason } = response {
-                tracing::warn!(operation, elapsed_ms, %reason, "GNOME desktop RPC unavailable");
+            // Warn once for a run of identical refusals, such as each retry
+            // against a GNOME extension from another release.
+            let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+            match response {
+                crate::desktop::DesktopResponse::Unavailable { reason } if *reason != *refused => {
+                    tracing::warn!(operation, elapsed_ms, %reason, "GNOME desktop RPC unavailable");
+                    refused.clone_from(reason);
+                }
+                crate::desktop::DesktopResponse::Unavailable { .. } => {}
+                _ => refused.clear(),
             }
         }
         Err(error) => {

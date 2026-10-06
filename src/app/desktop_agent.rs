@@ -21,6 +21,7 @@ pub fn run(install: bool) -> Result<()> {
     let updated = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
         let state = Arc::new(Mutex::new(super::gnome::State::default()));
         let connection = super::gnome::connect(state.clone()).await?;
+        tokio::spawn(super::updates::remind(connection.clone()));
         let mut timer=tokio::time::interval(Duration::from_secs(2));
         let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let mut interrupt=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

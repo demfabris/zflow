@@ -8,14 +8,15 @@ import {Updates} from './updates.js';
 const flags = Gio.ApplicationFlags.ALLOW_REPLACEMENT
     | (GLib.getenv('ZFLOW_REPLACE') === '1' ? Gio.ApplicationFlags.REPLACE : Gio.ApplicationFlags.FLAGS_NONE);
 const app = new Adw.Application({application_id: 'io.zflow.zflow', flags});
+let updates = null;
 app.connect('activate', () => {
-    if (app.active_window) { app.active_window.present(); return; }
+    if (app.active_window) { app.active_window.present(); updates?.opened(); return; }
     const window = new Adw.ApplicationWindow({application: app, title: 'zflow', icon_name: 'io.zflow.zflow', default_width: 520, default_height: 640});
     const toolbar = new Adw.ToolbarView();
     toolbar.add_top_bar(new Adw.HeaderBar());
     const settings = new Settings(window);
     const setup = new Setup(settings.client);
-    const updates = new Updates(window);
+    updates = new Updates(window);
     settings.page.add(updates.group);
     toolbar.add_top_bar(setup.banner);
     toolbar.content = settings.page;
