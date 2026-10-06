@@ -11,9 +11,11 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/demfabris/zflow/release
 - With three or more computers arranged, the pointer moves straight from one
   computer to the next one beside it, and back, while the computer whose
   keyboard and mouse you use routes it. The computers in between do not need
-  to trust each other.
+  to trust each other, and an edit to the arrangement on one of them keeps
+  the tiles of computers it has not paired.
 - A move on to the next computer waits until no key or mouse button is held;
-  until then the pointer stays where it is.
+  until then the pointer stays where it is, and what you type still reaches
+  the computer it is on. A finger resting on a touchpad does not count.
 - Update every computer to 0.6.0, including GNOME extension API 5. Pairing keys
   stay valid; the new input protocol does not connect to 0.5.0 or older peers.
 - Windows takes part as a computer the pointer passes through. Started from

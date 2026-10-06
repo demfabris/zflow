@@ -43,13 +43,21 @@ GitHub Actions builds all platforms.
 
 Install 0.6.0 on three computers, including GNOME extension API 5, and arrange
 B beside the source A and C beside B but not touching A. A must have paired B
-and C; B and C need not have paired each other.
+and C. B and C need not trust each other: introductions may pair them by
+themselves, so run the walk once more after forgetting C on B and B on C.
 
 - From a Mac A and again from a Linux A: walk A, B, C, B, A by pushing through
   each shared edge. Each step must land at the matching point of the next
   edge, and the panel must name the computer that gets input.
 - Push from B toward C while holding a modifier, a mouse button, and on Linux
-  any key. The pointer must stay on B. Release and push again: it moves on.
+  any key. The pointer must stay on B, and keys typed meanwhile still reach
+  B, a Windows B included. Release and push again: it moves on.
+- From a Linux A with touch forwarding on, push toward C with a finger on the
+  touchpad: the pointer moves on.
+- Enter B at the very end of its edge, next to a corner where C is: the
+  pointer stays on B until it is pushed toward C.
+- Move a tile and change the display size on B while B has not paired C:
+  C's tile stays where A placed it, on all three computers.
 - Type and click on C, then push home through C's edge to A if one touches, or
   back through B. Nothing may stay held on B or C afterwards.
 - With C asleep or its zflow stopped, push from B toward C: the pointer stays
