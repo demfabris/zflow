@@ -71,9 +71,55 @@ impl Shared {
             self.neighbors.borrow().strangers(&config, now)
         };
         let joining = self.window().tick(&strangers, now);
-        if let Some(stranger) = joining {
-            self.join(&stranger).await;
+        match joining {
+            Some(stranger) => self.join(&stranger).await,
+            None => self.introduce().await,
         }
+    }
+
+    /// Trusts a computer a peer placed, one a tick, as if a person here had
+    /// placed it. See [`crate::neighbors::Neighbors::introduced`].
+    async fn introduce(self: &Arc<Self>) {
+        let Some(layout) = self.layout.lock().await.clone() else {
+            return;
+        };
+        let key = {
+            let config = self.config.read().await;
+            let forgotten = self.forgotten();
+            let neighbors = self.neighbors.borrow();
+            neighbors
+                .introduced(&config, &layout, &forgotten)
+                .into_iter()
+                .next()
+        };
+        let Some(key) = key else {
+            return;
+        };
+        let _mutation = self.config_mutation.lock().await;
+        let config = self.config.read().await.clone();
+        match self.trust(config, &format!("key:{key}"), None).await {
+            Ok(name) => {
+                tracing::info!(peer = %name, "added a computer another paired computer placed");
+            }
+            Err(error) => {
+                tracing::debug!(%key, error = %format_args!("{error:#}"), "could not add a computer a peer placed");
+            }
+        }
+    }
+
+    pub(super) fn forgotten(&self) -> std::sync::MutexGuard<'_, crate::forgotten::Forgotten> {
+        self.forgotten
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Remembers that a person here forgot `record`, so no introduction
+    /// adds it back. Placing it again does.
+    pub(super) fn forgot(&self, record: &crate::config::PeerConfig) -> Result<()> {
+        let key = record.fingerprint_hex()?;
+        self.forgotten()
+            .forget(&key)
+            .context("Could not remember the forgotten computer")
     }
 
     /// Trusts the lone stranger the pairing window settled on. Saving it
@@ -320,6 +366,9 @@ impl Shared {
         };
         self.apply_config_locked(config, true).await?;
         self.window().placed();
+        if let Err(error) = self.forgotten().remember(key) {
+            tracing::warn!(%error, peer = %name, "placed, but may not be added again by itself after a forget");
+        }
         // A new tile starts beside this computer; a reinstalled one already
         // has its old tile.
         if let (None, Some(spot)) = (&namesake, spot)
@@ -454,6 +503,71 @@ mod tests {
         assert!(place(&shared, &unknown, None).await.is_err());
         assert!(place(&shared, "instance:zf-desk", None).await.is_err());
         assert_eq!(shared.config.read().await.peers.len(), 1);
+    }
+
+    /// A computer called `name` this computer found and said hello to,
+    /// which answered; returns its shelf id.
+    fn answered(shared: &Shared, spki: &[u8], name: &str) -> String {
+        let instance = format!("zf-{name}");
+        let remote: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        shared.neighbors.send_modify(|neighbors| {
+            neighbors.instance_seen(&instance, vec![remote], true, Some(name.into()));
+            neighbors.take_due_hellos(HELLO_SLOTS, tokio::time::Instant::now());
+        });
+        let hello = crate::hello::make_hello(name, 9, Vec::new(), false);
+        shared.heard(spki, remote, &hello, Some(&instance));
+        format!("key:{}", fingerprint(spki))
+    }
+
+    #[tokio::test]
+    async fn a_computer_a_peer_placed_is_added_until_a_person_here_forgets_it() {
+        let (shared, _kept) = test_daemon();
+        let (_directory, desk) = identity();
+        arranged(&shared).await;
+        let id = answered(&shared, desk.spki(), "desk");
+        let key = fingerprint(desk.spki());
+        shared.introduce().await;
+        assert!(
+            shared.config.read().await.peers.is_empty(),
+            "nobody placed it"
+        );
+
+        // A peer's layout came with its tile.
+        if let Some(layout) = shared.layout.lock().await.as_mut() {
+            layout.tiles.push(crate::desktop::Tile {
+                key: key.clone(),
+                display: None,
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            });
+        }
+        shared.introduce().await;
+        assert!(shared.config.read().await.peers.contains_key("desk"));
+        assert_eq!(shared.notices().last().unwrap().name, "desk");
+        let layout = shared.layout.lock().await.clone().unwrap();
+        assert_eq!(
+            tile_at(&layout, &id),
+            Some((-1920, 0)),
+            "where the peer put it"
+        );
+
+        {
+            let _mutation = shared.config_mutation.lock().await;
+            let mut config = shared.config.read().await.clone();
+            let record = config.peers.remove("desk").unwrap();
+            shared.forgot(&record).unwrap();
+            shared.apply_config_locked(config, true).await.unwrap();
+        }
+        shared.introduce().await;
+        assert!(
+            shared.config.read().await.peers.is_empty(),
+            "forgotten here"
+        );
+        // A person placing it again takes it off the list.
+        place(&shared, &id, None).await.unwrap();
+        assert!(!shared.forgotten().contains(&key));
     }
 
     #[tokio::test]

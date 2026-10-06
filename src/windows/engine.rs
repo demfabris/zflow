@@ -460,11 +460,13 @@ impl Engine {
                         "Only paired computers can be arranged"
                     );
                     self.local();
-                    self.layout = layout.to_shared(
-                        self.layout.version + 1,
-                        &self.identity.fingerprint_hex(),
-                        &self.keys(),
-                    );
+                    let own = self.identity.fingerprint_hex();
+                    let keys = self.keys();
+                    self.layout = layout
+                        .to_shared(self.layout.version + 1, &own, &keys)
+                        .with_others_from(&self.layout, |key| {
+                            key == own || keys.values().any(|known| known == key)
+                        });
                     self.save_layout()?;
                 }
                 ipc::Command::Activate { peer } => {

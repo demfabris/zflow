@@ -380,6 +380,23 @@ impl SharedLayout {
         Ok(())
     }
 
+    /// This edit with the tiles of `previous` that its editor could not show
+    /// put back: those whose key `known` does not know, such as computers it
+    /// has not paired. Other computers still place them, so an edit must not
+    /// move them. A tile the edit now covers is left out, since the person
+    /// making it could not see it.
+    pub fn with_others_from(mut self, previous: &Self, known: impl Fn(&str) -> bool) -> Self {
+        for tile in &previous.tiles {
+            if self.tiles.len() >= MAX_SHARED_TILES {
+                break;
+            }
+            if !known(&tile.key) && !self.tiles.iter().any(|other| overlaps(tile, other)) {
+                self.tiles.push(tile.clone());
+            }
+        }
+        self
+    }
+
     /// Whether this version replaces `other`. Both computers answer the same.
     pub fn is_newer_than(&self, other: &Self) -> bool {
         (self.version, &self.editor) > (other.version, &other.editor)

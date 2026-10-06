@@ -473,7 +473,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - Known limits:
     - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
     - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
-    - With three or more computers where not every pair is paired, an edit on one computer drops the tiles of computers it has not paired. A computer that paired them puts them back beside itself, but not where they were. SPEC's rule against resurrecting forgotten computers causes this; peer-to-peer hops (Phase 4) need a rule that keeps third-party tiles.
+    - Fixed in 0.6.0: an edit kept only the tiles of computers this one paired, so a computer that paired the others put them back beside itself. An edit now keeps the others where they were, unless it covers one.
 
 ### Phase 4: the Deskflow extras
 
@@ -508,7 +508,8 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 - **Status (2026-10-02):** built on both, on `arrange-to-pair`. The input ALPN is `zflow/4` and the version 0.3.0, so 0.2.0 computers show "Different zflow version".
 - **Left:**
   - The live sitting in TESTPLAN.md, "Arrange to pair sitting".
-  - Introductions: a pair that trusts each other vouching for a third computer, so a fresh computer next to them is not a rival. Hellos carry the vouch slots already, filled with random bytes.
+  - Introductions through the layout are built (0.6.0): a computer trusts a found computer a peer placed, unless a person here forgot it. See SPEC.md, "Introductions".
+  - Vouching for a fresh computer, so one next to a group is not a rival. Hellos carry the vouch slots already, filled with random bytes.
 
 ### Phase 5 (later)
 

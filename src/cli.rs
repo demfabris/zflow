@@ -1486,11 +1486,27 @@ fn revoke_peer(path: PathBuf, peer: String) -> Result<()> {
     if config.daemon.control_socket.exists() {
         return daemon_command(path, Request::RevokePeer { peer });
     }
-    if config.peers.remove(&peer).is_none() {
+    let Some(record) = config.peers.remove(&peer) else {
         bail!("unknown peer {peer}");
-    }
+    };
     config.save(&path)?;
+    forget_key(&config.daemon.state_dir, &record)?;
     println!("revoked {peer}");
+    Ok(())
+}
+
+/// Remembers a computer revoked while the service is stopped, so no
+/// introduction adds it back. The file goes to whoever owns the state
+/// directory, the service's account, which must be able to read it.
+fn forget_key(state_dir: &Path, record: &crate::config::PeerConfig) -> Result<()> {
+    let mut forgotten = crate::forgotten::Forgotten::load(state_dir);
+    forgotten.forget(&record.fingerprint_hex()?)?;
+    let owner = fs::metadata(state_dir)?;
+    std::os::unix::fs::chown(
+        forgotten.path(),
+        Some(std::os::unix::fs::MetadataExt::uid(&owner)),
+        Some(std::os::unix::fs::MetadataExt::gid(&owner)),
+    )?;
     Ok(())
 }
 

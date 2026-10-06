@@ -131,9 +131,10 @@ async fn desktop_command(
             Ok(DesktopReply::Ack)
         }
         Request::Forget { name } => {
-            if config.peers.remove(&name).is_none() {
+            let Some(record) = config.peers.remove(&name) else {
                 bail!("Unknown computer {name}");
-            }
+            };
+            shared.forgot(&record)?;
             shared.apply_config_locked(config, true).await?;
             Ok(DesktopReply::Ack)
         }

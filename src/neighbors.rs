@@ -559,6 +559,31 @@ impl Neighbors {
     }
 }
 
+impl Neighbors {
+    /// The found computers a peer placed, which this computer trusts as if
+    /// a person here had placed them. Each has a tile in `layout`, the one
+    /// this computer keeps from its peers, and answered a hello this
+    /// computer sent with that tile's key: a hello that only came in could
+    /// be from anywhere. One a person here forgot is never among them.
+    pub fn introduced(
+        &self,
+        config: &Config,
+        layout: &crate::desktop::SharedLayout,
+        forgotten: &crate::forgotten::Forgotten,
+    ) -> Vec<String> {
+        let trusted = trusted_keys(config);
+        self.strangers_of(config, &trusted, None)
+            .into_iter()
+            .filter(|stranger| {
+                stranger.answered
+                    && !forgotten.contains(&stranger.key)
+                    && layout.tiles.iter().any(|tile| tile.key == stranger.key)
+            })
+            .map(|stranger| stranger.key)
+            .collect()
+    }
+}
+
 fn trusted_keys(config: &Config) -> BTreeSet<String> {
     config
         .peers
@@ -653,6 +678,72 @@ mod tests {
         assert!(hello.trusts_you);
         let tile = serde_json::to_value(&shelf[1]).unwrap();
         assert!(tile.get("trusts_you").is_none(), "{tile}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn computers_a_peer_placed_are_introduced_unless_forgotten_here() {
+        let mut around = Neighbors::new(&spki(0));
+        let now = Instant::now();
+        // Says hello as `name`; `asked` when this computer found it and
+        // sent the hello, else the hello only came in.
+        let mut found = |byte: u8, name: &str, asked: bool| {
+            let address = SocketAddr::from(([192, 0, 2, byte], 43119));
+            let instance = format!("zf-{name}");
+            if asked {
+                around.instance_seen(&instance, vec![address], true, Some(name.into()));
+                around.take_due_hellos(4, now);
+            }
+            let hello = make_hello(name, 43119, Vec::new(), false);
+            around
+                .hello(
+                    &spki(byte),
+                    address,
+                    &hello,
+                    asked.then_some(&instance),
+                    now,
+                )
+                .unwrap()
+        };
+        let placed = found(1, "xps", true);
+        let unplaced = found(2, "desk", true);
+        let came_in = found(3, "laptop", false);
+        let tile = |key: &str, x| crate::desktop::Tile {
+            key: key.to_owned(),
+            display: None,
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let layout = crate::desktop::SharedLayout {
+            version: 3,
+            editor: fingerprint(&spki(9)),
+            tiles: vec![tile(&placed, 0), tile(&came_in, 1920)],
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut forgotten = crate::forgotten::Forgotten::load(directory.path());
+        let mut config = Config::default();
+        // Only the one with a tile that answered this computer's hello: a
+        // hello that came in could be from anywhere.
+        assert_eq!(
+            around.introduced(&config, &layout, &forgotten),
+            std::slice::from_ref(&placed)
+        );
+        assert!(
+            !around
+                .introduced(&config, &layout, &forgotten)
+                .contains(&unplaced)
+        );
+
+        trusting(&mut config, "xps", &spki(1));
+        assert!(around.introduced(&config, &layout, &forgotten).is_empty());
+        forgotten.forget(&placed).unwrap();
+        assert!(
+            around
+                .introduced(&Config::default(), &layout, &forgotten)
+                .is_empty(),
+            "a person here forgot it"
+        );
     }
 
     #[tokio::test(start_paused = true)]
