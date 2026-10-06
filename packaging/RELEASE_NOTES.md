@@ -21,6 +21,13 @@ curl --proto '=https' --tlsv1.2 -fsSL https://github.com/demfabris/zflow/release
 - Windows takes part as a computer the pointer passes through. Started from
   Windows, the pointer still only goes out and back.
 - Hops are not yet tried on real machines; the checklist is in TESTPLAN.md.
+- A Linux laptop's touchpad now drives the other computer like a mouse: one
+  finger moves the pointer, two fingers scroll the natural way, a tap clicks,
+  and a two-finger tap or press right-clicks. Before, the pointer stopped
+  until the escape chord. A finger resting on the touchpad no longer stops a
+  crossing. Raw touchpad contacts still go to a Linux computer when both have
+  touch forwarding on; a Mac gets pointer input instead of dropping them.
+  zflow does not read GNOME's touchpad settings yet and uses its defaults.
 
 ## Previous release: individual monitors (0.5.0)
 

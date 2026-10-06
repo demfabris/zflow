@@ -355,7 +355,8 @@ captures every keyboard, mouse, and touchpad. The packaged udev rule lets the
 zflow account read them. A device another program already grabbed is skipped:
 keyd, for example, holds the physical keyboard and types through `keyd virtual
 keyboard`, and zflow captures that one instead. `sudo zflow doctor` lists what
-it would capture.
+it would capture. A laptop touchpad drives the other computer like a mouse:
+one finger moves the pointer, two scroll, and taps and pad presses click.
 
 To capture only some devices, list them:
 

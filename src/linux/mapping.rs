@@ -414,6 +414,7 @@ impl FrameAccumulator {
                 scroll_y,
             },
             touch_snapshot: None,
+            as_pointer: None,
             event_count: self.event_count,
         };
         *self = Self::default();

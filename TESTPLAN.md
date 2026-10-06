@@ -66,6 +66,29 @@ themselves, so run the walk once more after forgetting C on B and B on C.
 - On the Mac, check in the log that a held modifier keeps the pointer on B
   while capture runs (`input_is_neutral` while the event tap swallows keys).
 
+## Linux laptop touchpad as the sender (0.6.0)
+
+Use the xps laptop's built-in touchpad with ubuntu beside it and the Mac
+beside ubuntu, touch forwarding off everywhere. GNOME on xps keeps its
+defaults (tap to click, natural scrolling).
+
+- Push xps's pointer into ubuntu with the touchpad, finger still down: it
+  crosses without lifting. Keep moving: ubuntu's pointer follows, slow moves
+  are precise and a quick swipe crosses most of the screen.
+- On ubuntu: tap (left click), two-finger tap (context menu), press the pad
+  with one finger (left) and with two (context menu). Press and drag a window
+  with one finger, and with the thumb pressing and another finger moving.
+- Two-finger scroll in a long page and a wide one: content follows the
+  fingers both ways, and a vertical scroll does not drift sideways.
+- Rest a palm on the pad while moving with a finger: the pointer follows the
+  finger only. Three fingers do nothing but a tap (middle click).
+- Hop on to the Mac and repeat move, tap, two-finger tap, press and scroll.
+- Cross back to xps: the pointer lands at the matching point. Note whether
+  the first touch afterwards jumps the local pointer; GNOME's libinput still
+  holds the finger that was down when the grab began.
+- Turn touch forwarding on for all three: ubuntu gets raw contacts again
+  (three-finger gestures work), and the Mac still gets pointer input.
+
 ## Individual monitors (0.5.0)
 
 Install the same 0.5.0 release on every computer, including GNOME extension API 4.

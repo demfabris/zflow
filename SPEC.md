@@ -353,6 +353,17 @@ Positions and source dimensions are hundredths of a millimetre on the source sur
 
 Touch forwarding remains an experiment because Linux libinput requires a correctly classified touchpad and macOS lacks a public high-level gesture injection constructor.
 
+### Linux touchpad as a pointer
+
+A Linux source sends raw touchpad contacts only when the session negotiated touch and the peer's hello says it runs Linux, whose virtual touchpad posts them. Every other target, a Mac or Windows computer or a Linux one without touch forwarding, gets the touchpad as ordinary pointer input that the source makes from the same contacts (`src/linux/touchpad.rs`). Each touchpad frame carries both, and the session picks one per peer, so a hop to a computer of another kind switches with it. The rules, with libinput's thresholds where it has them:
+
+- One finger moves the pointer. Travel is measured in millimetres through the axis resolution, or a 100 mm wide pad when the driver reports none, and becomes 8 counts per millimetre up to 25 mm/s, rising in a straight line to 24 counts per millimetre at 250 mm/s. Receivers treat a count like a mouse count. A finger moves nothing until it travels 0.5 mm, so taps, presses and the finger left after a scroll do not nudge the pointer.
+- Two fingers scroll by the movement of their midpoint, after the first millimetre, at 24 high-resolution units per millimetre (one wheel detent per 5 mm), in natural direction. A scroll that starts at least twice as far along one axis stays on it until the fingers change.
+- A clickpad press clicks by the fingers on the pad, as libinput's clickfinger method: one is left, two are right, three are middle. Two fingers more than 40 mm apart across or 30 mm down are a finger and a resting thumb, so left. The button that went down is the one that comes up. While the pad is pressed, the finger that moves drives the pointer instead of scrolling.
+- A tap clicks when every finger lifts within 180 ms of the first landing and none travelled more than 1.3 mm: one finger is left, two right, three middle. A press cancels it. There is no tap-and-drag.
+- Contacts the kernel marks as palms (MT_TOOL_PALM) are ignored. Three or more fingers, counted by BTN_TOOL_* even past the pad's slots, move and scroll nothing.
+- Tap to click and natural scrolling follow GNOME's defaults. zflowd runs without a session bus and does not read the user's GNOME touchpad settings yet.
+
 ## Transport and path management
 
 ### QUIC

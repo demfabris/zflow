@@ -44,6 +44,8 @@ const OFFER_DATAGRAM_SIZE: u32 = 1_024;
 pub struct SessionOptions {
     offer: NegotiationOffer,
     playout: PlayoutConfig,
+    /// The peer posts raw touchpad contacts on a virtual touchpad.
+    peer_takes_contacts: bool,
 }
 
 impl SessionOptions {
@@ -112,7 +114,16 @@ impl SessionOptions {
                 maximum_checkpoint_bound_ms: config.transport.checkpoint_ms as u32,
             },
             playout,
+            peer_takes_contacts: false,
         })
+    }
+
+    /// Only a Linux peer posts raw touchpad contacts, and only with touch
+    /// negotiated. Any other gets a Linux touchpad as pointer motion,
+    /// clicks and scrolling; a Mac would drop the contacts.
+    pub fn for_peer_os(mut self, os: Option<crate::wire::Os>) -> Self {
+        self.peer_takes_contacts = os == Some(crate::wire::Os::Linux);
+        self
     }
 }
 
@@ -386,6 +397,8 @@ async fn run_session(
         }
     };
     let _ = ready.send(Ok(negotiated.capabilities.clone()));
+    let takes_contacts =
+        options.peer_takes_contacts && negotiated.capabilities.contains(InputCapability::Touch);
 
     let clock = MonotonicClock::new();
     let mut desktop = DesktopRelay::default();
@@ -457,6 +470,7 @@ async fn run_session(
                             .at(captured_at)
                             .min(clock.now())
                             .max(active.last_observed_time());
+                        frame.frame.for_target(takes_contacts);
                         let transitions = capture_merge.merge(&mut frame);
                         send_capture(&mut channels, active, &negotiated, frame.frame, transitions, at)
                             .await?;
@@ -1106,6 +1120,7 @@ mod tests {
                     transitions: vec![CaptureTransition::Key { usage: key, state }],
                     motion: MotionDelta::default(),
                     touch_snapshot: None,
+                    as_pointer: None,
                     event_count: 1,
                 },
                 captured_at: Instant::now(),
@@ -1419,6 +1434,7 @@ mod tests {
                     ..MotionDelta::default()
                 },
                 touch_snapshot: None,
+                as_pointer: None,
                 event_count: 5,
             },
             captured_at: Instant::now(),
@@ -2479,6 +2495,122 @@ mod tests {
         })
         .await
         .expect("capture time regression timed out");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn touchpad_contacts_go_only_to_a_linux_peer_and_pointer_input_to_others() {
+        use crate::{
+            capture::PointerFrame,
+            core::{ContactId, TouchContact, TouchTool},
+            wire::Os,
+        };
+
+        let contact = TouchState::new([TouchContact {
+            id: ContactId(1),
+            x: 4_000,
+            y: 3_000,
+            pressure: None,
+            major: None,
+            minor: None,
+            orientation_millidegrees: None,
+            tool: TouchTool::Finger,
+            source_dimensions: None,
+        }])
+        .unwrap();
+        // What a Linux touchpad frame carries: the contact, and the same
+        // input as pointer motion.
+        let frame = CaptureFrame {
+            touch_snapshot: Some(contact.clone()),
+            as_pointer: Some(PointerFrame {
+                transitions: Vec::new(),
+                motion: MotionDelta {
+                    dx: 48,
+                    ..MotionDelta::default()
+                },
+            }),
+            event_count: 4,
+            ..CaptureFrame::default()
+        };
+
+        // Both computers turned touch forwarding on, so touch is negotiated
+        // either way. Returns the contacts and motion the peer was sent.
+        async fn sent_to(os: Option<Os>, frame: CaptureFrame) -> (Option<TouchState>, i64) {
+            let (channels, mut peer, _client, _server) = input_channel_pair().await;
+            let mut config = Config::default();
+            config.input.experimental_touchpad = true;
+            let options = SessionOptions::from_config(&config)
+                .unwrap()
+                .for_peer_os(os);
+            let offer = options.offer.clone();
+            let (commands, command_rx) = mpsc::channel(4);
+            let (events, _event_rx) = mpsc::channel(16);
+            let (ready, receipt) = oneshot::channel();
+            let actor = tokio::spawn(run_session(
+                reporter(1, "peer", events, Arc::default()),
+                channels,
+                command_rx,
+                options,
+                ready,
+            ));
+            let negotiated = negotiate(&mut peer, &offer).await.unwrap();
+            assert!(negotiated.capabilities.contains(InputCapability::Touch));
+            peer.datagrams
+                .configure_maximum(negotiated.maximum_datagram_size)
+                .unwrap();
+            receipt.await.unwrap().unwrap();
+            commands
+                .send(SessionCommand::BeginOutbound(context()))
+                .await
+                .unwrap();
+            commands
+                .send(SessionCommand::Capture(CapturedDeviceFrame {
+                    device_path: "/dev/input/event7".into(),
+                    frame,
+                    captured_at: Instant::now(),
+                }))
+                .await
+                .unwrap();
+
+            // One frame sends both kinds at once, so wait a little past the
+            // first for the other.
+            let (mut touch, mut dx) = (None, 0);
+            let mut until = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                tokio::select! {
+                    message = peer.control_receive.receive() => {
+                        if let InputControlMessage::Reliable(message) = message.unwrap()
+                            && let ReliableControl::TouchBegin { initial_state } = message.payload
+                        {
+                            touch = Some(initial_state);
+                            until = tokio::time::Instant::now() + Duration::from_millis(100);
+                        }
+                    }
+                    datagram = peer.datagrams.receive() => {
+                        if let InputDatagram::Motion(motion) = datagram.unwrap()
+                            && motion.totals.total_dx() != 0
+                        {
+                            dx = motion.totals.total_dx();
+                            until = tokio::time::Instant::now() + Duration::from_millis(100);
+                        }
+                    }
+                    () = tokio::time::sleep_until(until) => break,
+                }
+            }
+            actor.abort();
+            (touch, dx)
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            assert_eq!(
+                sent_to(Some(Os::Linux), frame.clone()).await,
+                (Some(contact), 0)
+            );
+            for os in [Some(Os::Macos), Some(Os::Windows), None] {
+                assert_eq!(sent_to(os, frame.clone()).await, (None, 48), "{os:?}");
+            }
+        })
+        .await
+        .expect("touchpad routing test timed out");
     }
 
     // Only Linux posts touch; the Mac backend drops it before this looks.
