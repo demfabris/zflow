@@ -1136,7 +1136,9 @@ impl Engine {
                     .insert(peer, (1, Instant::now() + Duration::from_secs(1), reason));
             }
             SessionEventKind::ReceiverEffects {
-                effects, applied, ..
+                mut effects,
+                applied,
+                ..
             } => {
                 let allowed = self.config.daemon.sharing
                     && input::available()
@@ -1175,15 +1177,14 @@ impl Engine {
                     let closed = effects
                         .iter()
                         .any(|e| matches!(e, ReceiverEffect::ActivationClosed { .. }));
-                    // The sender learns about a return on its next Poll. Ignore
-                    // in-flight frames until then; rejecting them would close
-                    // the session before it receives the return coordinates.
-                    let result = if self.lease.as_ref().is_some_and(|l| l.exited()) {
-                        self.injector.release();
-                        Ok(())
-                    } else {
-                        self.injector.apply(effects).map_err(|e| format!("{e:#}"))
-                    };
+                    // The sender learns about an exit on its next Poll, and
+                    // may keep the pointer here. Until then the pointer stays
+                    // put, but keys and clicks still apply; rejecting them
+                    // would close the session before it hears of the exit.
+                    if self.lease.as_ref().is_some_and(|l| l.exited()) {
+                        desktop::hold_pointer(&mut effects);
+                    }
+                    let result = self.injector.apply(effects).map_err(|e| format!("{e:#}"));
                     if closed {
                         self.inbound = None;
                     }

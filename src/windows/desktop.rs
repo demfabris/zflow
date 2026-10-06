@@ -1,5 +1,6 @@
 //! A desktop lease binds cursor placement and the exit edges to one session.
 use super::input;
+use crate::core::ReceiverEffect;
 use crate::desktop::{
     DesktopRequest, DesktopResponse, Edge, Exit, FRACTION_MAX, Geometry, LEASE_MS, Point,
     ReturnMapping,
@@ -65,12 +66,7 @@ impl Lease {
             && self.exited.is_none()
             && let Ok(cursor) = input::cursor()
         {
-            let resting = self.exits.iter().find_map(|(index, selected, exit)| {
-                Some((
-                    *index,
-                    at_edge(selected, exit.edge, exit.start, exit.end, cursor)?,
-                ))
-            });
+            let resting = self.resting_on(cursor);
             self.resting &= resting.is_some();
             if !self.resting && resting.is_some() {
                 self.exited = resting;
@@ -78,6 +74,15 @@ impl Lease {
             }
         }
         Ok(())
+    }
+    /// The exit whose outermost pixels `cursor` rests on, and where.
+    fn resting_on(&self, cursor: Point) -> Option<(u32, u32)> {
+        self.exits.iter().find_map(|(index, selected, exit)| {
+            Some((
+                *index,
+                at_edge(selected, exit.edge, exit.start, exit.end, cursor)?,
+            ))
+        })
     }
     pub fn request(&mut self, request: DesktopRequest) -> Result<DesktopResponse> {
         ensure!(!self.expired(), "Desktop handoff expired");
@@ -105,6 +110,17 @@ impl Lease {
             }
             DesktopRequest::Finish { .. } => Ok(DesktopResponse::Finished),
             _ => anyhow::bail!("A desktop handoff is already active"),
+        }
+    }
+}
+/// Keeps the pointer where it is while an exit waits for the peer, so it
+/// cannot leave again or slip onto another monitor. Keys, clicks and scroll
+/// still apply, since the peer may keep the pointer here.
+pub fn hold_pointer(effects: &mut [ReceiverEffect]) {
+    for effect in effects {
+        if let ReceiverEffect::Motion { delta, .. } = effect {
+            delta.dx = 0;
+            delta.dy = 0;
         }
     }
 }
@@ -143,7 +159,7 @@ pub fn prepare(
         actual.x.abs_diff(p.x) <= 2 && actual.y.abs_diff(p.y) <= 2,
         "Windows did not place the pointer at the entry point"
     );
-    let lease = Lease {
+    let mut lease = Lease {
         peer,
         session,
         token,
@@ -155,6 +171,9 @@ pub fn prepare(
         delivered: false,
         resting: false,
     };
+    // An entry on another exit's outermost pixels, as near a corner, is
+    // not a push out through it.
+    lease.resting = lease.resting_on(actual).is_some();
     Ok((
         lease,
         DesktopResponse::Prepared {
@@ -193,7 +212,33 @@ fn at_edge(geometry: &Geometry, edge: Edge, start: u32, end: u32, p: Point) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{HidUsage, MotionDelta, MotionSequence, PointerButton};
     use crate::desktop::Rect;
+    #[test]
+    fn a_pending_exit_holds_the_pointer_but_keeps_keys_clicks_and_scroll() {
+        let key = ReceiverEffect::Key {
+            key: HidUsage::keyboard(4),
+            pressed: true,
+            synthetic: false,
+        };
+        let click = ReceiverEffect::Button {
+            button: PointerButton(1),
+            pressed: true,
+            synthetic: false,
+        };
+        let motion = |dx, dy| ReceiverEffect::Motion {
+            delta: MotionDelta {
+                dx,
+                dy,
+                scroll_x: 0,
+                scroll_y: 120,
+            },
+            through_sequence: MotionSequence(3),
+        };
+        let mut effects = vec![key.clone(), motion(-40, 7), click.clone()];
+        hold_pointer(&mut effects);
+        assert_eq!(effects, [key, motion(0, 0), click]);
+    }
     #[test]
     fn negative_origin_and_partial_edge_return() {
         let g = Geometry {

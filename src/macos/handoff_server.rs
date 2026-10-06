@@ -413,7 +413,7 @@ impl<D: Desk> HandoffServer<D> {
                 Ok(guard) => guard,
                 Err(reason) => return DesktopResponse::unavailable(reason),
             };
-            *lease = Some(Lease {
+            let mut prepared = Lease {
                 peer: peer.to_owned(),
                 session_id,
                 token,
@@ -429,7 +429,11 @@ impl<D: Desk> HandoffServer<D> {
                 delivered: false,
                 resting: false,
                 _guard: guard,
-            });
+            };
+            // An entry on another exit's outermost pixels, as near a corner,
+            // is not a push out through it.
+            prepared.resting = prepared.at_edge(prepared.sampled).is_some();
+            *lease = Some(prepared);
         }
         self.changed.notify_waiters();
         self.desk.wake();
@@ -1175,6 +1179,47 @@ mod tests {
         assert!(
             server.moved(at(0.0, 270.0), at(10.0, 270.0)),
             "later motion is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_in_a_corner_does_not_leave_through_the_other_edge() {
+        let (server, desk, _) = setup(single());
+        let exit = |edge| Exit {
+            monitor: None,
+            edge,
+            start: 0,
+            end: MAX,
+        };
+        // The pointer enters at the top of the left edge, and another
+        // computer is above.
+        let prepare = DesktopRequest::Prepare {
+            monitor: None,
+            token: 7,
+            edge: Edge::Left,
+            start: 0,
+            end: MAX,
+            position: 0,
+            exits: vec![exit(Edge::Left), exit(Edge::Top)],
+        };
+        assert_eq!(
+            server.request("linux", 1, prepare).await,
+            DesktopResponse::Prepared {
+                geometry: single(),
+                position: Point { x: 3, y: 0 },
+            }
+        );
+        let poll = || server.request("linux", 1, DesktopRequest::Poll { token: 7 });
+        assert_eq!(poll().await, DesktopResponse::Active);
+        desk.state().cursor = Some(at(300.0, 40.0));
+        assert_eq!(poll().await, DesktopResponse::Active);
+        desk.state().cursor = Some(at(300.0, 0.0));
+        assert_eq!(
+            poll().await,
+            DesktopResponse::Exited {
+                exit: 1,
+                position: 156_250
+            }
         );
     }
 
