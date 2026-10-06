@@ -342,7 +342,10 @@ mod tests {
             state.observe(pad, key(code, 1));
         }
         state.observe(pad, report());
-        assert!(!state.is_neutral(), "arming still waits for the finger");
+        assert!(
+            !state.is_neutral(),
+            "the raw key state still lists the finger"
+        );
         assert!(state.nothing_pressed());
         // Clicking the pad is.
         state.observe(pad, key(KeyCode::BTN_LEFT, 1));
