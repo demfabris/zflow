@@ -130,11 +130,15 @@ Checks:
    install linux` with the configuration in place), an install over ssh with
    nobody logged in at the desktop, and a computer that already trusts one
    never add a computer by themselves.
-7. **Layouts add no trust.** On a computer that has not placed the VM, a
-   layout from Ubuntu that has the VM's tile shows no tile for it and adds no
-   record (`sudo zflow peers`).
+7. **Introductions (0.6.0).** The Mac trusts Ubuntu and the VM, which do not
+   trust each other. Within a few seconds of the Mac's layout reaching them,
+   each adds the other ("NAME joined", with Forget), its tile stays where the
+   Mac put it, and `sudo zflow peers` lists it. A computer that only said
+   hello to Ubuntu, and that Ubuntu did not find itself, is not added.
 8. **Forget.** Forget a computer: it goes back to Found on your network at
-   once and can be dragged in again. On Ubuntu, Forget asks nothing.
+   once, and no introduction adds it back (`/var/lib/zflow/forgotten` lists
+   its key). Dragging it in again works and takes it off that list. On
+   Ubuntu, Forget asks nothing.
 9. **Reinstalled.** Make Ubuntu fresh while the Mac still trusts its old key.
    The Mac's row says "Reset or reinstalled. Drag its new tile onto its old
    one." and the new key waits on the shelf. Drop it onto Ubuntu's old tile:

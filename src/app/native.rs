@@ -10,6 +10,7 @@ use crate::{
     config::Config,
     desktop::{MAX_SHARED_TILES, SharedLayout},
     discovery::UntrustedCandidate,
+    forgotten::Forgotten,
     hello::{self, Notice, NoticeKind, peer_name},
     identity::Identity,
     macos::{self, Advertiser, Found, Greeting, Heard, LinkState, Links, LocalNetwork},
@@ -112,6 +113,8 @@ pub(crate) struct NativeApp {
     window: PairingWindow,
     /// Computers that joined, newest last, for the window to post once.
     notices: Vec<Notice>,
+    /// Computers a person forgot here, which no introduction adds back.
+    forgotten: Forgotten,
     /// Receiver desktop sizes read over each peer's session.
     desktops: BTreeMap<String, (u32, u32)>,
     accessibility: bool,
@@ -165,6 +168,7 @@ impl NativeApp {
             identity,
             window: PairingWindow::load(&state_dir),
             notices: Vec::new(),
+            forgotten: Forgotten::load(&state_dir),
             desktops: BTreeMap::new(),
             accessibility: crate::macos::accessibility_authorized(false),
             tap_refused: None,
@@ -245,7 +249,13 @@ impl NativeApp {
                 self.neighbors_at = Instant::now() - NEIGHBORS_TICK;
             }
             Request::Forget { name } => {
-                self.document.draft.peers.remove(&name);
+                if let Some(record) = self.document.draft.peers.remove(&name)
+                    && let Err(error) = record
+                        .fingerprint_hex()
+                        .and_then(|key| self.forgotten.forget(&key))
+                {
+                    tracing::warn!(%error, %name, "forgotten, but a peer may add it back");
+                }
                 self.save_config()?;
                 self.restart();
                 self.place_new_peers();
@@ -682,6 +692,32 @@ impl NativeApp {
             .collect();
         self.links.set_found(found);
         self.tick_window(now);
+        self.introduce();
+    }
+
+    /// Trusts a computer a peer placed, one a tick, as if a person here had
+    /// placed it. See [`Neighbors::introduced`].
+    fn introduce(&mut self) {
+        let Some(layout) = &self.shared.draft.layout else {
+            return;
+        };
+        let introduced = self
+            .neighbors
+            .introduced(self.document.saved(), layout, &self.forgotten);
+        let Some(key) = introduced.into_iter().next() else {
+            return;
+        };
+        match self.trust(&key) {
+            Ok(name) => {
+                tracing::info!(%name, "added a computer another paired computer placed");
+                self.restart();
+                self.place_new_peers();
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                tracing::debug!(%key, %error, "could not add a computer a peer placed");
+            }
+        }
     }
 
     /// Opens a fresh install's pairing window once this Mac can reach the
@@ -719,6 +755,9 @@ impl NativeApp {
         let name = hello::trust_peer(config, &neighbor.spki, &neighbor.name, &addresses)?;
         let mark = neighbor.mark.clone();
         self.save_config()?;
+        if let Err(error) = self.forgotten.remember(key) {
+            tracing::warn!(%error, %name, "added, but may not come back by itself after a forget");
+        }
         self.joined(&name, &mark);
         Ok(name)
     }
@@ -850,7 +889,11 @@ impl NativeApp {
                 let keys = peer_keys(self.document.saved());
                 let version =
                     next_version(Some(&kept)).context("The layout cannot change again")?;
-                let shared = next.to_shared(version, &own, &keys);
+                let shared = next
+                    .to_shared(version, &own, &keys)
+                    .with_others_from(&kept, |key| {
+                        key == own || keys.values().any(|known| known == key)
+                    });
                 shared.validate()?;
                 self.keep_layout(shared);
                 self.show_shared()?;

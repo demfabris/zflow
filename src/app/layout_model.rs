@@ -110,7 +110,8 @@ impl Layout {
 
     /// The shared form of this layout. `keys` maps each paired computer's
     /// name here to its key fingerprint. A tile for a computer that is not
-    /// paired is left out, so a forgotten computer does not come back.
+    /// paired is left out; `SharedLayout::with_others_from` puts back the
+    /// ones other computers placed.
     pub fn to_shared(
         &self,
         version: u64,
@@ -412,13 +413,17 @@ mod tests {
             tiles: vec![tile(&own, 0), tile(&desk, 1920), tile(&found, -1920)],
         };
         let keys = BTreeMap::from([("desk".to_owned(), desk)]);
-        // Its tile is not shown here, so no crossing leads to it, and the
-        // next layout this computer writes leaves it out.
+        // Its tile is not shown here, so no crossing leads to it. The next
+        // layout this computer writes keeps it where the peer put it.
         let here = Layout::from_shared(&from_desk, &own, "This computer", &keys);
         let ids: Vec<&str> = here.monitors.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["local", "peer:desk"]);
         let written = here.to_shared(5, &own, &keys);
         assert!(written.tiles.iter().all(|tile| tile.key != found));
+        let written = written.with_others_from(&from_desk, |key| {
+            key == own || keys.values().any(|k| k == key)
+        });
+        assert!(written.tiles.contains(&tile(&found, -1920)));
     }
 
     #[test]

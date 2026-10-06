@@ -441,6 +441,7 @@ struct Shared {
     window: std::sync::Mutex<PairingWindow>,
     /// Computers that joined lately, newest last.
     notices: std::sync::Mutex<Vec<crate::hello::Notice>>,
+    forgotten: std::sync::Mutex<crate::forgotten::Forgotten>,
     /// The live link to each peer this computer may send to.
     links: Mutex<BTreeMap<String, links::Link>>,
     /// The newest layout this computer has seen from any peer.
@@ -503,6 +504,9 @@ impl Shared {
             neighbors: watch::Sender::new(Neighbors::new(identity.spki())),
             window: std::sync::Mutex::new(PairingWindow::load(&config.daemon.state_dir)),
             notices: std::sync::Mutex::new(Vec::new()),
+            forgotten: std::sync::Mutex::new(crate::forgotten::Forgotten::load(
+                &config.daemon.state_dir,
+            )),
             links: Mutex::new(BTreeMap::new()),
             layout: Mutex::new(None),
             crossing: Mutex::new(()),
@@ -1310,9 +1314,10 @@ async fn dispatch_result(request: Request, shared: &Arc<Shared>) -> Result<Respo
         Request::RevokePeer { peer } => {
             let _mutation = shared.config_mutation.lock().await;
             let mut config = shared.config.read().await.clone();
-            if config.peers.remove(&peer).is_none() {
+            let Some(record) = config.peers.remove(&peer) else {
                 bail!("unknown peer {peer}");
-            }
+            };
+            shared.forgot(&record)?;
             shared.apply_config_locked(config, true).await?;
             Ok(Response::Ack)
         }
@@ -1879,7 +1884,7 @@ fn initial_layout(
 
 /// A new version of `layout`, edited by this computer, with the tile `id` of
 /// its view at (x, y), or against an edge within `tolerance` of there. Tiles
-/// of computers not paired here are left out, as in any layout it writes.
+/// of computers not paired here stay where they were.
 fn with_tile_moved(
     layout: &crate::desktop::SharedLayout,
     own: &str,
@@ -1899,7 +1904,11 @@ fn with_tile_moved(
         .context("Computers cannot overlap")?;
     view.monitors[index].x = x;
     view.monitors[index].y = y;
-    let moved = view.to_shared(layout.version.saturating_add(1), own, keys);
+    let moved = view
+        .to_shared(layout.version.saturating_add(1), own, keys)
+        .with_others_from(layout, |key| {
+            key == own || keys.values().any(|known| known == key)
+        });
     moved.validate()?;
     Ok(moved)
 }
@@ -3179,10 +3188,18 @@ mod tests {
         assert_eq!((moved.version, &moved.editor), (8, &own));
         assert_eq!(at(&moved, &fingerprint(2)), (-1920, 40));
         assert_eq!(at(&moved, &own), (0, 0));
-        assert_eq!(moved.tiles.len(), 2, "the unpaired computer is left out");
+        assert_eq!(
+            at(&moved, &fingerprint(5)),
+            (0, 5000),
+            "the unpaired computer stays where its peers placed it"
+        );
         // This computer's own tile moves by its view's id.
         let moved = with_tile_moved(&moved, &own, &keys, "local", (0, 1100), 0).unwrap();
         assert_eq!((moved.version, at(&moved, &own)), (9, (0, 1100)));
+        assert_eq!(moved.tiles.len(), 3);
+        // A tile moved over one this computer cannot show replaces it.
+        let covered = with_tile_moved(&moved, &own, &keys, "local", (0, 4900), 0).unwrap();
+        assert!(covered.tiles.iter().all(|t| t.key != fingerprint(5)));
 
         // A huge tolerance is capped rather than read as a negative one.
         assert!(with_tile_moved(&layout, &own, &keys, "peer:mac", (-1900, 40), u32::MAX).is_ok());
