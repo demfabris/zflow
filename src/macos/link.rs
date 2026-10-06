@@ -233,7 +233,7 @@ impl Hops {
 
 enum Command {
     Cross {
-        handoff: Handoff,
+        handoff: Box<Handoff>,
         arrival: Arrival,
         reduce_wifi_latency: bool,
         stop: watch::Receiver<bool>,
@@ -243,6 +243,19 @@ enum Command {
     },
     Inbound(Opened),
     Retry,
+}
+
+impl Command {
+    /// The session a crossing that moved on here prepared its desktop on.
+    fn prepared_on(&self) -> Option<u64> {
+        match self {
+            Self::Cross {
+                arrival: Arrival::Hop { session, .. },
+                ..
+            } => Some(session.id()),
+            _ => None,
+        }
+    }
 }
 
 /// What a link's session depends on. The rest of a peer's record, such as
@@ -630,7 +643,7 @@ impl Links {
         let (status, events) = mpsc::unbounded_channel();
         link.commands
             .send(Command::Cross {
-                handoff,
+                handoff: Box::new(handoff),
                 arrival: Arrival::Edge(entry_position),
                 reduce_wifi_latency,
                 stop: stopped,
@@ -1003,8 +1016,8 @@ fn refuse(command: Command, reason: &str) {
             ..
         } => {
             // A crossing that moved on from another computer gives the Mac
-            // its input back first.
-            drop(arrival);
+            // its input back first, and lets go of the desktop it prepared.
+            arrival.give_back();
             drop(guard);
             let _ = status.send(SourceStatus::Cancelled(reason.into()));
         }
@@ -1363,6 +1376,15 @@ impl Session {
                         theirs.close(SessionCloseReason::Superseded);
                     }
                     Some(command) if !ready => refuse(command, "the other computer is not ready"),
+                    // The desktop was prepared on a session this link has
+                    // since replaced, so its polls would go nowhere.
+                    Some(command)
+                        if command
+                            .prepared_on()
+                            .is_some_and(|session| session != self.handle.id()) =>
+                    {
+                        refuse(command, "the other computer connected again");
+                    }
                     Some(Command::Cross {
                         handoff,
                         arrival,
@@ -1385,7 +1407,7 @@ impl Session {
                         };
                         let (failed, onward) = run_crossing(
                             activation,
-                            handoff,
+                            *handoff,
                             arrival,
                             reduce_wifi_latency,
                             stop.clone(),
@@ -3250,7 +3272,7 @@ mod tests {
         let ownership = Ownership::default();
         let (status, mut statuses) = mpsc::unbounded_channel();
         let command = Command::Cross {
-            handoff: handoff("linux"),
+            handoff: Box::new(handoff("linux")),
             arrival: Arrival::Edge(ENTRY),
             reduce_wifi_latency: false,
             stop: watch::channel(false).1,
@@ -3264,6 +3286,61 @@ mod tests {
             Ok(SourceStatus::Cancelled(_))
         ));
         assert!(ownership.claim_inbound("linux", 1).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hop_that_goes_no_further_lets_go_of_the_desktop_it_prepared() {
+        let (mac, linux) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let spki = Identity::load_or_create(mac.path())
+            .unwrap()
+            .spki()
+            .to_vec();
+        let mut receiver = receiver(linux.path(), &spki, false).await;
+        receiver
+            .hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let config = mac_config(mac.path(), linux.path(), receiver.address);
+        let session = Session::open(
+            "linux",
+            &config.peers["linux"],
+            &config,
+            &[receiver.address],
+        )
+        .await
+        .unwrap();
+        let ownership = Ownership::default();
+        let (status, mut statuses) = mpsc::unbounded_channel();
+        let hop = Command::Cross {
+            handoff: Box::new(handoff("linux")),
+            arrival: Arrival::Hop {
+                token: 7,
+                capture: super::super::MacCapture {
+                    running: false,
+                    raw_touch: false,
+                },
+                local_desktop: Vec::new(),
+                session: session.handle.clone(),
+            },
+            reduce_wifi_latency: false,
+            stop: watch::channel(false).1,
+            status,
+            guard: ownership.begin_outbound().unwrap(),
+        };
+        assert_eq!(hop.prepared_on(), Some(session.handle.id()));
+        // As when the next computer's link went away before it took the hop.
+        refuse(hop, "the next computer's link closed");
+        assert!(matches!(
+            statuses.try_recv(),
+            Ok(SourceStatus::Cancelled(_))
+        ));
+        assert!(ownership.claim_inbound("linux", 1).is_ok());
+        let (request, reply) = tokio::time::timeout(Duration::from_secs(2), receiver.held.recv())
+            .await
+            .expect("the prepared desktop was let go")
+            .unwrap();
+        assert_eq!(request, DesktopRequest::Finish { token: 7 });
+        let _ = reply.send(DesktopResponse::Finished);
+        session.close(SessionCloseReason::LocalRelease).await;
     }
 
     #[tokio::test]

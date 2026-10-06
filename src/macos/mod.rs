@@ -118,6 +118,18 @@ fn keep_first_failure<T>(result: &mut Result<T>, cleanup: Result<()>, operation:
     }
 }
 
+/// As [`keep_first_failure`], except that a crossing that moved on stays
+/// moved on: the next computer holds input and its prepared desktop now,
+/// and only the computer it left failed to clean up.
+fn keep_cleanup_failure(result: &mut Result<Outcome>, cleanup: Result<()>, operation: &str) {
+    if let (Ok(Outcome::Hopped(handoff, _)), Err(error)) = (&*result, &cleanup) {
+        tracing::warn!(operation, peer = %handoff.peer, error = %format!("{error:#}"),
+            "cleanup behind a hop failed");
+        return;
+    }
+    keep_first_failure(result, cleanup, operation);
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CursorPosition {
@@ -347,12 +359,37 @@ enum Arrival {
     /// Through an edge of the Mac, where the cursor was at that moment.
     Edge(CursorPosition),
     /// From another computer, with the Mac's input still captured and this
-    /// computer's desktop prepared under `token`.
+    /// computer's desktop prepared under `token` on `session`.
     Hop {
         token: u64,
         capture: MacCapture,
         local_desktop: Vec<DesktopRect>,
+        session: SessionHandle,
     },
+}
+
+impl Arrival {
+    /// Gives the Mac its input back from a hop that goes no further, and
+    /// lets go of the desktop prepared for it.
+    fn give_back(self) {
+        let Self::Hop {
+            token,
+            capture,
+            session,
+            ..
+        } = self
+        else {
+            return;
+        };
+        drop(capture);
+        tokio::spawn(async move {
+            let request = DesktopRequest::Finish { token };
+            if let Err(error) = handoff::check_finished(session.desktop_request(request).await) {
+                tracing::warn!(peer = %session.peer(), error = %format!("{error:#}"),
+                    "desktop not let go after a hop went no further");
+            }
+        });
+    }
 }
 
 /// How a crossing's time on one computer ended.
@@ -380,7 +417,7 @@ async fn run_crossing(
     reduce_wifi_latency: bool,
     mut stop: watch::Receiver<bool>,
     status: mpsc::UnboundedSender<SourceStatus>,
-) -> (bool, Option<(Handoff, Arrival)>) {
+) -> (bool, Option<(Box<Handoff>, Arrival)>) {
     let started = Instant::now();
     let result = cross(
         activation,
@@ -399,7 +436,7 @@ async fn run_crossing(
     let outcome = match result {
         Ok(Outcome::Hopped(handoff, arrival)) => {
             tracing::info!(peer = %handoff.peer, "crossing moves on");
-            return (false, Some((*handoff, arrival)));
+            return (false, Some((handoff, arrival)));
         }
         Ok(Outcome::Returned(position)) => {
             let _ = status.send(SourceStatus::Returned { position });
@@ -434,11 +471,14 @@ async fn cross(
     status: &mpsc::UnboundedSender<SourceStatus>,
 ) -> Result<Outcome> {
     let session = activation.session;
-    receive::answer_waiting_events(
+    if let Err(error) = receive::answer_waiting_events(
         activation.events,
         |layout| activation.layouts.take(session, layout),
         |clip| activation.clipboard.keep(session.peer(), clip),
-    )?;
+    ) {
+        arrival.give_back();
+        return Err(error);
+    }
     // AWDL goes down beside Prepare, before input starts. A peer that
     // controlled this Mac a moment ago, or the computer a hop came from, may
     // still hold it down; then the crossing shares its lease.
@@ -477,6 +517,7 @@ async fn cross(
             token,
             capture,
             local_desktop,
+            ..
         } => {
             awdl_down.await;
             (token, local_desktop, Some(capture), None)
@@ -521,7 +562,7 @@ async fn cross(
         success = finished.is_ok(),
         "desktop handoff cleanup completed"
     );
-    keep_first_failure(&mut result, finished, "desktop handoff cleanup");
+    keep_cleanup_failure(&mut result, finished, "desktop handoff cleanup");
     // A moment after the last user lets go, the shared lease gives AWDL back.
     drop(awdl);
     result
@@ -610,7 +651,7 @@ async fn remote(
         // Closing the session makes the receiver release everything it holds.
         session.close(SessionCloseReason::LocalRelease);
     }
-    keep_first_failure(&mut result, released, "remote input release");
+    keep_cleanup_failure(&mut result, released, "remote input release");
     // Keep the poll alive through Leave, then finish it before Finish. Late
     // responses cannot change the cursor placement or the capture result.
     if let Some(poll) = poll {
@@ -712,7 +753,7 @@ async fn capture<'a>(
             break ended;
         };
         match prepare_hop(activation, &mut next).await {
-            Ok(token) => {
+            Ok((token, session)) => {
                 tracing::info!(peer = %next.peer, captured_events = ended.events,
                     active_ms = started.elapsed().as_millis() as u64, "input moves on");
                 if ended.touch_active {
@@ -724,6 +765,7 @@ async fn capture<'a>(
                     token,
                     capture,
                     local_desktop: local_desktop.to_vec(),
+                    session,
                 };
                 return Ok(Outcome::Hopped(Box::new(next), arrival));
             }
@@ -771,9 +813,12 @@ async fn capture<'a>(
 }
 
 /// Prepares the next computer's desktop for a pointer that left this one,
-/// over that computer's own link, and returns the handoff's token. A
-/// desktop it prepared but that does not fit goes back.
-async fn prepare_hop(activation: &Activation<'_>, next: &mut Handoff) -> Result<u64> {
+/// over that computer's own link, and returns the handoff's token and that
+/// session. A desktop it prepared but that does not fit goes back.
+async fn prepare_hop(
+    activation: &Activation<'_>,
+    next: &mut Handoff,
+) -> Result<(u64, SessionHandle)> {
     let door = activation
         .hops
         .door(&next.peer)
@@ -792,7 +837,7 @@ async fn prepare_hop(activation: &Activation<'_>, next: &mut Handoff) -> Result<
             .desktop_request(DesktopRequest::Finish { token })
             .await;
     }
-    prepared.map(|()| token)
+    prepared.map(|()| (token, door.session))
 }
 
 fn return_point(local_desktop: &[DesktopRect], point: Point) -> Result<CursorPosition> {
@@ -1286,6 +1331,54 @@ mod tests {
         let owned = Ok(DesktopResponse::unavailable(receive::OWNED));
         assert!(busy("linux", &owned).is_none());
         assert!(busy("linux", &Err(anyhow!("timed out"))).is_none());
+    }
+
+    #[test]
+    fn a_hop_stays_a_hop_when_the_computer_it_left_does_not_clean_up() {
+        use crate::app::layout_model::{Layout, Monitor};
+        let tile = |name: &str, x| Monitor {
+            id: name.into(),
+            label: name.into(),
+            peer: (name != "mac").then(|| name.into()),
+            display: None,
+            x,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let layout = Layout {
+            monitors: vec![tile("mac", 0), tile("linux", 100)],
+        };
+        let geometry = Geometry {
+            displays: Vec::new(),
+            monitors: vec![Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+        };
+        let next = handoff::from_edge(
+            &layout,
+            &geometry,
+            None,
+            crate::desktop::Edge::Right,
+            500_000,
+        )
+        .unwrap();
+        let mut hopped = Ok(Outcome::Hopped(
+            Box::new(next),
+            Arrival::Edge(CursorPosition::default()),
+        ));
+        keep_cleanup_failure(&mut hopped, Err(anyhow!("Leave timed out")), "release");
+        keep_cleanup_failure(&mut hopped, Err(anyhow!("Finish lost")), "cleanup");
+        assert!(
+            matches!(hopped, Ok(Outcome::Hopped(..))),
+            "the next computer keeps the pointer"
+        );
+        let mut returned = Ok(Outcome::Returned(0));
+        keep_cleanup_failure(&mut returned, Err(anyhow!("Finish lost")), "cleanup");
+        assert!(returned.is_err());
     }
 
     #[test]
