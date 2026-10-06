@@ -69,7 +69,7 @@ enum Network {
         peer: String,
         session: u64,
         token: u64,
-        handoff: Option<handoff::Handoff>,
+        handoff: Option<Box<handoff::Handoff>>,
         result: Result<DesktopResponse>,
     },
     Polled {
@@ -948,7 +948,7 @@ impl Engine {
                     peer,
                     session,
                     token,
-                    handoff,
+                    handoff: handoff.map(|handoff| *handoff),
                     polling: false,
                     next_poll: Instant::now(),
                 });
@@ -1097,7 +1097,7 @@ impl Engine {
                     peer,
                     session,
                     token,
-                    handoff,
+                    handoff: handoff.map(Box::new),
                     result,
                 })
                 .await;

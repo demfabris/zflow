@@ -63,8 +63,8 @@ pub(crate) enum Onward {
 pub(crate) enum Next {
     /// Back here, to this point.
     Home(Point),
-    /// On to another computer.
-    Hop(Box<Handoff>),
+    /// On to another computer. Windows only routes home.
+    Hop(#[cfg_attr(windows, allow(dead_code))] Box<Handoff>),
 }
 
 impl Handoff {
