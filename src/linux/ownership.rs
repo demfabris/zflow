@@ -200,6 +200,24 @@ struct DeviceInputState {
     in_frame: bool,
 }
 
+/// The codes a touchpad or tablet holds while a finger or tool touches it,
+/// which are not presses. Stylus buttons are, so they are not here.
+const CONTACTS: [KeyCode; 13] = [
+    KeyCode::BTN_TOUCH,
+    KeyCode::BTN_TOOL_PEN,
+    KeyCode::BTN_TOOL_RUBBER,
+    KeyCode::BTN_TOOL_BRUSH,
+    KeyCode::BTN_TOOL_PENCIL,
+    KeyCode::BTN_TOOL_AIRBRUSH,
+    KeyCode::BTN_TOOL_FINGER,
+    KeyCode::BTN_TOOL_MOUSE,
+    KeyCode::BTN_TOOL_LENS,
+    KeyCode::BTN_TOOL_QUINTTAP,
+    KeyCode::BTN_TOOL_DOUBLETAP,
+    KeyCode::BTN_TOOL_TRIPLETAP,
+    KeyCode::BTN_TOOL_QUADTAP,
+];
+
 /// Physical key/button state is kept per evdev node so overlapping composite
 /// nodes do not release each other's keys. Neutrality is the union of all held
 /// state, and ownership changes only while no node has a partial frame.
@@ -269,6 +287,16 @@ impl AggregateInputState {
         self.devices.values().all(|device| device.held.is_empty())
     }
 
+    /// Whether no key or button is down, leaving out a finger or pen that
+    /// only touches a pad. A touchpad reports those as keys, so with one
+    /// finger resting on it the pointer could never move on to another
+    /// computer.
+    pub fn nothing_pressed(&self) -> bool {
+        self.devices
+            .values()
+            .all(|device| device.held.iter().all(|key| CONTACTS.contains(key)))
+    }
+
     pub fn all_at_boundary(&self) -> bool {
         self.devices.values().all(|device| !device.in_frame)
     }
@@ -296,6 +324,26 @@ mod tests {
             SynchronizationCode::SYN_REPORT.0,
             0,
         )
+    }
+
+    #[test]
+    fn a_finger_on_the_touchpad_is_not_a_press() {
+        let pad = std::path::Path::new("/dev/input/event7");
+        let mut state = AggregateInputState::default();
+        state.add_device(pad, []);
+        for code in [KeyCode::BTN_TOUCH, KeyCode::BTN_TOOL_DOUBLETAP] {
+            state.observe(pad, key(code, 1));
+        }
+        state.observe(pad, report());
+        assert!(!state.is_neutral(), "arming still waits for the finger");
+        assert!(state.nothing_pressed());
+        // Clicking the pad is.
+        state.observe(pad, key(KeyCode::BTN_LEFT, 1));
+        state.observe(pad, report());
+        assert!(!state.nothing_pressed());
+        state.observe(pad, key(KeyCode::BTN_LEFT, 0));
+        state.observe(pad, report());
+        assert!(state.nothing_pressed());
     }
 
     #[test]

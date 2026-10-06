@@ -152,7 +152,8 @@ pub struct LinuxRuntimeStatus {
     pub ownership: OwnershipPhase,
     pub selected_peer: Option<String>,
     /// No key or button is down across the capture set, as the input
-    /// thread tracks it. A crossing moves on to another computer only then.
+    /// thread tracks it; a finger resting on a touchpad does not count. A
+    /// crossing moves on to another computer only then.
     pub neutral: bool,
 }
 
@@ -1054,7 +1055,7 @@ impl RuntimeLoop {
     /// Tells the daemon when keys and buttons all come up or one goes down,
     /// without taking the status lock for every frame.
     fn publish_neutral(&mut self) {
-        let neutral = self.capture.aggregate_state().is_neutral();
+        let neutral = self.capture.aggregate_state().nothing_pressed();
         if neutral != self.neutral {
             self.neutral = neutral;
             lock_status(&self.status).neutral = neutral;
@@ -1215,7 +1216,7 @@ impl RuntimeLoop {
     /// is updated before the daemon hears about it.
     fn emit_ownership(&mut self) {
         let phase = self.ownership.phase();
-        self.neutral = self.capture.aggregate_state().is_neutral();
+        self.neutral = self.capture.aggregate_state().nothing_pressed();
         *lock_status(&self.status) = LinuxRuntimeStatus {
             ownership: phase,
             selected_peer: self.selected_peer.clone(),
