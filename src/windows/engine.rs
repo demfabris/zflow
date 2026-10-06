@@ -966,11 +966,18 @@ impl Engine {
                     out.next_poll = Instant::now() + Duration::from_millis(30);
                     match result {
                         Ok(DesktopResponse::Active) => {}
-                        Ok(DesktopResponse::Returned { position }) => {
+                        Ok(DesktopResponse::Exited { exit, position }) => {
+                            // Windows lists only the ways home, so every exit
+                            // brings input back here.
                             let back = out
                                 .handoff
                                 .as_ref()
-                                .map(|h| h.return_mapping.position(position))
+                                .map(|h| match h.next(exit, position)? {
+                                    handoff::Next::Home(point) => Ok(point),
+                                    handoff::Next::Hop(_) => {
+                                        bail!("the other computer left toward another one")
+                                    }
+                                })
                                 .transpose();
                             self.local();
                             if let Some(back) = back? {
@@ -1058,6 +1065,12 @@ impl Engine {
         };
         let session = link.handle.id();
         self.arming = Some((peer.clone(), session));
+        // Input comes back from the other computer, but Windows does not
+        // route it on to a third one.
+        let handoff = handoff.map(|mut h| {
+            h.keep_routes(|_| false);
+            h
+        });
         let request = handoff.as_ref().map_or(
             DesktopRequest::Prepare {
                 monitor: None,
@@ -1066,6 +1079,12 @@ impl Engine {
                 start: 0,
                 end: crate::desktop::FRACTION_MAX,
                 position: 500_000,
+                exits: vec![crate::desktop::Exit {
+                    monitor: None,
+                    edge: crate::desktop::Edge::Left,
+                    start: 0,
+                    end: crate::desktop::FRACTION_MAX,
+                }],
             },
             |h| h.prepare(token),
         );
@@ -1159,7 +1178,7 @@ impl Engine {
                     // The sender learns about a return on its next Poll. Ignore
                     // in-flight frames until then; rejecting them would close
                     // the session before it receives the return coordinates.
-                    let result = if self.lease.as_ref().is_some_and(|l| l.returned()) {
+                    let result = if self.lease.as_ref().is_some_and(|l| l.exited()) {
                         self.injector.release();
                         Ok(())
                     } else {
@@ -1431,7 +1450,7 @@ impl Engine {
         let mut boundaries = Vec::new();
         if self.desktop_available && self.config.daemon.sharing && self.outbound.is_none() {
             if let Some(lease) = &self.lease {
-                boundaries.extend(lease.boundary());
+                boundaries.extend(lease.boundaries());
             } else if self.inbound.is_none() {
                 let layout = self.local_layout();
                 for t in layout.transitions() {

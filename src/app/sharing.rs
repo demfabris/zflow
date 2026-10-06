@@ -26,6 +26,9 @@ const SECURE_INPUT_ON: &str = "Secure keyboard entry is on in a Mac app (a passw
 struct Running {
     crossing: Crossing,
     handoff: Handoff,
+    /// The computer input goes to now. A hop moves it on from the one the
+    /// handoff entered.
+    peer: String,
     returned: Option<u32>,
     failed: bool,
     cancelled: bool,
@@ -251,7 +254,7 @@ impl Observer {
     /// The computer that input goes to during a crossing.
     pub fn session_peer(&self) -> Option<&str> {
         let running = self.running.as_ref()?;
-        Some(&running.handoff.peer)
+        Some(&running.peer)
     }
 
     /// The notice says Secure Input keeps input on the Mac.
@@ -451,10 +454,12 @@ impl Observer {
         match status {
             SourceStatus::Sharing => {
                 tracing::info!(parent: &running.span, elapsed_ms = running.started.elapsed().as_millis() as u64, "edge observer saw capture start");
-                self.notice = format!(
-                    "Sharing with {}. Cross back or press Ctrl+Cmd+Backspace to return.",
-                    running.handoff.peer
-                );
+                self.notice = sharing_with(&running.peer);
+            }
+            SourceStatus::Hopped { peer } => {
+                tracing::info!(parent: &running.span, from = %running.peer, to = %peer, "input moved on to another computer");
+                self.notice = sharing_with(&peer);
+                running.peer = peer;
             }
             SourceStatus::Returned { position } => running.returned = Some(position),
             SourceStatus::LocalInputRestored => {
@@ -575,6 +580,7 @@ impl Observer {
         self.notice = format!("Switching to {}…", handoff.peer);
         self.running = Some(Running {
             crossing,
+            peer: handoff.peer.clone(),
             handoff,
             returned: None,
             failed: false,
@@ -585,6 +591,10 @@ impl Observer {
         });
         Ok(())
     }
+}
+
+fn sharing_with(peer: &str) -> String {
+    format!("Sharing with {peer}. Cross back or press Ctrl+Cmd+Backspace to return.")
 }
 
 /// Keep only configured, usable peer edges. Movement to this Mac's other
@@ -701,7 +711,11 @@ mod tests {
                     remote_start: 0.0,
                     remote_end: 1.0,
                 },
+                origin: 0,
+                routes: Vec::new(),
+                layout: Layout::default(),
             },
+            peer: "linux".into(),
             returned: None,
             failed: false,
             cancelled: false,
@@ -933,6 +947,25 @@ mod tests {
             );
             assert_eq!(handoff.is_some(), crosses);
         }
+    }
+
+    #[test]
+    fn a_crossing_follows_the_pointer_on_to_another_computer_and_home() {
+        let (mut observer, status, _stopped) = crossing();
+        observer.record(SourceStatus::Sharing);
+        assert_eq!(observer.session_peer(), Some("linux"));
+        observer.record(SourceStatus::Hopped {
+            peer: "desk".into(),
+        });
+        assert_eq!(observer.session_peer(), Some("desk"));
+        assert!(observer.notice.starts_with("Sharing with desk."));
+        observer.record(SourceStatus::Returned { position: 0 });
+        observer.record(SourceStatus::Stopped);
+        drop(status);
+        observer.finish();
+        assert!(observer.is_enabled() && !observer.has_session());
+        assert!(!observer.crossing_failed());
+        assert_eq!(observer.notice, "Back on the Mac. Edge sharing is ready.");
     }
 
     #[test]

@@ -459,13 +459,23 @@ export default class ZflowExtension extends Extension {
         if (r.command !== 'poll') throw new Error('Unknown desktop operation');
         this._lease.renewed = GLib.get_monotonic_time();
         const lease = this._lease;
-        if (lease.returned !== null) return {status: 'returned', position: lease.returned};
+        const exited = () => {
+            lease.delivered = true;
+            return {status: 'exited', ...lease.exited};
+        };
+        if (lease.exited !== null) {
+            if (!lease.delivered) return exited();
+            // Another Poll after the exit means the pointer stays here, as
+            // when a key is held on the way to a third computer. The next
+            // push out reports again.
+            lease.exited = null;
+        }
         return new Promise((resolve, reject) => {
             const reply = error => {
                 GLib.Source.remove(timer);
                 lease.polls.delete(reply);
                 if (error) reject(error);
-                else resolve({status: 'returned', position: lease.returned});
+                else resolve(exited());
             };
             const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, POLL_HOLD_MS, () => {
                 lease.polls.delete(reply);
@@ -481,6 +491,9 @@ export default class ZflowExtension extends Extension {
         if (!validRange(r.start, r.end) || !Number.isSafeInteger(r.position) || r.position < r.start || r.position > r.end)
             throw new Error('Invalid crossing range');
         if (!EDGES.includes(r.edge)) throw new Error('Invalid edge');
+        if (!Array.isArray(r.exits) || r.exits.length > 64 || !r.exits.every(e => EDGES.includes(e?.edge)
+            && validRange(e.start, e.end) && (e.monitor === undefined || (typeof e.monitor === 'string' && e.monitor.length > 0 && e.monitor.length <= 128))))
+            throw new Error('Invalid crossing exits');
         if ((global.backend.capabilities & Meta.BackendCapabilities.BARRIERS) === 0)
             throw new Error('This GNOME session does not provide pointer barriers');
         const g = edgeGeometry(this._selected(snapshot.geometry, r.monitor), r.edge, r.start, r.end);
@@ -498,13 +511,14 @@ export default class ZflowExtension extends Extension {
         if (m.width < 8 || m.height < 8) throw new Error('The entry monitor is too small');
         const point = vertical ? {x: r.edge === 'left' ? left + 3 : right - 4, y: coordinate}
             : {x: coordinate, y: r.edge === 'top' ? top + 3 : bottom - 4};
-        const lease = {token: r.token, renewed: GLib.get_monotonic_time(), returned: null, polls: new Set()};
+        // Where the pointer left and whether a Poll has answered it yet.
+        const lease = {token: r.token, renewed: GLib.get_monotonic_time(), exited: null, delivered: false, polls: new Set()};
         this._lease = lease;
         try {
             // Mutter runs a warp through the pointer barriers like any motion,
             // and a barrier the pointer rests on pins it to the edge when the
             // warp also moves along it, as after a return through this edge.
-            // So this computer's own barriers go first, and the return barriers
+            // So this computer's own barriers go first, and the exit barriers
             // go up only once the pointer is in.
             this._placeEdges();
             // GNOME 51 removed Clutter.get_default_backend().
@@ -525,16 +539,25 @@ export default class ZflowExtension extends Extension {
                 if (this._lease !== lease) throw new Error('Desktop changed during entry');
                 const actual = this._snapshot();
                 if (Math.abs(actual.position.x - point.x) <= 2 && Math.abs(actual.position.y - point.y) <= 2) {
-                    for (const s of segments) {
-                        const barrier = edgeBarrier(r.edge, g, s);
-                        barrier.connect('hit', (_barrier, event) => {
-                            if (this._lease !== lease || lease.returned !== null) return;
-                            const axis = vertical ? event.y : event.x;
-                            lease.returned = Math.max(r.start, Math.min(r.end, Math.round((axis - origin) * MAX / span)));
-                            for (const reply of lease.polls) reply();
-                        });
-                        this._barriers.push(barrier);
-                    }
+                    // Every way off this desktop: home to the computer that
+                    // sends, or on to another one it routes to.
+                    r.exits.forEach((exit, index) => {
+                        let e;
+                        try { e = edgeGeometry(this._selected(actual.geometry, exit.monitor), exit.edge, exit.start, exit.end); }
+                        catch { return; } // A disconnected monitor has no exit.
+                        for (const s of e.segments) {
+                            const barrier = edgeBarrier(exit.edge, e, s);
+                            barrier.connect('hit', (_barrier, event) => {
+                                if (this._lease !== lease || lease.exited !== null) return;
+                                const axis = e.vertical ? event.y : event.x;
+                                const position = Math.max(exit.start, Math.min(exit.end, Math.round((axis - e.origin) * MAX / e.span)));
+                                lease.exited = {exit: index, position};
+                                lease.delivered = false;
+                                for (const reply of lease.polls) reply();
+                            });
+                            this._barriers.push(barrier);
+                        }
+                    });
                     return {status: 'prepared', ...actual};
                 }
                 if (GLib.get_monotonic_time() >= deadline) {

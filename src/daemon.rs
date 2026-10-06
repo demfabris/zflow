@@ -539,9 +539,11 @@ impl Shared {
         DaemonStatus {
             identity: self.identity_fingerprint.clone(),
             ownership: ownership_status(runtime.ownership),
-            selected_peer: runtime
-                .selected_peer
-                .or_else(|| active.as_ref().map(|active| active.peer.clone())),
+            // A hop moves input on without the runtime choosing again.
+            selected_peer: active
+                .as_ref()
+                .map(|active| active.peer.clone())
+                .or(runtime.selected_peer),
             session_epoch: active
                 .as_ref()
                 .map(|active| encode_hex(&active.context.session_epoch.0)),
@@ -1162,6 +1164,77 @@ impl Shared {
             activation_id: self.allocate_activation()?,
         };
         session.begin_outbound(context)?;
+        *self.active_outbound.lock().await = Some(ActiveOutbound {
+            peer: peer.to_owned(),
+            session_id: session.id(),
+            context,
+        });
+        Ok(())
+    }
+
+    /// Moves this computer's input on from the computer it goes to now to
+    /// `peer`, as a hop does: Leave there, then Enter at `peer` with a new
+    /// activation. The runtime stays Remote, so nothing is ungrabbed, and
+    /// captured input waits on the policy lock until it can go to `peer`.
+    async fn switch_outbound(&self, peer: &str) -> Result<()> {
+        let _policy = self.policy.lock().await;
+        let record = self
+            .config
+            .read()
+            .await
+            .peers
+            .get(peer)
+            .cloned()
+            .with_context(|| format!("unknown peer {peer}"))?;
+        require_outbound_permission(&*self.config.read().await, peer, &record)?;
+        ensure!(
+            self.runtime.status().ownership == OwnershipPhase::Remote,
+            "this computer's input is not going anywhere"
+        );
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(peer)
+            .cloned()
+            .with_context(|| format!("peer {peer} disconnected"))?;
+        let context = SessionContext {
+            session_epoch: self.process_epoch,
+            transport_generation: session.generation(),
+            activation_id: self.allocate_activation()?,
+        };
+        let previous = self
+            .active_outbound
+            .lock()
+            .await
+            .take()
+            .context("input has no computer to move on from")?;
+        let left = self
+            .sessions
+            .lock()
+            .await
+            .get(&previous.peer)
+            .filter(|session| session.id() == previous.session_id)
+            .cloned();
+        if let Some(left) = left {
+            // As after a runtime close: the session may be waiting on the
+            // daemon, so bound the wait and close it instead.
+            let leave = left.end_outbound(SessionCloseReason::LocalRelease);
+            if !matches!(
+                tokio::time::timeout(TERMINAL_SEND_TIMEOUT, leave).await,
+                Ok(Ok(()))
+            ) {
+                tracing::warn!(peer = %previous.peer, "input could not leave before a hop");
+                left.close(SessionCloseReason::LocalRelease);
+            }
+        }
+        if let Err(error) = session.begin_outbound(context) {
+            // Input left and has nowhere to go, so it comes back here.
+            let _ = self.runtime.send(RuntimeCommand::Release {
+                transport_live: false,
+            });
+            return Err(error);
+        }
         *self.active_outbound.lock().await = Some(ActiveOutbound {
             peer: peer.to_owned(),
             session_id: session.id(),
@@ -3210,5 +3283,155 @@ mod tests {
         );
         let error = with_tile_moved(&layout, &own, &keys, "peer:mac", (100, 100), 0).unwrap_err();
         assert!(error.to_string().contains("overlap"), "{error}");
+    }
+
+    /// A session from `shared` to a new computer `name` it may send to. The
+    /// computer applies nothing and reports each receiver effect it gets.
+    async fn peer_session(
+        shared: &Shared,
+        name: &str,
+    ) -> (
+        mpsc::UnboundedReceiver<ReceiverEffect>,
+        Box<dyn std::any::Any>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let peer = Identity::load_or_create(directory.path()).unwrap();
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let server = crate::transport::input_server_config(&peer, shared.identity.spki()).unwrap();
+        let endpoint = Endpoint::server(server.quinn_config(), loopback).unwrap();
+        let client = crate::transport::input_client_config(&shared.identity, peer.spki()).unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let (local, remote) = tokio::join!(
+            crate::transport::connect_input(&shared.endpoint, address, &client),
+            async {
+                let incoming = endpoint.accept().await.unwrap();
+                crate::transport::accept_input(incoming, &server).await
+            }
+        );
+        let options = SessionOptions::from_config(&Config::default()).unwrap();
+        let generation = TransportGeneration(1);
+        let (events, mut received) = mpsc::channel(64);
+        // Both ends negotiate at once.
+        let (local, remote) = tokio::join!(
+            start_session(
+                local.unwrap(),
+                name.to_owned(),
+                generation,
+                options.clone(),
+                shared.session_events.clone(),
+            ),
+            start_session(remote.unwrap(), "linux".into(), generation, options, events)
+        );
+        let (local, remote) = (local.unwrap(), remote.unwrap());
+        let (effects, applied) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = received.recv().await {
+                if let SessionEventKind::ReceiverEffects {
+                    effects: batch,
+                    applied: reply,
+                    ..
+                } = event.kind
+                {
+                    batch.into_iter().for_each(|effect| {
+                        let _ = effects.send(effect);
+                    });
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+        shared.config.write().await.peers.insert(
+            name.to_owned(),
+            PeerConfig {
+                spki_der_hex: encode_hex(peer.spki()),
+                addresses: Vec::new(),
+                permissions: PeerPermissions {
+                    connect: true,
+                    send_normal: false,
+                    receive_normal: true,
+                    inject_prelogin: false,
+                },
+                keyboard: KeyboardMode::Standard,
+                reverse_scroll: false,
+            },
+        );
+        shared.sessions.lock().await.insert(name.to_owned(), local);
+        (applied, Box::new((directory, endpoint, remote)))
+    }
+
+    /// The next activation that opens or closes among `effects`.
+    async fn activation(effects: &mut mpsc::UnboundedReceiver<ReceiverEffect>) -> ReceiverEffect {
+        loop {
+            let effect = tokio::time::timeout(Duration::from_secs(2), effects.recv())
+                .await
+                .expect("an activation opened or closed")
+                .unwrap();
+            if matches!(
+                effect,
+                ReceiverEffect::ActivationOpened(_) | ReceiverEffect::ActivationClosed { .. }
+            ) {
+                return effect;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hop_moves_input_on_without_giving_it_back_here() {
+        let (shared, mut kept) = test_daemon();
+        let (mut b, _b) = peer_session(&shared, "b").await;
+        let (mut c, _c) = peer_session(&shared, "c").await;
+        type Kept = (
+            tempfile::TempDir,
+            mpsc::Receiver<RuntimeCommand>,
+            mio::Poll,
+            watch::Sender<SeatState>,
+            mpsc::Receiver<SessionEvent>,
+        );
+        let commands = &mut kept.downcast_mut::<Kept>().unwrap().1;
+        shared
+            .runtime
+            .set_status(crate::runtime::LinuxRuntimeStatus {
+                ownership: OwnershipPhase::Remote,
+                selected_peer: Some("b".into()),
+                neutral: true,
+            });
+        assert!(
+            shared.switch_outbound("c").await.is_err(),
+            "nothing to move on from before input goes anywhere"
+        );
+        shared.begin_outbound("b").await.unwrap();
+        assert!(matches!(
+            activation(&mut b).await,
+            ReceiverEffect::ActivationOpened(_)
+        ));
+        let first = shared.active_outbound.lock().await.clone().unwrap().context;
+
+        shared.switch_outbound("c").await.unwrap();
+        assert!(matches!(
+            activation(&mut b).await,
+            ReceiverEffect::ActivationClosed { .. }
+        ));
+        let ReceiverEffect::ActivationOpened(opened) = activation(&mut c).await else {
+            panic!("c's activation did not open");
+        };
+        let active = shared.active_outbound.lock().await.clone().unwrap();
+        assert_eq!(active.peer, "c");
+        assert_eq!(active.context, opened);
+        assert!(active.context.activation_id > first.activation_id);
+        assert_eq!(shared.status().await.selected_peer.as_deref(), Some("c"));
+        assert!(
+            commands.try_recv().is_err(),
+            "the runtime keeps its grabs: no Release"
+        );
+        // And back to b, as the walk b, c, b goes.
+        shared.switch_outbound("b").await.unwrap();
+        assert!(matches!(
+            activation(&mut c).await,
+            ReceiverEffect::ActivationClosed { .. }
+        ));
+        assert!(matches!(
+            activation(&mut b).await,
+            ReceiverEffect::ActivationOpened(_)
+        ));
+        assert!(commands.try_recv().is_err());
     }
 }

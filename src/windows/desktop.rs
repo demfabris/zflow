@@ -1,7 +1,8 @@
-//! A desktop lease binds cursor placement and the return edge to one session.
+//! A desktop lease binds cursor placement and the exit edges to one session.
 use super::input;
 use crate::desktop::{
-    DesktopRequest, DesktopResponse, Edge, FRACTION_MAX, Geometry, LEASE_MS, Point, ReturnMapping,
+    DesktopRequest, DesktopResponse, Edge, Exit, FRACTION_MAX, Geometry, LEASE_MS, Point,
+    ReturnMapping,
 };
 use anyhow::{Result, ensure};
 use std::time::{Duration, Instant};
@@ -11,13 +12,18 @@ pub struct Lease {
     pub session: u64,
     token: u64,
     geometry: Geometry,
-    selected: Geometry,
-    edge: Edge,
-    start: u32,
-    end: u32,
+    /// Each exit the peer gave that has a monitor behind it, by its index,
+    /// with that monitor.
+    exits: Vec<(u32, Geometry, Exit)>,
     expires: Instant,
     next_geometry: Instant,
-    returned: Option<u32>,
+    /// The exit the pointer left through, and where, once it has.
+    exited: Option<(u32, u32)>,
+    /// A Poll has answered `exited`.
+    delivered: bool,
+    /// The peer kept the pointer here after an exit, so resting on an exit's
+    /// edge does not report it again until the pointer moves off.
+    resting: bool,
 }
 impl Lease {
     pub fn belongs(&self, peer: &str, session: u64) -> bool {
@@ -26,20 +32,26 @@ impl Lease {
     pub fn expired(&self) -> bool {
         Instant::now() >= self.expires
     }
-    pub fn returned(&self) -> bool {
-        self.returned.is_some()
+    /// An exit waits for the peer, so its input is dropped meanwhile.
+    pub fn exited(&self) -> bool {
+        self.exited.is_some()
     }
-    pub fn boundary(&self) -> Option<input::Boundary> {
-        if self.expired() || self.returned() {
-            return None;
+    pub fn boundaries(&self) -> Vec<input::Boundary> {
+        if self.expired() || self.exited() {
+            return Vec::new();
         }
-        input::Boundary::new(
-            self.selected.bounds().ok()?,
-            self.edge,
-            self.start,
-            self.end,
-            true,
-        )
+        self.exits
+            .iter()
+            .filter_map(|(_, selected, exit)| {
+                input::Boundary::new(
+                    selected.bounds().ok()?,
+                    exit.edge,
+                    exit.start,
+                    exit.end,
+                    true,
+                )
+            })
+            .collect()
     }
     pub fn sample(&mut self) -> Result<()> {
         if Instant::now() >= self.next_geometry {
@@ -49,16 +61,21 @@ impl Lease {
             );
             self.next_geometry = Instant::now() + Duration::from_millis(250);
         }
-        if input::clean() {
-            self.returned = self.returned.or_else(|| {
-                at_edge(
-                    &self.selected,
-                    self.edge,
-                    self.start,
-                    self.end,
-                    input::cursor().ok()?,
-                )
+        if input::clean()
+            && self.exited.is_none()
+            && let Ok(cursor) = input::cursor()
+        {
+            let resting = self.exits.iter().find_map(|(index, selected, exit)| {
+                Some((
+                    *index,
+                    at_edge(selected, exit.edge, exit.start, exit.end, cursor)?,
+                ))
             });
+            self.resting &= resting.is_some();
+            if !self.resting && resting.is_some() {
+                self.exited = resting;
+                self.delivered = false;
+            }
         }
         Ok(())
     }
@@ -71,10 +88,20 @@ impl Lease {
         match request {
             DesktopRequest::Poll { .. } => {
                 self.expires = Instant::now() + Duration::from_millis(LEASE_MS);
+                if self.delivered {
+                    // Polling again after an exit means the pointer stays.
+                    self.exited = None;
+                    self.delivered = false;
+                    self.resting = true;
+                }
                 self.sample()?;
-                Ok(self.returned.map_or(DesktopResponse::Active, |position| {
-                    DesktopResponse::Returned { position }
-                }))
+                Ok(match self.exited {
+                    Some((exit, position)) => {
+                        self.delivered = true;
+                        DesktopResponse::Exited { exit, position }
+                    }
+                    None => DesktopResponse::Active,
+                })
             }
             DesktopRequest::Finish { .. } => Ok(DesktopResponse::Finished),
             _ => anyhow::bail!("A desktop handoff is already active"),
@@ -94,6 +121,7 @@ pub fn prepare(
         start,
         end,
         position,
+        exits,
     } = request
     else {
         anyhow::bail!("Expected Prepare");
@@ -101,6 +129,14 @@ pub fn prepare(
     let geometry = input::geometry()?;
     let selected = geometry.for_monitor(monitor.as_deref())?;
     let p = entry(&selected, edge, start, end, position)?;
+    // An exit on a monitor that is gone leads nowhere.
+    let exits = (0..)
+        .zip(exits)
+        .filter_map(|(index, exit)| {
+            let selected = geometry.for_monitor(exit.monitor.as_deref()).ok()?;
+            Some((index, selected, exit))
+        })
+        .collect();
     input::move_to(p)?;
     let actual = input::cursor()?;
     ensure!(
@@ -112,13 +148,12 @@ pub fn prepare(
         session,
         token,
         geometry: geometry.clone(),
-        selected,
-        edge,
-        start,
-        end,
+        exits,
         expires: Instant::now() + Duration::from_millis(LEASE_MS),
         next_geometry: Instant::now(),
-        returned: None,
+        exited: None,
+        delivered: false,
+        resting: false,
     };
     Ok((
         lease,

@@ -216,10 +216,28 @@ fn edge_point(bounds: Rect, edge: Edge, along: f64) -> Point {
     }
 }
 
+/// At most this many ways off a desktop go in one Prepare.
+pub const MAX_EXITS: usize = 64;
+
+/// A stretch of one edge of the desktop being prepared, as fractions of
+/// that monitor's edge, where leaving takes the pointer somewhere else:
+/// back to the computer that sends, or on to another one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+    pub edge: Edge,
+    pub start: u32,
+    pub end: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopRequest {
     Snapshot,
+    /// Puts the pointer at `position` of the range from `start` to `end`
+    /// on `edge`, and watches `exits` until Finish.
     Prepare {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         monitor: Option<String>,
@@ -228,6 +246,7 @@ pub enum DesktopRequest {
         start: u32,
         end: u32,
         position: u32,
+        exits: Vec<Exit>,
     },
     Poll {
         token: u64,
@@ -257,6 +276,7 @@ impl DesktopRequest {
             start,
             end,
             position,
+            exits,
             ..
         } = self
         {
@@ -268,18 +288,33 @@ impl DesktopRequest {
                 start < end && *end <= FRACTION_MAX && position >= start && position <= end,
                 "Invalid desktop edge range or position"
             );
+            ensure!(exits.len() <= MAX_EXITS, "Too many desktop exits");
+            for exit in exits {
+                ensure!(
+                    exit.monitor
+                        .as_ref()
+                        .is_none_or(|id| monitors::valid_id(id))
+                        && exit.start < exit.end
+                        && exit.end <= FRACTION_MAX,
+                    "Invalid desktop exit"
+                );
+            }
         }
         Ok(())
     }
 }
 
+/// A desktop's answers. `Exited` says the pointer left through the
+/// Prepare's `exits[exit]` at `position`, a fraction of that exit's edge. A
+/// Poll answers each report once; the next Poll means the pointer stays, and
+/// a new push out reports again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopResponse {
     Snapshot { geometry: Geometry, position: Point },
     Prepared { geometry: Geometry, position: Point },
     Active,
-    Returned { position: u32 },
+    Exited { exit: u32, position: u32 },
     Finished,
     Unavailable { reason: String },
 }
@@ -300,9 +335,10 @@ impl DesktopResponse {
                     "Cursor is outside active monitors"
                 );
             }
-            Self::Returned { position } => {
-                ensure!(*position <= FRACTION_MAX, "Invalid return position")
-            }
+            Self::Exited { exit, position } => ensure!(
+                (*exit as usize) < MAX_EXITS && *position <= FRACTION_MAX,
+                "Invalid exit position"
+            ),
             Self::Unavailable { reason } => {
                 ensure!(reason.len() <= 1024, "Desktop diagnostic is too long")
             }
@@ -1112,30 +1148,50 @@ mod tests {
     #[test]
     fn rejects_invalid_range_and_token() {
         assert!(DesktopRequest::Poll { token: 0 }.validate().is_err());
+        let prepare = |start, exits: Vec<Exit>| DesktopRequest::Prepare {
+            monitor: None,
+            token: 1,
+            edge: Edge::Left,
+            start,
+            end: FRACTION_MAX,
+            position: 0,
+            exits,
+        };
+        assert!(prepare(100, Vec::new()).validate().is_err());
+        assert!(prepare(0, Vec::new()).validate().is_ok());
+        let exit = |monitor: &str, start, end| Exit {
+            monitor: Some(monitor.into()),
+            edge: Edge::Bottom,
+            start,
+            end,
+        };
+        // The most exits, each on a monitor with the longest name, still fit
+        // one desktop message.
+        let most = vec![exit(&"m".repeat(128), 0, FRACTION_MAX); MAX_EXITS];
+        let message = DesktopMessage::Request {
+            id: 1,
+            request: prepare(0, most.clone()),
+        };
+        message.validate().unwrap();
+        assert!(serde_json::to_vec(&message).unwrap().len() <= MAX_MESSAGE_BYTES);
+        let mut too_many = most;
+        too_many.push(exit("m", 0, 1));
+        assert!(prepare(0, too_many).validate().is_err());
+        for invalid in [
+            exit("m", 5, 5),
+            exit("m", 0, FRACTION_MAX + 1),
+            exit(" ", 0, 1),
+        ] {
+            assert!(prepare(0, vec![invalid]).validate().is_err());
+        }
+        let exited = |exit, position| DesktopResponse::Exited { exit, position };
         assert!(
-            DesktopRequest::Prepare {
-                monitor: None,
-                token: 1,
-                edge: Edge::Left,
-                start: 100,
-                end: 200,
-                position: 0
-            }
-            .validate()
-            .is_err()
+            exited(MAX_EXITS as u32 - 1, FRACTION_MAX)
+                .validate()
+                .is_ok()
         );
-        assert!(
-            DesktopRequest::Prepare {
-                monitor: None,
-                token: 1,
-                edge: Edge::Left,
-                start: 0,
-                end: FRACTION_MAX,
-                position: 0
-            }
-            .validate()
-            .is_ok()
-        );
+        assert!(exited(MAX_EXITS as u32, 0).validate().is_err());
+        assert!(exited(0, FRACTION_MAX + 1).validate().is_err());
     }
     #[test]
     fn fraction_round_trips_all_edges_and_clamps_partial_ranges() {
