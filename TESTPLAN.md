@@ -39,6 +39,25 @@ installer fixture tests does not satisfy this matrix. The `just release`
 commands and signing-key setup belong on the publisher's development machine;
 GitHub Actions builds all platforms.
 
+## Hops across three computers (0.6.0)
+
+Install 0.6.0 on three computers, including GNOME extension API 5, and arrange
+B beside the source A and C beside B but not touching A. A must have paired B
+and C; B and C need not have paired each other.
+
+- From a Mac A and again from a Linux A: walk A, B, C, B, A by pushing through
+  each shared edge. Each step must land at the matching point of the next
+  edge, and the panel must name the computer that gets input.
+- Push from B toward C while holding a modifier, a mouse button, and on Linux
+  any key. The pointer must stay on B. Release and push again: it moves on.
+- Type and click on C, then push home through C's edge to A if one touches, or
+  back through B. Nothing may stay held on B or C afterwards.
+- With C asleep or its zflow stopped, push from B toward C: the pointer stays
+  on B and the way home still works.
+- With clipboard sharing on, copy on A and walk to C: C gets A's clipboard.
+- On the Mac, check in the log that a held modifier keeps the pointer on B
+  while capture runs (`input_is_neutral` while the event tap swallows keys).
+
 ## Individual monitors (0.5.0)
 
 Install the same 0.5.0 release on every computer, including GNOME extension API 4.

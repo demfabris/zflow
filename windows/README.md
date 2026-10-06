@@ -43,7 +43,7 @@ networks you use for sharing. Input and introductions use UDP port 43119;
 local discovery uses mDNS. Tailscale names and addresses work through
 **Add computer**, even when multicast discovery does not cross the VPN.
 
-Version 0.5.0 adds individual monitor discovery and uses `zflow/6` for input
+Version 0.6.0 lets the pointer walk between computers and uses `zflow/7` for input
 and `zflow-hello/5` for introductions. **Update the Mac and Linux computers
 to the same release, including the GNOME extension.** Older input
 protocols cannot connect; pairing keys are preserved.

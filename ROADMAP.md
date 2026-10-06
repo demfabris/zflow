@@ -50,7 +50,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 |---|---|---|---|---|---|
 | Which machine controls | One server, N clients. Radio button, core restart. | Sends only (`src/macos/mod.rs:657-671`) | Receives; sends only by chord or CLI (`src/daemon.rs:758-777`) | improve | Drop roles. The session is already two-way. |
 | Any machine controls any other | Not supported ([#5160](https://github.com/deskflow/deskflow/issues/5160)) | missing | partial | build | The main goal, and Deskflow's biggest gap. |
-| Three or more computers, pointer moves from peer to peer | The server routes between clients | partial. Crossing only starts from the local tile (`src/app/handoff.rs:61`) | same | build (Phase 4) | Needs a Returned reply that says which edge it left through. |
+| Three or more computers, pointer moves from peer to peer | The server routes between clients | exists: the source routes hops (`src/app/handoff.rs`, `Next::Hop`) | same | have (0.6.0, not live-tested) | Receivers report which exit the pointer left through. |
 | Wire compatibility with Barrier/Synergy | yes | no | no | skip | Different protocol by design. |
 | Reconnect | Fixed or backoff | exists (`src/macos/link.rs`) | exists: a live link per peer on the Mac's schedule (`src/daemon/links.rs`, `src/link.rs`) | have | |
 | Finds a peer whose IP changed | Several hostnames | exists: links find a peer by the key its hello proved (0.3.0) | same | have | |
@@ -486,11 +486,12 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
   - A Mac "switch to next computer" chord.
   - Mac media keys.
   - Open logs.
-- **Status (2026-10-02):** about half done, on main.
+- **Status (2026-10-06):** about two thirds done. Hops are on the `hops` branch, the rest on main.
   - Done on both: dead corners (Linux's outbound barriers stop 8 px short of the desktop's corners, and the Mac's crossings 8 points short), pause at edges (`[switching] pause_at_edges`, `set_switching`, a 250 ms rest against the edge), and reverse scrolling per computer (`reverse_scroll` on the peer record, in `set_peer` and in the snapshot).
   - Clipboard: done on both. The computer the pointer leaves sends its clipboard to the one it enters, as SPEC.md's Clipboard section says. `[clipboard] share` and the Share Clipboard switch (`set_clipboard`) turn it on for one computer. The GNOME extension reads and writes the clipboard through `St.Clipboard` in two D-Bus methods only the agent may call, and shows the over-limit notice. The agent carries clips to the service as base64 on its own stream, which alone allows messages that large. The Mac uses `NSPasteboard`.
+  - Peer-to-peer hops: built on both sources (0.6.0, `zflow/7`, GNOME extension API 5). Prepare lists every exit of the desktop being entered, receivers report which one the pointer left through, and the source routes: home, or on to a third computer with nothing held. Linux switches its outgoing session without ungrabbing (`Shared::switch_outbound`); the Mac hands its running capture to the next computer's link. Windows receives hops but, as a source, lists only the ways home. Unit and session tests cover the walk A, B, C, B, A; it has not been tried on real machines yet, and whether the Mac's `input_is_neutral` reads held modifiers while its event tap swallows them is unverified.
   - Left:
-    - Peer-to-peer hops.
+    - The live walk across three computers, from a Mac and from Linux.
     - Locking the pointer to the current computer.
     - The "switch to next computer" chord on the Mac. Linux's chord cycles through connected computers.
     - Media keys from the Mac. Capture still swallows them while sending (`capture_bridge.c`).
