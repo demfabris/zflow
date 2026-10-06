@@ -1176,6 +1176,8 @@ impl Shared {
     /// `peer`, as a hop does: Leave there, then Enter at `peer` with a new
     /// activation. The runtime stays Remote, so nothing is ungrabbed, and
     /// captured input waits on the policy lock until it can go to `peer`.
+    /// A release of input takes that lock too, so it ends whichever
+    /// activation is open once this is done.
     async fn switch_outbound(&self, peer: &str) -> Result<()> {
         let _policy = self.policy.lock().await;
         let record = self
@@ -1187,10 +1189,14 @@ impl Shared {
             .cloned()
             .with_context(|| format!("unknown peer {peer}"))?;
         require_outbound_permission(&*self.config.read().await, peer, &record)?;
+        let runtime = self.runtime.status();
         ensure!(
-            self.runtime.status().ownership == OwnershipPhase::Remote,
+            runtime.ownership == OwnershipPhase::Remote,
             "this computer's input is not going anywhere"
         );
+        // Checked again here: a key can go down while the next computer
+        // prepares its desktop.
+        ensure!(runtime.neutral, "a key or button is held");
         let session = self
             .sessions
             .lock()
@@ -1260,6 +1266,9 @@ impl Shared {
     }
 
     async fn finish_runtime_terminal(&self, reason: SessionCloseReason) -> Result<()> {
+        // Taken before the timeout below, so a hop that is moving input on
+        // finishes first and this ends the activation it left open.
+        let _policy = self.policy.lock().await;
         let active_session = if let Some(active) = self.active_outbound.lock().await.clone() {
             self.sessions
                 .lock()
@@ -1538,6 +1547,8 @@ async fn handle_runtime_event(event: RuntimeEvent, shared: &Arc<Shared>) -> Resu
                 .await?;
         }
         RuntimeEvent::ActivationClosed(reason) => {
+            // As in finish_runtime_terminal: a hop under way ends first.
+            let _policy = shared.policy.lock().await;
             let active = shared.active_outbound.lock().await.clone();
             if let Some(active) = active {
                 // The session may itself be waiting on this loop to apply input
@@ -3405,6 +3416,20 @@ mod tests {
         ));
         let first = shared.active_outbound.lock().await.clone().unwrap().context;
 
+        // A key went down while c prepared its desktop: input stays on b.
+        let remote = |neutral| crate::runtime::LinuxRuntimeStatus {
+            ownership: OwnershipPhase::Remote,
+            selected_peer: Some("b".into()),
+            neutral,
+        };
+        shared.runtime.set_status(remote(false));
+        assert!(shared.switch_outbound("c").await.is_err());
+        assert_eq!(
+            shared.active_outbound.lock().await.clone().unwrap().peer,
+            "b"
+        );
+        shared.runtime.set_status(remote(true));
+
         shared.switch_outbound("c").await.unwrap();
         assert!(matches!(
             activation(&mut b).await,
@@ -3433,5 +3458,70 @@ mod tests {
             ReceiverEffect::ActivationOpened(_)
         ));
         assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_during_a_hop_ends_the_activation_the_hop_opened() {
+        let (shared, mut kept) = test_daemon();
+        let (mut b, _b) = peer_session(&shared, "b").await;
+        let (mut c, _c) = peer_session(&shared, "c").await;
+        type Kept = (
+            tempfile::TempDir,
+            mpsc::Receiver<RuntimeCommand>,
+            mio::Poll,
+            watch::Sender<SeatState>,
+            mpsc::Receiver<SessionEvent>,
+        );
+        let commands = &mut kept.downcast_mut::<Kept>().unwrap().1;
+        shared
+            .runtime
+            .set_status(crate::runtime::LinuxRuntimeStatus {
+                ownership: OwnershipPhase::Remote,
+                selected_peer: Some("b".into()),
+                neutral: true,
+            });
+        shared.begin_outbound("b").await.unwrap();
+        activation(&mut b).await;
+        // The hop to c is under way when the escape chord asks for input back.
+        let held = shared.policy.lock().await;
+        let hop = tokio::spawn({
+            let shared = shared.clone();
+            async move { shared.switch_outbound("c").await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let release = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                shared
+                    .finish_runtime_terminal(SessionCloseReason::LocalRelease)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+        hop.await.unwrap().unwrap();
+        release.await.unwrap().unwrap();
+        assert!(matches!(
+            activation(&mut b).await,
+            ReceiverEffect::ActivationClosed { .. }
+        ));
+        assert!(matches!(
+            activation(&mut c).await,
+            ReceiverEffect::ActivationOpened(_)
+        ));
+        assert!(
+            matches!(
+                activation(&mut c).await,
+                ReceiverEffect::ActivationClosed { .. }
+            ),
+            "c is not left with an activation nobody sends to"
+        );
+        assert!(shared.active_outbound.lock().await.is_none());
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(RuntimeCommand::TerminalSent {
+                transport_live: true
+            })
+        ));
     }
 }
