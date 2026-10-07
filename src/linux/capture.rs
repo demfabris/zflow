@@ -4,15 +4,18 @@ use std::{
     io,
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
-use evdev::{InputEvent, KeyCode, raw_stream::RawDevice};
+use evdev::{InputEvent, KeyCode, PropType, raw_stream::RawDevice};
 use thiserror::Error;
 
 use crate::capture::CapturedDeviceFrame;
 
-use super::{AggregateInputState, DeviceInfo, FrameAccumulator, MappingError, TouchAccumulator};
+use super::{
+    AggregateInputState, DeviceInfo, FrameAccumulator, MappingError, TouchAccumulator,
+    TouchpadPointer, TouchpadSettings, is_contact,
+};
 
 #[derive(Debug)]
 struct CaptureNode {
@@ -22,6 +25,9 @@ struct CaptureNode {
     device: RawDevice,
     frames: FrameAccumulator,
     touch: Option<TouchAccumulator>,
+    /// The touchpad as a pointer, for targets that take no raw contacts.
+    /// A touchscreen has none.
+    pointer: Option<TouchpadPointer>,
 }
 
 impl CaptureNode {
@@ -34,12 +40,20 @@ impl CaptureNode {
         let device = RawDevice::try_from(file)?;
         let held = device.get_key_state()?.iter().collect();
         let touch = TouchAccumulator::from_device(&device)?;
+        let properties = device.properties();
+        let pointer = (touch.is_some() && !properties.contains(PropType::DIRECT)).then(|| {
+            TouchpadPointer::new(
+                properties.contains(PropType::BUTTONPAD),
+                TouchpadSettings::default(),
+            )
+        });
         Ok((
             Self {
                 path: info.path.clone(),
                 device,
                 frames: FrameAccumulator::default(),
                 touch,
+                pointer,
             },
             held,
         ))
@@ -281,7 +295,8 @@ impl CaptureSet {
     }
 
     /// Performs fresh EVIOCGKEY checks over every node. Unlike the tracked
-    /// state this closes the arming gap after startup or a dropped frame.
+    /// state this closes the arming gap after startup or a dropped frame. A
+    /// finger on a touchpad does not count, as in `nothing_pressed`.
     pub fn kernel_is_neutral(&self) -> Result<bool, CaptureSetError> {
         for node in &self.nodes {
             let held =
@@ -291,7 +306,7 @@ impl CaptureSet {
                         path: node.path.clone(),
                         source,
                     })?;
-            if held.iter().next().is_some() {
+            if !held.iter().all(is_contact) {
                 return Ok(false);
             }
         }
@@ -312,7 +327,7 @@ impl CaptureSet {
         if self.grabbed {
             return Ok(Vec::new());
         }
-        if !self.aggregate.is_neutral() || !self.aggregate.all_at_boundary() {
+        if !self.aggregate.nothing_pressed() || !self.aggregate.all_at_boundary() {
             return Err(CaptureSetError::NotNeutral);
         }
         if !self.kernel_is_neutral()? {
@@ -384,6 +399,7 @@ impl CaptureSet {
             &mut self.aggregate,
             &mut node.frames,
             node.touch.as_mut(),
+            node.pointer.as_mut(),
             events,
         )
     }
@@ -461,12 +477,14 @@ impl Drop for CaptureSet {
 
 /// Maps one batch of raw events into complete frames. SYN_DROPPED fails the
 /// batch, so the runtime closes the capture set and rebuilds it from fresh
-/// kernel state instead of guessing what was lost.
+/// kernel state instead of guessing what was lost. A touchpad frame also
+/// carries itself as pointer input.
 fn map_events(
     path: &Path,
     aggregate: &mut AggregateInputState,
     frames: &mut FrameAccumulator,
     mut touch: Option<&mut TouchAccumulator>,
+    mut pointer: Option<&mut TouchpadPointer>,
     events: Vec<InputEvent>,
 ) -> Result<Vec<CapturedDeviceFrame>, CaptureReadError> {
     let mut captured = Vec::new();
@@ -486,6 +504,20 @@ fn map_events(
                 if let Some((state, event_count)) = touch_state {
                     frame.touch_snapshot = Some(state);
                     frame.event_count = frame.event_count.saturating_add(event_count);
+                }
+                if let (Some(touch), Some(pointer)) = (touch.as_deref(), pointer.as_deref_mut()) {
+                    // The kernel stamps each report, so speed holds up when
+                    // reports are read in a burst.
+                    let at = event
+                        .timestamp()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO);
+                    frame.as_pointer = Some(pointer.report(
+                        &touch.fingers(),
+                        touch.finger_count(),
+                        &frame.transitions,
+                        at,
+                    ));
                 }
                 captured.push(CapturedDeviceFrame {
                     device_path: path.to_owned(),
@@ -516,7 +548,7 @@ mod tests {
     use evdev::{AbsoluteAxisCode, EventType, SynchronizationCode};
 
     use super::*;
-    use crate::linux::TouchAxisRange;
+    use crate::{capture::CaptureFrame, core::MotionDelta, linux::TouchAxisRange};
 
     fn event(kind: EventType, code: u16, value: i32) -> InputEvent {
         InputEvent::new(kind.0, code, value)
@@ -567,6 +599,7 @@ mod tests {
             &mut aggregate,
             &mut frames,
             Some(&mut touch),
+            None,
             finger_down(),
         )
         .unwrap();
@@ -574,6 +607,60 @@ mod tests {
         let state = captured[0].frame.touch_snapshot.as_ref().unwrap();
         assert_eq!(state.len(), 1);
         assert!(aggregate.all_at_boundary());
+    }
+
+    #[test]
+    fn touchpad_frames_carry_pointer_input_for_targets_without_contacts() {
+        let path = Path::new("/dev/input/event4");
+        let mut aggregate = AggregateInputState::default();
+        aggregate.add_device(path, []);
+        let mut frames = FrameAccumulator::default();
+        let mut touch = touchpad();
+        let mut pointer = TouchpadPointer::new(true, TouchpadSettings::default());
+        let mut events = finger_down();
+        // 2 mm across in one report. Unstamped reports count as 4 ms apart,
+        // fast enough for the full gain of 24 counts per millimetre.
+        events.extend([
+            event(
+                EventType::ABSOLUTE,
+                AbsoluteAxisCode::ABS_MT_POSITION_X.0,
+                60,
+            ),
+            sync(SynchronizationCode::SYN_REPORT),
+        ]);
+        let captured = map_events(
+            path,
+            &mut aggregate,
+            &mut frames,
+            Some(&mut touch),
+            Some(&mut pointer),
+            events,
+        )
+        .unwrap();
+        let moved = &captured[1].frame;
+        assert_eq!(moved.motion, MotionDelta::default());
+        assert!(moved.touch_snapshot.is_some());
+
+        let mut contacts = moved.clone();
+        contacts.for_target(true);
+        assert_eq!(
+            &contacts,
+            &CaptureFrame {
+                as_pointer: None,
+                ..moved.clone()
+            }
+        );
+
+        let mut pointer = moved.clone();
+        pointer.for_target(false);
+        assert_eq!(
+            pointer.motion,
+            MotionDelta {
+                dx: 48,
+                ..MotionDelta::default()
+            }
+        );
+        assert!(pointer.touch_snapshot.is_none() && pointer.as_pointer.is_none());
     }
 
     #[test]
@@ -592,6 +679,7 @@ mod tests {
             path,
             &mut aggregate,
             &mut FrameAccumulator::default(),
+            None,
             None,
             keys,
         )
@@ -613,6 +701,7 @@ mod tests {
             &mut aggregate,
             &mut FrameAccumulator::default(),
             Some(&mut touch),
+            None,
             lost_lift,
         )
         .unwrap_err();

@@ -79,8 +79,10 @@ impl SourceOwnership {
     }
 
     /// Advances ownership only when every device is between complete evdev
-    /// frames. Arming additionally needs both tracked aggregate state and a
-    /// fresh EVIOCGKEY observation to be neutral.
+    /// frames. Arming additionally needs no key or button down, in both
+    /// tracked aggregate state and a fresh EVIOCGKEY observation. A finger on
+    /// a touchpad is not a press: an edge push made with the touchpad still
+    /// has it down.
     pub fn at_complete_boundary(
         &mut self,
         aggregate: &AggregateInputState,
@@ -97,7 +99,7 @@ impl SourceOwnership {
         self.phase_transition_pending = false;
         match self.phase {
             OwnershipPhase::Arming
-                if !self.grab_pending && aggregate.is_neutral() && kernel_neutral =>
+                if !self.grab_pending && aggregate.nothing_pressed() && kernel_neutral =>
             {
                 self.grab_pending = true;
                 OwnershipEffect::AcquireGrabs
@@ -310,6 +312,11 @@ impl AggregateInputState {
     }
 }
 
+/// Whether a held `key` only says that a finger or tool touches a pad.
+pub fn is_contact(key: KeyCode) -> bool {
+    CONTACTS.contains(&key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +342,10 @@ mod tests {
             state.observe(pad, key(code, 1));
         }
         state.observe(pad, report());
-        assert!(!state.is_neutral(), "arming still waits for the finger");
+        assert!(
+            !state.is_neutral(),
+            "the raw key state still lists the finger"
+        );
         assert!(state.nothing_pressed());
         // Clicking the pad is.
         state.observe(pad, key(KeyCode::BTN_LEFT, 1));
@@ -488,5 +498,36 @@ mod tests {
 
         ownership.request_activation().unwrap();
         assert_eq!(ownership.force_release(), OwnershipEffect::CancelActivation);
+    }
+
+    #[test]
+    fn a_finger_resting_on_the_touchpad_does_not_block_arming() {
+        let pad = std::path::Path::new("/dev/input/event7");
+        let mut aggregate = AggregateInputState::default();
+        aggregate.add_device(pad, [KeyCode::BTN_TOUCH, KeyCode::BTN_TOOL_FINGER]);
+        let mut ownership = SourceOwnership::default();
+        ownership.request_activation().unwrap();
+        assert_eq!(
+            ownership.at_complete_boundary(&aggregate, true),
+            OwnershipEffect::AcquireGrabs
+        );
+        ownership.grab_failed().unwrap();
+
+        // Pressing the clickpad is a press.
+        ownership.request_activation().unwrap();
+        aggregate.observe(pad, key(KeyCode::BTN_LEFT, 1));
+        aggregate.observe(pad, report());
+        assert_eq!(
+            ownership.at_complete_boundary(&aggregate, true),
+            OwnershipEffect::None
+        );
+        aggregate.observe(pad, key(KeyCode::BTN_LEFT, 0));
+        aggregate.observe(pad, report());
+        assert_eq!(
+            ownership.at_complete_boundary(&aggregate, true),
+            OwnershipEffect::AcquireGrabs
+        );
+        assert!(is_contact(KeyCode::BTN_TOOL_DOUBLETAP));
+        assert!(!is_contact(KeyCode::BTN_LEFT) && !is_contact(KeyCode::BTN_STYLUS));
     }
 }

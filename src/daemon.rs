@@ -908,6 +908,17 @@ impl Shared {
         self.connect(peer, record, &addresses).await
     }
 
+    /// Session options for the computer with this key. Its hello tells
+    /// whether it runs Linux and can post raw touchpad contacts.
+    async fn session_options(&self, key: &str) -> Result<SessionOptions> {
+        let os = self
+            .neighbors
+            .borrow()
+            .neighbor(key)
+            .map(|neighbor| neighbor.os);
+        Ok(SessionOptions::from_config(&*self.config.read().await)?.for_peer_os(os))
+    }
+
     /// Dials `peer` at `addresses` and keeps the session, unless one the
     /// peer dialed at the same moment wins.
     async fn connect(
@@ -927,10 +938,7 @@ impl Shared {
         .await?;
         let remote = connection.remote_address();
         let generation = self.allocate_generation()?;
-        let options = {
-            let config = self.config.read().await;
-            SessionOptions::from_config(&config)?
-        };
+        let options = self.session_options(&record.fingerprint_hex()?).await?;
         let session = start_session(
             connection,
             peer.to_owned(),
@@ -1056,10 +1064,9 @@ impl Shared {
         // releases what it held before the new one is registered.
         self.retire_session(&peer).await;
         let generation = self.allocate_generation()?;
-        let options = {
-            let config = self.config.read().await;
-            SessionOptions::from_config(&config)?
-        };
+        let options = self
+            .session_options(&crate::neighbors::fingerprint(&peer_spki))
+            .await?;
         let session = start_session(
             connection,
             peer.clone(),

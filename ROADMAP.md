@@ -104,7 +104,7 @@ Deskflow issue numbers refer to [github.com/deskflow/deskflow](https://github.co
 | Pointer speed | open request | The Mac receiver moves one point per count; a curve is opt-in | libinput accelerates the virtual pointer (guess) | build (Mac, no UI at first) | |
 | Hi-res wheel | yes | Pixel deltas | exists (`src/linux/mapping.rs:368-381`) | have | |
 | Trackpad gestures | no ([#2905](https://github.com/deskflow/deskflow/issues/2905)) | Raw contacts to Linux, experimental | receives them | have (Mac to Linux); skip (Linux to Mac) | No public macOS API. |
-| Linux laptop touchpad as the sender | yes, through EIS | n/a | Raw contacts only (`src/linux/touch.rs`) | skip for now | Section 3. |
+| Linux laptop touchpad as the sender | yes, through EIS | n/a | The sender turns contacts into pointer motion, clicks and scrolling (`src/linux/touchpad.rs`); raw contacts only to a Linux peer with touch forwarding | have (0.6.0, not live-tested) | SPEC.md, "Linux touchpad as a pointer". GNOME's own touchpad settings are not read yet. |
 
 ### Clipboard, power, misc
 
@@ -231,7 +231,7 @@ Pros:
 
 Cons:
 - GNOME only.
-- A laptop touchpad gives raw contacts, not a pointer.
+- A laptop touchpad gives raw contacts, not a pointer. Since 0.6.0 the sender makes pointer input from them.
 - Idle must be inhibited while devices are grabbed.
 - The capture set must include every device the user touches.
 - Motion is raw, so the receiver must accelerate it.
@@ -440,7 +440,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - Scroll is 30 px per detent at any speed, with no wheel acceleration. The number is untuned.
     - The Mac reads every sender's scroll as 120 units per detent, so a Mac trackpad sender scrolls a Mac receiver slowly.
     - A connection that arrives during a crossing waits until the crossing ends.
-    - With `experimental_touchpad` on both computers, a Linux sender may send contacts the Mac cannot post, and they are dropped.
+    - Fixed in 0.6.0: with `experimental_touchpad` on both computers, a Linux sender sent contacts the Mac cannot post, and they were dropped. A Linux sender now sends raw contacts only to a Linux peer, and the Mac gets the touchpad as pointer input.
     - Secure fields, full-screen apps and games are untested.
     - Clipboard sharing and pause at edges are on the Mac too (Phase 4 items). The Mac reads the clipboard only when macOS allows it without asking; otherwise Checks says to allow zflow under Paste from Other Apps. Whether macOS 27 still shows an alert at crossings is for the sitting.
 
@@ -471,7 +471,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
     - Live links (`src/daemon/links.rs`): the daemon keeps a session to each peer it may send to, with the Mac's retry schedule (`src/link.rs`), so the first crossing reuses it. A session the peer dialed counts. Since 0.3.0 it dials only where a hello found the peer's key, so it dials a Mac only while the Mac listens. GNOME shows each peer as Connected, Connecting or Unreachable with a reason, plus a "Paired computers" health row with Retry. The GNOME API level stayed 2 then: the snapshot kept its shape, and `connecting`, `unreachable` and health actions were already part of it. It is 3 since 0.3.0, which dropped the code pairing requests.
   - Left: the live checks in TESTPLAN.md, "Two-way input sitting".
   - Known limits:
-    - A finger resting on a captured touchpad counts as held, so an edge push gives up. This matters on a Linux laptop.
+    - Fixed in 0.6.0: a finger resting on a captured touchpad counted as held, so an edge push made with the touchpad gave up. Arming and hops now leave touch contact codes out; a clickpad press still counts.
     - In capture-all mode, any captured device going away (a sleeping Bluetooth mouse) ends a crossing.
     - Fixed in 0.6.0: an edit kept only the tiles of computers this one paired, so a computer that paired the others put them back beside itself. An edit now keeps the others where they were, unless it covers one.
 
@@ -515,7 +515,7 @@ Rust produces one `Snapshot` and accepts one `Request` set on both platforms. Sw
 ### Phase 5 (later)
 
 - Portal sender for KDE and GNOME 51+.
-- Linux laptop touchpad as the sender.
+- Linux laptop touchpad as the sender, beyond 0.6.0's pointer, clicks and scrolling: read GNOME's touchpad settings (tap to click, natural scrolling, speed) through the desktop agent, since zflowd has no session bus; tap-and-drag; three- and four-finger gestures.
 - Mac login window.
 
 ### Order

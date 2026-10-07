@@ -1,11 +1,26 @@
 use std::{io, sync::Once};
 
-use evdev::{AbsoluteAxisCode, EventType, InputEvent, SynchronizationCode, raw_stream::RawDevice};
+use evdev::{
+    AbsoluteAxisCode, EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::RawDevice,
+};
 
+use super::Finger;
 use crate::{
     capture::MAX_TOUCHPAD_CONTACTS,
     core::{ContactId, SourceDimensions, TouchContact, TouchState, TouchTool},
 };
+
+/// ABS_MT_TOOL_TYPE for a contact the kernel recognised as a palm.
+const MT_TOOL_PALM: i32 = 2;
+
+/// The keys a touchpad holds for how many fingers touch it, one at a time.
+const TOOL_FINGERS: [KeyCode; 5] = [
+    KeyCode::BTN_TOOL_FINGER,
+    KeyCode::BTN_TOOL_DOUBLETAP,
+    KeyCode::BTN_TOOL_TRIPLETAP,
+    KeyCode::BTN_TOOL_QUADTAP,
+    KeyCode::BTN_TOOL_QUINTTAP,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TouchAxisRange {
@@ -38,6 +53,7 @@ struct SlotState {
     tracking_id: Option<ContactId>,
     x: i32,
     y: i32,
+    palm: bool,
 }
 
 /// Converts Linux type-B multitouch slot updates into complete contact states.
@@ -50,6 +66,8 @@ pub struct TouchAccumulator {
     units_per_100mm: [i64; 2],
     slots: [SlotState; MAX_TOUCHPAD_CONTACTS],
     current_slot: Option<usize>,
+    /// One bit per BTN_TOOL_* key held, lowest for one finger.
+    tools: u8,
     dirty: bool,
     event_count: u64,
 }
@@ -106,6 +124,7 @@ impl TouchAccumulator {
             units_per_100mm,
             slots: [SlotState::default(); MAX_TOUCHPAD_CONTACTS],
             current_slot: Some(0),
+            tools: 0,
             dirty: false,
             event_count: 0,
         }
@@ -129,6 +148,19 @@ impl TouchAccumulator {
                 }
                 _ => Ok(None),
             };
+        }
+        if event.event_type() == EventType::KEY {
+            if let Some(index) = TOOL_FINGERS
+                .iter()
+                .position(|key| key.code() == event.code())
+            {
+                if event.value() == 0 {
+                    self.tools &= !(1 << index);
+                } else {
+                    self.tools |= 1 << index;
+                }
+            }
+            return Ok(None);
         }
         if event.event_type() != EventType::ABSOLUTE {
             return Ok(None);
@@ -163,9 +195,45 @@ impl TouchAccumulator {
                 }
                 self.mapped();
             }
+            // Raw snapshots carry no palms; only the pointer path reads it.
+            AbsoluteAxisCode::ABS_MT_TOOL_TYPE => {
+                if let Some(slot) = self.current_slot {
+                    self.slots[slot].palm = event.value() == MT_TOOL_PALM;
+                }
+            }
             _ => {}
         }
         Ok(None)
+    }
+
+    /// The fingers on the pad now, palms left out, in hundredths of a
+    /// millimetre like snapshots.
+    pub fn fingers(&self) -> Vec<Finger> {
+        let [x_scale, y_scale] = self.units_per_100mm;
+        self.slots
+            .iter()
+            .filter(|slot| !slot.palm)
+            .filter_map(|slot| {
+                slot.tracking_id.map(|id| Finger {
+                    id,
+                    x: hundredths_mm(slot.x.into(), x_scale),
+                    y: hundredths_mm(slot.y.into(), y_scale),
+                })
+            })
+            .collect()
+    }
+
+    /// How many fingers touch the pad, palms left out. The kernel may count
+    /// more than the pad has slots for.
+    pub fn finger_count(&self) -> usize {
+        let active = |palm| {
+            self.slots
+                .iter()
+                .filter(|slot| slot.tracking_id.is_some() && slot.palm == palm)
+                .count()
+        };
+        let tools = (u8::BITS - self.tools.leading_zeros()) as usize;
+        active(false).max(tools.saturating_sub(active(true)))
     }
 
     fn mapped(&mut self) {
