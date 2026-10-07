@@ -9,7 +9,7 @@ struct MenuBarView: View {
     let snapshot = model.snapshot
     VStack(alignment: .leading, spacing: 2) {
       HStack(spacing: 10) {
-        Image(systemName: "computermouse").font(.title3).foregroundStyle(.tint).frame(width: 24)
+        Image(nsImage: Mark.full).renderingMode(.template).foregroundStyle(.tint).frame(width: 24)
         VStack(alignment: .leading, spacing: 0) {
           Text("zflow").fontWeight(.semibold)
           Text(model.title).font(.callout).foregroundStyle(.secondary)
