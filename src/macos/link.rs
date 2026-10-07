@@ -47,7 +47,7 @@ use crate::{
 };
 
 use super::{
-    Activation, CursorPosition, SourceStatus,
+    Activation, Arrival, CursorPosition, SourceStatus,
     receive::{Inbound, OutboundGuard, Receiving},
     run_crossing,
 };
@@ -196,10 +196,45 @@ impl LayoutRoute {
     }
 }
 
+/// The links whose sessions are ready for a crossing, by peer, so a
+/// crossing on one computer can move on to the next.
+#[derive(Clone, Default)]
+pub(super) struct Hops(Arc<std::sync::Mutex<BTreeMap<String, Door>>>);
+
+/// A ready link: its session, and the way to hand it a crossing.
+#[derive(Clone)]
+pub(super) struct Door {
+    pub session: SessionHandle,
+    commands: mpsc::WeakUnboundedSender<Command>,
+}
+
+impl Hops {
+    fn doors(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Door>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set(&self, peer: &str, door: Option<Door>) {
+        match door {
+            Some(door) => self.doors().insert(peer.to_owned(), door),
+            None => self.doors().remove(peer),
+        };
+    }
+
+    pub(super) fn door(&self, peer: &str) -> Option<Door> {
+        self.doors().get(peer).cloned()
+    }
+
+    pub(super) fn ready(&self, peer: &str) -> bool {
+        self.doors().contains_key(peer)
+    }
+}
+
 enum Command {
     Cross {
-        handoff: Handoff,
-        entry_position: CursorPosition,
+        handoff: Box<Handoff>,
+        arrival: Arrival,
         reduce_wifi_latency: bool,
         stop: watch::Receiver<bool>,
         status: mpsc::UnboundedSender<SourceStatus>,
@@ -208,6 +243,19 @@ enum Command {
     },
     Inbound(Opened),
     Retry,
+}
+
+impl Command {
+    /// The session a crossing that moved on here prepared its desktop on.
+    fn prepared_on(&self) -> Option<u64> {
+        match self {
+            Self::Cross {
+                arrival: Arrival::Hop { session, .. },
+                ..
+            } => Some(session.id()),
+            _ => None,
+        }
+    }
 }
 
 /// What a link's session depends on. The rest of a peer's record, such as
@@ -286,6 +334,8 @@ pub struct Links {
     heard_sender: mpsc::UnboundedSender<Heard>,
     /// Hellos this Mac is sending.
     dialing: Vec<JoinHandle<()>>,
+    /// The links ready for a crossing.
+    hops: Hops,
 }
 
 impl Links {
@@ -342,6 +392,7 @@ impl Links {
             heard,
             heard_sender,
             dialing: Vec::new(),
+            hops: Hops::default(),
         })
     }
 
@@ -404,6 +455,8 @@ impl Links {
                 config: settings.clone(),
                 window: self.dial_window,
                 heard: self.heard_sender.clone(),
+                hops: self.hops.clone(),
+                commands: commands.downgrade(),
             };
             let layouts = LayoutRoute {
                 peer: name.clone(),
@@ -573,10 +626,10 @@ impl Links {
 
     /// Hands a crossing to its peer's link, if that link is ready and no
     /// peer controls this Mac. `entry_position` is where the cursor reached
-    /// the edge.
+    /// the edge. The crossing can move on to the computers ready now.
     pub(crate) fn cross(
         &self,
-        handoff: Handoff,
+        mut handoff: Handoff,
         entry_position: CursorPosition,
         reduce_wifi_latency: bool,
     ) -> Option<Crossing> {
@@ -584,13 +637,14 @@ impl Links {
         if !matches!(*link.state.borrow(), LinkState::Ready(_)) {
             return None;
         }
+        handoff.keep_routes(|peer| self.hops.ready(peer));
         let guard = self.receiving.ownership().begin_outbound()?;
         let (stop, stopped) = watch::channel(false);
         let (status, events) = mpsc::unbounded_channel();
         link.commands
             .send(Command::Cross {
-                handoff,
-                entry_position,
+                handoff: Box::new(handoff),
+                arrival: Arrival::Edge(entry_position),
                 reduce_wifi_latency,
                 stop: stopped,
                 status,
@@ -790,6 +844,11 @@ struct Remote {
     window: Duration,
     /// Where each session's address goes, for the app to save.
     heard: mpsc::UnboundedSender<Heard>,
+    /// Every link ready for a crossing, which this one joins while ready.
+    hops: Hops,
+    /// This link's own commands, for a crossing another link hands on.
+    /// Weak, so dropping the link's sender still stops it.
+    commands: mpsc::WeakUnboundedSender<Command>,
 }
 
 impl Remote {
@@ -874,9 +933,10 @@ async fn run(
                         &mut inbound,
                         &mut layouts,
                         wins,
-                        remote.window,
+                        &remote,
                     )
                     .await;
+                remote.hops.set(name, None);
                 // Lets go of whatever the peer held before the session goes.
                 drop(inbound);
                 let reason = match served {
@@ -949,12 +1009,38 @@ async fn keep_one(
 
 fn refuse(command: Command, reason: &str) {
     match command {
-        Command::Cross { status, guard, .. } => {
+        Command::Cross {
+            arrival,
+            status,
+            guard,
+            ..
+        } => {
+            // A crossing that moved on from another computer gives the Mac
+            // its input back first, and lets go of the desktop it prepared.
+            arrival.give_back();
             drop(guard);
             let _ = status.send(SourceStatus::Cancelled(reason.into()));
         }
         Command::Inbound(opened) => opened.close(SessionCloseReason::Superseded),
         Command::Retry => {}
+    }
+}
+
+/// Hands a crossing that moved on to the next computer's link. If that link
+/// went away meanwhile, input comes back to the Mac.
+fn hand_on(hops: &Hops, command: Command) {
+    let Command::Cross { handoff, .. } = &command else {
+        return;
+    };
+    let commands = hops
+        .door(&handoff.peer)
+        .and_then(|door| door.commands.upgrade());
+    let refused = match commands {
+        Some(commands) => commands.send(command).err().map(|error| error.0),
+        None => Some(command),
+    };
+    if let Some(command) = refused {
+        refuse(command, "the next computer's link closed");
     }
 }
 
@@ -1236,8 +1322,9 @@ impl Session {
 
     /// Serves crossings and the peer's input until the session ends, the
     /// link is closed, or the peer's newer session replaces this one. A
-    /// session the peer opens while this Mac's dial is `window` old or
-    /// younger counts as dialed at the same moment, and `wins` picks one.
+    /// session the peer opens while this Mac's dial is `remote.window` old
+    /// or younger counts as dialed at the same moment, and `wins` picks one.
+    /// While ready, the link is among `remote.hops`.
     async fn serve(
         &mut self,
         commands: &mut mpsc::UnboundedReceiver<Command>,
@@ -1245,7 +1332,7 @@ impl Session {
         inbound: &mut Inbound,
         layouts: &mut LayoutRoute,
         wins: bool,
-        window: Duration,
+        remote: &Remote,
     ) -> Served {
         // A new session holds nothing yet.
         layouts.peer_has = None;
@@ -1254,6 +1341,7 @@ impl Session {
         // answer is awaited next to it. Only crossings wait for it.
         let mut snapshot = self.ask(inbound);
         let mut ready = false;
+        let mut listed = false;
         if !self.sends {
             state.send_replace(LinkState::Connected);
         }
@@ -1261,6 +1349,14 @@ impl Session {
         loop {
             if ready {
                 retry = FIRST_SNAPSHOT_RETRY;
+            }
+            if ready != listed {
+                let door = ready.then(|| Door {
+                    session: self.handle.clone(),
+                    commands: remote.commands.clone(),
+                });
+                remote.hops.set(&remote.name, door);
+                listed = ready;
             }
             tokio::select! {
                 command = commands.recv() => match command {
@@ -1272,7 +1368,7 @@ impl Session {
                     Some(Command::Inbound(theirs)) => {
                         // A peer that connects later lost its connection,
                         // so its new one replaces this one.
-                        let simultaneous = self.dialed_at.is_some_and(|at| at.elapsed() < window);
+                        let simultaneous = self.dialed_at.is_some_and(|at| at.elapsed() < remote.window);
                         if !(simultaneous && wins) {
                             return Served::Replaced(theirs);
                         }
@@ -1280,9 +1376,18 @@ impl Session {
                         theirs.close(SessionCloseReason::Superseded);
                     }
                     Some(command) if !ready => refuse(command, "the other computer is not ready"),
+                    // The desktop was prepared on a session this link has
+                    // since replaced, so its polls would go nowhere.
+                    Some(command)
+                        if command
+                            .prepared_on()
+                            .is_some_and(|session| session != self.handle.id()) =>
+                    {
+                        refuse(command, "the other computer connected again");
+                    }
                     Some(Command::Cross {
                         handoff,
-                        entry_position,
+                        arrival,
                         reduce_wifi_latency,
                         stop,
                         status,
@@ -1297,20 +1402,35 @@ impl Session {
                             clipboard: &clipboard,
                             context,
                             raw_touch: self.raw_touch,
+                            hops: &remote.hops,
+                            neutral: super::input_is_neutral,
                         };
-                        let failed = run_crossing(
+                        let (failed, onward) = run_crossing(
                             activation,
-                            handoff,
-                            entry_position,
+                            *handoff,
+                            arrival,
                             reduce_wifi_latency,
-                            stop,
+                            stop.clone(),
                             status.clone(),
                         )
                         .await;
-                        // Input is back on the Mac. Let a peer take control
-                        // before the observer hears the crossing ended.
-                        drop(guard);
-                        drop(status);
+                        if let Some((handoff, arrival)) = onward {
+                            // The next computer's link takes the crossing,
+                            // with the guard that keeps peers out meanwhile.
+                            hand_on(&remote.hops, Command::Cross {
+                                handoff,
+                                arrival,
+                                reduce_wifi_latency,
+                                stop,
+                                status,
+                                guard,
+                            });
+                        } else {
+                            // Input is back on the Mac. Let a peer take control
+                            // before the observer hears the crossing ended.
+                            drop(guard);
+                            drop(status);
+                        }
                         if failed {
                             // The receiver may have changed; check it before the next crossing.
                             ready = false;
@@ -1726,6 +1846,7 @@ mod tests {
                 start: 0,
                 end: FRACTION_MAX,
                 position: 500_000,
+                exits: Vec::new(),
             };
             let prepared = session.handle.desktop_request(prepare).await.unwrap();
             assert!(matches!(prepared, DesktopResponse::Prepared { .. }));
@@ -1841,7 +1962,173 @@ mod tests {
             position: 500_000,
             expected_width: 1920,
             expected_height: 1080,
+            origin: 500_000,
+            routes: Vec::new(),
+            layout: Default::default(),
         }
+    }
+
+    /// Whether a button or modifier is held, for [`neutral`].
+    static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    fn neutral() -> bool {
+        !HELD.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pointer_moves_on_once_nothing_is_held_and_the_next_computer_is_ready() {
+        use crate::app::layout_model::{Layout, Monitor};
+        use crate::macos::{Ended, MacCapture, forward, poll_desktop};
+        let (mac, linux) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let spki = Identity::load_or_create(mac.path())
+            .unwrap()
+            .spki()
+            .to_vec();
+        let mut receiver = receiver(linux.path(), &spki, false).await;
+        receiver
+            .hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let config = mac_config(mac.path(), linux.path(), receiver.address);
+        let mut session = Session::open(
+            "linux",
+            &config.peers["linux"],
+            &config,
+            &[receiver.address],
+        )
+        .await
+        .unwrap();
+        // This Mac, linux to its right, and desk below linux.
+        let tile = |name: &str, x, y| Monitor {
+            id: name.into(),
+            label: name.into(),
+            peer: (name != "mac").then(|| name.into()),
+            display: None,
+            x,
+            y,
+            width: 1920,
+            height: 1080,
+        };
+        let layout = Layout {
+            monitors: vec![
+                tile("mac", 0, 0),
+                tile("linux", 1920, 0),
+                tile("desk", 1920, 1080),
+            ],
+        };
+        let handoff =
+            crate::app::handoff::from_edge(&layout, &geometry(), None, Edge::Right, 500_000)
+                .unwrap();
+        assert_eq!(handoff.routes.len(), 2, "home, and on to desk");
+        let hops = Hops::default();
+        let (_kept, kept) = watch::channel(None);
+        let mut layouts = LayoutRoute {
+            peer: "linux".into(),
+            kept,
+            received: mpsc::unbounded_channel().0,
+            peer_has: None,
+        };
+        let clipboard =
+            super::super::clipboard::Clipboard::new(Arc::new(FakePasteboard::default()));
+        let context = session.next_context();
+        let mut activation = Activation {
+            session: &session.handle,
+            events: &mut session.events,
+            layouts: &mut layouts,
+            clipboard: &clipboard,
+            context,
+            raw_touch: false,
+            hops: &hops,
+            neutral,
+        };
+        // Native capture never starts here; forward only reads its queue.
+        let mut capture = MacCapture {
+            running: false,
+            raw_touch: false,
+        };
+        let (_stop, mut stop) = watch::channel(false);
+        let (status, _statuses) = mpsc::unbounded_channel();
+        let token = 9;
+        let ended = Ended {
+            reason: "",
+            returned: None,
+            hop: None,
+            error: None,
+            touch_active: false,
+            events: 0,
+        };
+        let mut poll = Some(poll_desktop(activation.session, token));
+        let (commands, _taken) = mpsc::unbounded_channel();
+        let desk = Door {
+            session: activation.session.clone(),
+            commands: commands.downgrade(),
+        };
+        let driving = async {
+            let mut poll = async || {
+                let (request, reply) = receiver.held.recv().await.unwrap();
+                assert_eq!(request, DesktopRequest::Poll { token });
+                reply
+            };
+            let toward_desk = DesktopResponse::Exited {
+                exit: 1,
+                position: 750_000,
+            };
+            // A button is held: the pointer stays on linux, which hears that
+            // from the next Poll. Each change below waits for that Poll, so
+            // forward has decided by then.
+            poll().await.send(toward_desk.clone()).unwrap();
+            let reply = poll().await;
+            // Nothing held, but desk is not ready.
+            HELD.store(false, std::sync::atomic::Ordering::SeqCst);
+            reply.send(toward_desk.clone()).unwrap();
+            let reply = poll().await;
+            hops.set("desk", Some(desk));
+            reply.send(toward_desk).unwrap();
+        };
+        let (mut ended, ()) = tokio::join!(
+            forward(
+                &mut capture,
+                &mut activation,
+                &handoff,
+                token,
+                &mut poll,
+                &mut stop,
+                &status,
+                ended
+            ),
+            driving
+        );
+        assert!(ended.error.is_none() && ended.returned.is_none());
+        let next = ended.hop.take().unwrap();
+        assert_eq!(next.peer, "desk");
+        assert_eq!((next.edge, next.position), (Edge::Top, 750_000));
+
+        // Home through the edge the pointer came in at.
+        poll = Some(poll_desktop(activation.session, token));
+        let home = async {
+            let (_, reply) = receiver.held.recv().await.unwrap();
+            reply
+                .send(DesktopResponse::Exited {
+                    exit: 0,
+                    position: 250_000,
+                })
+                .unwrap();
+        };
+        let (ended, ()) = tokio::join!(
+            forward(
+                &mut capture,
+                &mut activation,
+                &handoff,
+                token,
+                &mut poll,
+                &mut stop,
+                &status,
+                ended
+            ),
+            home
+        );
+        assert_eq!(ended.returned, Some((Point { x: 1916, y: 270 }, 250_000)));
+        drop(poll);
+        session.close(SessionCloseReason::LocalRelease).await;
     }
 
     // Links own a runtime, so this test drives them from a plain thread.
@@ -2037,6 +2324,12 @@ mod tests {
             start: 0,
             end: FRACTION_MAX,
             position: 500_000,
+            exits: vec![crate::desktop::Exit {
+                monitor: None,
+                edge: Edge::Left,
+                start: 0,
+                end: FRACTION_MAX,
+            }],
         };
         assert_eq!(
             ask(prepare),
@@ -2091,7 +2384,13 @@ mod tests {
                 response => break response,
             }
         };
-        assert_eq!(returned, DesktopResponse::Returned { position: 500_000 });
+        assert_eq!(
+            returned,
+            DesktopResponse::Exited {
+                exit: 0,
+                position: 500_000
+            }
+        );
         // Motion after that stays off the Mac.
         fake.take_log();
         for frame in [
@@ -2973,8 +3272,8 @@ mod tests {
         let ownership = Ownership::default();
         let (status, mut statuses) = mpsc::unbounded_channel();
         let command = Command::Cross {
-            handoff: handoff("linux"),
-            entry_position: ENTRY,
+            handoff: Box::new(handoff("linux")),
+            arrival: Arrival::Edge(ENTRY),
             reduce_wifi_latency: false,
             stop: watch::channel(false).1,
             status,
@@ -2987,6 +3286,61 @@ mod tests {
             Ok(SourceStatus::Cancelled(_))
         ));
         assert!(ownership.claim_inbound("linux", 1).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hop_that_goes_no_further_lets_go_of_the_desktop_it_prepared() {
+        let (mac, linux) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let spki = Identity::load_or_create(mac.path())
+            .unwrap()
+            .spki()
+            .to_vec();
+        let mut receiver = receiver(linux.path(), &spki, false).await;
+        receiver
+            .hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let config = mac_config(mac.path(), linux.path(), receiver.address);
+        let session = Session::open(
+            "linux",
+            &config.peers["linux"],
+            &config,
+            &[receiver.address],
+        )
+        .await
+        .unwrap();
+        let ownership = Ownership::default();
+        let (status, mut statuses) = mpsc::unbounded_channel();
+        let hop = Command::Cross {
+            handoff: Box::new(handoff("linux")),
+            arrival: Arrival::Hop {
+                token: 7,
+                capture: super::super::MacCapture {
+                    running: false,
+                    raw_touch: false,
+                },
+                local_desktop: Vec::new(),
+                session: session.handle.clone(),
+            },
+            reduce_wifi_latency: false,
+            stop: watch::channel(false).1,
+            status,
+            guard: ownership.begin_outbound().unwrap(),
+        };
+        assert_eq!(hop.prepared_on(), Some(session.handle.id()));
+        // As when the next computer's link went away before it took the hop.
+        refuse(hop, "the next computer's link closed");
+        assert!(matches!(
+            statuses.try_recv(),
+            Ok(SourceStatus::Cancelled(_))
+        ));
+        assert!(ownership.claim_inbound("linux", 1).is_ok());
+        let (request, reply) = tokio::time::timeout(Duration::from_secs(2), receiver.held.recv())
+            .await
+            .expect("the prepared desktop was let go")
+            .unwrap();
+        assert_eq!(request, DesktopRequest::Finish { token: 7 });
+        let _ = reply.send(DesktopResponse::Finished);
+        session.close(SessionCloseReason::LocalRelease).await;
     }
 
     #[tokio::test]

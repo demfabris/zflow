@@ -13,7 +13,7 @@ pub const BUS: &str = "io.zflow.Desktop";
 const PATH: &str = "/io/zflow/Desktop";
 /// packaging/gnome-extension/client.js mirrors this. Raise both when the agent
 /// and the extension stop understanding each other.
-pub(super) const API: u32 = 4;
+pub(super) const API: u32 = 5;
 const AUTOSTART: &str = "autostart/io.zflow.desktop-agent.desktop";
 /// Where the package keeps the service's settings.
 const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";

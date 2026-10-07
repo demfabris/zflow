@@ -41,7 +41,7 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}], monitorDa
     };
     // GNOME 51 reaches the backend only through the stage context.
     const context = {
-        API: 4,
+        API: 5,
         Extension: class {},
         Indicator: class { destroy() {} },
         TextDecoder,
@@ -114,7 +114,12 @@ function desktop(monitors = [{x: 0, y: 0, width: 1920, height: 1080}], monitorDa
     }};
 }
 
-const prepare = (edge = 'left', extra = {}) => ({command: 'prepare', token: 7, edge, start: 0, end: 1000000, position: 500000, ...extra});
+// By default the only way off is back through the edge the pointer came in at.
+const prepare = (edge = 'left', extra = {}) => {
+    const {monitor, start = 0, end = 1000000} = extra;
+    return {command: 'prepare', token: 7, edge, start, end, position: 500000,
+        exits: [{edge, start, end, ...(monitor === undefined ? {} : {monitor})}], ...extra};
+};
 
 {
     const d = desktop(undefined, {resources: {'width-mm': 530, 'height-mm': 300}});
@@ -235,9 +240,44 @@ for (const [edge, expectedY, direction] of [['top', 3, 4], ['bottom', 1076, 8]])
     assert.equal((await poll).status, 'active');
     assert.equal(d.timers.size, 1, 'only the lease timer remains after the hold');
     d.barriers[0].hit(d.barriers[0], {x: 0, y: 270});
-    assert.equal((await d.extension._request({command: 'poll', token: 7})).position, 250000);
     await assert.rejects(d.extension._request({command: 'finish', token: 8}), /expired|ended/);
-    assert.equal((await d.extension._request({command: 'poll', token: 7})).status, 'returned', 'a stale token cannot clear the active lease');
+    assert.deepEqual({...await d.extension._request({command: 'poll', token: 7})}, {status: 'exited', exit: 0, position: 250000},
+        'a stale token cannot clear the active lease');
+    // The sending computer keeps the pointer here, say because a key is
+    // held: it polls again, and the same exit reports on the next push.
+    const kept = d.extension._request({command: 'poll', token: 7});
+    let answered = false;
+    kept.then(() => {answered = true;});
+    await new Promise(setImmediate);
+    assert.equal(answered, false, 'a report is answered once');
+    d.barriers[0].hit(d.barriers[0], {x: 0, y: 540});
+    assert.deepEqual({...await kept}, {status: 'exited', exit: 0, position: 500000});
+    d.extension.disable();
+}
+{
+    // Every exit gets its barriers: home through the left edge, on to
+    // another computer from the right half of the bottom edge.
+    const d = desktop([{x: 0, y: 0, width: 1920, height: 1080}, {x: 1920, y: 0, width: 1920, height: 1080}]);
+    const {displays} = (await d.extension._request({command: 'snapshot'})).geometry;
+    const [first, second] = displays.map(display => display.id);
+    const exits = [{edge: 'left', start: 0, end: 1000000, monitor: first},
+        {edge: 'bottom', start: 500000, end: 1000000, monitor: second},
+        {edge: 'top', start: 0, end: 1000000, monitor: 'unplugged'}];
+    assert.equal((await d.extension._request(prepare('left', {monitor: first, exits}))).status, 'prepared');
+    const [home, onward, ...rest] = d.barriers.filter(b => !b.destroyed);
+    assert.equal(rest.length, 0, 'an exit on a monitor that is gone has no barrier');
+    assert.deepEqual([home.properties.x1, home.properties.y1, home.properties.y2], [0, 0, 1080]);
+    assert.deepEqual([onward.properties.x1, onward.properties.x2, onward.properties.y1], [2880, 3840, 1080]);
+    onward.hit(onward, {x: 3360, y: 1080});
+    home.hit(home, {x: 0, y: 10});
+    assert.deepEqual({...await d.extension._request({command: 'poll', token: 7})}, {status: 'exited', exit: 1, position: 750000},
+        'the first exit the pointer reaches is the one reported');
+    await d.extension._request({command: 'finish', token: 7});
+    assert.ok(d.barriers.every(b => b.destroyed));
+    for (const invalid of [undefined, [{edge: 'middle', start: 0, end: 1}], [{edge: 'left', start: 5, end: 5}],
+        [{edge: 'left', start: 0, end: 1, monitor: ''}], Array(65).fill({edge: 'left', start: 0, end: 1})])
+        await assert.rejects(d.extension._request({...prepare(), exits: invalid}), /Invalid crossing exits/);
+    assert.equal(d.extension._lease, null);
     d.extension.disable();
 }
 {
@@ -418,7 +458,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     await call(':1.99', {command: 'snapshot'});
     assert.equal(d.extension._lease, null);
     assert.equal(d.barriers.length, 0);
-    await call(':1.7', {command: 'snapshot', api: 4});
+    await call(':1.7', {command: 'snapshot', api: 5});
     d.watch.vanished();
     await call(':1.7', {command: 'snapshot'});
     const denied = 'org.freedesktop.DBus.Error.AccessDenied';
@@ -450,7 +490,7 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
     d.context.Main.layoutManager.monitors.length = 0;
     assert.deepEqual({...await d.extension._request({command: 'focus'})}, {status: 'focus', terminal: true}, 'focus needs no monitors');
     const replies = [];
-    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus', api: 4})], {
+    const call = sender => d.extension.CallAsync([JSON.stringify({command: 'focus', api: 5})], {
         get_sender: () => sender,
         return_dbus_error: name => replies.push(name),
         return_value: variant => replies.push(JSON.parse(variant.value[0]).terminal),
@@ -475,10 +515,10 @@ for (const [range, y] of [[{start: 185185, position: 185185}, 200], [{end: 50000
         get_sender: () => ':1.7',
         return_value: variant => replies.push(JSON.parse(variant.value[0])),
     });
-    await call({command: 'snapshot', api: 5});
+    await call({command: 'snapshot', api: 6});
     await call({command: 'snapshot', api: 1});
     await call({command: 'snapshot'});
-    await call({command: 'snapshot', api: 4});
+    await call({command: 'snapshot', api: 5});
     assert.match(replies[0].reason, /^Update zflow: its GNOME extension is older/);
     assert.match(replies[1].reason, /^Update zflow: the app is older/);
     assert.match(replies[2].reason, /^Update zflow: the app is older/, 'agents from before API levels speak API 1');
@@ -694,7 +734,7 @@ function clipboardCalls(d) {
     assert.deepEqual(d.notices, [['zflow', notice], ['zflow', 'x'.repeat(256)]]);
     for (const message of [undefined, '', 7]) await assert.rejects(d.extension._request({command: 'notify', message}), /Invalid notice/);
     const replies = [];
-    await d.extension.CallAsync([JSON.stringify({command: 'notify', message: 'hi', api: 4})], {
+    await d.extension.CallAsync([JSON.stringify({command: 'notify', message: 'hi', api: 5})], {
         get_sender: () => ':1.99',
         return_dbus_error: name => replies.push(name),
     });

@@ -1,12 +1,13 @@
 //! Where a crossing enters the other computer and where it comes back.
 //! The Mac finds the edge by watching its cursor and its own pointer's
-//! pushes; Linux by a GNOME barrier.
+//! pushes; Linux by a GNOME barrier. The computer whose input it is routes
+//! every way off the other computer: home, or on to a third one.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::desktop::{
-    DesktopRequest, DesktopResponse, Edge, FRACTION_MAX, Geometry, MAX_TOKEN, Point, Rect,
-    ReturnMapping,
+    DesktopRequest, DesktopResponse, Edge, Exit, FRACTION_MAX, Geometry, MAX_EXITS, MAX_TOKEN,
+    Point, Rect, ReturnMapping,
 };
 
 use super::layout_model::{Layout, Transition};
@@ -25,7 +26,45 @@ pub(crate) struct Handoff {
     /// Where the Mac's cursor may travel while the crossing is prepared.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub entry_region: Rect,
+    /// The edge here the crossing left from, and its range on the first
+    /// computer it entered. A hop keeps it.
     pub return_mapping: ReturnMapping,
+    /// Where the crossing entered that first computer, in
+    /// `return_mapping`'s remote range. A hop keeps it too.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub origin: u32,
+    /// The ways off this computer's desktop, in the order Prepare lists
+    /// their exits.
+    pub routes: Vec<Route>,
+    /// The layout the routes come from, which plans the next hop.
+    pub layout: Layout,
+}
+
+/// One way off the other computer's desktop, and where it leads.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Route {
+    pub exit: Exit,
+    pub onward: Onward,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Onward {
+    /// Back to this computer, at the matching point of one of its edges.
+    Home(ReturnMapping),
+    /// On to another computer, through this transition of the layout.
+    Peer {
+        peer: String,
+        transition: Transition,
+    },
+}
+
+/// Where the pointer goes once it left the other computer.
+#[derive(Debug)]
+pub(crate) enum Next {
+    /// Back here, to this point.
+    Home(Point),
+    /// On to another computer. Windows only routes home.
+    Hop(#[cfg_attr(windows, allow(dead_code))] Box<Handoff>),
 }
 
 impl Handoff {
@@ -34,7 +73,8 @@ impl Handoff {
         self.source_geometry == *geometry
     }
 
-    /// Asks the other computer to put its cursor at the entry point.
+    /// Asks the other computer to put its cursor at the entry point and to
+    /// watch every route's exit.
     pub fn prepare(&self, token: u64) -> DesktopRequest {
         DesktopRequest::Prepare {
             monitor: self.monitor.clone(),
@@ -43,7 +83,60 @@ impl Handoff {
             start: self.start,
             end: self.end,
             position: self.position,
+            exits: self.routes.iter().map(|route| route.exit.clone()).collect(),
         }
+    }
+
+    /// Keeps the routes home, and those on to the computers `reachable`
+    /// says input can go to now.
+    pub fn keep_routes(&mut self, reachable: impl Fn(&str) -> bool) {
+        self.routes.retain(|route| match &route.onward {
+            Onward::Home(_) => true,
+            Onward::Peer { peer, .. } => reachable(peer),
+        });
+    }
+
+    /// Where the pointer goes after it left the other computer through the
+    /// route `exit` at `position`, a fraction of that exit's edge.
+    pub fn next(&self, exit: u32, position: u32) -> Result<Next> {
+        let route = self
+            .routes
+            .get(exit as usize)
+            .context("the other computer reported an exit it was not given")?;
+        ensure!(
+            (route.exit.start..=route.exit.end).contains(&position),
+            "the pointer left outside the configured edge range"
+        );
+        let transition = match &route.onward {
+            Onward::Home(mapping) => return Ok(Next::Home(mapping.position(position)?)),
+            Onward::Peer { transition, .. } => transition,
+        };
+        // The same linear map as a return: along the exit, then onto the
+        // next computer's part of that edge.
+        let along = f64::from(position) / f64::from(FRACTION_MAX);
+        let progress = ((along - transition.source_start)
+            / (transition.source_end - transition.source_start))
+            .clamp(0.0, 1.0);
+        let entry =
+            transition.target_start + progress * (transition.target_end - transition.target_start);
+        let mut next = entering(
+            &self.layout,
+            &self.source_geometry,
+            transition,
+            fraction(entry),
+            self.entry_region,
+            self.return_mapping.clone(),
+        )
+        .context("the layout has no computer past that edge")?;
+        next.origin = self.origin;
+        Ok(Next::Hop(Box::new(next)))
+    }
+
+    /// Where the pointer comes back here when the crossing ends without
+    /// leaving through an exit: where it left this computer.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn home(&self) -> Result<Point> {
+        self.return_mapping.position(self.origin)
     }
 
     /// Checks that the other computer prepared a desktop of the size the
@@ -288,9 +381,7 @@ fn handoff_at(
     transition: &Transition,
     current: Point,
 ) -> Option<Handoff> {
-    let peer = layout.monitors[transition.target].peer.as_ref()?;
     let source = &layout.monitors[transition.source];
-    let target = &layout.monitors[transition.target];
     let selected = geometry
         .for_monitor(source.display.as_ref().map(|d| d.id.as_str()))
         .ok()?;
@@ -302,6 +393,36 @@ fn handoff_at(
         remote_end: transition.target_end,
         geometry: selected.clone(),
     };
+    let entry_region = entry_region(
+        &selected,
+        transition.edge,
+        transition.source_start,
+        transition.source_end,
+        current,
+    )?;
+    let position = return_mapping.fraction(current).ok()?;
+    entering(
+        layout,
+        geometry,
+        transition,
+        position,
+        entry_region,
+        return_mapping,
+    )
+}
+
+/// The crossing through `transition` onto its target computer, at
+/// `position` of the target's range.
+fn entering(
+    layout: &Layout,
+    geometry: &Geometry,
+    transition: &Transition,
+    position: u32,
+    entry_region: Rect,
+    return_mapping: ReturnMapping,
+) -> Option<Handoff> {
+    let target = &layout.monitors[transition.target];
+    let peer = target.peer.as_ref()?;
     Some(Handoff {
         peer: peer.clone(),
         monitor: target.display.as_ref().map(|d| d.id.clone()),
@@ -309,7 +430,7 @@ fn handoff_at(
         edge: opposite(transition.edge),
         start: fraction(transition.target_start),
         end: fraction(transition.target_end),
-        position: return_mapping.fraction(current).ok()?,
+        position,
         expected_width: target
             .display
             .as_ref()
@@ -318,15 +439,55 @@ fn handoff_at(
             .display
             .as_ref()
             .map_or(target.height, |d| d.bounds.height),
-        entry_region: entry_region(
-            &selected,
-            transition.edge,
-            transition.source_start,
-            transition.source_end,
-            current,
-        )?,
+        entry_region,
         return_mapping,
+        origin: position,
+        routes: routes(layout, geometry, peer),
+        layout: layout.clone(),
     })
+}
+
+/// Every way off `peer`'s monitors that the layout shows: back to one of
+/// this computer's, or on to another computer's. The ways home come first.
+fn routes(layout: &Layout, geometry: &Geometry, peer: &str) -> Vec<Route> {
+    let id = |index: usize| {
+        layout.monitors[index]
+            .display
+            .as_ref()
+            .map(|d| d.id.clone())
+    };
+    let mut routes: Vec<Route> = layout
+        .transitions()
+        .into_iter()
+        .filter(|t| layout.monitors[t.source].peer.as_deref() == Some(peer))
+        .filter_map(|t| {
+            let exit = Exit {
+                monitor: id(t.source),
+                edge: t.edge,
+                start: fraction(t.source_start),
+                end: fraction(t.source_end),
+            };
+            let onward = match &layout.monitors[t.target].peer {
+                Some(next) => Onward::Peer {
+                    peer: next.clone(),
+                    transition: t.clone(),
+                },
+                // A monitor here that is gone takes nothing back.
+                None => Onward::Home(ReturnMapping {
+                    geometry: geometry.for_monitor(id(t.target).as_deref()).ok()?,
+                    edge: opposite(t.edge),
+                    local_start: t.target_start,
+                    local_end: t.target_end,
+                    remote_start: t.source_start,
+                    remote_end: t.source_end,
+                }),
+            };
+            (exit.start < exit.end).then_some(Route { exit, onward })
+        })
+        .collect();
+    routes.sort_by_key(|route| matches!(route.onward, Onward::Peer { .. }));
+    routes.truncate(MAX_EXITS);
+    routes
 }
 
 fn entry_region(
@@ -1039,5 +1200,109 @@ mod tests {
             }
         );
         assert!(!handoff.entry_region.contains(Point { x: 999, y: 100 }));
+    }
+
+    /// This computer, `b` to its right, and `c` below `b`, shifted right so
+    /// that only the right half of b's bottom edge touches it.
+    fn three() -> (Layout, Geometry) {
+        let (mut layout, geometry) = setup();
+        layout.monitors[1].y = 0;
+        layout.monitors[1].peer = Some("b".into());
+        layout.monitors.push(Monitor {
+            display: None,
+            id: "c".into(),
+            label: "C".into(),
+            peer: Some("c".into()),
+            x: 2500,
+            y: 1000,
+            width: 1000,
+            height: 500,
+        });
+        (layout, geometry)
+    }
+
+    fn exit(edge: Edge, start: u32, end: u32) -> Exit {
+        Exit {
+            monitor: None,
+            edge,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn the_other_computer_watches_every_way_off_its_desktop() {
+        let (layout, geometry) = three();
+        let b = from_edge(&layout, &geometry, None, Edge::Right, 500_000).unwrap();
+        assert_eq!(b.peer, "b");
+        let DesktopRequest::Prepare { exits, .. } = b.prepare(1) else {
+            panic!("not a Prepare");
+        };
+        // Home through the edge it came in at, and on to c from the right
+        // half of its bottom edge.
+        assert_eq!(
+            exits,
+            [
+                exit(Edge::Left, 0, FRACTION_MAX),
+                exit(Edge::Bottom, 500_000, FRACTION_MAX)
+            ]
+        );
+        assert!(
+            matches!(&b.routes[0].onward, Onward::Home(mapping) if *mapping == b.return_mapping),
+            "the way home is the way in"
+        );
+        let mut alone = b.clone();
+        alone.keep_routes(|peer| peer != "c");
+        assert_eq!(alone.routes, b.routes[..1]);
+        b.prepare(1).validate().unwrap();
+    }
+
+    #[test]
+    fn a_hop_enters_the_next_computer_where_the_pointer_left() {
+        let (layout, geometry) = three();
+        let b = from_edge(&layout, &geometry, None, Edge::Right, 500_000).unwrap();
+        // Three quarters along b's bottom edge is halfway along c's top.
+        let Next::Hop(c) = b.next(1, 750_000).unwrap() else {
+            panic!("not a hop");
+        };
+        assert_eq!(c.peer, "c");
+        assert_eq!(
+            (c.edge, c.start, c.end, c.position),
+            (Edge::Top, 0, 500_000, 250_000)
+        );
+        assert_eq!((c.expected_width, c.expected_height), (1000, 500));
+        // c's only way off is back up to b; nothing touches this computer.
+        assert_eq!(c.routes.len(), 1);
+        assert_eq!(c.routes[0].exit, exit(Edge::Top, 0, 500_000));
+        // The way home keeps pointing where the crossing left.
+        assert_eq!(c.return_mapping, b.return_mapping);
+        assert_eq!(c.home().unwrap(), b.home().unwrap());
+        c.prepare(2).validate().unwrap();
+
+        assert!(b.next(2, 750_000).is_err(), "an exit b was not given");
+        assert!(b.next(1, 400_000).is_err(), "outside the exit's range");
+    }
+
+    #[test]
+    fn the_pointer_walks_to_the_third_computer_and_back_home() {
+        let (layout, geometry) = three();
+        let b = from_edge(&layout, &geometry, None, Edge::Right, 500_000).unwrap();
+        let Next::Hop(c) = b.next(1, 900_000).unwrap() else {
+            panic!("not a hop to c");
+        };
+        let Next::Hop(back) = c.next(0, 400_000).unwrap() else {
+            panic!("not a hop back to b");
+        };
+        assert_eq!(back.peer, "b");
+        assert_eq!(
+            (back.edge, back.start, back.end, back.position),
+            (Edge::Bottom, 500_000, FRACTION_MAX, 900_000)
+        );
+        assert_eq!(back.routes, b.routes, "b offers the same ways off");
+        // Home at y 300 on b's left edge is y 100 here, three points in.
+        let Next::Home(point) = back.next(0, 300_000).unwrap() else {
+            panic!("not home");
+        };
+        assert_eq!(point, Point { x: 996, y: 100 });
     }
 }

@@ -291,6 +291,47 @@ mod tests {
     }
 
     #[test]
+    fn fitting_this_computer_keeps_the_tiles_of_computers_it_has_not_paired() {
+        // This computer, key 1, has paired the Mac, key 2, but not key 3,
+        // which the Mac placed below itself, with a monitor now unplugged.
+        let mut layout = legacy();
+        let theirs = |x, y, display| Tile {
+            key: key(3),
+            display,
+            x,
+            y,
+            width: 1920,
+            height: 1080,
+        };
+        let mut unplugged = display("old", 0, 0, 1920, 1080);
+        unplugged.active = false;
+        layout.tiles.push(theirs(3840, 1080, None));
+        layout.tiles.push(theirs(9000, 0, Some(unplugged)));
+        let split = geometry(vec![
+            display("left", -1920, 0, 1920, 1080),
+            display("right", 0, 0, 1920, 1080),
+        ]);
+        let resized = Geometry {
+            monitors: vec![Rect {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            }],
+            displays: Vec::new(),
+        };
+        for geometry in [split, resized] {
+            let next = layout.with_geometry(&key(1), &geometry).unwrap();
+            next.validate().unwrap();
+            assert_eq!(
+                next.tiles.iter().filter(|tile| tile.key == key(3)).count(),
+                2,
+                "an edit that only fits this computer keeps the others' tiles"
+            );
+        }
+    }
+
+    #[test]
     fn physical_size_is_independent_of_resolution_and_disabled_positions_survive_edits() {
         let mut left = display("dell", 0, 0, 3840, 2160);
         left.width_mm = 600;

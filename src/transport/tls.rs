@@ -26,7 +26,7 @@ use crate::identity::Identity;
 
 use super::TransportError;
 
-pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/6";
+pub const INPUT_ALPN_PROTOCOL: &[u8] = b"zflow/7";
 /// Answered on the input port by computers that do not trust each other yet.
 pub const HELLO_ALPN_PROTOCOL: &[u8] = b"zflow-hello/5";
 const INPUT_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -493,6 +493,7 @@ mod tests {
         ("0.3.0", b"zflow/4", b"zflow-hello/4"),
         ("0.4.0", b"zflow/5", b"zflow-hello/5"),
         ("0.5.0", b"zflow/6", b"zflow-hello/5"),
+        ("0.6.0", b"zflow/7", b"zflow-hello/5"),
     ];
 
     #[test]

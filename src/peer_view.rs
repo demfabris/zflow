@@ -658,7 +658,10 @@ mod tests {
                 position: Point { x: 3, y: 540 },
             },
             DesktopResponse::Active,
-            DesktopResponse::Returned { position: 7 },
+            DesktopResponse::Exited {
+                exit: 1,
+                position: 7,
+            },
             DesktopResponse::Finished,
             DesktopResponse::unavailable("GNOME integration unavailable"),
         ] {

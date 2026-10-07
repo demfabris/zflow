@@ -1,7 +1,7 @@
 //! Answers a controlling peer's desktop handoff, as the GNOME extension does
 //! on Linux. Prepare puts the cursor where the pointer enters, Poll says when
-//! it leaves again through the same edge, and Finish or a lapsed lease ends
-//! the handoff.
+//! it leaves through one of the exits the peer gave, and Finish or a lapsed
+//! lease ends the handoff.
 
 use std::{
     sync::{Mutex, MutexGuard, PoisonError},
@@ -253,14 +253,39 @@ struct Lease {
     /// The display generation the entry was placed in, and its displays.
     generation: u32,
     geometry: Geometry,
-    edge: ArmedEdge,
+    /// Each exit the peer gave that has a display behind it, by its index.
+    exits: Vec<(u32, ArmedEdge)>,
     sampled: CursorPosition,
-    /// Where the pointer left, once it has.
-    returned: Option<u32>,
+    /// The exit the pointer left through, and where, once it has.
+    exited: Option<(u32, u32)>,
+    /// A Poll has answered `exited`.
+    delivered: bool,
+    /// The peer kept the pointer here after an exit, so a cursor resting
+    /// on an exit's edge does not report it again until it moves off.
+    resting: bool,
     _guard: LeaseGuard,
 }
 
 impl Lease {
+    /// The exit a move from `from` to `to` leaves through, if any.
+    fn crossing(&self, from: CursorPosition, to: CursorPosition) -> Option<(u32, u32)> {
+        self.exits
+            .iter()
+            .find_map(|(index, edge)| Some((*index, edge.crossing(from, to)?)))
+    }
+
+    /// The exit whose outermost pixels the cursor rests on, if any.
+    fn at_edge(&self, cursor: CursorPosition) -> Option<(u32, u32)> {
+        self.exits
+            .iter()
+            .find_map(|(index, edge)| Some((*index, edge.at_edge(cursor)?)))
+    }
+
+    fn exit(&mut self, exit: (u32, u32)) {
+        self.exited = Some(exit);
+        self.delivered = false;
+    }
+
     fn permits(&self, peer: &str, session_id: u64, token: u64) -> bool {
         self.peer == peer && self.session_id == session_id && self.token == token
     }
@@ -272,7 +297,7 @@ pub(crate) struct HandoffServer<D> {
     desk: D,
     ownership: Ownership,
     lease: Mutex<Option<Lease>>,
-    /// Wakes a held Poll when the pointer returns or the handoff ends, and
+    /// Wakes a held Poll when the pointer leaves or the handoff ends, and
     /// `watch` when a handoff starts.
     changed: Notify,
 }
@@ -345,6 +370,7 @@ impl<D: Desk> HandoffServer<D> {
             start,
             end,
             position,
+            exits,
         } = request
         else {
             return DesktopResponse::unavailable("Not a desktop handoff");
@@ -365,6 +391,17 @@ impl<D: Desk> HandoffServer<D> {
             Ok(entry) => entry,
             Err(reason) => return DesktopResponse::unavailable(reason),
         };
+        // An exit on a display that is gone leads nowhere.
+        let exits = (0..)
+            .zip(&exits)
+            .filter_map(|(index, exit)| {
+                let selected = geometry.for_monitor(exit.monitor.as_deref()).ok()?;
+                Some((
+                    index,
+                    ArmedEdge::new(&selected, exit.edge, exit.start, exit.end).ok()?,
+                ))
+            })
+            .collect();
         {
             let mut lease = self.lease();
             // A request can outlive its session, whose close ended any
@@ -376,21 +413,27 @@ impl<D: Desk> HandoffServer<D> {
                 Ok(guard) => guard,
                 Err(reason) => return DesktopResponse::unavailable(reason),
             };
-            *lease = Some(Lease {
+            let mut prepared = Lease {
                 peer: peer.to_owned(),
                 session_id,
                 token,
                 renewed: Instant::now(),
                 generation,
                 geometry: geometry.clone(),
-                edge: armed,
+                exits,
                 sampled: CursorPosition {
                     x: f64::from(entry.x),
                     y: f64::from(entry.y),
                 },
-                returned: None,
+                exited: None,
+                delivered: false,
+                resting: false,
                 _guard: guard,
-            });
+            };
+            // An entry on another exit's outermost pixels, as near a corner,
+            // is not a push out through it.
+            prepared.resting = prepared.at_edge(prepared.sampled).is_some();
+            *lease = Some(prepared);
         }
         self.changed.notify_waiters();
         self.desk.wake();
@@ -422,7 +465,7 @@ impl<D: Desk> HandoffServer<D> {
 
     /// Renews the handoff, then answers where the pointer left, or Active
     /// once the hold runs out. Meanwhile it watches the cursor, so the Mac's
-    /// own trackpad can hand the pointer back too.
+    /// own trackpad can move the pointer off too.
     async fn poll(&self, peer: &str, session_id: u64, token: u64) -> DesktopResponse {
         {
             let mut lease = self.lease();
@@ -433,6 +476,13 @@ impl<D: Desk> HandoffServer<D> {
                 return DesktopResponse::unavailable(STALE);
             }
             active.renewed = Instant::now();
+            if active.delivered {
+                // Polling again after an exit means the pointer stays here,
+                // as when a key is held on the way to a third computer.
+                active.exited = None;
+                active.delivered = false;
+                active.resting = true;
+            }
         }
         let hold = tokio::time::Instant::now() + POLL_HOLD;
         loop {
@@ -440,9 +490,9 @@ impl<D: Desk> HandoffServer<D> {
             if let Ok(cursor) = self.desk.cursor() {
                 self.sample(cursor);
             }
-            match self.returned(session_id, token) {
+            match self.exited(session_id, token) {
                 Err(reason) => return DesktopResponse::unavailable(reason),
-                Ok(Some(position)) => return DesktopResponse::Returned { position },
+                Ok(Some((exit, position))) => return DesktopResponse::Exited { exit, position },
                 Ok(None) => {}
             }
             let now = tokio::time::Instant::now();
@@ -475,23 +525,26 @@ impl<D: Desk> HandoffServer<D> {
     }
 
     /// Checks one of the peer's pointer moves before it is posted. A move
-    /// out through the handoff's edge hands the pointer back and wakes the
-    /// Poll. True once the pointer is back, so this and later moves are
-    /// dropped.
+    /// out through an exit reports it and wakes the Poll. True while an exit
+    /// waits for the peer, so this and later moves are dropped.
     pub fn moved(&self, from: CursorPosition, to: CursorPosition) -> bool {
         let mut lease = self.lease();
         let Some(active) = lease.as_mut() else {
             return false;
         };
-        if active.returned.is_some() {
+        if active.exited.is_some() {
             return true;
         }
-        let Some(position) = active.edge.crossing(from, to) else {
+        let Some((exit, position)) = active.crossing(from, to) else {
             return false;
         };
-        active.returned = Some(position);
+        active.exit((exit, position));
         drop(lease);
-        tracing::info!(position, "pointer left through the desktop handoff edge");
+        tracing::info!(
+            exit,
+            position,
+            "pointer left through a desktop handoff exit"
+        );
         self.changed.notify_waiters();
         true
     }
@@ -500,34 +553,45 @@ impl<D: Desk> HandoffServer<D> {
     /// between polls. Injected peer moves are checked before posting by moved().
     fn sample(&self, cursor: CursorPosition) {
         let mut lease = self.lease();
-        if let Some(active) = lease.as_mut()
-            && active.returned.is_none()
-        {
-            let previous = std::mem::replace(&mut active.sampled, cursor);
-            if let Some(position) = active
-                .edge
-                .crossing(previous, cursor)
-                .or_else(|| active.edge.at_edge(cursor))
-            {
-                active.returned = Some(position);
-                drop(lease);
-                tracing::info!(position, "cursor reached the desktop handoff edge");
-                self.changed.notify_waiters();
-            }
+        let Some(active) = lease.as_mut() else {
+            return;
+        };
+        let previous = std::mem::replace(&mut active.sampled, cursor);
+        if active.exited.is_some() {
+            return;
         }
+        let resting = active.at_edge(cursor);
+        active.resting &= resting.is_some();
+        let Some((exit, position)) = active
+            .crossing(previous, cursor)
+            .or(resting.filter(|_| !active.resting))
+        else {
+            return;
+        };
+        active.exit((exit, position));
+        drop(lease);
+        tracing::info!(exit, position, "cursor reached a desktop handoff exit");
+        self.changed.notify_waiters();
     }
 
-    fn returned(&self, session_id: u64, token: u64) -> Result<Option<u32>, &'static str> {
-        match self.lease().as_ref() {
+    /// The exit no Poll has answered yet, which this answer takes.
+    fn exited(&self, session_id: u64, token: u64) -> Result<Option<(u32, u32)>, &'static str> {
+        match self.lease().as_mut() {
             Some(lease) if lease.session_id == session_id && lease.token == token => {
-                Ok(lease.returned)
+                if lease.delivered {
+                    return Ok(None);
+                }
+                lease.delivered = lease.exited.is_some();
+                Ok(lease.exited)
             }
             _ => Err(ENDED),
         }
     }
 
     fn holds(&self, session_id: u64, token: u64) -> bool {
-        self.returned(session_id, token).is_ok()
+        self.lease()
+            .as_ref()
+            .is_some_and(|lease| lease.session_id == session_id && lease.token == token)
     }
 
     /// Drops the handoff, if it is still this one.
@@ -609,6 +673,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::desktop::Exit;
     use crate::macos::receive::{HANDOFF_ACTIVE, OWNED, SENDING};
 
     const MAX: u32 = FRACTION_MAX;
@@ -801,6 +866,16 @@ mod tests {
         (Arc::new(server), desk, ownership)
     }
 
+    /// The way back through the whole edge the pointer came in at.
+    fn back(monitor: Option<&str>, edge: Edge) -> Vec<Exit> {
+        vec![Exit {
+            monitor: monitor.map(str::to_owned),
+            edge,
+            start: 0,
+            end: MAX,
+        }]
+    }
+
     fn prepare(token: u64) -> DesktopRequest {
         DesktopRequest::Prepare {
             monitor: None,
@@ -809,6 +884,7 @@ mod tests {
             start: 0,
             end: MAX,
             position: 500_000,
+            exits: back(None, Edge::Left),
         }
     }
 
@@ -847,6 +923,7 @@ mod tests {
             start: 0,
             end: MAX,
             position: 500000,
+            exits: back(Some(monitor), Edge::Bottom),
         };
         assert!(matches!(
             server.request("linux", 1, prepare("missing")).await,
@@ -866,7 +943,10 @@ mod tests {
             server
                 .request("linux", 1, DesktopRequest::Poll { token: 7 })
                 .await,
-            DesktopResponse::Returned { position: 750000 }
+            DesktopResponse::Exited {
+                exit: 0,
+                position: 750000
+            }
         );
         assert_eq!(
             server
@@ -902,6 +982,7 @@ mod tests {
                 start: 0,
                 end: MAX,
                 position: 500_000,
+                exits: back(Some("panel-0"), Edge::Right),
             };
             assert!(matches!(
                 server.request("linux", 1, prepare).await,
@@ -923,7 +1004,10 @@ mod tests {
                 server
                     .request("linux", 1, DesktopRequest::Poll { token: 7 })
                     .await,
-                DesktopResponse::Returned { position: 500_000 }
+                DesktopResponse::Exited {
+                    exit: 0,
+                    position: 500_000
+                }
             );
             assert_eq!(
                 server
@@ -970,17 +1054,23 @@ mod tests {
 
         // The Mac's own trackpad at the edge hands the pointer back too.
         desk.state().cursor = Some(at(0.0, 270.0));
-        let returned = DesktopResponse::Returned { position: 250_000 };
-        assert_eq!(ask(poll.clone()).await, returned);
         assert_eq!(
             ask(DesktopRequest::Finish { token: 8 }).await,
-            unavailable(STALE)
-        );
-        assert_eq!(
-            ask(poll.clone()).await,
-            returned,
+            unavailable(STALE),
             "a stale token cannot end the handoff"
         );
+        let exited = DesktopResponse::Exited {
+            exit: 0,
+            position: 250_000,
+        };
+        assert_eq!(ask(poll.clone()).await, exited);
+        // Polling on keeps the pointer here. Resting on the edge does not
+        // report again; moving off and back does.
+        assert_eq!(ask(poll.clone()).await, DesktopResponse::Active);
+        desk.state().cursor = Some(at(40.0, 270.0));
+        assert_eq!(ask(poll.clone()).await, DesktopResponse::Active);
+        desk.state().cursor = Some(at(0.0, 270.0));
+        assert_eq!(ask(poll.clone()).await, exited);
         assert_eq!(
             server.request("desk", 2, poll.clone()).await,
             unavailable(OWNED)
@@ -1048,6 +1138,7 @@ mod tests {
             start: 366_667,
             end: 600_000,
             position: 500_000,
+            exits: Vec::new(),
         };
         assert_eq!(
             server.request("linux", 1, gap).await,
@@ -1077,11 +1168,145 @@ mod tests {
         );
         assert!(server.moved(at(1.0, 270.0), at(-2.0, 270.0)));
         let (response, elapsed) = polling.await.unwrap();
-        assert_eq!(response, DesktopResponse::Returned { position: 250_000 });
+        assert_eq!(
+            response,
+            DesktopResponse::Exited {
+                exit: 0,
+                position: 250_000
+            }
+        );
         assert!(elapsed < POLL_HOLD, "woken, not timed out");
         assert!(
             server.moved(at(0.0, 270.0), at(10.0, 270.0)),
             "later motion is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_in_a_corner_does_not_leave_through_the_other_edge() {
+        let (server, desk, _) = setup(single());
+        let exit = |edge| Exit {
+            monitor: None,
+            edge,
+            start: 0,
+            end: MAX,
+        };
+        // The pointer enters at the top of the left edge, and another
+        // computer is above.
+        let prepare = DesktopRequest::Prepare {
+            monitor: None,
+            token: 7,
+            edge: Edge::Left,
+            start: 0,
+            end: MAX,
+            position: 0,
+            exits: vec![exit(Edge::Left), exit(Edge::Top)],
+        };
+        assert_eq!(
+            server.request("linux", 1, prepare).await,
+            DesktopResponse::Prepared {
+                geometry: single(),
+                position: Point { x: 3, y: 0 },
+            }
+        );
+        let poll = || server.request("linux", 1, DesktopRequest::Poll { token: 7 });
+        assert_eq!(poll().await, DesktopResponse::Active);
+        desk.state().cursor = Some(at(300.0, 40.0));
+        assert_eq!(poll().await, DesktopResponse::Active);
+        desk.state().cursor = Some(at(300.0, 0.0));
+        assert_eq!(
+            poll().await,
+            DesktopResponse::Exited {
+                exit: 1,
+                position: 156_250
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn every_exit_reports_and_a_kept_pointer_reports_again() {
+        let mut geometry = desktop(&[(-1920, 0, 1920, 1080), (0, 0, 2560, 1440)]);
+        geometry.displays = geometry
+            .monitors
+            .iter()
+            .enumerate()
+            .map(|(i, bounds)| crate::desktop::Display {
+                id: format!("panel-{i}"),
+                name: format!("Display {i}"),
+                bounds: *bounds,
+                width_mm: 0,
+                height_mm: 0,
+                active: true,
+            })
+            .collect();
+        let (server, _desk, _) = setup(geometry);
+        let exit = |monitor: &str, edge, start| Exit {
+            monitor: Some(monitor.into()),
+            edge,
+            start,
+            end: MAX,
+        };
+        let prepare = DesktopRequest::Prepare {
+            monitor: Some("panel-0".into()),
+            token: 7,
+            edge: Edge::Left,
+            start: 0,
+            end: MAX,
+            position: 500_000,
+            // Home through the left edge, on to another computer below the
+            // right half of the second display, and one past a display
+            // that is gone.
+            exits: vec![
+                exit("panel-0", Edge::Left, 0),
+                exit("unplugged", Edge::Top, 0),
+                exit("panel-1", Edge::Bottom, 500_000),
+            ],
+        };
+        assert!(matches!(
+            server.request("linux", 1, prepare).await,
+            DesktopResponse::Prepared { .. }
+        ));
+        let poll = || server.request("linux", 1, DesktopRequest::Poll { token: 7 });
+        let onward = DesktopResponse::Exited {
+            exit: 2,
+            position: 750_000,
+        };
+        assert!(
+            !server.moved(at(640.0, 1438.0), at(640.0, 1442.0)),
+            "the left half of that edge leads nowhere"
+        );
+        assert!(server.moved(at(1920.0, 1438.0), at(1920.0, 1442.0)));
+        assert_eq!(poll().await, onward);
+        // The peer polls on, so the pointer stays, and pushing out again
+        // reports again.
+        let kept = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .request("linux", 1, DesktopRequest::Poll { token: 7 })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!server.moved(at(1920.0, 1430.0), at(1920.0, 1438.0)));
+        assert!(server.moved(at(1920.0, 1438.0), at(1920.0, 1441.0)));
+        assert_eq!(kept.await.unwrap(), onward);
+        let home = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .request("linux", 1, DesktopRequest::Poll { token: 7 })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(server.moved(at(-1918.0, 540.0), at(-1922.0, 540.0)));
+        assert_eq!(
+            home.await.unwrap(),
+            DesktopResponse::Exited {
+                exit: 0,
+                position: 500_000
+            }
         );
     }
 

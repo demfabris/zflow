@@ -25,7 +25,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::{
-    app::handoff::{self, Handoff},
+    app::handoff::{self, Handoff, Next},
     capture::{
         CaptureFrame, CaptureTransition, CapturedDeviceFrame, KeyState, MAX_TOUCHPAD_CONTACTS,
     },
@@ -78,10 +78,13 @@ extern "C" fn wake_capture() {
     CAPTURE_WAKE.notify_one();
 }
 
+/// How a crossing goes, for the app. `Hopped` says input moved on to another
+/// computer without coming back first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceStatus {
     PauseRequested,
     Sharing,
+    Hopped { peer: String },
     LocalInputRestored,
     Returned { position: u32 },
     Stopped,
@@ -113,6 +116,18 @@ fn keep_first_failure<T>(result: &mut Result<T>, cleanup: Result<()>, operation:
             *result = Err(error.context(format!("Could not finish {operation}")));
         }
     }
+}
+
+/// As [`keep_first_failure`], except that a crossing that moved on stays
+/// moved on: the next computer holds input and its prepared desktop now,
+/// and only the computer it left failed to clean up.
+fn keep_cleanup_failure(result: &mut Result<Outcome>, cleanup: Result<()>, operation: &str) {
+    if let (Ok(Outcome::Hopped(handoff, _)), Err(error)) = (&*result, &cleanup) {
+        tracing::warn!(operation, peer = %handoff.peer, error = %format!("{error:#}"),
+            "cleanup behind a hop failed");
+        return;
+    }
+    keep_first_failure(result, cleanup, operation);
 }
 
 #[repr(C)]
@@ -333,43 +348,103 @@ struct Activation<'a> {
     clipboard: &'a Arc<clipboard::Clipboard>,
     context: SessionContext,
     raw_touch: bool,
+    /// The links ready for a crossing, which it can move on to.
+    hops: &'a link::Hops,
+    /// Whether no button or modifier is held, so input can move on.
+    neutral: fn() -> bool,
+}
+
+/// How a crossing reaches a computer.
+enum Arrival {
+    /// Through an edge of the Mac, where the cursor was at that moment.
+    Edge(CursorPosition),
+    /// From another computer, with the Mac's input still captured and this
+    /// computer's desktop prepared under `token` on `session`.
+    Hop {
+        token: u64,
+        capture: MacCapture,
+        local_desktop: Vec<DesktopRect>,
+        session: SessionHandle,
+    },
+}
+
+impl Arrival {
+    /// Gives the Mac its input back from a hop that goes no further, and
+    /// lets go of the desktop prepared for it.
+    fn give_back(self) {
+        let Self::Hop {
+            token,
+            capture,
+            session,
+            ..
+        } = self
+        else {
+            return;
+        };
+        drop(capture);
+        tokio::spawn(async move {
+            let request = DesktopRequest::Finish { token };
+            if let Err(error) = handoff::check_finished(session.desktop_request(request).await) {
+                tracing::warn!(peer = %session.peer(), error = %format!("{error:#}"),
+                    "desktop not let go after a hop went no further");
+            }
+        });
+    }
+}
+
+/// How a crossing's time on one computer ended.
+enum Outcome {
+    /// Input is back on the Mac without coming home through an edge, as
+    /// after a stop.
+    Stopped,
+    /// The pointer came home through an exit, at this position of it.
+    Returned(u32),
+    /// The pointer moved on to the computer `handoff` names.
+    Hopped(Box<Handoff>, Arrival),
 }
 
 type DesktopPoll<'a> = Pin<Box<dyn Future<Output = Result<DesktopResponse>> + Send + 'a>>;
 
-/// Runs one crossing and reports how it ended. The status sender drops only
-/// after cleanup, so the observer rearms once the Mac owns input again.
-/// `entry_position` is where the cursor was when it reached the edge.
-/// Returns true when the crossing failed.
+/// Runs one crossing on one computer and reports how it ended. The status
+/// sender drops only after cleanup, so the observer rearms once the Mac
+/// owns input again. Returns whether the crossing failed, and where it goes
+/// on to, if it moved to another computer; that computer's link reports
+/// from then on.
 async fn run_crossing(
     activation: Activation<'_>,
     handoff: Handoff,
-    entry_position: CursorPosition,
+    arrival: Arrival,
     reduce_wifi_latency: bool,
     mut stop: watch::Receiver<bool>,
     status: mpsc::UnboundedSender<SourceStatus>,
-) -> bool {
+) -> (bool, Option<(Box<Handoff>, Arrival)>) {
     let started = Instant::now();
     let result = cross(
         activation,
         handoff,
-        entry_position,
+        arrival,
         reduce_wifi_latency,
         &mut stop,
         &status,
     )
     .await;
-    let outcome = match &result {
-        Ok(returned) => {
-            if let Some(position) = returned {
-                let _ = status.send(SourceStatus::Returned {
-                    position: *position,
-                });
-            }
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        success = result.is_ok(),
+        "crossing completed"
+    );
+    let outcome = match result {
+        Ok(Outcome::Hopped(handoff, arrival)) => {
+            tracing::info!(peer = %handoff.peer, "crossing moves on");
+            return (false, Some((handoff, arrival)));
+        }
+        Ok(Outcome::Returned(position)) => {
+            let _ = status.send(SourceStatus::Returned { position });
             SourceStatus::Stopped
         }
+        Ok(Outcome::Stopped) => SourceStatus::Stopped,
         Err(error) => {
-            let outcome = failure_status(error);
+            let outcome = failure_status(&error);
             if matches!(outcome, SourceStatus::Cancelled(_)) {
                 tracing::info!(error = %format!("{error:#}"), "crossing cancelled");
             } else {
@@ -380,69 +455,84 @@ async fn run_crossing(
     };
     let failed = matches!(outcome, SourceStatus::Failed(_));
     let _ = status.send(outcome);
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        success = result.is_ok(),
-        "crossing completed"
-    );
-    failed
+    (failed, None)
 }
 
 /// Prepares the receiver's desktop, forwards input until it returns, and
 /// finishes the handoff. The session outlives the crossing, so every desktop
-/// request is awaited: dropping one closes the transport.
+/// request is awaited: dropping one closes the transport. A crossing that
+/// arrives from another computer is already prepared and captured.
 async fn cross(
     mut activation: Activation<'_>,
     mut handoff: Handoff,
-    entry_position: CursorPosition,
+    arrival: Arrival,
     reduce_wifi_latency: bool,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
-) -> Result<Option<u32>> {
+) -> Result<Outcome> {
     let session = activation.session;
-    receive::answer_waiting_events(
+    if let Err(error) = receive::answer_waiting_events(
         activation.events,
         |layout| activation.layouts.take(session, layout),
         |clip| activation.clipboard.keep(session.peer(), clip),
-    )?;
-    if stopped(stop) {
-        return Ok(None);
+    ) {
+        arrival.give_back();
+        return Err(error);
     }
-    let local_desktop = active_desktop_rectangles()?;
-    let token = handoff::token()?;
-    let prepare = prepare_request(&mut handoff, entry_position, token)?;
-    let preparing = Instant::now();
     // AWDL goes down beside Prepare, before input starts. A peer that
-    // controlled this Mac a moment ago may still hold it down; then the
-    // crossing shares its lease.
+    // controlled this Mac a moment ago, or the computer a hop came from, may
+    // still hold it down; then the crossing shares its lease.
     let awdl = reduce_wifi_latency.then(|| awdl::shared().want());
-    // Await Prepare even after Stop so Finish can use the same session.
-    let ((), prepared) = tokio::join!(
-        async {
-            if awdl.is_some() {
-                awdl::shared()
-                    .down(session.peer(), AWDL_ACQUIRE_TIMEOUT)
-                    .await;
+    let awdl_down = async {
+        if awdl.is_some() {
+            awdl::shared()
+                .down(session.peer(), AWDL_ACQUIRE_TIMEOUT)
+                .await;
+        }
+    };
+    let (token, local_desktop, captured, prepared) = match arrival {
+        Arrival::Edge(entry_position) => {
+            if stopped(stop) {
+                return Ok(Outcome::Stopped);
             }
-        },
-        activation.session.desktop_request(prepare)
-    );
-    tracing::info!(
-        elapsed_ms = preparing.elapsed().as_millis() as u64,
-        "desktop preparation completed"
-    );
-    if let Some(cancelled) = busy(session.peer(), &prepared) {
-        // It refused before reserving anything, so there is nothing to
-        // finish, and a Finish it refused too would fail the crossing.
-        return Err(cancelled);
-    }
+            let local_desktop = active_desktop_rectangles()?;
+            let token = handoff::token()?;
+            let prepare = prepare_request(&mut handoff, entry_position, token)?;
+            let preparing = Instant::now();
+            // Await Prepare even after Stop so Finish can use the same session.
+            let ((), prepared) =
+                tokio::join!(awdl_down, activation.session.desktop_request(prepare));
+            tracing::info!(
+                elapsed_ms = preparing.elapsed().as_millis() as u64,
+                "desktop preparation completed"
+            );
+            if let Some(cancelled) = busy(session.peer(), &prepared) {
+                // It refused before reserving anything, so there is nothing to
+                // finish, and a Finish it refused too would fail the crossing.
+                return Err(cancelled);
+            }
+            (token, local_desktop, None, Some(prepared))
+        }
+        Arrival::Hop {
+            token,
+            capture,
+            local_desktop,
+            ..
+        } => {
+            awdl_down.await;
+            (token, local_desktop, Some(capture), None)
+        }
+    };
     let mut result = async {
         // The link's snapshot already showed the receiver handles desktop
         // requests, so a failure here is the session or the receiver.
-        handoff
-            .check_prepared(prepared.context("Could not prepare the other computer's desktop")?)?;
+        if let Some(prepared) = prepared {
+            handoff.check_prepared(
+                prepared.context("Could not prepare the other computer's desktop")?,
+            )?;
+        }
         if stopped(stop) {
-            return Ok(None);
+            return Ok(Outcome::Stopped);
         }
         ensure!(
             local_desktop == active_desktop_rectangles()?,
@@ -453,6 +543,7 @@ async fn cross(
             &handoff,
             &local_desktop,
             token,
+            captured,
             stop,
             status,
         )
@@ -471,7 +562,7 @@ async fn cross(
         success = finished.is_ok(),
         "desktop handoff cleanup completed"
     );
-    keep_first_failure(&mut result, finished, "desktop handoff cleanup");
+    keep_cleanup_failure(&mut result, finished, "desktop handoff cleanup");
     // A moment after the last user lets go, the shared lease gives AWDL back.
     drop(awdl);
     result
@@ -500,6 +591,7 @@ fn prepare_request(
     let refreshed = handoff.entry_region.contains(point);
     if refreshed {
         handoff.position = handoff.return_mapping.fraction(point)?;
+        handoff.origin = handoff.position;
     }
     tracing::debug!(
         original_position,
@@ -517,14 +609,17 @@ fn prepare_request(
 }
 
 /// Owns input on the receiver: activation, native capture, and release.
+/// `captured` is the capture a hop brought along.
+#[allow(clippy::too_many_arguments)]
 async fn remote(
     activation: &mut Activation<'_>,
     handoff: &Handoff,
     local_desktop: &[DesktopRect],
     token: u64,
+    captured: Option<MacCapture>,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
-) -> Result<Option<u32>> {
+) -> Result<Outcome> {
     let session = activation.session;
     session.begin_outbound(activation.context)?;
     let mut poll = None;
@@ -533,6 +628,7 @@ async fn remote(
         handoff,
         local_desktop,
         token,
+        captured,
         &mut poll,
         stop,
         status,
@@ -555,7 +651,7 @@ async fn remote(
         // Closing the session makes the receiver release everything it holds.
         session.close(SessionCloseReason::LocalRelease);
     }
-    keep_first_failure(&mut result, released, "remote input release");
+    keep_cleanup_failure(&mut result, released, "remote input release");
     // Keep the poll alive through Leave, then finish it before Finish. Late
     // responses cannot change the cursor placement or the capture result.
     if let Some(poll) = poll {
@@ -569,7 +665,11 @@ async fn remote(
 /// Why forwarding stopped.
 struct Ended {
     reason: &'static str,
-    returned: Option<u32>,
+    /// Where the pointer comes home, and the position of the exit it left
+    /// through.
+    returned: Option<(Point, u32)>,
+    /// The next computer, for a pointer that left toward one.
+    hop: Option<Handoff>,
     error: Option<anyhow::Error>,
     touch_active: bool,
     events: u64,
@@ -589,40 +689,100 @@ async fn capture<'a>(
     handoff: &Handoff,
     local_desktop: &[DesktopRect],
     token: u64,
+    captured: Option<MacCapture>,
     poll: &mut Option<DesktopPoll<'a>>,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
-) -> Result<Option<u32>> {
+) -> Result<Outcome> {
     let started = Instant::now();
-    let mut capture =
-        MacCapture::start(activation.raw_touch, handoff.entry_region).inspect_err(|error| {
-            tracing::warn!(elapsed_ms = started.elapsed().as_millis() as u64,
+    let mut capture = match captured {
+        // The tap kept running through the hop, so nothing is admitted again:
+        // its entry region is on the Mac's edge toward the first computer.
+        Some(capture) => {
+            let _ = status.send(SourceStatus::Hopped {
+                peer: activation.session.peer().to_owned(),
+            });
+            capture
+        }
+        None => {
+            let capture = MacCapture::start(activation.raw_touch, handoff.entry_region)
+                .inspect_err(|error| {
+                    tracing::warn!(elapsed_ms = started.elapsed().as_millis() as u64,
+                        cursor = ?cursor_position().ok().map(|p| (p.x, p.y)),
+                        error = %error, "native capture start rejected");
+                })?;
+            if activation.raw_touch && !capture.raw_touch {
+                tracing::info!(reason = %MacCapture::last_error(),
+                    "raw touch unavailable; forwarding pointer and scroll");
+            }
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                raw_touch = capture.raw_touch,
                 cursor = ?cursor_position().ok().map(|p| (p.x, p.y)),
-                error = %error, "native capture start rejected");
-        })?;
-    if activation.raw_touch && !capture.raw_touch {
-        tracing::info!(reason = %MacCapture::last_error(),
-            "raw touch unavailable; forwarding pointer and scroll");
-    }
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        raw_touch = capture.raw_touch,
-        cursor = ?cursor_position().ok().map(|p| (p.x, p.y)),
-        "native capture started"
-    );
-    let _ = status.send(SourceStatus::Sharing);
+                "native capture started"
+            );
+            let _ = status.send(SourceStatus::Sharing);
+            capture
+        }
+    };
     // The pointer left for the peer, so the clipboard goes along.
     activation.clipboard.share(activation.session);
-    // Polling renews the receiver's handoff and reports its return edge.
+    // Polling renews the receiver's handoff and reports its exits.
     *poll = Some(poll_desktop(activation.session, token));
-    let ended = forward(&mut capture, activation, handoff, token, poll, stop, status).await;
+    let mut ended = Ended {
+        reason: "stop requested",
+        returned: None,
+        hop: None,
+        error: None,
+        touch_active: false,
+        events: 0,
+    };
+    let ended = loop {
+        ended = forward(
+            &mut capture,
+            activation,
+            handoff,
+            token,
+            poll,
+            stop,
+            status,
+            ended,
+        )
+        .await;
+        let Some(mut next) = ended.hop.take() else {
+            break ended;
+        };
+        match prepare_hop(activation, &mut next).await {
+            Ok((token, session)) => {
+                tracing::info!(peer = %next.peer, captured_events = ended.events,
+                    active_ms = started.elapsed().as_millis() as u64, "input moves on");
+                if ended.touch_active {
+                    let _ = activation
+                        .session
+                        .capture(touch_frame(TouchState::default()));
+                }
+                let arrival = Arrival::Hop {
+                    token,
+                    capture,
+                    local_desktop: local_desktop.to_vec(),
+                    session,
+                };
+                return Ok(Outcome::Hopped(Box::new(next), arrival));
+            }
+            Err(error) => {
+                tracing::info!(peer = %next.peer, error = %format!("{error:#}"),
+                    "the next computer did not take the pointer; it stays");
+                *poll = Some(poll_desktop(activation.session, token));
+            }
+        }
+    };
     tracing::info!(reason = ended.reason, captured_events = ended.events,
         active_ms = started.elapsed().as_millis() as u64,
         error = ?ended.error.as_ref().map(|error| format!("{error:#}")), "stopping native capture");
     let mut error = ended.error;
     let return_point = match ended
         .returned
-        .map(|position| return_point(handoff, local_desktop, position))
+        .map(|(point, _)| return_point(local_desktop, point))
     {
         Some(Ok(point)) => Some(point),
         Some(Err(failure)) => {
@@ -646,15 +806,41 @@ async fn capture<'a>(
             .session
             .capture(touch_frame(TouchState::default()));
     }
-    error.map_or(Ok(ended.returned), Err)
+    let outcome = ended.returned.map_or(Outcome::Stopped, |(_, position)| {
+        Outcome::Returned(position)
+    });
+    error.map_or(Ok(outcome), Err)
 }
 
-fn return_point(
-    handoff: &Handoff,
-    local_desktop: &[DesktopRect],
-    position: u32,
-) -> Result<CursorPosition> {
-    let point = handoff.return_mapping.position(position)?;
+/// Prepares the next computer's desktop for a pointer that left this one,
+/// over that computer's own link, and returns the handoff's token and that
+/// session. A desktop it prepared but that does not fit goes back.
+async fn prepare_hop(
+    activation: &Activation<'_>,
+    next: &mut Handoff,
+) -> Result<(u64, SessionHandle)> {
+    let door = activation
+        .hops
+        .door(&next.peer)
+        .context("that computer is not ready")?;
+    next.keep_routes(|peer| activation.hops.ready(peer));
+    let token = handoff::token()?;
+    let prepared = door
+        .session
+        .desktop_request(next.prepare(token))
+        .await
+        .context("Could not prepare the other computer's desktop")
+        .and_then(|prepared| next.check_prepared(prepared));
+    if prepared.is_err() {
+        let _ = door
+            .session
+            .desktop_request(DesktopRequest::Finish { token })
+            .await;
+    }
+    prepared.map(|()| (token, door.session))
+}
+
+fn return_point(local_desktop: &[DesktopRect], point: Point) -> Result<CursorPosition> {
     ensure!(
         local_desktop == active_desktop_rectangles()?,
         "the Mac desktop changed before returning input"
@@ -665,7 +851,9 @@ fn return_point(
     })
 }
 
-/// Forwards captured input until the crossing ends and reports why.
+/// Forwards captured input until the crossing ends, or the pointer leaves
+/// toward another computer while nothing is held and that computer is ready,
+/// and reports why in `ended`.
 #[allow(clippy::too_many_arguments)]
 async fn forward<'a>(
     capture: &mut MacCapture,
@@ -675,15 +863,10 @@ async fn forward<'a>(
     poll: &mut Option<DesktopPoll<'a>>,
     stop: &mut watch::Receiver<bool>,
     status: &mpsc::UnboundedSender<SourceStatus>,
+    mut ended: Ended,
 ) -> Ended {
     let session = activation.session;
-    let mut ended = Ended {
-        reason: "stop requested",
-        returned: None,
-        error: None,
-        touch_active: false,
-        events: 0,
-    };
+    ended.reason = "stop requested";
     let mut secure_input_check = tokio::time::interval(SECURE_INPUT_CHECK_INTERVAL);
     secure_input_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_touch = Instant::now();
@@ -694,17 +877,26 @@ async fn forward<'a>(
             _ = stop_requested(stop) => return ended,
             response = next_poll(poll) => match response {
                 Ok(DesktopResponse::Active) => *poll = Some(poll_desktop(session, token)),
-                Ok(DesktopResponse::Returned { position }) => {
-                    tracing::info!(position, "receiver reported return edge");
-                    ended.reason = "GNOME return edge";
-                    if position < handoff.start || position > handoff.end {
-                        ended.error =
-                            Some(anyhow!("the pointer came back outside the configured edge range"));
-                    } else {
-                        ended.returned = Some(position);
+                Ok(DesktopResponse::Exited { exit, position }) => match handoff.next(exit, position) {
+                    Ok(Next::Home(point)) => {
+                        tracing::info!(exit, position, "receiver reported the way home");
+                        ended.reason = "return edge";
+                        ended.returned = Some((point, position));
+                        return ended;
                     }
-                    return ended;
-                }
+                    Ok(Next::Hop(next)) if (activation.neutral)() && activation.hops.ready(&next.peer) => {
+                        tracing::info!(exit, position, peer = %next.peer, "receiver reported an edge to another computer");
+                        ended.reason = "edge to another computer";
+                        ended.hop = Some(*next);
+                        return ended;
+                    }
+                    Ok(Next::Hop(next)) => {
+                        // Polling on tells the receiver the pointer stays.
+                        tracing::debug!(peer = %next.peer, "a button or modifier is held, or that computer is not ready; the pointer stays");
+                        *poll = Some(poll_desktop(session, token));
+                    }
+                    Err(error) => return ended.failed("invalid exit", error),
+                },
                 Ok(DesktopResponse::Unavailable { reason }) => {
                     let error = anyhow!("the other computer's desktop is unavailable: {reason}");
                     return ended.failed("desktop unavailable", error);
@@ -765,9 +957,13 @@ async fn forward<'a>(
                 Some(SessionEventKind::OutboundEnded) => {
                     // The session ends remote control when the receiver stops
                     // acknowledging, for example after a Wi-Fi stall outlived its
-                    // lease. Return at the entry point and keep sharing armed.
+                    // lease. Return where the crossing left the Mac and keep
+                    // sharing armed.
                     ended.reason = "remote ownership ended";
-                    ended.returned = Some(handoff.position);
+                    match handoff.home() {
+                        Ok(point) => ended.returned = Some((point, handoff.origin)),
+                        Err(error) => return ended.failed("remote ownership ended", error),
+                    }
                     return ended;
                 }
                 Some(SessionEventKind::Closed { reason }) => {
@@ -1135,6 +1331,54 @@ mod tests {
         let owned = Ok(DesktopResponse::unavailable(receive::OWNED));
         assert!(busy("linux", &owned).is_none());
         assert!(busy("linux", &Err(anyhow!("timed out"))).is_none());
+    }
+
+    #[test]
+    fn a_hop_stays_a_hop_when_the_computer_it_left_does_not_clean_up() {
+        use crate::app::layout_model::{Layout, Monitor};
+        let tile = |name: &str, x| Monitor {
+            id: name.into(),
+            label: name.into(),
+            peer: (name != "mac").then(|| name.into()),
+            display: None,
+            x,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let layout = Layout {
+            monitors: vec![tile("mac", 0), tile("linux", 100)],
+        };
+        let geometry = Geometry {
+            displays: Vec::new(),
+            monitors: vec![Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+        };
+        let next = handoff::from_edge(
+            &layout,
+            &geometry,
+            None,
+            crate::desktop::Edge::Right,
+            500_000,
+        )
+        .unwrap();
+        let mut hopped = Ok(Outcome::Hopped(
+            Box::new(next),
+            Arrival::Edge(CursorPosition::default()),
+        ));
+        keep_cleanup_failure(&mut hopped, Err(anyhow!("Leave timed out")), "release");
+        keep_cleanup_failure(&mut hopped, Err(anyhow!("Finish lost")), "cleanup");
+        assert!(
+            matches!(hopped, Ok(Outcome::Hopped(..))),
+            "the next computer keeps the pointer"
+        );
+        let mut returned = Ok(Outcome::Returned(0));
+        keep_cleanup_failure(&mut returned, Err(anyhow!("Finish lost")), "cleanup");
+        assert!(returned.is_err());
     }
 
     #[test]

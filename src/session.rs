@@ -194,7 +194,7 @@ pub(crate) fn desktop_response_kind(response: &crate::desktop::DesktopResponse) 
         Snapshot { .. } => "snapshot",
         Prepared { .. } => "prepared",
         Active => "active",
-        Returned { .. } => "returned",
+        Exited { .. } => "exited",
         Finished => "finished",
         Unavailable { .. } => "unavailable",
     }
@@ -1919,6 +1919,7 @@ mod tests {
                     start: 0,
                     end: FRACTION_MAX,
                     position: 500_000,
+                    exits: Vec::new(),
                 })
                 .await
         });
@@ -2039,6 +2040,7 @@ mod tests {
                     start: 0,
                     end: FRACTION_MAX,
                     position: 1,
+                    exits: Vec::new(),
                 })
                 .await
         });

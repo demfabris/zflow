@@ -151,6 +151,10 @@ pub enum RuntimeEvent {
 pub struct LinuxRuntimeStatus {
     pub ownership: OwnershipPhase,
     pub selected_peer: Option<String>,
+    /// No key or button is down across the capture set, as the input
+    /// thread tracks it; a finger resting on a touchpad does not count. A
+    /// crossing moves on to another computer only then.
+    pub neutral: bool,
 }
 
 /// Read-only capture resolution used by setup diagnostics.
@@ -198,6 +202,7 @@ impl Default for LinuxRuntimeStatus {
         Self {
             ownership: OwnershipPhase::Idle,
             selected_peer: None,
+            neutral: true,
         }
     }
 }
@@ -310,6 +315,11 @@ impl LinuxRuntimeControl {
             stop: Arc::new(AtomicBool::new(false)),
         };
         (control, receiver, poll)
+    }
+
+    /// Says what the input thread would, for a control made by [`Self::queue`].
+    pub(crate) fn set_status(&self, status: LinuxRuntimeStatus) {
+        *lock_status(&self.status) = status;
     }
 }
 
@@ -579,6 +589,8 @@ struct RuntimeLoop {
     activation_chord: ChordTracker,
     escape_chord: ChordTracker,
     selected_peer: Option<String>,
+    /// What the shared status last said about held keys and buttons.
+    neutral: bool,
     arming_leakage_events: u64,
     capture_selection_complete: bool,
     registrations: BTreeMap<Token, RegisteredDevice>,
@@ -637,6 +649,7 @@ impl RuntimeLoop {
             activation_chord,
             escape_chord,
             selected_peer: None,
+            neutral: true,
             arming_leakage_events: 0,
             capture_selection_complete: selection.is_complete(),
             registrations: BTreeMap::new(),
@@ -1036,6 +1049,17 @@ impl RuntimeLoop {
             _ => {}
         }
         self.advance_ownership_boundary();
+        self.publish_neutral();
+    }
+
+    /// Tells the daemon when keys and buttons all come up or one goes down,
+    /// without taking the status lock for every frame.
+    fn publish_neutral(&mut self) {
+        let neutral = self.capture.aggregate_state().nothing_pressed();
+        if neutral != self.neutral {
+            self.neutral = neutral;
+            lock_status(&self.status).neutral = neutral;
+        }
     }
 
     fn advance_ownership_boundary(&mut self) {
@@ -1192,9 +1216,11 @@ impl RuntimeLoop {
     /// is updated before the daemon hears about it.
     fn emit_ownership(&mut self) {
         let phase = self.ownership.phase();
+        self.neutral = self.capture.aggregate_state().nothing_pressed();
         *lock_status(&self.status) = LinuxRuntimeStatus {
             ownership: phase,
             selected_peer: self.selected_peer.clone(),
+            neutral: self.neutral,
         };
         self.emit(RuntimeEvent::OwnershipChanged {
             phase,

@@ -604,6 +604,12 @@ mod tests {
                 start: 0,
                 end: FRACTION_MAX,
                 position: 500_000,
+                exits: vec![Exit {
+                    monitor: Some("panel".into()),
+                    edge: Edge::Bottom,
+                    start: 0,
+                    end: FRACTION_MAX / 2,
+                }],
             },
         });
         let bytes = encode(&message).unwrap();

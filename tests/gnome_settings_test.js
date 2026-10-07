@@ -62,7 +62,7 @@ const layout = {monitors: [
     {id: 'peer:MacBook', label: 'MacBook', peer: 'MacBook', x: 2560, y: 0, width: 1920, height: 1080},
 ]};
 const snapshot = {
-    api: 4, status: ready, sharing: true,
+    api: 5, status: ready, sharing: true,
     health: [{id: 'service', level: 'ok', title: 'Background service', detail: 'Running', action: null}],
     pairing_window: closedWindow, layout, own_mark: 'a1b2c3', unplaced: [],
     peers: [peer('MacBook')], pause_at_edges: false,
