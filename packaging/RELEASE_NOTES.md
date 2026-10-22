@@ -115,8 +115,9 @@ the binaries. Ubuntu/Debian installations use the `.deb` when no archive/source
 installation is present. Other supported Linux systems use the archive.
 Existing archive/source installations continue using `/usr/local` on upgrades.
 
-Linux binaries require glibc 2.39+ and systemd 254+. GNOME settings require
-GJS, GTK 4.12+, and libadwaita 1.5+. macOS requires version 26 or newer.
+Linux binaries require glibc 2.39+ and systemd 254+. The settings window needs
+Wayland or X11 and Vulkan or OpenGL, which a GNOME desktop has. macOS requires
+version 26 or newer.
 No Rust, Swift, Xcode, or C compiler is needed on the installing computer.
 
 Mac apps include Developer ID signatures and Apple's notarization ticket.

@@ -74,9 +74,10 @@ elif development_identity="$(security find-identity -v -p codesigning 2>/dev/nul
 fi
 
 readonly output_dir="$REPO_ROOT/target/$profile"
-lib_dir="$output_dir"
+bin_dir="$output_dir"
 cargo_args=(build --locked --manifest-path "$REPO_ROOT/Cargo.toml"
-    --target-dir "$REPO_ROOT/target" --lib)
+    --target-dir "$REPO_ROOT/target" -p zflow-app)
+# The AWDL helper is a small Swift daemon; the app itself is Rust.
 swift_args=(--package-path "$REPO_ROOT/macos" --configuration "$profile")
 if [[ "$profile" == release ]]; then
     cargo_args+=(--release)
@@ -84,28 +85,21 @@ fi
 if [[ "$universal" == true ]]; then
     cargo_args+=(--target aarch64-apple-darwin --target x86_64-apple-darwin)
     swift_args+=(--arch arm64 --arch x86_64)
-    lib_dir="$REPO_ROOT/target/universal-apple-darwin/$profile"
+    bin_dir="$REPO_ROOT/target/universal-apple-darwin/$profile"
 fi
 MACOSX_DEPLOYMENT_TARGET=26.0 cargo "${cargo_args[@]}"
 if [[ "$universal" == true ]]; then
-    # The linker takes each architecture's slice from one fat library.
-    mkdir -p -- "$lib_dir"
-    lipo -create -output "$lib_dir/libzflow.a" \
-        "$REPO_ROOT/target/aarch64-apple-darwin/$profile/libzflow.a" \
-        "$REPO_ROOT/target/x86_64-apple-darwin/$profile/libzflow.a"
+    mkdir -p -- "$bin_dir"
+    lipo -create -output "$bin_dir/zflow-app" \
+        "$REPO_ROOT/target/aarch64-apple-darwin/$profile/zflow-app" \
+        "$REPO_ROOT/target/x86_64-apple-darwin/$profile/zflow-app"
 fi
-
-swift_output="$(ZFLOW_RUST_LIB_DIR="$lib_dir" swift build "${swift_args[@]}" --show-bin-path)"
-readonly binary="$swift_output/zflow-app"
-# SwiftPM's native build system does not track a library linked through
-# unsafeFlags, so a newer libzflow.a may not relink the app. Removing the stale
-# binary forces the link.
-if [[ "$lib_dir/libzflow.a" -nt "$binary" ]]; then
-    rm -f -- "$binary"
-fi
-ZFLOW_RUST_LIB_DIR="$lib_dir" swift build "${swift_args[@]}"
+readonly binary="$bin_dir/zflow-app"
+swift build "${swift_args[@]}"
+swift_output="$(swift build "${swift_args[@]}" --show-bin-path)"
+sparkle_dir="$("$SCRIPT_DIR/fetch-sparkle.sh")"
 readonly bundle="$output_dir/zflow.app"
-[[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || die "missing native executable: $binary"
+[[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || die "missing app executable: $binary"
 [[ ! -L "$bundle" ]] || die "refusing to replace a symlink: $bundle"
 [[ ! -e "$bundle" || -d "$bundle" ]] || die "app output is not a directory: $bundle"
 
@@ -116,12 +110,11 @@ install -d -m 0755 "$app/Contents/MacOS" "$app/Contents/Library/LaunchDaemons" \
     "$app/Contents/Resources" "$app/Contents/Frameworks"
 install -m 0755 "$binary" "$app/Contents/MacOS/zflow-app"
 install -m 0755 "$swift_output/zflow-awdl-daemon" "$app/Contents/MacOS/zflow-awdl-daemon"
-# SwiftPM links binary dependencies, but this custom app bundle must embed them.
-sparkle="$REPO_ROOT/macos/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+# The app loads Sparkle from its Frameworks folder when it starts.
+sparkle="$sparkle_dir/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 [[ -d "$sparkle" ]] || die "missing Sparkle framework: $sparkle"
 ditto "$sparkle" "$app/Contents/Frameworks/Sparkle.framework"
-install -m 0644 "$REPO_ROOT/macos/.build/artifacts/sparkle/Sparkle/LICENSE" \
-    "$app/Contents/Resources/Sparkle-LICENSE"
+install -m 0644 "$sparkle_dir/LICENSE" "$app/Contents/Resources/Sparkle-LICENSE"
 if [[ "$universal" == true ]]; then
     for executable in "$app"/Contents/MacOS/* "$app/Contents/Frameworks/Sparkle.framework/Sparkle"; do
         for arch in arm64 x86_64; do

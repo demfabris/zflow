@@ -10,6 +10,9 @@
     <string>io.zflow.zflow</string>
     <key>CFBundleExecutable</key>
     <string>zflow-app</string>
+    <!-- zflow starts in the menu bar; its window brings the Dock icon along. -->
+    <key>LSUIElement</key>
+    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>CFBundlePackageType</key>

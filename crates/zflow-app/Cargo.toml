@@ -1,0 +1,54 @@
+[package]
+name = "zflow-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "zflow's window and menu, on zz-gpui"
+publish = false
+
+[[bin]]
+name = "zflow-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zflow-kvm = { path = "../.." }
+zz-gpui = { workspace = true, features = ["default"] }
+zz-gpui-kit.workspace = true
+zz-gpui-platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+zz-gpui-tray = { path = "../zz-gpui-tray" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+# Metal shaders compile when the app starts, so a build needs no Metal toolchain.
+zz-gpui-platform = { workspace = true, features = ["runtime_shaders"] }
+image.workspace = true
+libc.workspace = true
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSEvent", "NSGraphics", "NSPasteboard", "NSResponder", "NSRunningApplication", "NSScreen", "block2", "objc2-core-foundation"] }
+objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSDictionary", "NSError", "NSGeometry", "NSProcessInfo", "NSString"] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
+resvg.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+velopack = "=1.3.39-g8d2844f"
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
+windows-registry.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", default-features = false, features = ["blocking-api", "tokio"] }
+
+[dev-dependencies]
+zz-gpui = { workspace = true, features = ["test-support"] }
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[lints]
+workspace = true

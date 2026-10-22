@@ -18,6 +18,7 @@ readonly SLEEP_HOOK_FILE="/usr/lib/systemd/system-sleep/zflow"
 readonly SLEEP_MARKER="/run/zflowd-resume-after-sleep"
 readonly ZFLOW_BIN="/usr/local/bin/zflow"
 readonly ZFLOWD_BIN="/usr/local/bin/zflowd"
+readonly ZFLOW_APP_BIN="/usr/local/bin/zflow-app"
 readonly LIB_DIR="/usr/local/lib/zflow"
 readonly ZFLOW_GUI_BIN="/usr/local/bin/zflow-gui"
 readonly FIREWALL_SCRIPT="$LIB_DIR/firewall.sh"
@@ -84,6 +85,7 @@ rm -f -- \
     "$SLEEP_MARKER" \
     "$ZFLOW_BIN" \
     "$ZFLOWD_BIN" \
+    "$ZFLOW_APP_BIN" \
     "$LIB_DIR/uninstall.sh" \
     "$FIREWALL_SCRIPT" \
     "$ZFLOW_GUI_BIN" \

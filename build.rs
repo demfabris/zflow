@@ -39,5 +39,6 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rustc-link-lib=framework=ImageIO");
     println!("cargo:rustc-link-lib=framework=IOKit");
+    println!("cargo:rustc-link-lib=framework=Security");
     println!("cargo:rustc-link-lib=objc");
 }

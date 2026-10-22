@@ -7,7 +7,7 @@
 | macOS | `zflow.icon/` | The Mac build compiles the Icon Composer document into `Assets.car` and `zflow.icns`, including light, dark and tinted appearances. |
 | GNOME | `linux/io.zflow.zflow.svg` | 128px app icon, installed under `hicolor/scalable/apps`. |
 | GNOME symbolic | `linux/io.zflow.zflow-symbolic.svg` | 16px monochrome icon, installed under `hicolor/symbolic/apps`. |
-| Windows | `windows/zflow.svg` | Editable 48px master; `zflow.ico` supplies executable, window and tray icons, and `zflow.png` supplies the title bar. |
+| Windows | `windows/zflow.svg` | Editable 48px master; `zflow.ico` is the executable's icon, which the window and taskbar take, and `zflow.png` is the notification-area icon. |
 
 The GNOME version uses the GNOME palette and a 4px lower profile. The Windows version uses a blue gradient and a subtle face highlight. Both keep transparent backgrounds and orange motion strokes from the Mac icon's palette.
 

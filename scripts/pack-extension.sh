@@ -5,12 +5,12 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 output="$root/target/dist"
 zip="$output/zflow@demfabris.shell-extension.zip"
 # The files desktop-agent --install writes (EXTENSION_FILES in src/app/desktop.rs).
-# pack adds metadata.json, extension.js and prefs.js on its own.
-files=(client.js extension.js indicator.js metadata.json prefs.js settings.js shell.js)
+# pack adds metadata.json and extension.js on its own.
+files=(client.js extension.js indicator.js metadata.json shell.js)
 command -v gnome-extensions >/dev/null 2>&1 || { echo 'Packing needs gnome-extensions from GNOME Shell.' >&2; exit 1; }
 mkdir -p "$output"
 gnome-extensions pack "$root/packaging/gnome-extension" --force --out-dir="$output" \
-    --extra-source=shell.js --extra-source=indicator.js --extra-source=client.js --extra-source=settings.js
+    --extra-source=shell.js --extra-source=indicator.js --extra-source=client.js
 # pack leaves out a missing file without an error.
 packed=$(unzip -Z1 "$zip" | sort)
 if [[ "$packed" != "$(printf '%s\n' "${files[@]}")" ]]; then

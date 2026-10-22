@@ -11,7 +11,7 @@ die() { printf 'setup-updates: %s\n' "$*" >&2; exit 1; }
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
     printf 'usage: ./scripts/setup-updates.sh\n'
     printf 'Create or reuse a local Sparkle key and configure %s release credentials.\n' "$repository"
-    printf 'Maintainers need gh and either macOS Swift/Keychain or Linux Python 3 with cryptography.\n'
+    printf 'Maintainers need gh and either the macOS Keychain or Linux Python 3 with cryptography.\n'
     exit 0
 fi
 [[ $# == 0 ]] || die 'no arguments expected'
@@ -23,9 +23,8 @@ configured=$(gh variable list --repo "$repository" --json name,value \
     --jq '.[] | select(.name == "SPARKLE_PUBLIC_ED_KEY") | .value')
 umask 077
 if [[ "$platform" == Darwin ]]; then
-    swift package --package-path "$root/macos" resolve
-    keytool="$root/macos/.build/artifacts/sparkle/Sparkle/bin/generate_keys"
-    [[ -x "$keytool" ]] || die 'SwiftPM did not download Sparkle key tools'
+    keytool="$("$root/scripts/fetch-sparkle.sh")/bin/generate_keys"
+    [[ -x "$keytool" ]] || die 'Sparkle has no key tools'
     if [[ -n "$configured" ]]; then
         public=$("$keytool" --account "$account" -p) || die 'Import the existing release key into Keychain before configuring this Mac'
         [[ "$public" == "$configured" ]] || die 'The Keychain key differs from the release key; key rotation requires a separate release'

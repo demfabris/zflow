@@ -19,7 +19,7 @@ mod test 'just/test.just'
 default:
     @just --list
 
-# Build and open the native app.
+# Build and open the app.
 run platform *args: (_platform platform)
     #!/usr/bin/env bash
     set -euo pipefail
@@ -29,10 +29,11 @@ run platform *args: (_platform platform)
         ./scripts/build-macos-app.sh --debug
         open target/debug/zflow.app --args "$@"
     else
+        cargo build --locked -p zflow-app
         cargo run --locked --bin zflow -- settings "$@"
     fi
 
-# Package the Mac app or build the Linux service and native app launcher.
+# Package the Mac app, or build the Linux service, its command and the app.
 build platform *args: (_platform platform)
     #!/usr/bin/env bash
     set -euo pipefail
@@ -42,6 +43,7 @@ build platform *args: (_platform platform)
         ./scripts/build-macos-app.sh "$@"
     else
         cargo build --locked --bin zflow --bin zflowd "$@"
+        cargo build --locked -p zflow-app "$@"
     fi
 
 # Lint Rust code.
@@ -49,4 +51,4 @@ lint:
     cargo clippy --locked --all-targets -- -D warnings
 
 # Check formatting, lint, and run tests.
-check: fmt::check lint test::rust test::desktop test::install test::release
+check: fmt::check lint test::rust test::app test::desktop test::install test::release

@@ -77,15 +77,16 @@ linux_dependencies() {
     if command -v apt-get >/dev/null 2>&1; then
         manager=apt-get
         packages=(kmod udev passwd util-linux curl)
-        if [[ "$desktop" == true ]]; then packages+=(gjs gir1.2-gtk-4.0 gir1.2-adw-1 pkexec); fi
+        if [[ "$desktop" == true ]]; then packages+=(libxkbcommon-x11-0 libwayland-client0 libvulkan1 mesa-vulkan-drivers pkexec); fi
     elif command -v dnf >/dev/null 2>&1; then
         manager=dnf
         packages=(kmod systemd-udev shadow-utils util-linux curl)
-        if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita polkit); fi
+        if [[ "$desktop" == true ]]; then packages+=(libxkbcommon-x11 libwayland-client vulkan-loader mesa-vulkan-drivers polkit); fi
     elif command -v pacman >/dev/null 2>&1; then
         manager=pacman
         packages=(kmod systemd shadow util-linux curl)
-        if [[ "$desktop" == true ]]; then packages+=(gjs gtk4 libadwaita polkit); fi
+        # Arch has no default Vulkan driver; without one the window draws with OpenGL.
+        if [[ "$desktop" == true ]]; then packages+=(libxkbcommon-x11 wayland vulkan-icd-loader polkit); fi
     else
         die 'Automatic dependency installation supports apt, dnf, and pacman. Install the runtime dependencies and use the installation script inside the release archive.'
     fi
@@ -141,18 +142,6 @@ root_install() {
 check_linux() {
     require udevadm
     udevadm --help | grep 'verify' >/dev/null || die 'udevadm verify is required (systemd 254 or newer).'
-    if [[ "$desktop" == true ]]; then
-        local versions gtk_version adw_version
-        # Missing libraries are installed with zflow; only reject ones that are too old.
-        # These template expressions belong to JavaScript.
-        # shellcheck disable=SC2016
-        if command -v gjs >/dev/null 2>&1 && versions=$(gjs -c 'imports.gi.versions.Gtk="4.0"; imports.gi.versions.Adw="1"; const {Gtk,Adw}=imports.gi; print(`${Gtk.get_major_version()}.${Gtk.get_minor_version()} ${Adw.get_major_version()}.${Adw.get_minor_version()}`);' 2>/dev/null); then
-            IFS=' ' read -r gtk_version adw_version <<< "$versions"
-            if ! version_at_least "$gtk_version" 4.12 || ! version_at_least "$adw_version" 1.5; then
-                die 'GNOME settings require GTK 4.12+ and libadwaita 1.5+. Upgrade the distribution or use --headless.'
-            fi
-        fi
-    fi
 }
 
 check_macos() {
@@ -254,7 +243,7 @@ install_linux() {
     as_root bash -c "set -euo pipefail; $(declare -f die sha256_of root_install); root_install \"\$@\"" \
         zflow-install "${root_args[@]}"
     # The running desktop agent detects its replaced executable and restarts.
-    # Keep the GTK caller alive so it can show the result and reopen settings.
+    # The settings window that asked for the update shows the result and restarts itself.
     if [[ "${update:-false}" == true ]]; then return; fi
     if [[ "$desktop" == false ]]; then
         say 'The Linux service is installed. Run zflow desktop-agent --install from a GNOME session to add the desktop app.'

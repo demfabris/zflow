@@ -7,7 +7,7 @@ set working-directory := ".."
 default:
     @just --list debug
 
-# Run native Mac app diagnostics and save output under target/logs.
+# Run Mac app diagnostics and save output under target/logs.
 mac *args:
     @just debug _app mac "$@"
 

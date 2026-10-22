@@ -1,5 +1,5 @@
-//! Release checks and the Linux install transaction used by GTK settings,
-//! and the desktop agent's reminder when a release comes out.
+//! Release checks and the Linux install transaction the app runs through
+//! `zflow update`, and the desktop agent's reminder when a release comes out.
 use std::{collections::HashMap, path::Path, process::Command, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};

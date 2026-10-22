@@ -18,16 +18,13 @@ env:
 
 jobs:
   windows:
-    name: Windows x64 / WinUI 3
+    name: Windows x64
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
-        with:
-          dotnet-version: '10.0.x'
       - name: Install Rust build toolchain
         run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt --component clippy
       - name: Rust
@@ -40,12 +37,54 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --locked --all-targets
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Build self-contained WinUI app
+      - name: Build Windows app
         run: ./scripts/build-windows.ps1
-      - name: Windows update lifecycle
+      - name: Open the app
+        run: ./scripts/check-windows-app.ps1 -App windows/dist/Zflow.App.exe -Out target/app-check/built
+      # vpk, Velopack's packager, is a .NET tool.
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.x'
+      # Installs v0.7.0, the last WinUI release, and updates it to this build
+      # the way its updater does: quit the app, then Update.exe apply.
+      - name: Update from the WinUI app
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          dotnet run --project windows/Zflow.UpdateTests
+          $check = New-Item -ItemType Directory -Force target/app-check/updated
+          gh release download v0.7.0 --repo $env:GITHUB_REPOSITORY --pattern zflow-windows-x86_64-Setup.exe --dir $check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $root = Join-Path $env:LOCALAPPDATA 'Zflow.App'
+          # Start-Process -Wait would also wait for the app Setup starts.
+          $setup = Start-Process (Join-Path $check 'zflow-windows-x86_64-Setup.exe') -ArgumentList '--silent' -PassThru
+          if (-not $setup.WaitForExit(300000)) { throw 'The WinUI installer did not finish' }
+          if (-not (Test-Path (Join-Path $root 'current/Zflow.App.exe'))) { throw 'The WinUI release did not install' }
+          Start-Sleep -Seconds 10
+          & (Join-Path $root 'current/Zflow.App.exe') --quit
+          Start-Sleep -Seconds 5
+          Get-Process Zflow.App, zflow -ErrorAction SilentlyContinue | Stop-Process -Force
+          ./scripts/package-windows.ps1 -PackVersion 0.7.1
+          $package = Resolve-Path target/windows-release/Zflow.App-0.7.1-win-x64-full.nupkg
+          $update = Start-Process (Join-Path $root 'Update.exe') -PassThru `
+            -ArgumentList 'apply', '--silent', '--norestart', '--package', "`"$package`""
+          $null = $update.Handle  # keeps ExitCode readable after it exits
+          if (-not $update.WaitForExit(300000)) { throw 'Update.exe apply did not finish' }
+          Get-ChildItem $root -Filter *.log | Copy-Item -Destination $check
+          if ($update.ExitCode) { throw "Update.exe apply failed with $($update.ExitCode)" }
+          $installed = Get-Content -Raw (Join-Path $root 'current/sq.version')
+          if ($installed -notmatch '<version>0\.7\.1</version>') { $installed; throw 'The update did not land' }
+          if (-not (Test-Path (Join-Path $root 'current/zflow.exe'))) { throw 'The update left out the engine' }
+          # Velopack keeps the app at current\, which updates replace in place.
+          ./scripts/check-windows-app.ps1 -App (Join-Path $root 'current/Zflow.App.exe') -Out $check
+      - name: Upload app check
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zflow-app-check-windows
+          path: target/app-check/
+          if-no-files-found: ignore
+      - name: Windows script checks
+        run: |
           pwsh -NoProfile -File windows/Zflow.UpdateTests/Install.Tests.ps1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           pwsh -NoProfile -File windows/Zflow.UpdateTests/Build.Tests.ps1
@@ -66,10 +105,12 @@ jobs:
           persist-credentials: false
       - name: Install Rust build toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
-      - name: PipeWire headers for the lens
+      - name: Build libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev
+          # PipeWire for the lens; the rest for the app's window.
+          sudo apt-get install -y pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libfontconfig-dev libfreetype-dev
       - name: Rust
         run: |
           cargo fmt --all --check
@@ -82,14 +123,6 @@ jobs:
           node tests/gnome_desktop_test.mjs
           node tests/gnome_panel_test.mjs
           node tests/gnome_loader_test.mjs
-      - name: Native GTK controls
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gjs gir1.2-gtk-4.0 gir1.2-adw-1 gnome-shell-common xvfb xauth
-          for test in gnome_settings_test gnome_setup_test gnome_updates_test; do
-            GSETTINGS_BACKEND=memory GTK_A11Y=none GIO_USE_VFS=local GDK_BACKEND=x11 \
-              xvfb-run --auto-servernum dbus-run-session --config-file=tests/gtk-session.conf -- gjs -m "tests/$test.js"
-          done
       - name: Installer
         run: python3 tests/install_test.py
       - name: Release commands
@@ -112,10 +145,12 @@ jobs:
           persist-credentials: false
       - name: Install Rust build toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-      - name: PipeWire headers for the lens
+      - name: Build libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev
+          # PipeWire for the lens; the rest for the app's window.
+          sudo apt-get install -y pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libfontconfig-dev libfreetype-dev
       - name: Rust
         run: cargo test --locked --all-targets
 
@@ -162,10 +197,42 @@ jobs:
           MTC_CRASH_ON_REPORT=1 \
             DYLD_INSERT_LIBRARIES="$(xcode-select -p)/usr/lib/libMainThreadChecker.dylib" \
             ./target/debug/macos-pasteboard-test
-      - name: Swift bridge
+      # The app, the AWDL helper, Sparkle and the icon, in a signed bundle.
+      - name: App bundle
+        run: ./scripts/build-macos-app.sh --debug
+      # Opens the bundle on a fresh configuration: it must stay up with its
+      # window on screen. The picture and the log are kept with the run.
+      - name: Open the app
         run: |
-          MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --locked --lib
-          swift test --package-path macos
+          mkdir -p target/app-check
+          cd target/app-check
+          cat > windows.swift <<'SWIFT'
+          import CoreGraphics
+          let pid = Int(CommandLine.arguments[1])!
+          let all = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+          let mine = all.filter { $0[kCGWindowOwnerPID as String] as? Int == pid }
+          for window in mine { print(window[kCGWindowBounds as String] ?? "") }
+          let big = mine.contains { (($0[kCGWindowBounds as String] as? [String: Any])?["Width"] as? Double ?? 0) >= 700 }
+          if !big { print("no zflow window on screen"); exit(1) }
+          SWIFT
+          RUST_LOG=warn,zflow=debug ../debug/zflow.app/Contents/MacOS/zflow-app \
+            --config "$PWD/config/config.toml" --show-settings 2> app.log &
+          pid=$!
+          sleep 20
+          screencapture -x macos.png || true
+          kill -0 "$pid" || { cat app.log; exit 1; }
+          swift windows.swift "$pid" || { cat app.log; exit 1; }
+          kill "$pid"
+          wait "$pid" || true
+          cat app.log
+          ! grep -q panicked app.log
+      - name: Upload app check
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zflow-app-check-macos
+          path: target/app-check/
+          if-no-files-found: ignore
       # install.sh also runs on Macs, with their own tar and checksum tools.
       - name: Installer
         run: python3 tests/install_test.py

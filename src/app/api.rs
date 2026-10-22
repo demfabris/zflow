@@ -1,9 +1,10 @@
-//! The settings both apps show: one snapshot and one set of requests.
+//! The settings the app shows: one snapshot and one set of requests.
 //!
-//! The Mac app reads this through the C FFI, and the GNOME window and panel
-//! over D-Bus. The top of the settings window is the same on both, in the
-//! order of the `Snapshot` fields. Each platform fills `platform` with the
-//! rows under it.
+//! The Mac app runs the engine in its own process, the Linux window and the
+//! GNOME panel reach the desktop agent over D-Bus, and the Windows app reads
+//! the engine's pipe through [`super::windows_view`]. The top of the window is
+//! the same everywhere, in the order of the `Snapshot` fields. Each platform
+//! fills `platform` with the rows under it.
 
 use std::path::PathBuf;
 
@@ -15,8 +16,8 @@ use crate::{
     pairing_window::View as PairingWindow,
 };
 
-#[derive(Serialize)]
-pub(super) struct Snapshot<P> {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot<P> {
     pub status: Status,
     /// None while the part that shares input cannot be reached.
     pub sharing: Option<bool>,
@@ -26,14 +27,17 @@ pub(super) struct Snapshot<P> {
     /// None while there is no layout to arrange.
     pub layout: Option<Layout>,
     /// Where the layout's screens touch, for the board to draw.
+    #[serde(default)]
     pub seams: Vec<Seam>,
     /// This computer's key mark, drawn on its own tile. None until known.
     pub own_mark: Option<String>,
     /// Computers found but not on the board, for the shelf under it.
+    #[serde(default)]
     pub unplaced: Vec<Unplaced>,
     pub peers: Vec<Peer>,
     /// None where crossings cannot pause yet.
     pub pause_at_edges: Option<bool>,
+    #[serde(default)]
     pub shortcuts: Vec<Shortcut>,
     /// None where clipboards are not shared yet.
     pub share_clipboard: Option<bool>,
@@ -43,21 +47,22 @@ pub(super) struct Snapshot<P> {
     pub config_path: PathBuf,
     /// Things to tell people once, such as a computer that joined. Ids grow,
     /// so a window posts each one it has not posted before.
+    #[serde(default)]
     pub notices: Vec<Notice>,
     pub platform: P,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct Status {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Status {
     pub state: State,
     /// The other computer while one controls the other.
     pub peer: Option<String>,
     pub title: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum State {
+pub enum State {
     Ready,
     /// This computer controls `peer`.
     Controlling,
@@ -107,8 +112,8 @@ impl Status {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct Peer {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peer {
     pub name: String,
     pub state: PeerState,
     /// What the row says under the name; an unreachable peer's error.
@@ -119,14 +124,15 @@ pub(super) struct Peer {
     /// Whether its scrolling is turned around here.
     pub reverse_scroll: bool,
     /// Whether it may look at this screen through a lens.
+    #[serde(default)]
     pub share_screen: bool,
     /// Its key's mark, as its tile on the shelf showed it.
     pub mark: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum PeerState {
+pub enum PeerState {
     Paired,
     Connecting,
     Connected,
@@ -163,8 +169,8 @@ impl Peer {
 
 /// One line of the health list. Rows that are fine stay in the list, so
 /// people see what was checked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct Health {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Health {
     /// Stays the same between snapshots, so a window can keep the row.
     pub id: String,
     pub level: Level,
@@ -173,9 +179,9 @@ pub(super) struct Health {
     pub action: Option<Action>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Level {
+pub enum Level {
     Ok,
     Warning,
     Error,
@@ -183,8 +189,8 @@ pub(super) enum Level {
 
 /// A fix button. The window sends `{"command": command}` unless it handles
 /// that command itself, as the Mac app does when it opens System Settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct Action {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Action {
     pub label: String,
     pub command: String,
 }
@@ -201,8 +207,8 @@ impl Health {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct Shortcut {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shortcut {
     pub title: String,
     pub keys: String,
 }
@@ -211,9 +217,9 @@ pub(super) struct Shortcut {
 /// have fails with an error rather than doing nothing.
 // Each platform leaves the fields of the other's requests unread.
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum Request {
+pub enum Request {
     Snapshot,
     SetSharing {
         enabled: bool,
@@ -302,6 +308,12 @@ pub(crate) enum Request {
     OpenLogs,
     /// Linux: installs and turns on the GNOME extension.
     InstallExtension,
+    /// Windows: sends this computer's input to computer `name` now.
+    TakeControl {
+        name: String,
+    },
+    /// Windows: brings input back to this computer.
+    ReturnHere,
 }
 
 #[cfg(test)]

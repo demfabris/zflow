@@ -24,7 +24,6 @@ command() {
     if [[ "$1" == -v ]]; then
         case "$2" in
             apt-get|dnf|pacman) [[ "$2" == "$MANAGER" ]]; return ;;
-            gjs|gnome-extensions) [[ -z "${GNOME_TOOLS_MISSING:-}" ]]; return ;;
             # Debian keeps these in /usr/sbin, outside a normal user's PATH.
             getent|groupadd|useradd|runuser|modprobe|systemd-analyze) return 1 ;;
         esac
@@ -49,7 +48,6 @@ dpkg() { echo "${DPKG_ARCH:-amd64}"; }
 getconf() { echo "${LIBC:-glibc 2.39}"; }
 systemctl() { echo "${SYSTEMD_VERSION-259}"; }
 udevadm() { echo verify; }
-gjs() { [[ -z "${GTK_MISSING:-}" ]] || return 1; echo "${GTK_VERSIONS:-4.12 1.5}"; }
 gnome-extensions() { record "extension $*"; }
 pkexec() { record "unexpected pkexec"; return 99; }
 for tool in cargo rustup rustc swift xcrun xcode-select cc make; do
@@ -84,7 +82,7 @@ class InstallerTest(unittest.TestCase):
         (self.source / "scripts").mkdir(parents=True)
         (self.source / "bin").mkdir()
         (self.source / "scripts/install.sh").write_text('printf \'setup %s %s\\n\' "$0" "$*" >> "$LOG"\n')
-        for name in ("zflow", "zflowd"):
+        for name in ("zflow", "zflowd", "zflow-app"):
             binary = self.source / "bin" / name
             # TMPDIR can be noexec, so the installer must never run downloaded files.
             binary.write_text('#!/bin/sh\necho executed-download >> "$LOG"\n')
@@ -161,7 +159,7 @@ class InstallerTest(unittest.TestCase):
         calls = self.calls()
         self.assertEqual(len(self.elevations()), 1)
         self.assertIn("\napt-get install -y kmod", calls)
-        self.assertIn("gir1.2-adw-1", calls)
+        self.assertIn("mesa-vulkan-drivers", calls)
         # Root runs the installer from its own extracted copy, not the user's download.
         self.assertIn(f"setup {self.root}/root/zflow-install.", calls)
         self.assertIn("/payload/scripts/install.sh --install-built", calls)
@@ -179,7 +177,7 @@ class InstallerTest(unittest.TestCase):
                 self.assertEqual(len(self.elevations()), 1)
                 self.assertIn(f"\n{manager} ", self.calls())
                 self.assertIn("--install-built", self.calls())
-                self.assertNotIn("gjs", self.calls())
+                self.assertNotIn("libxkbcommon-x11", self.calls())
                 self.assertNotIn("installed-zflow", self.calls())
                 self.assertNotIn("pacman -Sy", self.calls())
 
@@ -260,25 +258,17 @@ command() {
         self.assertIn("armhf", output)
         self.assertNotIn("fetch ", self.calls())
 
-    def test_old_gtk_stops_before_changes_but_missing_gtk_is_installed(self):
-        output = self.run_shell("main --yes --no-launch", env={"LEGACY": "false", "GTK_VERSIONS": "4.10 1.4"}, ok=False)
-        self.assertIn("GTK 4.12+", output)
-        self.assertNotIn("fetch ", self.calls())
-        self.assertNotIn("root ", self.calls())
-        self.run_shell("main --yes --no-launch", env={"LEGACY": "false", "GTK_MISSING": "1"})
-        self.assertIn("deb-zflow desktop-agent --install", self.calls())
-
-    def test_missing_gnome_tools_are_installed_before_desktop_setup(self):
+    def test_window_runtime_is_installed_before_desktop_setup(self):
         for legacy in ("false", "true"):
             with self.subTest(legacy=legacy):
                 self.log.write_text("")
-                self.run_shell("main --no-launch", env={"LEGACY": legacy, "GNOME_TOOLS_MISSING": "1"})
+                self.run_shell("main --no-launch", env={"LEGACY": legacy})
                 calls = self.calls()
                 self.assertLess(calls.index("apt-get install"), calls.index("desktop-agent --install"))
                 if legacy == "false":
                     self.assertIn("--install-recommends", calls)
                 else:
-                    self.assertIn("gjs gir1.2-gtk-4.0 gir1.2-adw-1 pkexec", calls)
+                    self.assertIn("libxkbcommon-x11-0 libwayland-client0 libvulkan1 mesa-vulkan-drivers pkexec", calls)
 
     def test_headless_debian_skips_desktop_recommendations(self):
         self.run_shell("main --yes --headless", env={"LEGACY": "false"})
@@ -483,7 +473,7 @@ class PackagingTest(unittest.TestCase):
             for path in ("scripts", "packaging", "assets/linux"):
                 shutil.copytree(self.ROOT / path, root / path)
             (root / "bin").mkdir()
-            for name in ("zflow", "zflowd"):
+            for name in ("zflow", "zflowd", "zflow-app"):
                 binary = root / "bin" / name
                 binary.write_text("#!/bin/sh\nexit 0\n")
                 binary.chmod(0o755)
@@ -542,14 +532,11 @@ class PackagingTest(unittest.TestCase):
         packaged = set(re.search(r"addprefix packaging/gnome-extension/,([^)]*)\)", self.read("debian/rules")).group(1).split())
         self.assertEqual(written, packed)
         self.assertEqual(written, packaged)
-        # The setup banner installs extensions, which extensions.gnome.org reviewers reject.
-        self.assertNotIn("setup.js", written)
-        self.assertNotIn("app.js", written)
-        self.assertNotIn("updates.js", written)
 
     def test_archive_install_and_uninstall_cover_the_same_session_files(self):
         install, uninstall = self.read("scripts/install.sh"), self.read("scripts/uninstall.sh")
-        for path in ("/usr/local/share/applications/io.zflow.zflow.desktop",
+        for path in ("/usr/local/bin/zflow-app",
+                     "/usr/local/share/applications/io.zflow.zflow.desktop",
                      "/usr/local/share/dbus-1/services/io.zflow.Desktop.service",
                      "/etc/xdg/autostart/io.zflow.desktop-agent.desktop",
                      "/usr/local/share/icons/hicolor/scalable/apps/io.zflow.zflow.svg",

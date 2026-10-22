@@ -9,8 +9,8 @@ Tags: **exists**, **partial**, **missing**. "Guess" marks anything not proven by
 ## How to use this plan
 
 - Phases ship one at a time, in the order in [Order](#order). Each phase lists its acceptance checks.
-- **(Mac)** marks steps that need macOS to build or test: Swift, `src/macos/`, `just test native`, the C harnesses. On the Ubuntu box, those files can be edited but not built. Leave them for the Mac, or note what is left.
-- Run the checks from README's Develop section: `just check` and `just test gtk` on Linux; `just test native` and the C harnesses on the Mac.
+- **(Mac)** marks steps that need macOS to build or test: `src/macos/`, the Mac parts of `crates/zflow-app`, the Swift AWDL helper, the C harnesses. On the Ubuntu box, those files can be edited but not built. Leave them for the Mac, or note what is left.
+- Run the checks from README's Develop section: `just check` and `just test bus` on Linux; `just check` and the C harnesses on the Mac. Windows parts of the app type-check from Linux (see [crates/README.md](crates/README.md)).
 - When a phase changes a rule written in SPEC.md, update SPEC.md in the same commit. Known ones:
   - `SPEC.md:161`: the capture set is watched while idle.
   - `SPEC.md:166`: grabs are all-or-none.
@@ -307,7 +307,7 @@ The baseline is CGEventPost from the logged-in app, which is what Deskflow and l
 
 ## 5. Unified GUI
 
-Rust produces one `Snapshot` and accepts one `Request` set on both platforms. SwiftUI and libadwaita render them natively. The top section is always shared. The bottom section comes from `snapshot.platform`. Health is a list of `{id, level, title, detail, action}` built in Rust.
+Rust produces one `Snapshot` and accepts one `Request` set on both platforms. The zz-gpui app renders them on every system. The top section is always shared. The bottom section comes from `snapshot.platform`. Health is a list of `{id, level, title, detail, action}` built in Rust.
 
 ### Top section (shared, in this order)
 

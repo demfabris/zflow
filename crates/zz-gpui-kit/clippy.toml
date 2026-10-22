@@ -1,0 +1,7 @@
+doc-valid-idents = ["OpenAI", "AppKit", "KWin", ".."]
+
+disallowed-methods = [
+    { path = "zz_gpui::rgb", reason = "chrome colors must come from cx.theme(); see knowledge/configuration/ui-conventions doc" },
+    { path = "zz_gpui::rgba", reason = "chrome colors must come from cx.theme(); see knowledge/configuration/ui-conventions doc" },
+    { path = "zz_gpui::hsla", reason = "chrome colors must come from cx.theme(); see knowledge/configuration/ui-conventions doc" },
+]

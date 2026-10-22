@@ -14,7 +14,7 @@ mkdir "$stage/$name"
 case "$target" in
     x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
         install -d "$stage/$name/bin" "$stage/$name/scripts" "$stage/$name/packaging" "$stage/$name/assets"
-        install -m 0755 "$binary_dir/zflow" "$binary_dir/zflowd" "$stage/$name/bin/"
+        install -m 0755 "$binary_dir/zflow" "$binary_dir/zflowd" "$binary_dir/zflow-app" "$stage/$name/bin/"
         install -m 0755 "$root/scripts/install.sh" "$root/scripts/uninstall.sh" "$stage/$name/scripts/"
         for directory in config linux modules-load.d system-sleep systemd udev; do
             cp -R "$root/packaging/$directory" "$stage/$name/packaging/"

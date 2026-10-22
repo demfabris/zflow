@@ -25,12 +25,27 @@ const LINGER: Duration = Duration::from_secs(1);
 const TROUBLE_AFTER: u32 = 3;
 
 unsafe extern "C" {
+    fn zflow_awdl_check() -> i32;
+    fn zflow_signing_team() -> i32;
     fn zflow_awdl_lease(
         input: *mut i32,
         output: *mut i32,
         error: *mut c_char,
         error_size: usize,
     ) -> i32;
+}
+
+/// Whether the AWDL helper is installed and answers. Blocks up to three
+/// seconds, so call it off the UI thread.
+pub fn helper_ready() -> bool {
+    // SAFETY: takes nothing and returns a flag.
+    unsafe { zflow_awdl_check() != 0 }
+}
+
+/// Whether this app is signed by a team, which installing the helper needs.
+pub fn signed_by_team() -> bool {
+    // SAFETY: takes nothing and returns a flag.
+    unsafe { zflow_signing_team() != 0 }
 }
 
 /// Owns the pipes that keep the helper's two-second AWDL lease alive. The

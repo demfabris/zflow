@@ -308,17 +308,22 @@ sudo /usr/local/lib/zflow/uninstall.sh
 
 Use `--purge` only when you also want to delete those files and the account.
 
-## Native macOS app
+## macOS app
 
 `scripts/build-macos-app.sh [--debug] [--universal] [--dmg] [--sign IDENTITY]`
-builds the Rust static library and Swift package, then assembles
-`target/{debug,release}/zflow.app`. It builds for the current CPU unless
-`--universal` asks for Apple silicon and Intel in one app. `--dmg`, or `just package dmg`,
-also packs `zflow.dmg` beside the app, signed with the app's identity unless that
-is ad hoc, and never notarized.
-The app requires macOS 26 and Swift 6.2 or newer. It uses SwiftUI Settings and
-MenuBarExtra with no Dock icon. The bundle contains the AWDL daemon and its
-SMAppService launchd plist. All executables use hardened runtime signatures.
+builds the app (`crates/zflow-app`, Rust on zz-gpui) and the AWDL helper (a
+small Swift package in `macos/`), fetches Sparkle with
+`scripts/fetch-sparkle.sh`, then assembles `target/{debug,release}/zflow.app`.
+It builds for the current CPU unless `--universal` asks for Apple silicon and
+Intel in one app. `--dmg`, or `just package dmg`, also packs `zflow.dmg` beside
+the app, signed with the app's identity unless that is ad hoc, and never
+notarized.
+The app requires macOS 26. It runs the engine in its own process, starts in the
+menu bar with no Dock icon (`LSUIElement`), and takes the Dock icon while its
+window is open. Its Metal shaders compile when it starts, so a build needs
+Xcode but not its Metal toolchain. The bundle contains the AWDL daemon and its
+SMAppService launchd plist, and Sparkle under `Contents/Frameworks`, which the
+app loads when it starts. All executables use hardened runtime signatures.
 Without `--sign`, the script signs with the first Apple Development identity
 in your keychain, so the Accessibility grant survives rebuilds. With no such
 identity, or with `--sign -`, the build is ad hoc and macOS treats every
@@ -366,17 +371,18 @@ wrote, since they would shadow the system files. Then:
    cannot, so the Mac can connect without waiting for the next login. An agent
    that is already running is stopped first, so an update takes effect now.
 
-Opening zflow runs `zflow settings`. Its window shows a banner until the
-extension runs: **Install** (asks the agent to do the steps above), **Turn On**
-(for an extension GNOME loaded but that is off), or **Log Out** (for files GNOME
-has not loaded yet; GNOME asks to confirm). The banner lives in `setup.js`,
-outside the extension, because extensions.gnome.org discourages extensions that
-install or enable extensions.
+Opening zflow runs `zflow settings`, which starts the agent and opens the
+window, `zflow-app`. The window shows a banner until the extension runs:
+**Install** (asks the agent to do the steps above), **Turn On** (for an
+extension GNOME loaded but that is off), or **Log Out** (for files GNOME has not
+loaded yet; GNOME asks to confirm). The banner lives in the app, outside the
+extension, because extensions.gnome.org discourages extensions that install or
+enable extensions.
 
-The extension adds a panel indicator with sharing and settings actions. Its
-preferences and the standalone app use the same GTK4/libadwaita controls.
-Install GJS, GTK 4.12+ and libadwaita 1.5+ for the window. The service and agent
-remain usable without the GTK runtime.
+The extension adds a panel indicator with sharing and settings actions. The
+window is the same zz-gpui app as on the Mac and Windows; it needs Wayland or X11
+and Vulkan or OpenGL, which a GNOME desktop has. The service and agent run
+without it.
 
 The agent reconnects to the system service and serves desktop requests
 without opening a window. It obtains public
@@ -399,9 +405,7 @@ the level in the agent's snapshot and shows **Update zflow**. Raise both only
 when the agent and the extension stop understanding each other.
 
 The system uninstaller and package removal do not touch home folders. The
-GNOME extension, a `Hidden=true` autostart override, and the settings window
-assets in `$XDG_CACHE_HOME/zflow/desktop` (default `~/.cache`) stay in each
-account.
+GNOME extension and a `Hidden=true` autostart override stay in each account.
 
 ## GNOME extension on extensions.gnome.org
 
@@ -410,8 +414,8 @@ account.
 `target/dist/zflow@demfabris.shell-extension.zip`. It needs GNOME Shell's
 `gnome-extensions` tool. The zip holds exactly the files that
 `desktop-agent --install` writes and the `.deb` installs: `metadata.json`,
-`extension.js`, `indicator.js`, `client.js`, `settings.js` and `prefs.js`.
-`app.js` and `setup.js` belong to the standalone window only.
+`extension.js`, `shell.js`, `indicator.js` and `client.js`. The settings window
+is the `zflow-app` program, not part of the extension.
 `tests/install_test.py` checks that the three lists match.
 
 `metadata.json` has no `version`: extensions.gnome.org sets it on upload. That

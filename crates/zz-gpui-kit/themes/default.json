@@ -1,0 +1,26 @@
+{
+  "name": "Default",
+  "materials": {
+    "radius": 10,
+    "outline": 0.5,
+    "row-inset": 4,
+    "primary": "foreground",
+    "glass": null
+  },
+  "light": {
+    "background": "#fcfcfc",
+    "foreground": "#1d1d1f",
+    "accent": "#3d6df2",
+    "success": "#1f8a4c",
+    "warning": "#b25e09",
+    "danger": "#d22f3c"
+  },
+  "dark": {
+    "background": "#18181a",
+    "foreground": "#e4e4e7",
+    "accent": "#6b8cff",
+    "success": "#3fbf74",
+    "warning": "#f0a14a",
+    "danger": "#f2555f"
+  }
+}

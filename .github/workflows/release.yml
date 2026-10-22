@@ -86,11 +86,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential debhelper pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev
-          cargo build --locked --release --bin zflow --bin zflowd
+          sudo apt-get install -y build-essential debhelper pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libfontconfig-dev libfreetype-dev
+          cargo build --locked --release -p zflow-kvm -p zflow-app --bin zflow --bin zflowd --bin zflow-app
           ./scripts/build-deb.sh
           ./tests/deb_lifecycle.sh
-      - name: Native macOS app
+      - name: macOS app
         if: runner.os == 'macOS'
         env:
           SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
@@ -203,14 +204,15 @@ jobs:
           retention-days: 7
 
   windows:
-    name: Build Windows WinUI app
+    name: Build Windows app
     needs: preflight
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # vpk, Velopack's packager, is a .NET tool.
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: '10.0.x'

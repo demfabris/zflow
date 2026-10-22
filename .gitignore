@@ -5,6 +5,4 @@ spikes/a-radio/results.csv
 /macos/.build/
 /macos/.swiftpm/
 
-/windows/**/bin/
-/windows/**/obj/
 /windows/dist/

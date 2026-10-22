@@ -11,10 +11,9 @@ default:
 rust *args:
     cargo test --locked --all-targets "$@"
 
-# Run Swift/Rust bridge tests with an isolated temporary configuration (macOS).
-native: (_platform "mac")
-    MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --locked --lib
-    swift test --package-path macos
+# Run the app's tests: its pages, arrangement math, tray menu and platform rules.
+app:
+    cargo test --locked -p zflow-app -p zz-gpui-tray
 
 # Exercise the shipped GNOME extension with a simulated compositor (requires Node.js).
 desktop:
@@ -22,12 +21,9 @@ desktop:
     node tests/gnome_panel_test.mjs
     node tests/gnome_loader_test.mjs
 
-# Exercise native GTK controls through D-Bus on the current display (Linux).
-gtk: (_platform "linux")
+# Exercise the desktop agent's D-Bus service on a private bus (Linux).
+bus: (_platform "linux")
     dbus-run-session -- cargo test --locked --lib app:: -- --ignored --skip native_desktop_geometry
-    GTK_A11Y=none GIO_USE_VFS=local dbus-run-session --config-file=tests/gtk-session.conf -- gjs -m tests/gnome_settings_test.js
-    GSETTINGS_BACKEND=memory GTK_A11Y=none GIO_USE_VFS=local dbus-run-session --config-file=tests/gtk-session.conf -- gjs -m tests/gnome_setup_test.js
-    GTK_A11Y=none GIO_USE_VFS=local dbus-run-session --config-file=tests/gtk-session.conf -- gjs -m tests/gnome_updates_test.js
 
 # Exercise installation and recovery without changing the host (requires Python 3).
 install:

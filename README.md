@@ -1,8 +1,10 @@
 # zflow
 
 zflow shares keyboard, pointer, and trackpad input over authenticated QUIC.
-Windows now has a native WinUI 3 preview with keyboard and pointer sharing,
-screen arrangement, clipboard sharing and a notification-area app. See
+One app runs on Linux, macOS and Windows: a window with the computers and the
+settings, built in Rust on zz's UI stack ([`crates/`](crates/README.md)). Windows
+is a preview with keyboard and pointer sharing, screen arrangement, clipboard
+sharing and a notification-area icon. See
 [Windows setup and build instructions](windows/README.md). This source version
 is 0.6.1; update all participating computers together. Its input protocol,
 unchanged since 0.6.0, lets the pointer walk from one paired computer to the
@@ -22,9 +24,8 @@ monitors follows system display settings. A monitor connected to two computers a
 connection: choosing its visible input and automatic input switching are not
 part of this version.
 
-Linux runs a system service with a GNOME panel indicator and native
-GTK4/libadwaita settings. macOS runs a native SwiftUI menu-bar app with a small
-settings window. Input goes both ways: the Mac sends to Linux, and a paired
+Linux runs a system service with a GNOME panel indicator and a settings
+window. On macOS the app lives in the menu bar and runs the engine itself. Input goes both ways: the Mac sends to Linux, and a paired
 Linux computer can control the Mac. This is a working prototype. Live two-host
 qualification in [TESTPLAN.md](TESTPLAN.md) still gates the alpha label, and
 the two-way sitting there has not run yet.
@@ -44,13 +45,14 @@ The installer downloads prebuilt GitHub release artifacts and verifies their
 SHA-256 checksums. The command downloads the installer from the latest published
 release. The installer resolves the latest tag once before downloading its files.
 It needs no Rust, Swift, Xcode, or C compiler. Linux binaries
-support x86-64 and ARM64 with glibc 2.39+ and systemd 254+. Native Mac apps support
+support x86-64 and ARM64 with glibc 2.39+ and systemd 254+. Mac apps support
 Intel and Apple Silicon on macOS 26+.
 
 On Ubuntu/Debian, a fresh installation uses the `.deb` package. On other
 supported Linux distributions, or when updating an existing `/usr/local`
 installation, it uses the binary archive. Linux runtime dependencies come from
-apt, dnf, or pacman. GNOME settings need GJS, GTK 4.12+, and libadwaita 1.5+.
+apt, dnf, or pacman. The GNOME settings window draws with Vulkan, or with
+OpenGL when no Vulkan driver is installed.
 The installer lists what it will change, then requests administrator access
 once, through GNOME's password dialog when available, or `sudo` in the
 terminal. That prompt is the only confirmation.
@@ -82,19 +84,19 @@ It installs for your account and adds a Start menu shortcut. See
 [Windows instructions](windows/README.md) for portable copies and migration
 from the earlier ZIP installation.
 
-Installed releases can check for updates from their native settings:
+Installed releases can check for updates from the app's Settings page:
 
 - **macOS:** choose **Check for Updates…** from the zflow menu. Settings controls
   automatic checks and downloads. Sparkle verifies the signed update and
   handles installation and relaunch.
-- **GNOME:** the **Updates** group checks when you open the window and every
-  six hours while it stays open. **Install…** asks before interrupting sharing,
+- **GNOME:** **Updates** checks when you open the window and every six hours
+  while it stays open. **Install…** asks before interrupting sharing,
   then uses the system administrator prompt. Debian installations stay under
   apt; archive installations stay under `/usr/local`. Copies owned by other
   package managers direct you to that manager.
-- **Windows:** **About zflow → Updates** checks, downloads, and offers
-  **Restart and update**. **Settings → App updates** controls automatic checks.
-  Portable copies link to the installer.
+- **Windows:** **Updates** checks, downloads, and offers **Restart and
+  update**, and controls automatic checks. Portable copies link to the
+  installer.
 
 The first release with these controls must be installed through the command,
 disk image, or Windows installer above. Later updates preserve settings and
@@ -147,7 +149,7 @@ desktop agent running during use; it supplies cursor placement, desktop
 dimensions, and the barriers where the pointer leaves.
 
 On Ubuntu, open zflow. Computers running zflow on the same network show up
-under **Found on your network**, below the arrangement.
+under **Found on this network**, below the arrangement.
 
 The Mac app lives in the menu bar. While no computer is added, it opens its
 window at launch; otherwise choose **Open zflow** from the menu-bar icon, or
@@ -181,7 +183,7 @@ Once added, **Computers** shows the arrangement, with the new tile where you
 dropped it. **Start at login** and **Reduce Wi-Fi lag**, which installs the
 AWDL helper described below, are in **Settings** (⌘,).
 
-To add another computer later, drag it in from **Found on your network** on
+To add another computer later, drag it in from **Found on this network** on
 **Computers**; the menu-bar menu lists it with **Place…**. For one zflow
 cannot find on the network, such as a computer across Tailscale, use **+**
 (**Add a Computer by Address**) and type its IP address: it joins the shelf
@@ -297,9 +299,8 @@ reinstalled. Drag its new tile onto its old one.** Only those two make the statu
 **Needs attention**; a computer that is asleep or away is a warning, and
 zflow keeps trying. A **Retry** button tries again without waiting. Its
 panel menu shows
-the current sender or receiver and a sharing switch. The extension
-preferences show the same GTK settings. Closing either window leaves the
-desktop agent running.
+the current sender or receiver and a sharing switch, and **Settings…** opens
+the window. Closing the window leaves the desktop agent running.
 
 With **Share Clipboard** on at both ends, the clipboard goes with the
 pointer: the computer the pointer leaves sends its text, or one PNG image,
@@ -571,20 +572,20 @@ Run `just` to list actions, `just test` to list test targets, or
 commands without running them.
 
 ```sh
-just build mac               # Package the native release app
-just build linux             # Build the service and native app launcher
-just run mac                 # Build and open the native debug app
-just run linux               # Open native GNOME settings
-just debug mac               # Native app diagnostics under target/logs
+just build mac               # Package the release app
+just build linux             # Build the service, its command and the app
+just run mac                 # Build and open the debug app
+just run linux               # Open the app on GNOME
+just debug mac               # App diagnostics under target/logs
 just debug linux             # Desktop-agent diagnostics
 just debug daemon            # Linux daemon diagnostics until reboot
 just install linux           # Install/update the Linux service
 just package dmg             # Local Mac disk image (--universal for both CPUs)
 just package extension       # Zip for extensions.gnome.org (Linux with GNOME Shell)
 just test rust               # Rust tests
-just test native             # Swift bridge tests (macOS)
+just test app                # The app's tests: arrangement, pages, tray menu
 just test desktop            # GNOME extension tests (Node.js)
-just test gtk                # Native GTK controls and D-Bus tests (Linux display)
+just test bus                # Desktop agent D-Bus tests on a private bus (Linux)
 just test install            # Binary installer and recovery tests (Python 3)
 just test package            # Debian lifecycle tests in Docker (build a .deb first)
 just test release            # Release command and macOS updater packaging tests
@@ -598,30 +599,30 @@ just release publish         # Push main, require CI, tag, and wait for publicat
 
 Before the first update-enabled release, run `just release setup` on Linux or
 macOS with GitHub repository administration access to configure Sparkle signing.
-Linux maintainers need Python 3 with `cryptography`; macOS uses Swift and Keychain.
+Linux maintainers need Python 3 with `cryptography`; macOS uses the Keychain.
 For each release, update `Cargo.toml`, `Cargo.lock`, the protocol version table
 when needed, and `packaging/RELEASE_NOTES.md`; commit on `main`, then run
 `just release publish`. The command releases the committed Cargo version and
 requires a clean checkout. See [release setup](packaging/README.md) for keys,
 native validation and recovering a failed workflow.
 
-CI (`.github/workflows/ci.yml`) runs these checks plus ShellCheck on Linux, and
-Clippy, Rust tests, the C harnesses, and Swift bridge tests on macOS, for every
-pull request and push to `main`.
+CI (`.github/workflows/ci.yml`) runs these checks plus ShellCheck on Linux;
+Clippy, Rust tests, the C harnesses and an app bundle build on macOS; and
+Clippy, Rust tests and the app build on Windows, for every pull request and push
+to `main`.
 
-Linux settings require GJS, GTK 4.12 or newer, and libadwaita 1.5 or newer.
-On Ubuntu, install `gjs gir1.2-gtk-4.0 gir1.2-adw-1`; on Arch, install
-`gjs gtk4 libadwaita`. The GNOME extension supplies the panel/tray icon, without
-an AppIndicator extension. Settings use native GTK widgets through GJS.
-`zflow settings` starts one desktop agent per session; the daemon retains input
-ownership and privileged configuration. Install the updated system service
+The Linux settings window is `zflow-app` (`crates/zflow-app`), installed next
+to `zflow`. The GNOME extension supplies the panel/tray icon, without an
+AppIndicator extension. `zflow settings` opens the window and starts one
+desktop agent per session; the daemon retains input ownership and privileged
+configuration. Install the updated system service
 before using the new controls.
 
-Mac builds produce `target/{debug,release}/zflow.app`. The Swift sources are in
-`macos/`, and `src/app/` contains UI-independent application services. A small C
-ABI links the Rust static library into the Swift app. The Rust worker owns input
-sharing independently of window visibility. No web view or embedded browser is
-used. Native system controls follow the current macOS appearance.
+Mac builds produce `target/{debug,release}/zflow.app`. The app is
+`crates/zflow-app`; `src/app/` holds the services it shows, and `macos/` only the
+Swift AWDL helper. The engine runs on its own thread of the app, so input
+sharing does not depend on the window. No web view or embedded browser is used.
+The app draws zz's Default theme and follows the system's light or dark mode.
 
 For an isolated configuration, launch the bundle executable with
 `--config /absolute/path/zflow.toml`. `RUST_LOG` controls Rust diagnostics.

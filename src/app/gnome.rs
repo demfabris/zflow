@@ -1,4 +1,4 @@
-//! Session service shared by the GNOME panel and GTK settings window.
+//! Session service shared by the GNOME panel and the settings window, zflow-app.
 use super::{
     api::{self, Action, Health, Level, Peer, PeerState, Request, Shortcut, Status},
     desktop::DesktopReceiver,
@@ -11,10 +11,10 @@ use std::{
 };
 
 pub const BUS: &str = "io.zflow.Desktop";
-const PATH: &str = "/io/zflow/Desktop";
+pub(crate) const PATH: &str = "/io/zflow/Desktop";
 /// packaging/gnome-extension/client.js mirrors this. Raise both when the agent
 /// and the extension stop understanding each other.
-pub(super) const API: u32 = 6;
+pub(crate) const API: u32 = 6;
 const AUTOSTART: &str = "autostart/io.zflow.desktop-agent.desktop";
 /// Where the package keeps the service's settings.
 const CONFIG_PATH: &str = "/etc/zflow/zflow.toml";
@@ -169,6 +169,8 @@ impl Service {
             | Request::SetAwdl { .. }
             | Request::HelperReady { .. }
             | Request::Lens { .. }
+            | Request::TakeControl { .. }
+            | Request::ReturnHere
             | Request::AllowAccessibility
             | Request::CheckAccessibility
             | Request::Discover => bail!("Not available on this computer"),
@@ -422,7 +424,7 @@ pub(super) fn xdg_dirs(variable: &str, fallback: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn remove_if_present(path: &Path) -> Result<()> {
+pub(super) fn remove_if_present(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
         _ => Ok(()),
@@ -513,35 +515,6 @@ pub(super) fn set_autostart(enabled: bool) -> Result<()> {
     Autostart::find()?.set(enabled)
 }
 
-pub(super) fn write_assets(path: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    for (name, contents) in [
-        (
-            "client.js",
-            include_str!("../../packaging/gnome-extension/client.js"),
-        ),
-        (
-            "settings.js",
-            include_str!("../../packaging/gnome-extension/settings.js"),
-        ),
-        (
-            "setup.js",
-            include_str!("../../packaging/gnome-extension/setup.js"),
-        ),
-        (
-            "app.js",
-            include_str!("../../packaging/gnome-extension/app.js"),
-        ),
-        (
-            "updates.js",
-            include_str!("../../packaging/gnome-extension/updates.js"),
-        ),
-    ] {
-        std::fs::write(path.join(name), contents)?;
-    }
-    Ok(())
-}
-
 /// Moves this account to the launcher, D-Bus activation file and autostart
 /// entry that the package installs for every user. Older versions wrote
 /// copies into the account, and those would shadow the system files.
@@ -608,27 +581,34 @@ pub(super) async fn start_agent(connection: &zbus::Connection, replace: bool) ->
     Ok(())
 }
 
+/// Starts the desktop agent, then becomes the settings window: the zflow-app
+/// beside this executable, or the one on PATH.
 pub fn settings() -> Result<()> {
     use std::os::unix::process::CommandExt;
     ensure!(
         !nix::unistd::Uid::effective().is_root(),
         "Open settings as your desktop user, without sudo"
     );
-    let path = xdg("XDG_CACHE_HOME", ".cache")?.join("zflow/desktop");
     super::desktop::refresh_extension()?;
-    write_assets(&path)?;
+    // Older versions ran the window from scripts copied here.
+    if let Ok(cache) = xdg("XDG_CACHE_HOME", ".cache") {
+        let _ = std::fs::remove_dir_all(cache.join("zflow/desktop"));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async { start_agent(&zbus::Connection::session().await?, false).await })?;
     drop(runtime);
-    Err(std::process::Command::new("gjs")
-        .env("ZFLOW_EXECUTABLE", std::env::current_exe()?)
-        .env("ZFLOW_VERSION", env!("CARGO_PKG_VERSION"))
-        .arg("-m")
-        .arg(path.join("app.js"))
+    let zflow = std::env::current_exe()?;
+    let mut app = zflow.with_file_name("zflow-app");
+    if !app.is_file() {
+        app = "zflow-app".into();
+    }
+    // The window runs `zflow update` and `zflow settings` through this path.
+    Err(std::process::Command::new(&app)
+        .env("ZFLOW_EXECUTABLE", &zflow)
         .exec())
-    .context("Install GJS, GTK4 and libadwaita to open zflow settings")
+    .with_context(|| format!("Could not open {}. Reinstall zflow", app.display()))
 }
 
 #[cfg(test)]

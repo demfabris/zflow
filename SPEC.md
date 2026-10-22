@@ -4,6 +4,7 @@
 >
 > Implementation status: the headless Linux prototype is implemented. It is not yet a qualified alpha: the privileged, packaged two-host qualification run in [TESTPLAN.md](TESTPLAN.md) has not run.
 > September 16 implementation: macOS uses a native SwiftUI menu-bar app linked to the Rust core through a C ABI. Linux uses a headless desktop agent and GNOME extension for cursor placement and return barriers. AWDL suppression uses a signed, same-team XPC service registered through SMAppService. Live two-host and signed-helper qualification remain outstanding; broader portal and macOS receiver matrices below are future work.
+> October 21 implementation: one Rust app on zz's GPUI stack (`crates/zflow-app`) replaces the SwiftUI, WinUI and GTK windows on every system. On a Mac it runs the engine in process on its own thread, with no C ABI; on Linux it talks to the desktop agent over D-Bus; on Windows it talks to the engine's pipe.
 > September 28 implementation: the Mac app also receives. A paired computer controls the logged-in Mac through CGEventPost from the app's own process, over the same authenticated sessions the Mac uses to send. The two-way sitting in [TESTPLAN.md](TESTPLAN.md) has not run yet. The LoginWindow process model and virtual-HID backends below remain future work.
 >
 > v0.3 records three maintainer decisions after adversarial review: on-demand device grabs, raw-contact capture in the signed macOS baseline behind a flag, and the split of release matrices into [TESTPLAN.md](TESTPLAN.md).
@@ -587,7 +588,8 @@ ei_gestures carries recognized gestures rather than raw MT contacts. It cannot r
 ### Process model
 
 The current source-only app runs capture and networking in its user process.
-SwiftUI owns the menu and Settings window; a Rust worker owns engine lifetimes.
+The zz-gpui app owns the menu bar item and the window; an engine thread owns
+engine lifetimes.
 A separate SMAppService daemon handles only leased AWDL suppression. The app
 connects to it over XPC directly; each side requires the same signing team and
 the other's exact identifier. The

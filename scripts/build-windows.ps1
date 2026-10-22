@@ -1,15 +1,13 @@
 [CmdletBinding()]
-param([ValidateSet('Debug','Release')][string]$Configuration = 'Release', [switch]$Launch)
+param([switch]$Launch)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$localSdk = Join-Path $env:LOCALAPPDATA 'zflow-dev/dotnet/dotnet.exe'
-$dotnet = if (Test-Path -LiteralPath $localSdk) { $localSdk } else { (Get-Command dotnet -ErrorAction Stop).Source }
 Push-Location $repo
 try {
     $target = 'x86_64-pc-windows-msvc'
     $metadata = & cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
-    $engine = Join-Path $metadata.target_directory "$target/release/zflow.exe"
+    $built = Join-Path $metadata.target_directory "$target/release"
     # Cargo chooses one flag source. Append to the active environment override,
     # or merge the target flags through Cargo's own configuration support.
     $flagVariable = @('CARGO_ENCODED_RUSTFLAGS', 'RUSTFLAGS', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS') |
@@ -29,34 +27,39 @@ try {
             $cargoConfig = @('--config', $configFile)
         }
         # An explicit target keeps these flags off host build scripts and proc macros.
-        & cargo build --locked --release --bin zflow --target $target @cargoConfig
-        if ($LASTEXITCODE -ne 0) { throw 'Rust engine build failed' }
+        & cargo build --locked --release --target $target -p zflow-kvm -p zflow-app --bin zflow --bin zflow-app @cargoConfig
+        if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
     } finally {
         if ($flagVariable) { [Environment]::SetEnvironmentVariable($flagVariable, $previousFlags) }
         if ($configFile) { Remove-Item -LiteralPath $configFile -Force }
     }
-    if (-not (Test-Path -LiteralPath $engine)) { throw "Rust engine is missing: $engine" }
-    $manifest = Get-Content -LiteralPath (Join-Path $repo 'Cargo.toml') -Raw
-    $version = [regex]::Match($manifest, '(?m)^version = "([^"]+)"').Groups[1].Value
-    if (-not $version) { throw 'Cargo version is missing' }
+    # Existing installs, Velopack's main executable and the Run key all use the
+    # name Zflow.App.exe, so the app keeps it.
+    $binaries = [ordered]@{ 'zflow-app.exe' = 'Zflow.App.exe'; 'zflow.exe' = 'zflow.exe' }
     $output = Join-Path $repo 'windows/dist'
     if (Test-Path -LiteralPath $output) { Remove-Item -LiteralPath $output -Recurse -Force }
-    & $dotnet publish windows/Zflow.App/Zflow.App.csproj -c $Configuration -p:Platform=x64 "-p:Version=$version" "-p:ZflowEnginePath=$engine" --output $output
-    if ($LASTEXITCODE -ne 0) { throw 'WinUI app build failed' }
+    New-Item -ItemType Directory -Path $output | Out-Null
+    foreach ($name in $binaries.Keys) {
+        $path = Join-Path $built $name
+        if (-not (Test-Path -LiteralPath $path)) { throw "Build output is missing: $path" }
+        Copy-Item -LiteralPath $path -Destination (Join-Path $output $binaries[$name])
+    }
     $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
     if (-not $dumpbin) {
         $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
         $dumpbin = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' |
             Select-Object -First 1
     }
-    if (-not $dumpbin) { throw 'Visual Studio dumpbin.exe is required to verify the packaged engine' }
-    $packagedEngine = Join-Path $output 'zflow.exe'
-    $headers = & $dumpbin /HEADERS $packagedEngine
-    if ($LASTEXITCODE -ne 0 -or -not ($headers -match '^\s*8664 machine')) { throw 'The packaged Rust engine must be Windows x64' }
-    $dependencies = & $dumpbin /DEPENDENTS $packagedEngine
-    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the packaged Rust engine dependencies' }
-    if ($dependencies -match '^\s*(VCRUNTIME|MSVCP|CONCRT|VCCORLIB|MSVCR)\d[^\s]*\.dll\s*$') {
-        throw 'The packaged Rust engine requires a Visual C++ runtime DLL; build it with the static CRT'
+    if (-not $dumpbin) { throw 'Visual Studio dumpbin.exe is required to verify the packaged executables' }
+    foreach ($name in $binaries.Values) {
+        $packaged = Join-Path $output $name
+        $headers = & $dumpbin /HEADERS $packaged
+        if ($LASTEXITCODE -ne 0 -or -not ($headers -match '^\s*8664 machine')) { throw "The packaged $name must be Windows x64" }
+        $dependencies = & $dumpbin /DEPENDENTS $packaged
+        if ($LASTEXITCODE -ne 0) { throw "Could not inspect the dependencies of the packaged $name" }
+        if ($dependencies -match '^\s*(VCRUNTIME|MSVCP|CONCRT|VCCORLIB|MSVCR)\d[^\s]*\.dll\s*$') {
+            throw "The packaged $name requires a Visual C++ runtime DLL; build it with the static CRT"
+        }
     }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install-windows.ps1') -Destination $output
     Copy-Item -LiteralPath (Join-Path $repo 'windows/README.md') -Destination $output

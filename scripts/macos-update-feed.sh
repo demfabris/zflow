@@ -20,8 +20,8 @@ output=${3:-$root/target/dist/appcast.xml}
     printf 'Expected final release disk image zflow-v%s-macos.dmg\n' "$version" >&2; exit 1;
 }
 : "${SPARKLE_PRIVATE_ED_KEY:?Missing SPARKLE_PRIVATE_ED_KEY}"
-generator="$root/macos/.build/artifacts/sparkle/Sparkle/bin/generate_appcast"
-[[ -x "$generator" ]] || { printf 'Build the macOS app first to fetch Sparkle tools\n' >&2; exit 1; }
+generator="$("$root/scripts/fetch-sparkle.sh")/bin/generate_appcast"
+[[ -x "$generator" ]] || { printf 'Sparkle has no generate_appcast\n' >&2; exit 1; }
 codesign --verify --strict "$dmg"
 xcrun stapler validate "$dmg"
 mkdir -p -- "$(dirname -- "$output")"

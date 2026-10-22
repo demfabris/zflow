@@ -15,8 +15,6 @@ pub mod core;
 pub mod daemon;
 pub mod desktop;
 pub mod discovery;
-#[cfg(target_os = "macos")]
-mod ffi;
 pub mod forgotten;
 pub mod hello;
 pub mod identity;

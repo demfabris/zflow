@@ -1,0 +1,508 @@
+//! Icons: the glyph set, and the element that draws one.
+//!
+//! Every glyph but the brand marks is zz's own, drawn by [`glyphs`] from the
+//! skeletons in `mac.json` so its corners follow the theme radius and corner
+//! smoothing (`knowledge/configuration/icon-set.md`). The brand marks are
+//! files in `assets/icons/`: `openai` and `claude` are
+//! [Simple Icons](https://simpleicons.org) (CC0-1.0), `brand-chrome` is
+//! [Tabler Icons](https://tabler.io/icons) (MIT, `assets/icons/LICENSE-TABLER`),
+//! and `zz` is the zz mark.
+
+mod assets;
+pub mod glyphs;
+
+pub use assets::Assets;
+
+use zz_gpui::{
+    AnyElement, App, Hsla, IntoElement, Pixels, RenderOnce, SharedString, StyleRefinement, Styled,
+    Svg, Transformation, Window, font, prelude::FluentBuilder as _, svg,
+};
+
+use crate::{Sizable, Size, Theme};
+
+/// A single SVG glyph, sized and tinted like the text around it.
+///
+/// Size falls back in ascending priority: ambient font size, an explicit
+/// width/height through [`Styled`], then [`Sizable::with_size`].
+#[derive(Clone, Default, IntoElement)]
+pub struct Icon {
+    path: SharedString,
+    style: StyleRefinement,
+    text_color: Option<Hsla>,
+    size: Option<Size>,
+    transformation: Option<Transformation>,
+}
+
+impl Icon {
+    #[must_use]
+    pub fn new(icon: impl Into<Self>) -> Self {
+        icon.into()
+    }
+
+    /// An icon-shaped blank. Keeps rows aligned where one item carries a glyph
+    /// and its neighbour does not.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Point the icon at an arbitrary asset path, such as `icons/globe.svg`.
+    /// Resolved through the [`zz_gpui::AssetSource`] the app was built with.
+    #[must_use]
+    pub fn path(mut self, path: impl Into<SharedString>) -> Self {
+        self.path = path.into();
+        self
+    }
+
+    /// Apply an SVG transformation: rotation, scale, translation. Paint-only,
+    /// so layout and hit testing do not move.
+    #[must_use]
+    pub fn transform(mut self, transformation: Transformation) -> Self {
+        self.transformation = Some(transformation);
+        self
+    }
+}
+
+impl Styled for Icon {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+
+    fn text_color(mut self, color: impl Into<Hsla>) -> Self {
+        self.text_color = Some(color.into());
+        self
+    }
+}
+
+impl Icon {
+    #[must_use]
+    pub fn medium(self) -> Self {
+        self.with_size(Size::Medium)
+    }
+}
+
+impl Sizable for Icon {
+    fn with_size(mut self, size: impl Into<Size>) -> Self {
+        self.size = Some(size.into());
+        self
+    }
+}
+
+impl RenderOnce for Icon {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let path = cx
+            .try_global::<Theme>()
+            .and_then(|theme| {
+                glyphs::path(&self.path, theme.radius.into(), crate::CORNER_SMOOTHING)
+            })
+            .unwrap_or(self.path);
+        let color = self.text_color.unwrap_or_else(|| window.text_style().color);
+        let ambient = window.text_style().font_size.to_pixels(window.rem_size());
+        let styled_size = self.style.size.width.is_some() || self.style.size.height.is_some();
+
+        let mut base = svg();
+        *base.style() = self.style;
+
+        base.flex_shrink_0()
+            .text_color(color)
+            .when(!styled_size, |this| this.size(ambient))
+            .when_some(self.size, |this, size| match size {
+                Size::Size(size) => this.size(size),
+                Size::Small => this.size_3(),
+                Size::Medium => this.size_3p5(),
+            })
+            .when_some(self.transformation, Svg::with_transformation)
+            .path(path)
+    }
+}
+
+impl From<Icon> for AnyElement {
+    fn from(icon: Icon) -> Self {
+        icon.into_any_element()
+    }
+}
+
+/// How far an icon of `icon_size`, centred on a line of the theme's UI font at
+/// `font_size`, moves down to sit centred on the line's capitals, the way SF
+/// Symbols sit next to text.
+///
+/// A line centres the font's ascent and descent, so the middle of its
+/// capitals is half of ascent less descent less cap height below the middle of
+/// the line: 0.33px for SF Pro at 13px, none for Inter. GPUI rounds the text's
+/// baseline and the icon to device pixels separately, so the drop is moved by
+/// at most a quarter point to keep the icon's top a whole number of half points
+/// above the baseline. Both then round the same way wherever the row lands,
+/// and at 2x the icon never jumps a pixel against the letters as rows scroll.
+#[must_use]
+pub fn cap_center_drop(font_size: Pixels, icon_size: Pixels, cx: &App) -> Pixels {
+    let Some(theme) = cx.try_global::<Theme>() else {
+        return Pixels::ZERO;
+    };
+    let text = cx.text_system();
+    let font = text.resolve_font(&font(theme.font_family.clone()));
+    let baseline = (text.ascent(font, font_size) + text.descent(font, font_size)) / 2.0;
+    let icon_top = text.cap_height(font, font_size) / 2.0 + icon_size / 2.0;
+    baseline + icon_size / 2.0 - (icon_top * 2.0).round() / 2.0
+}
+
+/// Every icon zz ships, drawn by [`glyphs`] or a brand mark in `assets/icons/`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, IntoElement)]
+pub enum IconName {
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowsMove,
+    Asterisk,
+    AppWindow,
+    Bell,
+    Bot,
+    Braces,
+    BrandChrome,
+    Calendar,
+    CaseSensitive,
+    ChatPlus,
+    Check,
+    ChevronDown,
+    ChevronLeft,
+    ChevronRight,
+    ChevronUp,
+    CircleCheck,
+    CircleUser,
+    CircleX,
+    Clock,
+    Claude,
+    Xmark,
+    Copy,
+    Cpu,
+    Ellipsis,
+    EllipsisVertical,
+    ExternalLink,
+    Eye,
+    EyeFilled,
+    File,
+    Folder,
+    GalleryVerticalEnd,
+    GitBranch,
+    Globe,
+    GripVertical,
+    HardDrive,
+    History,
+    Inbox,
+    Info,
+    Inspector,
+    KeyAltIso,
+    KeyControl,
+    KeyControlIso,
+    KeyEscape,
+    KeyOption,
+    KeyTab,
+    KeyTabIso,
+    Keyboard,
+    Laptop,
+    Layers,
+    LayoutColumns,
+    LayoutDashboard,
+    Loader,
+    Minus,
+    Moon,
+    Openai,
+    Palette,
+    PanelBottom,
+    PanelLeft,
+    PanelRight,
+    PanelsTopLeft,
+    Pencil,
+    Plus,
+    Redo2,
+    RobotFace,
+    Search,
+    Server,
+    Settings,
+    SiteControls,
+    Sparkle,
+    SquareTerminal,
+    Star,
+    Stop,
+    Sun,
+    Terminal,
+    TriangleAlert,
+    Undo2,
+    User,
+    WindowClose,
+    WindowMaximize,
+    WindowMinimize,
+    WindowRestore,
+    ZoomIn,
+    Zz,
+}
+
+impl IconName {
+    /// Every variant, in declaration order.
+    pub const ALL: &[Self] = &[
+        Self::ArrowDown,
+        Self::ArrowLeft,
+        Self::ArrowRight,
+        Self::ArrowUp,
+        Self::ArrowsMove,
+        Self::Asterisk,
+        Self::AppWindow,
+        Self::Bell,
+        Self::Bot,
+        Self::Braces,
+        Self::BrandChrome,
+        Self::Calendar,
+        Self::CaseSensitive,
+        Self::ChatPlus,
+        Self::Check,
+        Self::ChevronDown,
+        Self::ChevronLeft,
+        Self::ChevronRight,
+        Self::ChevronUp,
+        Self::CircleCheck,
+        Self::CircleUser,
+        Self::CircleX,
+        Self::Clock,
+        Self::Claude,
+        Self::Xmark,
+        Self::Copy,
+        Self::Cpu,
+        Self::Ellipsis,
+        Self::EllipsisVertical,
+        Self::ExternalLink,
+        Self::Eye,
+        Self::EyeFilled,
+        Self::File,
+        Self::Folder,
+        Self::GalleryVerticalEnd,
+        Self::GitBranch,
+        Self::Globe,
+        Self::GripVertical,
+        Self::HardDrive,
+        Self::History,
+        Self::Inbox,
+        Self::Info,
+        Self::Inspector,
+        Self::KeyAltIso,
+        Self::KeyControl,
+        Self::KeyControlIso,
+        Self::KeyEscape,
+        Self::KeyOption,
+        Self::KeyTab,
+        Self::KeyTabIso,
+        Self::Keyboard,
+        Self::Laptop,
+        Self::Layers,
+        Self::LayoutColumns,
+        Self::LayoutDashboard,
+        Self::Loader,
+        Self::Minus,
+        Self::Moon,
+        Self::Openai,
+        Self::Palette,
+        Self::PanelBottom,
+        Self::PanelLeft,
+        Self::PanelRight,
+        Self::PanelsTopLeft,
+        Self::Pencil,
+        Self::Plus,
+        Self::Redo2,
+        Self::RobotFace,
+        Self::Search,
+        Self::Server,
+        Self::Settings,
+        Self::SiteControls,
+        Self::Sparkle,
+        Self::SquareTerminal,
+        Self::Star,
+        Self::Stop,
+        Self::Sun,
+        Self::Terminal,
+        Self::TriangleAlert,
+        Self::Undo2,
+        Self::User,
+        Self::WindowClose,
+        Self::WindowMaximize,
+        Self::WindowMinimize,
+        Self::WindowRestore,
+        Self::ZoomIn,
+        Self::Zz,
+    ];
+
+    /// The icon's asset path, such as `icons/arrow-down.svg`. Resolved through
+    /// the [`zz_gpui::AssetSource`] the app was built with, [`Assets`] by default.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::ArrowDown => "icons/arrow-down.svg",
+            Self::ArrowLeft => "icons/arrow-left.svg",
+            Self::ArrowRight => "icons/arrow-right.svg",
+            Self::ArrowUp => "icons/arrow-up.svg",
+            Self::ArrowsMove => "icons/arrows-move.svg",
+            Self::Asterisk => "icons/asterisk.svg",
+            Self::AppWindow => "icons/app-window.svg",
+            Self::Bell => "icons/bell.svg",
+            Self::Bot => "icons/bot.svg",
+            Self::Braces => "icons/braces.svg",
+            Self::BrandChrome => "icons/brand-chrome.svg",
+            Self::Calendar => "icons/calendar.svg",
+            Self::CaseSensitive => "icons/case-sensitive.svg",
+            Self::ChatPlus => "icons/chat-plus.svg",
+            Self::Check => "icons/check.svg",
+            Self::ChevronDown => "icons/chevron-down.svg",
+            Self::ChevronLeft => "icons/chevron-left.svg",
+            Self::ChevronRight => "icons/chevron-right.svg",
+            Self::ChevronUp => "icons/chevron-up.svg",
+            Self::CircleCheck => "icons/circle-check.svg",
+            Self::CircleUser => "icons/circle-user.svg",
+            Self::CircleX => "icons/circle-x.svg",
+            Self::Clock => "icons/clock.svg",
+            Self::Claude => "icons/claude.svg",
+            Self::Xmark => "icons/xmark.svg",
+            Self::Copy => "icons/copy.svg",
+            Self::Cpu => "icons/cpu.svg",
+            Self::Ellipsis => "icons/ellipsis.svg",
+            Self::EllipsisVertical => "icons/ellipsis-vertical.svg",
+            Self::ExternalLink => "icons/external-link.svg",
+            Self::Eye => "icons/eye.svg",
+            Self::EyeFilled => "icons/eye-filled.svg",
+            Self::File => "icons/file.svg",
+            Self::Folder => "icons/folder.svg",
+            Self::GalleryVerticalEnd => "icons/gallery-vertical-end.svg",
+            Self::GitBranch => "icons/git-branch.svg",
+            Self::Globe => "icons/globe.svg",
+            Self::GripVertical => "icons/grip-vertical.svg",
+            Self::HardDrive => "icons/hard-drive.svg",
+            Self::History => "icons/history.svg",
+            Self::Inbox => "icons/inbox.svg",
+            Self::Info => "icons/info.svg",
+            Self::Inspector => "icons/inspector.svg",
+            Self::KeyAltIso => "icons/key-alt-iso.svg",
+            Self::KeyControl => "icons/key-control.svg",
+            Self::KeyControlIso => "icons/key-control-iso.svg",
+            Self::KeyEscape => "icons/key-escape.svg",
+            Self::KeyOption => "icons/key-option.svg",
+            Self::KeyTab => "icons/key-tab.svg",
+            Self::KeyTabIso => "icons/key-tab-iso.svg",
+            Self::Keyboard => "icons/keyboard.svg",
+            Self::Laptop => "icons/laptop.svg",
+            Self::Layers => "icons/layers.svg",
+            Self::LayoutColumns => "icons/layout-columns.svg",
+            Self::LayoutDashboard => "icons/layout-dashboard.svg",
+            Self::Loader => "icons/loader.svg",
+            Self::Minus => "icons/minus.svg",
+            Self::Moon => "icons/moon.svg",
+            Self::Openai => "icons/openai.svg",
+            Self::Palette => "icons/palette.svg",
+            Self::PanelBottom => "icons/panel-bottom.svg",
+            Self::PanelLeft => "icons/panel-left.svg",
+            Self::PanelRight => "icons/panel-right.svg",
+            Self::PanelsTopLeft => "icons/panels-top-left.svg",
+            Self::Pencil => "icons/pencil.svg",
+            Self::Plus => "icons/plus.svg",
+            Self::Redo2 => "icons/redo-2.svg",
+            Self::RobotFace => "icons/robot-face.svg",
+            Self::Search => "icons/search.svg",
+            Self::Server => "icons/server.svg",
+            Self::Settings => "icons/settings.svg",
+            Self::SiteControls => "icons/site-controls.svg",
+            Self::Sparkle => "icons/sparkle.svg",
+            Self::SquareTerminal => "icons/square-terminal.svg",
+            Self::Star => "icons/star.svg",
+            Self::Stop => "icons/stop.svg",
+            Self::Sun => "icons/sun.svg",
+            Self::Terminal => "icons/terminal.svg",
+            Self::TriangleAlert => "icons/triangle-alert.svg",
+            Self::Undo2 => "icons/undo-2.svg",
+            Self::User => "icons/user.svg",
+            Self::WindowClose => "icons/window-close.svg",
+            Self::WindowMaximize => "icons/window-maximize.svg",
+            Self::WindowMinimize => "icons/window-minimize.svg",
+            Self::WindowRestore => "icons/window-restore.svg",
+            Self::ZoomIn => "icons/zoom-in.svg",
+            Self::Zz => "icons/zz.svg",
+        }
+    }
+}
+
+impl From<IconName> for Icon {
+    fn from(name: IconName) -> Self {
+        Self::default().path(name.path())
+    }
+}
+
+impl From<IconName> for AnyElement {
+    fn from(name: IconName) -> Self {
+        Icon::from(name).into_any_element()
+    }
+}
+
+impl RenderOnce for IconName {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        Icon::from(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashSet, path::PathBuf};
+
+    use zz_gpui::AssetSource as _;
+
+    use super::{Assets, IconName};
+
+    fn icons_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons")
+    }
+
+    #[test]
+    fn every_variant_loads_from_the_asset_source() {
+        for icon in IconName::ALL {
+            let path = icon.path();
+            let loaded = Assets
+                .load(path)
+                .unwrap_or_else(|error| panic!("{icon:?} ({path}) failed to load: {error}"));
+            assert!(loaded.is_some(), "{icon:?} ({path}) is not in assets/icons");
+        }
+    }
+
+    #[test]
+    fn every_shipped_file_has_a_variant() {
+        let named: HashSet<&str> = IconName::ALL.iter().map(IconName::path).collect();
+
+        for entry in std::fs::read_dir(icons_dir()).expect("assets/icons is readable") {
+            let file_name = entry.expect("readable directory entry").file_name();
+            let file_name = file_name.to_string_lossy();
+            if !file_name.ends_with(".svg") {
+                continue;
+            }
+
+            assert!(
+                named.contains(format!("icons/{file_name}").as_str()),
+                "assets/icons/{file_name} has no IconName variant"
+            );
+        }
+    }
+
+    #[test]
+    fn every_drawn_icon_names_its_variant_and_ships_no_file() {
+        let set: serde_json::Value =
+            serde_json::from_str(include_str!("mac.json")).expect("the icon set parses");
+        for icon in set["icons"].as_array().expect("the set lists icons") {
+            let name = icon["name"].as_str().expect("every icon has a name");
+            let path = format!("icons/{name}.svg");
+            let variant = IconName::ALL
+                .iter()
+                .find(|variant| variant.path() == path)
+                .unwrap_or_else(|| panic!("{name} has no IconName variant"));
+            assert_eq!(
+                Some(format!("{variant:?}").as_str()),
+                icon["variant"].as_str()
+            );
+            assert!(
+                !icons_dir().join(format!("{name}.svg")).exists(),
+                "assets/icons/{name}.svg shadows the drawn {name}"
+            );
+        }
+    }
+}

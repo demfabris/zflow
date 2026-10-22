@@ -1,10 +1,12 @@
 [CmdletBinding()]
-param([string]$SignParameters)
+# -PackVersion packs under another version, as CI does to update an
+# installed release to this build.
+param([string]$SignParameters, [string]$PackVersion)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 & (Join-Path $PSScriptRoot 'build-windows.ps1')
 $manifest = Get-Content -LiteralPath (Join-Path $repo 'Cargo.toml') -Raw
-$version = [regex]::Match($manifest, '(?m)^version = "([^"]+)"').Groups[1].Value
+$version = if ($PackVersion) { $PackVersion } else { [regex]::Match($manifest, '(?m)^version = "([^"]+)"').Groups[1].Value }
 if (-not $version) { throw 'Cargo version is missing' }
 if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'The tag must match Cargo.toml' }
 $output = Join-Path $repo 'target/windows-release'
@@ -14,7 +16,12 @@ $localSdk = Join-Path $env:LOCALAPPDATA 'zflow-dev/dotnet/dotnet.exe'
 $dotnet = if (Test-Path -LiteralPath $localSdk) { $localSdk } else { (Get-Command dotnet -ErrorAction Stop).Source }
 $tools = Join-Path $repo 'target/velopack-tools'
 if (Test-Path -LiteralPath $tools) { Remove-Item -LiteralPath $tools -Recurse -Force }
-& $dotnet tool install vpk --version 1.2.161 --tool-path $tools
+# vpk bundles the Update.exe that the app's velopack crate drives, so both
+# come from the same Velopack release.
+$lock = Get-Content -LiteralPath (Join-Path $repo 'Cargo.lock') -Raw
+$velopack = [regex]::Match($lock, '(?m)^name = "velopack"\r?\nversion = "([^"]+)"').Groups[1].Value
+if (-not $velopack) { throw 'Cargo.lock does not pin the velopack crate' }
+& $dotnet tool install vpk --version $velopack --tool-path $tools
 if ($LASTEXITCODE -ne 0) { throw 'Velopack tool installation failed' }
 $pack = @('pack', '--packId', 'Zflow.App', '--packVersion', $version,
     '--packDir', (Join-Path $repo 'windows/dist'), '--mainExe', 'Zflow.App.exe',

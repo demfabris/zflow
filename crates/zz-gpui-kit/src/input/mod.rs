@@ -1,0 +1,37 @@
+//! The text field: a single-line or auto-growing multi-line editor.
+
+// Each allow below is for a lint that fires only on zz-gpui's element and action
+// shapes; correctness, perf and suspicious lints stay on.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::fn_params_excessive_bools,
+    clippy::module_name_repetitions,
+    clippy::needless_pass_by_value,
+    clippy::struct_excessive_bools
+)]
+
+mod actions;
+mod element;
+mod field;
+mod history;
+mod number;
+mod state;
+
+pub use actions::{
+    Backspace, Copy, Cut, Delete, DeleteToBeginningOfLine, DeleteToEndOfLine, DeleteToNextWordEnd,
+    DeleteToPreviousWordStart, Enter, Escape, IndentInline, MoveDown, MoveEnd, MoveHome, MoveLeft,
+    MoveRight, MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, OutdentInline,
+    Paste, Redo, SelectAll, SelectDown, SelectLeft, SelectRight, SelectToEnd, SelectToEndOfLine,
+    SelectToNextWordEnd, SelectToPreviousWordStart, SelectToStart, SelectToStartOfLine, SelectUp,
+    ShowCharacterPalette, Undo,
+};
+pub(crate) use field::field_text;
+pub use field::{Input, InputContentType, field_chrome, field_paint};
+pub use number::NumberInput;
+pub use state::{InputEvent, InputState};
+pub use zz_gpui::TextAlign;
+
+pub(crate) fn init(cx: &mut zz_gpui::App) {
+    actions::init(cx);
+    number::init(cx);
+}

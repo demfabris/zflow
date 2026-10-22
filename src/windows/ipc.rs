@@ -87,7 +87,7 @@ pub fn pipe_name(path: &Path) -> Result<String> {
     Ok(format!(r"\\.\pipe\zflow-{}", &hash[..24]))
 }
 
-pub(super) fn user_sid() -> Result<String> {
+pub fn user_sid() -> Result<String> {
     unsafe {
         let mut token = std::ptr::null_mut();
         ensure!(

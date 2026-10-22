@@ -33,10 +33,13 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends /tmp/zflow.deb | tee /tmp/install.log
 test -x /usr/bin/zflow
 /usr/bin/zflow --version
+# The settings window. Its linked libraries come from the package's dependencies.
+test -x /usr/bin/zflow-app
+if ldd /usr/bin/zflow-app | grep 'not found'; then echo 'zflow-app is missing libraries' >&2; exit 1; fi
 # The extension is what scripts/pack-extension.sh uploads, plus Shell's code again in the build
 # folder `current` names, which the loader reloads without a new login.
 extension=/usr/share/gnome-shell/extensions/zflow@demfabris
-test "$(ls "$extension" | grep -v '^build-' | tr '\n' ' ')" = 'client.js current extension.js indicator.js metadata.json prefs.js settings.js shell.js '
+test "$(ls "$extension" | grep -v '^build-' | tr '\n' ' ')" = 'client.js current extension.js indicator.js metadata.json shell.js '
 build=$(cat "$extension/current")
 test "$(ls "$extension/$build" | tr '\n' ' ')" = 'client.js indicator.js shell.js '
 cmp "$extension/shell.js" "$extension/$build/shell.js"
@@ -76,6 +79,7 @@ printf '[Unit]\nBefore=display-manager.service\n' > /etc/systemd/system/zflowd.s
 dpkg --remove zflow
 test -f /etc/systemd/system/zflowd.service.d/prelogin.conf
 test ! -e /usr/bin/zflow
+test ! -e /usr/bin/zflow-app
 test ! -e /usr/share/icons/hicolor/scalable/apps/io.zflow.zflow.svg
 test ! -e /usr/share/icons/hicolor/symbolic/apps/io.zflow.zflow-symbolic.svg
 test ! -e /usr/share/dbus-1/services/io.zflow.Desktop.service

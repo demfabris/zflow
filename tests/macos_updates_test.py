@@ -111,11 +111,11 @@ class MacOSUpdatesTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / "scripts").mkdir()
-        for script in ("macos-update-feed.sh", "sign-macos-app.sh", "setup-updates.sh", "build-macos-app.sh"):
-            shutil.copyfile(ROOT / "scripts" / script, self.root / "scripts" / script)
+        for script in ("macos-update-feed.sh", "sign-macos-app.sh", "setup-updates.sh", "build-macos-app.sh", "fetch-sparkle.sh"):
+            shutil.copy(ROOT / "scripts" / script, self.root / "scripts" / script)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        self.sparkle_bin = self.root / "macos/.build/artifacts/sparkle/Sparkle/bin"
+        self.sparkle_bin = self.root / "target/sparkle/2.10.0/bin"
         self.sparkle_bin.mkdir(parents=True)
         for name in ("codesign", "xcrun", "uname", "gh", "swift", "cargo"):
             self.tool(self.bin / name)
